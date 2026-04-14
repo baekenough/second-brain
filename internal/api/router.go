@@ -15,6 +15,7 @@ import (
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/scheduler"
 	"github.com/baekenough/second-brain/internal/search"
+	"github.com/baekenough/second-brain/internal/store"
 )
 
 // DocumentStore is the subset of store.DocumentStore used by the API.
@@ -23,6 +24,7 @@ type DocumentStore interface {
 	ListBySource(ctx context.Context, src model.SourceType, limit, offset int) ([]*model.Document, error)
 	ListRecent(ctx context.Context, includeSrc model.SourceType, excludeSrcs []model.SourceType, limit, offset int) ([]*model.Document, error)
 	CountBySource(ctx context.Context) (map[string]int, error)
+	QueryBaselineStats(ctx context.Context) (*store.BaselineStats, error)
 }
 
 // CollectorRegistry exposes collector status to the API.
@@ -87,6 +89,7 @@ func (s *Server) Handler() http.Handler {
 		r.Get("/api/v1/sources", s.listSourcesHandler)
 
 		r.Get("/api/v1/stats", s.statsHandler)
+		r.Get("/api/v1/stats/baseline", s.baselineStatsHandler)
 	})
 
 	return r

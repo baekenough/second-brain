@@ -13,6 +13,41 @@ import (
 	"github.com/baekenough/second-brain/internal/store"
 )
 
+// ExportNewDiscordGatewayForTest creates a DiscordGateway with a pre-injected
+// docStore for unit tests that exercise the real-time collection path.
+// botID is the fake bot user ID used by the in-memory discordgo state.
+func ExportNewDiscordGatewayForTest(docStore AttachmentDocumentStore) *DiscordGateway {
+	return &DiscordGateway{
+		botToken:               "test-gateway-token",
+		mentionResponseEnabled: false,
+		docStore:               docStore,
+	}
+}
+
+// ExportGatewayPersistMessageRealtime exposes persistMessageRealtime for testing.
+// It calls the method synchronously (not in a goroutine) so tests can observe
+// the side effects without synchronisation primitives.
+func ExportGatewayPersistMessageRealtime(
+	g *DiscordGateway,
+	ctx context.Context,
+	s *discordgo.Session,
+	m *discordgo.MessageCreate,
+) {
+	g.persistMessageRealtime(ctx, s, m)
+}
+
+// ExportIsAllowedChannelType exposes isAllowedChannelType for testing.
+func ExportIsAllowedChannelType(t discordgo.ChannelType) bool {
+	return isAllowedChannelType(t)
+}
+
+// ExportGatewayHandleMessageCreate invokes the handleMessageCreate event handler
+// synchronously for testing. In production, discordgo calls this in a goroutine;
+// tests use it synchronously to observe side effects without race conditions.
+func ExportGatewayHandleMessageCreate(g *DiscordGateway, s *discordgo.Session, m *discordgo.MessageCreate) {
+	g.handleMessageCreate(s, m)
+}
+
 // ExportNewDiscordCollectorForTest creates a DiscordCollector with injected
 // httpClient, docStore, and extractionFailures for white-box attachment tests.
 func ExportNewDiscordCollectorForTest(

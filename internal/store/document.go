@@ -401,6 +401,241 @@ func (s *DocumentStore) CountBySource(ctx context.Context) (map[string]int, erro
 	return out, nil
 }
 
+// --- baseline stats ---
+
+// ContentLengthStats holds percentile and aggregate statistics for content length.
+type ContentLengthStats struct {
+	Mean float64 `json:"mean"`
+	P50  float64 `json:"p50"`
+	P95  float64 `json:"p95"`
+	Max  int64   `json:"max"`
+}
+
+// DocumentSourceStats holds per-source aggregate document metrics.
+type DocumentSourceStats struct {
+	Count         int                `json:"count"`
+	ContentLength ContentLengthStats `json:"content_length"`
+}
+
+// BaselineDocumentStats aggregates document-level baseline metrics.
+type BaselineDocumentStats struct {
+	Total      int                            `json:"total"`
+	BySource   map[string]DocumentSourceStats `json:"by_source_type"`
+}
+
+// BaselineChunkStats aggregates chunk-level baseline metrics.
+type BaselineChunkStats struct {
+	Total                int64   `json:"total"`
+	AvgChunksPerDocument float64 `json:"avg_chunks_per_document"`
+	AvgChunkSizeBytes    float64 `json:"avg_chunk_size_bytes"`
+}
+
+// BaselineFailureStats aggregates extraction failure metrics.
+type BaselineFailureStats struct {
+	Open       int64          `json:"open"`
+	DeadLetter int64          `json:"dead_letter"`
+	BySource   map[string]int `json:"by_source_type"`
+}
+
+// BaselineCollectionStats holds the most recent collection timestamps per source.
+type BaselineCollectionStats struct {
+	MostRecentCollectedAt *time.Time         `json:"most_recent_collected_at"`
+	BySource              map[string]*time.Time `json:"by_source_type"`
+}
+
+// BaselineStats is the top-level structure returned by the baseline stats query.
+type BaselineStats struct {
+	Documents          BaselineDocumentStats   `json:"documents"`
+	Chunks             BaselineChunkStats      `json:"chunks"`
+	ExtractionFailures BaselineFailureStats    `json:"extraction_failures"`
+	Collection         BaselineCollectionStats `json:"collection"`
+}
+
+// QueryBaselineStats executes four independent queries and assembles BaselineStats.
+// Each query is kept separate for readability and to avoid a single monstrous CTE.
+func (s *DocumentStore) QueryBaselineStats(ctx context.Context) (*BaselineStats, error) {
+	docStats, err := s.queryDocumentStats(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("baseline stats documents: %w", err)
+	}
+
+	chunkStats, err := s.queryChunkStats(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("baseline stats chunks: %w", err)
+	}
+
+	failureStats, err := s.queryFailureStats(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("baseline stats failures: %w", err)
+	}
+
+	collectionStats, err := s.queryCollectionStats(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("baseline stats collection: %w", err)
+	}
+
+	return &BaselineStats{
+		Documents:          docStats,
+		Chunks:             chunkStats,
+		ExtractionFailures: failureStats,
+		Collection:         collectionStats,
+	}, nil
+}
+
+// queryDocumentStats returns per-source document counts and content-length percentiles.
+func (s *DocumentStore) queryDocumentStats(ctx context.Context) (BaselineDocumentStats, error) {
+	const q = `
+		SELECT
+			source_type,
+			COUNT(*)::bigint                                                        AS cnt,
+			AVG(LENGTH(content))::double precision                                  AS mean_len,
+			PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY LENGTH(content))::double precision AS p50_len,
+			PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY LENGTH(content))::double precision AS p95_len,
+			MAX(LENGTH(content))::bigint                                            AS max_len
+		FROM documents
+		WHERE status = 'active'
+		GROUP BY source_type`
+
+	rows, err := s.pg.pool.Query(ctx, q)
+	if err != nil {
+		return BaselineDocumentStats{}, fmt.Errorf("document stats query: %w", err)
+	}
+	defer rows.Close()
+
+	bySource := make(map[string]DocumentSourceStats)
+	total := 0
+	for rows.Next() {
+		var (
+			src                      string
+			cnt                      int64
+			meanLen, p50Len, p95Len  float64
+			maxLen                   int64
+		)
+		if err := rows.Scan(&src, &cnt, &meanLen, &p50Len, &p95Len, &maxLen); err != nil {
+			return BaselineDocumentStats{}, fmt.Errorf("document stats scan: %w", err)
+		}
+		bySource[src] = DocumentSourceStats{
+			Count: int(cnt),
+			ContentLength: ContentLengthStats{
+				Mean: meanLen,
+				P50:  p50Len,
+				P95:  p95Len,
+				Max:  maxLen,
+			},
+		}
+		total += int(cnt)
+	}
+	if err := rows.Err(); err != nil {
+		return BaselineDocumentStats{}, fmt.Errorf("document stats iter: %w", err)
+	}
+
+	return BaselineDocumentStats{Total: total, BySource: bySource}, nil
+}
+
+// queryChunkStats returns aggregate chunk metrics across all documents.
+func (s *DocumentStore) queryChunkStats(ctx context.Context) (BaselineChunkStats, error) {
+	const q = `
+		SELECT
+			COUNT(*)::bigint                               AS total_chunks,
+			COALESCE(AVG(byte_size), 0)::double precision AS avg_chunk_size,
+			COALESCE(
+				COUNT(*)::double precision / NULLIF(COUNT(DISTINCT document_id), 0),
+				0
+			)                                              AS avg_per_doc
+		FROM chunks`
+
+	var stats BaselineChunkStats
+	if err := s.pg.pool.QueryRow(ctx, q).Scan(
+		&stats.Total,
+		&stats.AvgChunkSizeBytes,
+		&stats.AvgChunksPerDocument,
+	); err != nil {
+		return BaselineChunkStats{}, fmt.Errorf("chunk stats query: %w", err)
+	}
+	return stats, nil
+}
+
+// queryFailureStats returns open and dead-letter extraction failure counts per source.
+func (s *DocumentStore) queryFailureStats(ctx context.Context) (BaselineFailureStats, error) {
+	const q = `
+		SELECT
+			source_type,
+			COUNT(*) FILTER (WHERE NOT dead_letter)::bigint AS open_cnt,
+			COUNT(*) FILTER (WHERE dead_letter)::bigint     AS dead_cnt
+		FROM extraction_failures
+		GROUP BY source_type`
+
+	rows, err := s.pg.pool.Query(ctx, q)
+	if err != nil {
+		return BaselineFailureStats{}, fmt.Errorf("failure stats query: %w", err)
+	}
+	defer rows.Close()
+
+	bySource := make(map[string]int)
+	var totalOpen, totalDead int64
+	for rows.Next() {
+		var (
+			src              string
+			openCnt, deadCnt int64
+		)
+		if err := rows.Scan(&src, &openCnt, &deadCnt); err != nil {
+			return BaselineFailureStats{}, fmt.Errorf("failure stats scan: %w", err)
+		}
+		bySource[src] = int(openCnt + deadCnt)
+		totalOpen += openCnt
+		totalDead += deadCnt
+	}
+	if err := rows.Err(); err != nil {
+		return BaselineFailureStats{}, fmt.Errorf("failure stats iter: %w", err)
+	}
+
+	return BaselineFailureStats{
+		Open:       totalOpen,
+		DeadLetter: totalDead,
+		BySource:   bySource,
+	}, nil
+}
+
+// queryCollectionStats returns the most recent collected_at per source type.
+func (s *DocumentStore) queryCollectionStats(ctx context.Context) (BaselineCollectionStats, error) {
+	const q = `
+		SELECT source_type, MAX(collected_at)
+		FROM documents
+		WHERE status = 'active'
+		GROUP BY source_type`
+
+	rows, err := s.pg.pool.Query(ctx, q)
+	if err != nil {
+		return BaselineCollectionStats{}, fmt.Errorf("collection stats query: %w", err)
+	}
+	defer rows.Close()
+
+	bySource := make(map[string]*time.Time)
+	var mostRecent *time.Time
+	for rows.Next() {
+		var (
+			src string
+			ts  time.Time
+		)
+		if err := rows.Scan(&src, &ts); err != nil {
+			return BaselineCollectionStats{}, fmt.Errorf("collection stats scan: %w", err)
+		}
+		t := ts // local copy for pointer
+		bySource[src] = &t
+		if mostRecent == nil || ts.After(*mostRecent) {
+			mostRecent = &t
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return BaselineCollectionStats{}, fmt.Errorf("collection stats iter: %w", err)
+	}
+
+	return BaselineCollectionStats{
+		MostRecentCollectedAt: mostRecent,
+		BySource:              bySource,
+	}, nil
+}
+
 // ListActiveSourceIDs returns all source_ids for active documents of a given source type.
 func (s *DocumentStore) ListActiveSourceIDs(ctx context.Context, sourceType model.SourceType) ([]string, error) {
 	rows, err := s.pg.pool.Query(ctx, `

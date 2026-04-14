@@ -541,6 +541,8 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 
 `POST /api/v1/search` — Bearer 인증 필요 (API_KEY 설정 시)
 
+`GET /api/v1/stats/baseline` — Bearer 인증 필요. 문서 수·컨텐츠 길이 백분위수(p50/p95), 청크 집계, 추출 실패 수, 소스별 최신 수집 시각을 JSON으로 반환. 스키마: `{documents, chunks, extraction_failures, collection}`.
+
 **요청 스키마**:
 ```json
 {
