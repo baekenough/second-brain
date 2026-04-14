@@ -359,7 +359,7 @@ type Searcher interface {
 // legacyFallbackMessage is the static reply used when RAG dependencies are not
 // configured. Defined as a constant so tests can assert on the exact value
 // without hardcoding the string in multiple places (#31).
-const legacyFallbackMessage = "검색 시스템 온라인입니다. 질문은 /api/v1/search 엔드포인트를 사용해주세요."
+const legacyFallbackMessage = "지금은 AI 응답 기능이 비활성 상태입니다. 관리자에게 문의해주세요."
 
 // DiscordGateway holds the WebSocket session used for real-time mention responses.
 // It is decoupled from the REST-based DiscordCollector to keep concerns separate.
