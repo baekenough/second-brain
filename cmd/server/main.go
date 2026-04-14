@@ -16,6 +16,7 @@ import (
 	"github.com/baekenough/second-brain/internal/api"
 	"github.com/baekenough/second-brain/internal/collector"
 	"github.com/baekenough/second-brain/internal/config"
+	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/scheduler"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
@@ -132,19 +133,36 @@ func run() error {
 		go watcher.Run(ctx)
 	}
 
+	// --- Search service ---
+	searchSvc := search.NewService(docStore, embedClient)
+
+	// --- LLM client (Discord RAG) ---
+	llmClient := llm.New(llm.Config{
+		BaseURL:     cfg.LLMAPIURL,
+		Model:       cfg.LLMModel,
+		APIKey:      cfg.LLMAPIKey,
+		MaxTokens:   cfg.LLMMaxTokens,
+		Temperature: cfg.LLMTemperature,
+	}, nil)
+	if llmClient.Enabled() {
+		slog.Info("LLM client configured", "url", cfg.LLMAPIURL, "model", cfg.LLMModel)
+	} else {
+		slog.Info("LLM client not configured — Discord RAG disabled, static fallback active")
+	}
+
 	// --- Discord WebSocket gateway (mention responses) ---
 	// The gateway is always-on when the bot token is set, independent of the
 	// cron-based collection cycle.
+	// searchSvc and llmClient are injected to enable the full RAG pipeline.
 	discordGateway := collector.NewDiscordGateway(
 		cfg.DiscordBotToken,
 		cfg.DiscordMentionResponseEnabled,
+		searchSvc,
+		llmClient,
 	)
 	if discordGateway.Enabled() {
 		go discordGateway.Run(ctx)
 	}
-
-	// --- Search service ---
-	searchSvc := search.NewService(docStore, embedClient)
 
 	// --- HTTP server ---
 	srv := api.NewServer(docStore, searchSvc, sched, cfg.FilesystemPath, cfg.APIKey)
