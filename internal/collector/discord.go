@@ -488,7 +488,37 @@ func (g *DiscordGateway) handleMessageCreate(s *discordgo.Session, m *discordgo.
 	}
 }
 
+// discordSystemPrompt is the system prompt injected into every LLM call.
+// It instructs the model to be a helpful team AI that uses RAG context when
+// available but always answers using general knowledge as a fallback.
+const discordSystemPrompt = `당신은 second-brain 팀의 AI 어시스턴트입니다. 이 서버(Discord)에서 팀원의 질문에 답하며, 팀 지식베이스(Slack, Discord, GitHub 등 수집된 문서)를 RAG로 참조할 수 있습니다.
+
+역할:
+- 친근하고 유능한 팀 동료 AI. 대화를 자연스럽게 이어가며 실질적 도움을 드립니다.
+- RAG 문서가 있으면 그것을 우선 참고해 답변하되, 부족한 부분은 일반 지식으로 자유롭게 보완합니다.
+- 채널 최근 대화 맥락을 활용해 후속 질문·지시대명사("그거", "위에서 말한 것")를 이해합니다.
+
+응답 원칙:
+1. 항상 도움이 되는 답변을 먼저 제공합니다. "모른다", "정보 없음" 같은 회피는 정말 답이 불가능할 때만 최소한으로.
+2. RAG 문서가 있으면 답변 말미에 "출처: [제목]" 1-2개 간결히 표기.
+3. 추측해서 틀린 정보를 주는 것은 금지. 확실하지 않으면 "~일 가능성이 높습니다"처럼 명시.
+4. 코드/명령어/설정은 코드 블록 사용.
+5. 답변은 한국어로 2000자 이내. 구체적이고 실용적으로.
+6. 질문이 모호하면 짐작해서 가장 그럴듯한 해석으로 답하되, 한 줄로 가정을 명시.`
+
 // buildReply orchestrates the RAG pipeline and returns the text to send to Discord.
+//
+// Flow:
+//  1. Extract query (strip bot mention)
+//  2. Show typing indicator
+//  3. Fetch channel history (last 20 messages, non-fatal on error)
+//  4. Search knowledge base (limit=10, non-fatal on error)
+//  5. Build context block from search results
+//  6. Convert channel history to conversation turns
+//  7. Append current user turn (with embedded RAG context if available)
+//  8. Call CompleteWithMessages for multi-turn LLM completion
+//  9. Return answer
+//
 // It falls back to a static message when dependencies are not configured.
 func (g *DiscordGateway) buildReply(
 	ctx context.Context,
@@ -510,49 +540,86 @@ func (g *DiscordGateway) buildReply(
 	// 2. Show typing indicator while we work.
 	_ = s.ChannelTyping(m.ChannelID)
 
-	// 3. Search knowledge base (best-effort; search is optional context, not a gate).
-	const searchLimit = 5
+	// 3. Fetch channel history for conversation context (non-fatal).
+	// beforeID = m.ID so we get messages sent before this one.
+	history, err := s.ChannelMessages(m.ChannelID, 20, m.ID, "", "")
+	if err != nil {
+		slog.Warn("discord gateway: failed to fetch channel history",
+			"channel_id", m.ChannelID, "error", err)
+		history = nil // non-fatal — continue without conversation context
+	}
+	// ChannelMessages with beforeID returns messages in descending order
+	// (newest first). Reverse to get chronological order for the LLM.
+	for i, j := 0, len(history)-1; i < j; i, j = i+1, j-1 {
+		history[i], history[j] = history[j], history[i]
+	}
+
+	// 4. Search knowledge base (best-effort; search is optional context, not a gate).
+	const searchLimit = 10
 	results, err := g.searcher.Search(ctx, model.SearchQuery{
 		Query:          query,
 		Limit:          searchLimit,
 		IncludeDeleted: false,
 	})
 	if err != nil {
-		// Search failure is non-fatal — log and continue with no context so the
-		// LLM can still answer from its own knowledge.
 		slog.Warn("discord gateway: search failed, proceeding without context",
 			"error", err, "query", query)
 		results = nil
 	}
 
-	// 4. Build the context block for the LLM prompt (may be empty).
+	// 5. Build the RAG context block for the LLM prompt (may be empty).
 	contextBlock := buildContextBlock(results)
 
-	const systemPrompt = `당신은 second-brain 팀의 AI 어시스턴트입니다. 팀 지식베이스(Slack, Discord, GitHub 등)를 RAG로 참조할 수 있지만, 검색 결과가 없더라도 자연스러운 대화와 일반 지식으로 도움을 드립니다.
+	// 6. Convert channel history to ordered conversation turns.
+	conversationMsgs := buildConversationHistory(history, s.State.User.ID)
 
-응답 원칙:
-- 내부 문서가 제공되면 우선 참고하여 답변하고, 말미에 "출처: [제목](링크)" 형식으로 1-3개만 표기합니다.
-- 내부 문서가 없거나 관련성이 낮으면 일반 지식으로 답변하되, 그 사실을 티 내지 않고 자연스럽게 답합니다.
-- 모르는 것은 모른다고 말해도 됩니다 — 추측으로 잘못된 정보를 주지 마세요.
-- 한국어로 간결하고 친근하게 답변합니다. 2000자 이내.
-- 코드/명령어 질문은 코드 블록을 사용합니다.`
-
-	// 5. Build user message — include internal docs when available, else ask directly.
-	var userPrompt string
+	// 7. Append the current user turn.
+	// Embed RAG context into the final user message when available so the LLM
+	// sees it alongside the question without polluting the history turns.
+	var currentTurn string
 	if contextBlock == "" {
-		userPrompt = "질문: " + query
+		currentTurn = "질문: " + query
 	} else {
-		userPrompt = fmt.Sprintf("질문: %s\n\n참고 가능한 내부 문서:\n%s", query, contextBlock)
+		currentTurn = fmt.Sprintf("참고 가능한 내부 문서:\n%s\n\n질문: %s", contextBlock, query)
 	}
+	conversationMsgs = append(conversationMsgs, llm.Message{Role: "user", Content: currentTurn})
 
-	// 6. Call LLM.
-	answer, err := g.llmClient.Complete(ctx, systemPrompt, userPrompt)
+	// 8. Call LLM with full conversation history.
+	answer, err := g.llmClient.CompleteWithMessages(ctx, discordSystemPrompt, conversationMsgs)
 	if err != nil {
 		slog.Error("discord gateway: LLM completion failed", "error", err)
 		return "답변 생성 중 오류가 발생했어요. 잠시 후 다시 시도해주세요."
 	}
 
 	return answer
+}
+
+// buildConversationHistory converts a slice of Discord messages (in chronological
+// order) to a sequence of llm.Message turns suitable for multi-turn completion.
+//
+// Bot messages become "assistant" turns with content as-is.
+// All other messages become "user" turns prefixed with the author username so
+// the LLM can distinguish multiple participants.
+// Empty messages are skipped.
+func buildConversationHistory(history []*discordgo.Message, botID string) []llm.Message {
+	msgs := make([]llm.Message, 0, len(history))
+	for _, msg := range history {
+		if msg.Content == "" {
+			continue
+		}
+		if msg.Author.ID == botID {
+			msgs = append(msgs, llm.Message{
+				Role:    "assistant",
+				Content: msg.Content,
+			})
+		} else {
+			msgs = append(msgs, llm.Message{
+				Role:    "user",
+				Content: fmt.Sprintf("%s: %s", msg.Author.Username, msg.Content),
+			})
+		}
+	}
+	return msgs
 }
 
 // --- Helper functions ---
@@ -576,8 +643,8 @@ func buildContextBlock(results []*model.SearchResult) string {
 		return ""
 	}
 
-	const maxContextLen = 8000
-	const maxSnippetLen = 500
+	const maxContextLen = 12000
+	const maxSnippetLen = 800
 
 	var sb strings.Builder
 	for i, r := range results {
