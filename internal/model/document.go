@@ -15,6 +15,7 @@ const (
 	SourceGDrive     SourceType = "gdrive"
 	SourceNotion     SourceType = "notion"
 	SourceFilesystem SourceType = "filesystem"
+	SourceDiscord    SourceType = "discord"
 )
 
 // Document represents a piece of content collected from an external source.

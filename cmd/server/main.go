@@ -87,10 +87,37 @@ func run() error {
 			collector.NewFilesystemCollectorWithDriveExport(cfg.FilesystemPath, driveExporter))
 	}
 
+	// Discord collector (optional).
+	discordCol := collector.NewDiscordCollector(
+		cfg.DiscordBotToken,
+		cfg.DiscordApplicationID,
+		cfg.DiscordGuildIDs,
+		cfg.DiscordMentionResponseEnabled,
+	)
+	if discordCol.Enabled() {
+		collectors = append(collectors, discordCol)
+	}
+
 	// --- Scheduler ---
-	sched := scheduler.New(docStore, embedClient, collectors...)
+	// The Discord collector uses its own interval (DISCORD_COLLECT_INTERVAL)
+	// rather than the shared COLLECT_INTERVAL, so it is registered separately.
+	otherCollectors := make([]collector.Collector, 0, len(collectors))
+	for _, col := range collectors {
+		if col.Source() != "discord" {
+			otherCollectors = append(otherCollectors, col)
+		}
+	}
+	sched := scheduler.New(docStore, embedClient, otherCollectors...)
 	if err := sched.Register(cfg.CollectInterval); err != nil {
 		return err
+	}
+	if discordCol.Enabled() {
+		discordSched := scheduler.New(docStore, embedClient, discordCol)
+		if err := discordSched.Register(cfg.DiscordCollectInterval); err != nil {
+			return err
+		}
+		discordSched.Start()
+		defer discordSched.Stop()
 	}
 	sched.Start()
 	defer sched.Stop()
@@ -103,6 +130,17 @@ func run() error {
 	if slackCol.Enabled() {
 		watcher := collector.NewSlackChannelWatcher(slackCol, docStore, embedClient, 60*time.Second)
 		go watcher.Run(ctx)
+	}
+
+	// --- Discord WebSocket gateway (mention responses) ---
+	// The gateway is always-on when the bot token is set, independent of the
+	// cron-based collection cycle.
+	discordGateway := collector.NewDiscordGateway(
+		cfg.DiscordBotToken,
+		cfg.DiscordMentionResponseEnabled,
+	)
+	if discordGateway.Enabled() {
+		go discordGateway.Run(ctx)
 	}
 
 	// --- Search service ---

@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"time"
 )
 
@@ -23,6 +24,13 @@ type Config struct {
 	// Slack (optional)
 	SlackBotToken string
 	SlackTeamID   string
+
+	// Discord (optional)
+	DiscordBotToken               string
+	DiscordApplicationID          string
+	DiscordGuildIDs               []string
+	DiscordCollectInterval        time.Duration
+	DiscordMentionResponseEnabled bool
 
 	// GitHub (optional)
 	GitHubToken string
@@ -53,6 +61,20 @@ func Load() (*Config, error) {
 		interval = time.Hour
 	}
 
+	discordInterval, err := time.ParseDuration(getenv("DISCORD_COLLECT_INTERVAL", "5m"))
+	if err != nil {
+		discordInterval = 5 * time.Minute
+	}
+
+	var discordGuildIDs []string
+	if raw := os.Getenv("DISCORD_GUILD_IDS"); raw != "" {
+		for _, id := range strings.Split(raw, ",") {
+			if trimmed := strings.TrimSpace(id); trimmed != "" {
+				discordGuildIDs = append(discordGuildIDs, trimmed)
+			}
+		}
+	}
+
 	return &Config{
 		Port:        getenv("PORT", "9200"),
 		DatabaseURL: getenv("DATABASE_URL", "postgres://brain:brain@localhost:5432/second_brain?sslmode=disable"),
@@ -64,6 +86,12 @@ func Load() (*Config, error) {
 
 		SlackBotToken: os.Getenv("SLACK_BOT_TOKEN"),
 		SlackTeamID:   os.Getenv("SLACK_TEAM_ID"),
+
+		DiscordBotToken:               os.Getenv("DISCORD_BOT_TOKEN"),
+		DiscordApplicationID:          os.Getenv("DISCORD_APPLICATION_ID"),
+		DiscordGuildIDs:               discordGuildIDs,
+		DiscordCollectInterval:        discordInterval,
+		DiscordMentionResponseEnabled: getenv("DISCORD_MENTION_RESPONSE_ENABLED", "true") == "true",
 
 		GitHubToken: os.Getenv("GITHUB_TOKEN"),
 		GitHubOrg:   os.Getenv("GITHUB_ORG"),
