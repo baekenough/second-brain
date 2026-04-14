@@ -7,7 +7,6 @@ resources:
   - postgres-service.yaml
   - second-brain-pv.yaml
   - second-brain-configmap.yaml
-  - second-brain-secret.yaml
   - second-brain-deployment.yaml
   - second-brain-service.yaml
   - second-brain-web-deployment.yaml

@@ -33,6 +33,13 @@ RUN GOTOOLCHAIN=auto go mod download
 # -----------------------------------------------------------------------------
 FROM golang:1.24-alpine AS builder
 
+# BuildKit injects TARGETOS/TARGETARCH automatically when using
+# `docker buildx build --platform linux/amd64,linux/arm64`.
+# Declare them as ARGs so they are available to RUN commands.
+# Defaults (linux/amd64) apply for plain `docker build` without --platform.
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
 WORKDIR /workspace
 
 # Reuse the downloaded module cache from the deps stage.
@@ -46,7 +53,7 @@ COPY . .
 # CGO_ENABLED=0  — pure Go, no libc dependency → compatible with alpine/scratch
 # -s -w          — strip debug info and DWARF tables (~30 % size reduction)
 # -trimpath      — remove local build paths from the binary (security hygiene)
-RUN GOTOOLCHAIN=auto CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+RUN GOTOOLCHAIN=auto CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build \
       -trimpath \
       -ldflags="-s -w" \

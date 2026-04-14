@@ -356,6 +356,11 @@ type Searcher interface {
 	Search(ctx context.Context, q model.SearchQuery) ([]*model.SearchResult, error)
 }
 
+// legacyFallbackMessage is the static reply used when RAG dependencies are not
+// configured. Defined as a constant so tests can assert on the exact value
+// without hardcoding the string in multiple places (#31).
+const legacyFallbackMessage = "검색 시스템 온라인입니다. 질문은 /api/v1/search 엔드포인트를 사용해주세요."
+
 // DiscordGateway holds the WebSocket session used for real-time mention responses.
 // It is decoupled from the REST-based DiscordCollector to keep concerns separate.
 //
@@ -370,7 +375,7 @@ type DiscordGateway struct {
 	session                *discordgo.Session
 
 	searcher  Searcher
-	llmClient *llm.Client
+	llmClient llm.Completer
 }
 
 // NewDiscordGateway creates a gateway that connects to the Discord WebSocket and
@@ -382,7 +387,7 @@ func NewDiscordGateway(
 	botToken string,
 	mentionResponseEnabled bool,
 	searcher Searcher,
-	llmClient *llm.Client,
+	llmClient llm.Completer,
 ) *DiscordGateway {
 	return &DiscordGateway{
 		botToken:               botToken,
@@ -527,7 +532,7 @@ func (g *DiscordGateway) buildReply(
 ) string {
 	// Fall back to legacy static message when RAG is not configured.
 	if g.searcher == nil || g.llmClient == nil || !g.llmClient.Enabled() {
-		return "검색 시스템 온라인입니다. 질문은 /api/v1/search 엔드포인트를 사용해주세요."
+		return legacyFallbackMessage
 	}
 
 	// 1. Extract query — strip the bot mention token(s).

@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  go-lint-build-test:
+    name: Go build + vet + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+      - name: go mod download
+        run: go mod download
+      - name: go vet
+        run: go vet ./...
+      - name: go build
+        run: go build ./...
+      - name: go test
+        run: go test -race -count=1 ./...
+
+  yaml-lint:
+    name: k8s YAML hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+      - name: Assert kustomization does not reference *secret*.yaml
+        run: |
+          if yq '.resources[]' deploy/k8s/kustomization.yaml | grep -iE "secret\.yaml$"; then
+            echo "::error::kustomization.yaml must not reference secret YAMLs (prevents Secret overwrite #29)"
+            exit 1
+          fi
+      - name: Lint discord handler for hardcoded strings (#31)
+        run: |
+          if grep -rn "api/v1/search 엔드포인트를 사용" internal/collector/; then
+            echo "::error::hardcoded placeholder response in Discord handler"
+            exit 1
+          fi
+
+  docker-build-multiarch:
+    name: Docker multi-arch build (no-cache)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build (linux/amd64, linux/arm64) — no cache
+        run: |
+          docker buildx build \
+            --no-cache \
+            --platform linux/amd64,linux/arm64 \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --label "org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}" \
+            --tag second-brain:ci \
+            .
+
+  frontend-build:
+    name: Next.js build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+      - name: next build
+        run: pnpm run build
