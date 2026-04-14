@@ -24,6 +24,40 @@ func ExportNewDiscordGatewayForTest(docStore AttachmentDocumentStore) *DiscordGa
 	}
 }
 
+// ExportNewDiscordGatewayWithFeedback creates a DiscordGateway with a pre-injected
+// feedbackStore for unit tests that exercise the reaction feedback path.
+func ExportNewDiscordGatewayWithFeedback(feedbackStore FeedbackRecorder) *DiscordGateway {
+	return &DiscordGateway{
+		botToken:               "test-gateway-token",
+		mentionResponseEnabled: false,
+		feedbackStore:          feedbackStore,
+	}
+}
+
+// ExportProcessReactionFeedback exposes the processReactionFeedback pure function
+// for unit tests. It avoids any dependency on *discordgo.Session.
+func ExportProcessReactionFeedback(
+	ctx context.Context,
+	botUserID string,
+	reactorUserID string,
+	msgAuthorID string,
+	emoji string,
+	channelID, messageID, guildID string,
+	msgContent string,
+	recorder FeedbackRecorder,
+) bool {
+	return processReactionFeedback(
+		ctx,
+		botUserID,
+		reactorUserID,
+		msgAuthorID,
+		emoji,
+		channelID, messageID, guildID,
+		msgContent,
+		recorder,
+	)
+}
+
 // ExportGatewayPersistMessageRealtime exposes persistMessageRealtime for testing.
 // It calls the method synchronously (not in a goroutine) so tests can observe
 // the side effects without synchronisation primitives.
