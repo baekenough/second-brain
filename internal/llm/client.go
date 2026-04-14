@@ -68,16 +68,18 @@ func (c *Client) Enabled() bool {
 	return c.baseURL != "" && c.model != "" && c.tokens != nil
 }
 
-// message is a single chat message in the OpenAI format.
-type message struct {
-	Role    string `json:"role"`
+// Message is a single chat message in the OpenAI format.
+// It is exported so callers can build multi-turn conversation histories
+// for CompleteWithMessages.
+type Message struct {
+	Role    string `json:"role"`    // "system", "user", or "assistant"
 	Content string `json:"content"`
 }
 
 // chatRequest is the request body for POST /v1/chat/completions.
 type chatRequest struct {
 	Model       string    `json:"model"`
-	Messages    []message `json:"messages"`
+	Messages    []Message `json:"messages"`
 	Temperature float64   `json:"temperature"`
 	MaxTokens   int       `json:"max_tokens"`
 }
@@ -99,16 +101,27 @@ type chatResponse struct {
 // system is the system prompt; user is the user turn content.
 // 4xx responses are not retried. 5xx and network errors are retried up to 2 times.
 func (c *Client) Complete(ctx context.Context, system, user string) (string, error) {
+	return c.CompleteWithMessages(ctx, system, []Message{
+		{Role: "user", Content: user},
+	})
+}
+
+// CompleteWithMessages sends a multi-turn chat completion request.
+// system is the system prompt; messages is the ordered conversation history
+// including the final user turn. The system message is always prepended.
+// 4xx responses are not retried. 5xx and network errors are retried up to 2 times.
+func (c *Client) CompleteWithMessages(ctx context.Context, system string, messages []Message) (string, error) {
 	if !c.Enabled() {
 		return "", fmt.Errorf("llm: client is not configured (missing base URL or model)")
 	}
 
+	allMessages := make([]Message, 0, len(messages)+1)
+	allMessages = append(allMessages, Message{Role: "system", Content: system})
+	allMessages = append(allMessages, messages...)
+
 	reqBody := chatRequest{
-		Model: c.model,
-		Messages: []message{
-			{Role: "system", Content: system},
-			{Role: "user", Content: user},
-		},
+		Model:       c.model,
+		Messages:    allMessages,
 		Temperature: c.temperature,
 		MaxTokens:   c.maxTokens,
 	}
