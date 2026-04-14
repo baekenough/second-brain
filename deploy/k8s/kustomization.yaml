@@ -5,7 +5,8 @@ resources:
   - namespace.yaml
   - postgres-statefulset.yaml
   - postgres-service.yaml
-  - second-brain-pv.yaml
+  # second-brain-pv.yaml is excluded by default — apply manually when Drive host mount is ready.
+  # See docs/runbook-deploy.md "Filesystem collector 활성화" for instructions.
   - second-brain-configmap.yaml
   - second-brain-deployment.yaml
   - second-brain-service.yaml

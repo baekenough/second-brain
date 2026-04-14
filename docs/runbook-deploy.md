@@ -6,7 +6,7 @@
 > **네임스페이스**: `second-brain`
 > **책임자**: @sang2-tpm (or rotation)
 > **최종 갱신**: 2026-04-14
-> **관련 이슈**: #21 #28 #29 #34 #35 #36 #37
+> **관련 이슈**: #6 #21 #28 #29 #34 #35 #36 #37
 
 ---
 
@@ -26,7 +26,8 @@
 5. [Rollback](#5-rollback)
 6. [문제 해결](#6-문제-해결)
 7. [환경 변수 레퍼런스](#7-환경-변수-레퍼런스)
-8. [관련 문서](#8-관련-문서)
+8. [Filesystem Collector 활성화 (선택)](#8-filesystem-collector-활성화-선택)
+9. [관련 문서](#9-관련-문서)
 
 ---
 
@@ -236,8 +237,10 @@ kubectl apply -f namespace.yaml
 # 5-2. ConfigMap 갱신 (환경변수 변경 있을 때만)
 kubectl apply -f second-brain-configmap.yaml
 
-# 5-3. PersistentVolume (변경 있을 때만)
-kubectl apply -f second-brain-pv.yaml
+# 5-3. PersistentVolume (선택 — Drive 마운트 환경에서만 적용)
+# second-brain-pv.yaml은 kustomization.yaml에서 제외됨. 필요 시 수동 적용.
+# 자세한 내용: §8 "Filesystem Collector 활성화"
+# kubectl apply -f second-brain-pv.yaml
 
 # 5-4. Deployment 스펙 변경 (리소스 한도, probe 등 변경 있을 때만)
 kubectl apply -f second-brain-deployment.yaml
@@ -550,7 +553,7 @@ docker images | grep second-brain
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | 임베딩 모델 |
 | `CLIPROXY_AUTH_FILE` | `/etc/cliproxy/auth.json` | cliproxy 인증 파일 경로 |
 | `FILESYSTEM_PATH` | `/data/drive` | 파일시스템 수집 경로 |
-| `FILESYSTEM_ENABLED` | `true` | 파일시스템 수집 활성화 |
+| `FILESYSTEM_ENABLED` | `false` | 파일시스템 수집 활성화 (Drive 마운트 있는 환경에서만 `true`) |
 | `MIGRATIONS_DIR` | `/app/migrations` | DB 마이그레이션 경로 |
 
 ### Secret (`second-brain-secret`) — 민감 정보 (.env 관리)
@@ -582,7 +585,61 @@ docker images | grep second-brain
 
 ---
 
-## 8. 관련 문서
+## 8. Filesystem Collector 활성화 (선택)
+
+기본 배포는 Drive 수집기를 비활성화한다 (`FILESYSTEM_ENABLED=false`, `emptyDir` 볼륨).
+Linux 서버에는 Google Drive Desktop이 없으므로 기본값은 disabled이며 pod는 정상 기동한다.
+
+### 전제 조건
+
+호스트에 Google Drive가 실제로 마운트되어 있어야 한다:
+
+```bash
+ls /mnt/drive   # 파일이 보여야 함 — 빈 디렉토리이면 활성화 불필요
+```
+
+### 활성화 절차
+
+```bash
+# 1. PersistentVolume 적용 (선택, hostPath 직접 사용 시 불필요)
+cd ~/second-brain/deploy/k8s
+kubectl apply -f second-brain-pv.yaml
+
+# 2. Deployment에 hostPath 볼륨 주입 (emptyDir → hostPath 교체)
+kubectl -n second-brain patch deployment/second-brain --type=json -p='[
+  {"op":"replace","path":"/spec/template/spec/volumes/0",
+   "value":{"name":"drive","hostPath":{"path":"/mnt/drive","type":"Directory"}}}]'
+
+# 3. FILESYSTEM_ENABLED 활성화
+kubectl -n second-brain set env deployment/second-brain FILESYSTEM_ENABLED=true
+
+# 4. Rollout 재시작 및 검증
+kubectl -n second-brain rollout restart deployment/second-brain
+kubectl -n second-brain rollout status deployment/second-brain --timeout=120s
+kubectl logs -n second-brain deploy/second-brain --tail=20 | grep filesystem
+```
+
+### 비활성화 (원복)
+
+```bash
+# 1. 볼륨을 emptyDir로 복원
+kubectl -n second-brain patch deployment/second-brain --type=json -p='[
+  {"op":"replace","path":"/spec/template/spec/volumes/0",
+   "value":{"name":"drive","emptyDir":{}}}]'
+
+# 2. 플래그 비활성화
+kubectl -n second-brain set env deployment/second-brain FILESYSTEM_ENABLED=false
+
+# 3. Rollout 재시작
+kubectl -n second-brain rollout restart deployment/second-brain
+```
+
+> **주의**: `second-brain-pv.yaml`은 kustomization.yaml에서 제외되어 있다.
+> `kubectl apply -k`로 적용해도 PV는 생성되지 않는다. 수동 `kubectl apply -f second-brain-pv.yaml` 필요.
+
+---
+
+## 9. 관련 문서
 
 | 문서 | 경로 | 설명 |
 |------|------|------|
@@ -595,6 +652,7 @@ docker images | grep second-brain
 
 | 이슈 | 제목 | 이 Runbook의 대응 |
 |------|------|-------------------|
+| #6 | Drive hostPath PV 선택형 전환 | §8 Filesystem Collector 활성화, ConfigMap default off |
 | #21 | 초기 배포 셋업 | 전체 절차 정립 |
 | #28 | Docker 캐시 스테일 이미지 | Step 4 `--no-cache` 필수화 |
 | #29 | kustomize Secret 덮어쓰기 | Step 5 개별 적용, DO NOT §1 |

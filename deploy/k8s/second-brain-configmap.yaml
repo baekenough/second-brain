@@ -10,7 +10,9 @@ data:
   EMBEDDING_MODEL: "text-embedding-3-small"
   CLIPROXY_AUTH_FILE: "/etc/cliproxy/auth.json"
   FILESYSTEM_PATH: "/data/drive"
-  FILESYSTEM_ENABLED: "true"
+  # Default: disabled — enable only when the host has a Drive mount at /mnt/drive.
+  # See docs/runbook-deploy.md "Filesystem collector 활성화" for instructions.
+  FILESYSTEM_ENABLED: "false"
   PORT: "9200"
   # Explicit migrations dir: required when binary is built with -trimpath
   # (runtime.Caller returns module-relative path, not filesystem path)

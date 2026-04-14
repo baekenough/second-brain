@@ -5,6 +5,20 @@ import (
 	"net/http"
 )
 
+// baselineStatsHandler handles GET /api/v1/stats/baseline.
+// Returns detailed baseline metrics: document counts with content-length
+// percentiles per source type, chunk aggregates, extraction failure counts,
+// and the most recent collection timestamp per source type.
+func (s *Server) baselineStatsHandler(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.docs.QueryBaselineStats(r.Context())
+	if err != nil {
+		slog.Error("baseline stats: query failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
+}
+
 // statsHandler handles GET /api/v1/stats.
 // Returns document counts grouped by source_type (active only).
 func (s *Server) statsHandler(w http.ResponseWriter, r *http.Request) {

@@ -4,8 +4,10 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
+	"github.com/bwmarrin/discordgo"
 	"github.com/baekenough/second-brain/internal/collector"
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
@@ -421,4 +423,192 @@ func TestBuildReply_SearchError_StillCallsLLM(t *testing.T) {
 	if answer != "LLM answer despite search error" {
 		t.Fatalf("want LLM answer, got %q", answer)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Issue #38 — Gateway real-time collection via MessageCreate
+// ---------------------------------------------------------------------------
+
+// mockDocStore records Upsert calls for test assertions.
+// It satisfies collector.AttachmentDocumentStore.
+type mockDocStore struct {
+	calls []*model.Document
+	err   error
+}
+
+func (m *mockDocStore) Upsert(_ context.Context, doc *model.Document) error {
+	m.calls = append(m.calls, doc)
+	return m.err
+}
+
+// buildTestSession returns a minimal *discordgo.Session backed by an in-memory
+// state so State.Channel and State.User lookups succeed without a real WebSocket.
+func buildTestSession(t *testing.T, botID, channelID string, chanType int) *discordgo.Session {
+	t.Helper()
+	sess := &discordgo.Session{
+		State: discordgo.NewState(),
+	}
+	sess.State.User = &discordgo.User{ID: botID, Username: "test-bot"}
+	// Add a guild channel so State.Channel returns it.
+	_ = sess.State.GuildAdd(&discordgo.Guild{ID: "guild-1"})
+	_ = sess.State.ChannelAdd(&discordgo.Channel{
+		ID:      channelID,
+		GuildID: "guild-1",
+		Name:    "general",
+		Type:    discordgo.ChannelType(chanType),
+	})
+	return sess
+}
+
+// TestGateway_OnMessageCreate_PersistsImmediately verifies that a valid guild
+// text message triggers exactly one Upsert call on the docStore.
+func TestGateway_OnMessageCreate_PersistsImmediately(t *testing.T) {
+	t.Parallel()
+
+	const (
+		botID     = "bot-001"
+		channelID = "chan-001"
+	)
+
+	store := &mockDocStore{}
+	gw := collector.ExportNewDiscordGatewayForTest(store)
+	sess := buildTestSession(t, botID, channelID, int(discordgo.ChannelTypeGuildText))
+
+	msg := &discordgo.MessageCreate{
+		Message: &discordgo.Message{
+			ID:        "msg-001",
+			GuildID:   "guild-1",
+			ChannelID: channelID,
+			Content:   "hello team",
+			Author:    &discordgo.User{ID: "user-42", Username: "alice"},
+			Timestamp: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+	}
+
+	// persistMessageRealtime is called synchronously via the export helper.
+	collector.ExportGatewayPersistMessageRealtime(gw, context.Background(), sess, msg)
+
+	if len(store.calls) != 1 {
+		t.Fatalf("want 1 Upsert call, got %d", len(store.calls))
+	}
+
+	doc := store.calls[0]
+	if doc.SourceType != model.SourceDiscord {
+		t.Errorf("SourceType: want %q, got %q", model.SourceDiscord, doc.SourceType)
+	}
+	if !strings.Contains(doc.SourceID, "msg-001") {
+		t.Errorf("SourceID %q must contain message ID %q", doc.SourceID, "msg-001")
+	}
+	if doc.Content != "hello team" {
+		t.Errorf("Content: want %q, got %q", "hello team", doc.Content)
+	}
+}
+
+// TestGateway_OnMessageCreate_IgnoresBotSelf verifies that messages authored
+// by the bot itself are silently skipped (no Upsert, no panic).
+//
+// The bot-self guard in handleMessageCreate (m.Author.ID == s.State.User.ID)
+// triggers an early return before the persistMessageRealtime goroutine is
+// spawned, so no synchronisation is needed — the mock store stays empty.
+func TestGateway_OnMessageCreate_IgnoresBotSelf(t *testing.T) {
+	t.Parallel()
+
+	const (
+		botID     = "bot-001"
+		channelID = "chan-002"
+	)
+
+	ds := &mockDocStore{}
+	gw := collector.ExportNewDiscordGatewayForTest(ds)
+	sess := buildTestSession(t, botID, channelID, int(discordgo.ChannelTypeGuildText))
+
+	// Construct a message whose Author.ID matches the bot's own ID.
+	botMsg := &discordgo.MessageCreate{
+		Message: &discordgo.Message{
+			ID:        "msg-bot",
+			GuildID:   "guild-1",
+			ChannelID: channelID,
+			Content:   "bot-sent reply",
+			Author:    &discordgo.User{ID: botID, Username: "test-bot"},
+			Timestamp: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+	}
+
+	// Call the handler synchronously. The early-return guard means no goroutine
+	// is launched and the function returns before any store call.
+	collector.ExportGatewayHandleMessageCreate(gw, sess, botMsg)
+
+	if len(ds.calls) != 0 {
+		t.Fatalf("bot-self message must not trigger Upsert, got %d calls", len(ds.calls))
+	}
+}
+
+// TestGateway_OnMessageCreate_IgnoresDM verifies that messages from DM channels
+// (non-guild channel types) are never collected.
+func TestGateway_OnMessageCreate_IgnoresDM(t *testing.T) {
+	t.Parallel()
+
+	// Validate that isAllowedChannelType rejects DM channel types.
+	dmTypes := []discordgo.ChannelType{
+		discordgo.ChannelTypeDM,
+		discordgo.ChannelTypeGroupDM,
+	}
+	for _, ct := range dmTypes {
+		if collector.ExportIsAllowedChannelType(ct) {
+			t.Errorf("channel type %v must not be allowed (DM guard failed)", ct)
+		}
+	}
+
+	// Validate that guild text / thread types ARE allowed.
+	allowedTypes := []discordgo.ChannelType{
+		discordgo.ChannelTypeGuildText,
+		discordgo.ChannelTypeGuildPublicThread,
+		discordgo.ChannelTypeGuildPrivateThread,
+	}
+	for _, ct := range allowedTypes {
+		if !collector.ExportIsAllowedChannelType(ct) {
+			t.Errorf("channel type %v must be allowed but was rejected", ct)
+		}
+	}
+}
+
+// TestGateway_OnMessageCreate_NilDocStore_NoOp verifies that a gateway without
+// a docStore injected does not panic when a message arrives.
+//
+// In production the handleMessageCreate guard (g.docStore != nil) prevents
+// persistMessageRealtime from being called, so there is no nil-pointer risk.
+// This test confirms that the handler returns cleanly without panicking.
+func TestGateway_OnMessageCreate_NilDocStore_NoOp(t *testing.T) {
+	t.Parallel()
+
+	const (
+		botID     = "bot-001"
+		channelID = "chan-003"
+	)
+
+	// Gateway with no docStore injected (nil) — backward-compatible mode.
+	gw := collector.ExportNewDiscordGatewayForTest(nil)
+	sess := buildTestSession(t, botID, channelID, int(discordgo.ChannelTypeGuildText))
+
+	msg := &discordgo.MessageCreate{
+		Message: &discordgo.Message{
+			ID:        "msg-noop",
+			GuildID:   "guild-1",
+			ChannelID: channelID,
+			Content:   "some message",
+			Author:    &discordgo.User{ID: "user-1", Username: "bob"},
+			Timestamp: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("handleMessageCreate panicked with nil docStore: %v", r)
+		}
+	}()
+
+	// The handler must return cleanly: the (g.docStore != nil) guard ensures
+	// persistMessageRealtime is never called, so no goroutine is spawned and
+	// no nil-dereference occurs.
+	collector.ExportGatewayHandleMessageCreate(gw, sess, msg)
 }

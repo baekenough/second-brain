@@ -1,3 +1,15 @@
+# OPTIONAL — Apply manually only when the host has a Google Drive mount at /mnt/drive.
+#
+# This PV is NOT included in kustomization.yaml by default. The Deployment uses
+# emptyDir for the drive volume and FILESYSTEM_ENABLED=false disables collection.
+#
+# To activate on a host with Drive mounted:
+#   1. Verify host mount: ls /mnt/drive
+#   2. kubectl apply -f second-brain-pv.yaml
+#   3. Follow docs/runbook-deploy.md "Filesystem collector 활성화"
+#
+# Note: This PV is not bound to any PVC in the default configuration.
+# It is kept here for reference when enabling Drive collection via volume patch.
 apiVersion: v1
 kind: PersistentVolume
 metadata:
@@ -14,4 +26,4 @@ spec:
     # 실행 전 반드시:
     #   minikube mount "/Users/sangyi/Google Drive/공유 드라이브/Vibers.AI:/mnt/drive" &
     path: /mnt/drive
-    type: DirectoryOrCreate
+    type: Directory

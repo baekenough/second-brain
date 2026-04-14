@@ -256,9 +256,10 @@ func (s *Scheduler) embedDocuments(ctx context.Context, docs []model.Document) {
 // chunk-based FTS index is affected.
 func (s *Scheduler) persistChunks(ctx context.Context, doc *model.Document) {
 	texts := chunker.Split(doc.Content, chunker.Options{
-		TargetSize: defaultChunkTargetSize,
-		MaxSize:    defaultChunkMaxSize,
-		Overlap:    defaultChunkOverlap,
+		TargetSize:   defaultChunkTargetSize,
+		MaxSize:      defaultChunkMaxSize,
+		Overlap:      defaultChunkOverlap,
+		HeadingAware: true,
 	})
 	if len(texts) == 0 {
 		return

@@ -175,16 +175,26 @@ func run() error {
 		slog.Info("LLM client not configured — Discord RAG disabled, static fallback active")
 	}
 
-	// --- Discord WebSocket gateway (mention responses) ---
+	// --- Discord WebSocket gateway (mention responses + real-time collection) ---
 	// The gateway is always-on when the bot token is set, independent of the
 	// cron-based collection cycle.
 	// searchSvc and llmClient are injected to enable the full RAG pipeline.
+	//
+	// SetDocStore enables the real-time MessageCreate → Upsert path (issue #38).
+	// The 5-minute cron collector continues to run as a backfill for messages
+	// missed during gateway downtime; duplicate source_ids are de-duplicated by
+	// the UNIQUE constraint on documents.source_id.
 	discordGateway := collector.NewDiscordGateway(
 		cfg.DiscordBotToken,
 		cfg.DiscordMentionResponseEnabled,
 		searchSvc,
 		llmClient,
 	)
+	if discordCol.Enabled() {
+		// Share the same docStore as the cron collector so both paths write to
+		// the same table with the same de-duplication semantics.
+		discordGateway.SetDocStore(docStore)
+	}
 	if discordGateway.Enabled() {
 		go discordGateway.Run(ctx)
 	}
