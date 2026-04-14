@@ -1,0 +1,50 @@
+# Compiled binaries
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Build output
+dist/
+
+# Go workspace
+go.work
+go.work.sum
+
+# Go test cache
+*.test
+
+# Dependency vendor directory (if using vendor mode)
+vendor/
+
+# Environment files (never commit secrets)
+.env
+.env.local
+.env.*.local
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+node_modules/
+.next/
+
+# TypeScript build info
+web/tsconfig.tsbuildinfo

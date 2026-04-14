@@ -1,0 +1,6 @@
+.next/
+node_modules/
+.env*
+*.log
+README.md
+tsconfig.tsbuildinfo

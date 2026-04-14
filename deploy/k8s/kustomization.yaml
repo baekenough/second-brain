@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: second-brain
+resources:
+  - namespace.yaml
+  - postgres-statefulset.yaml
+  - postgres-service.yaml
+  - second-brain-pv.yaml
+  - second-brain-configmap.yaml
+  - second-brain-secret.yaml
+  - second-brain-deployment.yaml
+  - second-brain-service.yaml
+  - second-brain-web-deployment.yaml
+  - second-brain-web-service.yaml
