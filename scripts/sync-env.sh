@@ -14,13 +14,19 @@ if [ ! -f "$ENV_FILE" ]; then
 fi
 
 if ! command -v kubectl >/dev/null 2>&1; then
-    echo "[ERR] kubectl not installed" >&2
-    exit 1
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+        echo "[DRY-RUN] kubectl not found — skipping cluster checks" >&2
+    else
+        echo "[ERR] kubectl not installed" >&2
+        exit 1
+    fi
 fi
 
-if ! kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
-    echo "[ERR] namespace $NAMESPACE does not exist" >&2
-    exit 1
+if [ "${DRY_RUN:-false}" != "true" ]; then
+    if ! kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
+        echo "[ERR] namespace $NAMESPACE does not exist" >&2
+        exit 1
+    fi
 fi
 
 # ---------- safety checks ----------
@@ -39,7 +45,16 @@ fi
 
 echo "[INFO] syncing $key_count keys from $ENV_FILE to $NAMESPACE/$SECRET_NAME"
 
-# ---------- dry-run first ----------
+# ---------- apply ----------
+if [ "${DRY_RUN:-false}" = "true" ]; then
+    echo "[DRY-RUN] would apply secret (not actually applying)"
+    echo "[DRY-RUN] target: $NAMESPACE/$SECRET_NAME"
+    echo "[DRY-RUN] keys: $key_count"
+    echo "[DRY-RUN] skipped kubectl apply"
+    exit 0
+fi
+
+# ---------- render + sanity check ----------
 rendered=$(kubectl create secret generic "$SECRET_NAME" \
     --from-env-file="$ENV_FILE" \
     --namespace "$NAMESPACE" \
@@ -51,7 +66,6 @@ if ! echo "$rendered" | grep -q '^data:'; then
     exit 1
 fi
 
-# ---------- apply ----------
 echo "$rendered" | kubectl apply -f -
 
 # ---------- post-check ----------
