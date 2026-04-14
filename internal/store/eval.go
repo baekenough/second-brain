@@ -13,7 +13,7 @@ import (
 type EvalPair struct {
 	ID             int64          `json:"id"`
 	Query          string         `json:"query"`
-	RelevantDocIDs []int64        `json:"relevant_doc_ids"`
+	RelevantDocIDs []string       `json:"relevant_doc_ids"`
 	Source         string         `json:"source"`   // "feedback", "manual"
 	CreatedAt      time.Time      `json:"created_at"`
 	Metadata       map[string]any `json:"metadata,omitempty"`
