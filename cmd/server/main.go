@@ -59,6 +59,7 @@ func run() error {
 	}
 
 	docStore := store.NewDocumentStore(pg)
+	_ = store.NewExtractionFailureStore(pg) // TODO(issue#8): wire into retry worker goroutine
 
 	// --- Embedding client ---
 	embedClient := search.NewEmbedClient(cfg.EmbeddingAPIURL, cfg.EmbeddingAPIKey, cfg.CliProxyAuthFile, cfg.EmbeddingModel)

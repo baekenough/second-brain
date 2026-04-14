@@ -302,7 +302,7 @@ func (c *SlackCollector) get(ctx context.Context, method string, params url.Valu
 	}
 	req.Header.Set("Authorization", "Bearer "+c.botToken)
 
-	res, err := c.client.Do(req)
+	res, err := c.doWithBackoff(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -326,7 +326,7 @@ func (c *SlackCollector) post(ctx context.Context, method string, params url.Val
 	req.Header.Set("Authorization", "Bearer "+c.botToken)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := c.client.Do(req)
+	resp, err := c.doWithBackoff(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -340,6 +340,78 @@ func (c *SlackCollector) post(ctx context.Context, method string, params url.Val
 		return fmt.Errorf("slack %s: status %d", method, resp.StatusCode)
 	}
 	return json.Unmarshal(body, dest)
+}
+
+// doWithBackoff executes req, retrying on 429 Too Many Requests responses by
+// honouring the Retry-After header, and on transient network errors using
+// exponential backoff. The caller is responsible for closing the returned
+// response body on success.
+func (c *SlackCollector) doWithBackoff(ctx context.Context, req *http.Request) (*http.Response, error) {
+	const (
+		maxRetries = 5
+		baseDelay  = 1 * time.Second
+		maxDelay   = 60 * time.Second
+	)
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		resp, err := c.client.Do(req)
+		if err != nil {
+			if attempt == maxRetries {
+				return nil, fmt.Errorf("slack: request failed after %d retries: %w", maxRetries, err)
+			}
+			delay := min(baseDelay*time.Duration(1<<attempt), maxDelay)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+			continue
+		}
+
+		if resp.StatusCode != http.StatusTooManyRequests {
+			return resp, nil
+		}
+
+		// 429: respect the Retry-After header, fall back to exponential backoff.
+		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
+		if retryAfter == 0 {
+			retryAfter = min(baseDelay*time.Duration(1<<attempt), maxDelay)
+		}
+		resp.Body.Close()
+
+		slog.Warn("slack: rate limited",
+			"attempt", attempt+1,
+			"retry_after", retryAfter,
+			"path", req.URL.Path,
+		)
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(retryAfter):
+		}
+	}
+	return nil, fmt.Errorf("slack: max retries (%d) exceeded", maxRetries)
+}
+
+// parseRetryAfter parses the value of a Retry-After HTTP header.
+// It supports both integer-seconds format and HTTP-date format (RFC 5322).
+// Returns 0 if h is empty or cannot be parsed.
+func parseRetryAfter(h string) time.Duration {
+	if h == "" {
+		return 0
+	}
+	// Integer seconds format (most common for Slack).
+	if sec, err := strconv.Atoi(h); err == nil {
+		return time.Duration(sec) * time.Second
+	}
+	// HTTP-date format (RFC 5322).
+	if t, err := http.ParseTime(h); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 // joinChannel attempts to join the given public channel so the bot can read
