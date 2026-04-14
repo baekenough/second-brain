@@ -891,6 +891,79 @@ The `getRenderKind(ext)` function determines the rendering method by file extens
 | `NEXT_PUBLIC_API_URL` | Optional | Client-accessible URL (not recommended for use) |
 | `API_KEY` | Optional | Backend Bearer token (server-side only) |
 
+### 11.1 cliproxy Integration
+
+**Purpose**: Proxy OpenAI-compatible API calls (embeddings, chat completions) through ChatGPT Pro / Claude Pro / Gemini OAuth credentials. second-brain treats cliproxy as a **local HTTP proxy**; cliproxy itself handles OAuth token refresh, upstream routing, and rate limiting.
+
+#### Deployment Model
+
+```mermaid
+flowchart LR
+    pod[second-brain Pod<br/>:9200] -- "HTTP<br/>Bearer inbound key" --> cliproxy[cliproxy<br/>127.0.0.1:8317]
+    cliproxy -- "OAuth access_token<br/>auto-refresh" --> upstream[(OpenAI API<br/>chat.openai.com)]
+
+    subgraph host["host (baekenough-ubuntu24)"]
+      cliproxy
+      auth["~/.cli-proxy-api/<br/>codex-*.json<br/>claude-*.json<br/>gemini-*.json"]
+      cliproxy -.-> auth
+    end
+
+    subgraph minikube["minikube docker driver"]
+      pod
+    end
+
+    pod -->|host.minikube.internal:8317| cliproxy
+```
+
+#### Authentication Layers (2-Stage)
+
+1. **Inbound (second-brain → cliproxy)**: Static API key registered in cliproxy's `config.yaml` under `api-keys`. Stored in environment variables `LLM_API_KEY` and `EMBEDDING_API_KEY`.
+2. **Upstream (cliproxy → OpenAI/Claude/Gemini)**: OAuth access_token from `~/.cli-proxy-api/*.json`. cliproxy auto-refreshes these; second-brain requires no involvement.
+
+#### Environment Variable Mapping
+
+| Variable | Purpose | Example Server Value |
+|---|---|---|
+| `LLM_API_URL` | Chat completions endpoint | `http://host.minikube.internal:8317/v1` |
+| `LLM_API_KEY` | Inbound API key | Key from cliproxy `config.yaml` |
+| `LLM_MODEL` | Model identifier | `gpt-codex-5.3` |
+| `EMBEDDING_API_URL` | Embeddings endpoint (returns 404 if unsupported → falls back to FTS) | Same as above |
+| `EMBEDDING_API_KEY` | Inbound API key (may be same as LLM) | Same as above |
+| `CLIPROXY_AUTH_FILE` | Deprecated — static key path takes priority | unused |
+
+#### Supported Endpoints
+
+| Path | cliproxy | OpenAI Direct | Current second-brain |
+|---|---|---|---|
+| `/v1/chat/completions` | ✅ | ✅ | Uses cliproxy |
+| `/v1/embeddings` | ❌ (404) | ✅ | Falls back to FTS, routing decision pending (#34) |
+| `/v1/models` | ✅ | ✅ | Not used |
+
+#### Failure Modes
+
+| Scenario | Symptom | Remediation |
+|---|---|---|
+| cliproxy down | All LLM calls fail → Discord mention responses error | `pm2 restart cli-proxy-api` |
+| Inbound key mismatch | `401 Invalid API key` | Verify `LLM_API_KEY` / `EMBEDDING_API_KEY` match cliproxy `config.yaml` |
+| Embeddings call | `404 page not found` | Expected — handled by FTS fallback |
+| OAuth token expiry | cliproxy auto-refreshes | No impact on second-brain |
+
+#### Operational Commands
+
+```bash
+# Check cliproxy status
+pm2 list | grep cli-proxy-api
+pm2 logs cli-proxy-api
+
+# Restart cliproxy
+pm2 restart cli-proxy-api
+
+# systemd user service (currently disabled, switchable)
+systemctl --user status cliproxy.service
+```
+
+**Related Issues**: #33 (this documentation) · #34 (embedding routing decision) · #4 (JWT deprecation — replaced by cliproxy)
+
 ---
 
 ## 12. Architecture Decision Records

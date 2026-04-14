@@ -4,11 +4,45 @@ package collector
 
 import (
 	"context"
+	"net/http"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/baekenough/second-brain/internal/collector/extractor"
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/baekenough/second-brain/internal/store"
 )
+
+// ExportNewDiscordCollectorForTest creates a DiscordCollector with injected
+// httpClient, docStore, and extractionFailures for white-box attachment tests.
+func ExportNewDiscordCollectorForTest(
+	httpClient *http.Client,
+	docStore AttachmentDocumentStore,
+	extractionFailures *store.ExtractionFailureStore,
+) *DiscordCollector {
+	return &DiscordCollector{
+		botToken:           "test-token",
+		guildIDs:           []string{"guild-1"},
+		httpClient:         httpClient,
+		docStore:           docStore,
+		extractionFailures: extractionFailures,
+		extractorReg:       extractor.NewRegistry(),
+	}
+}
+
+// ExportProcessAttachment exposes processAttachment for testing.
+func ExportProcessAttachment(
+	c *DiscordCollector,
+	ctx context.Context,
+	guildID, channelID string,
+	msg *discordgo.Message,
+	att *discordgo.MessageAttachment,
+) error {
+	return c.processAttachment(ctx, guildID, channelID, msg, att)
+}
+
+// ExportAllowedAttachmentExts exposes the allowedAttachmentExts map for assertions.
+var ExportAllowedAttachmentExts = allowedAttachmentExts
 
 // ExportBuildContextBlock exposes buildContextBlock for testing.
 func ExportBuildContextBlock(results []*model.SearchResult) string {

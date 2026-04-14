@@ -10,33 +10,97 @@
 // This file covers:
 //  1. Periodic REST-based collection (full backfill on first run, incremental after)
 //  2. Mention-response via WebSocket gateway (always-on, separate from cron)
+//  3. Attachment download + extraction pipeline per message
 package collector
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/google/uuid"
+	"github.com/baekenough/second-brain/internal/collector/extractor"
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/baekenough/second-brain/internal/store"
 )
+
+// maxAttachmentBytes is the hard cap for a single Discord attachment download.
+// Attachments larger than this are skipped to protect memory.
+const maxAttachmentBytes = 25 * 1024 * 1024 // 25 MB
+
+// attachmentExtractTimeout is the per-attachment deadline for binary extraction
+// (PDF, Office formats). Plain-text formats do not use this; they read in-memory.
+const attachmentExtractTimeout = 15 * time.Second
+
+// allowedAttachmentExts is a positive-list of extensions whose text can be
+// extracted and indexed. Extensions not in this list are silently skipped.
+var allowedAttachmentExts = map[string]bool{
+	".txt":  true,
+	".md":   true,
+	".pdf":  true,
+	".docx": true,
+	".xlsx": true,
+	".pptx": true,
+	".html": true,
+	".htm":  true,
+	".csv":  true,
+	".json": true,
+	".yaml": true,
+	".yml":  true,
+}
+
+// plainTextAttachmentExts are extensions that can be decoded directly as
+// UTF-8 without an extractor (no binary parsing needed).
+var plainTextAttachmentExts = map[string]bool{
+	".txt":  true,
+	".md":   true,
+	".csv":  true,
+	".json": true,
+	".yaml": true,
+	".yml":  true,
+}
+
+// AttachmentDocumentStore is the document persistence interface used by
+// DiscordCollector for attachment documents. It is a subset of store.DocumentStore.
+type AttachmentDocumentStore interface {
+	Upsert(ctx context.Context, doc *model.Document) error
+}
 
 // DiscordCollector collects messages from Discord guild channels using the
 // discordgo library. It respects discordgo's built-in rate-limit handler.
 type DiscordCollector struct {
-	botToken              string
-	applicationID         string
-	guildIDs              []string
+	botToken               string
+	applicationID          string
+	guildIDs               []string
 	mentionResponseEnabled bool
 
 	// session is the discordgo session used for REST API calls.
 	// It is created lazily on the first Collect call and reused.
 	session *discordgo.Session
+
+	// httpClient is used for attachment downloads. When nil, http.DefaultClient is used.
+	httpClient *http.Client
+
+	// docStore is the document persistence layer for attachment documents.
+	// When nil, attachment documents are not persisted.
+	docStore AttachmentDocumentStore
+
+	// extractionFailures records extraction failures for retry. When nil,
+	// failures are only logged.
+	extractionFailures *store.ExtractionFailureStore
+
+	// extractorReg is the extractor registry for binary/structured formats.
+	extractorReg *extractor.Registry
 }
 
 // NewDiscordCollector returns a DiscordCollector configured from the given
@@ -49,10 +113,35 @@ func NewDiscordCollector(
 	mentionResponseEnabled bool,
 ) *DiscordCollector {
 	return &DiscordCollector{
-		botToken:              botToken,
+		botToken:               botToken,
 		applicationID:         applicationID,
-		guildIDs:              guildIDs,
+		guildIDs:               guildIDs,
 		mentionResponseEnabled: mentionResponseEnabled,
+		httpClient:             &http.Client{Timeout: 60 * time.Second},
+		extractorReg:           extractor.NewRegistry(),
+	}
+}
+
+// NewDiscordCollectorWithAttachments returns a DiscordCollector with full
+// attachment processing support. docStore and extractionFailures may be nil
+// (attachments are then skipped or failures only logged respectively).
+func NewDiscordCollectorWithAttachments(
+	botToken string,
+	applicationID string,
+	guildIDs []string,
+	mentionResponseEnabled bool,
+	docStore AttachmentDocumentStore,
+	extractionFailures *store.ExtractionFailureStore,
+) *DiscordCollector {
+	return &DiscordCollector{
+		botToken:               botToken,
+		applicationID:         applicationID,
+		guildIDs:               guildIDs,
+		mentionResponseEnabled: mentionResponseEnabled,
+		httpClient:             &http.Client{Timeout: 60 * time.Second},
+		docStore:               docStore,
+		extractionFailures:     extractionFailures,
+		extractorReg:           extractor.NewRegistry(),
 	}
 }
 
@@ -238,10 +327,6 @@ func (c *DiscordCollector) collectChannel(
 
 	var docs []model.Document
 	for _, m := range msgs {
-		if m.Content == "" {
-			continue
-		}
-
 		threadID := ""
 		threadName := ""
 		channelID := ch.ID
@@ -256,38 +341,54 @@ func (c *DiscordCollector) collectChannel(
 			}
 		}
 
-		sourceID := fmt.Sprintf("discord:%s:%s:%s", guildID, channelID, m.ID)
-		if isThread {
-			sourceID = fmt.Sprintf("discord:%s:%s:%s:%s", guildID, channelID, threadID, m.ID)
+		// Process message body (skip empty-content messages).
+		if m.Content != "" {
+			sourceID := fmt.Sprintf("discord:%s:%s:%s", guildID, channelID, m.ID)
+			if isThread {
+				sourceID = fmt.Sprintf("discord:%s:%s:%s:%s", guildID, channelID, threadID, m.ID)
+			}
+
+			// Derive title: use channel/thread name + short timestamp prefix.
+			title := fmt.Sprintf("#%s — %s", channelName, m.Timestamp.Format("2006-01-02"))
+			if isThread {
+				title = fmt.Sprintf("#%s > %s — %s", channelName, threadName, m.Timestamp.Format("2006-01-02"))
+			}
+
+			metadata := map[string]any{
+				"guild_id":     guildID,
+				"channel_id":   channelID,
+				"channel_name": channelName,
+				"author_id":    m.Author.ID,
+				"author_name":  m.Author.Username,
+			}
+			if isThread {
+				metadata["thread_id"] = threadID
+				metadata["thread_name"] = threadName
+			}
+
+			docs = append(docs, model.Document{
+				ID:          uuid.New(),
+				SourceType:  model.SourceDiscord,
+				SourceID:    sourceID,
+				Title:       title,
+				Content:     m.Content,
+				Metadata:    metadata,
+				CollectedAt: time.Now().UTC(),
+			})
 		}
 
-		// Derive title: use channel/thread name + short timestamp prefix.
-		title := fmt.Sprintf("#%s — %s", channelName, m.Timestamp.Format("2006-01-02"))
-		if isThread {
-			title = fmt.Sprintf("#%s > %s — %s", channelName, threadName, m.Timestamp.Format("2006-01-02"))
+		// Process attachments — failures are logged but never abort message collection.
+		for _, att := range m.Attachments {
+			if err := c.processAttachment(ctx, guildID, channelID, m, att); err != nil {
+				slog.Warn("discord: attachment processing failed",
+					"guild", guildID,
+					"channel", channelID,
+					"message", m.ID,
+					"filename", att.Filename,
+					"err", err)
+				// continue — one attachment failure does not abort other attachments
+			}
 		}
-
-		metadata := map[string]any{
-			"guild_id":     guildID,
-			"channel_id":   channelID,
-			"channel_name": channelName,
-			"author_id":    m.Author.ID,
-			"author_name":  m.Author.Username,
-		}
-		if isThread {
-			metadata["thread_id"] = threadID
-			metadata["thread_name"] = threadName
-		}
-
-		docs = append(docs, model.Document{
-			ID:          uuid.New(),
-			SourceType:  model.SourceDiscord,
-			SourceID:    sourceID,
-			Title:       title,
-			Content:     m.Content,
-			Metadata:    metadata,
-			CollectedAt: time.Now().UTC(),
-		})
 	}
 
 	if len(msgs) > 0 {
@@ -713,6 +814,196 @@ func splitForDiscord(text string, maxLen int) []string {
 		chunks = append(chunks, text)
 	}
 	return chunks
+}
+
+// --- Attachment processing ---
+
+// processAttachment downloads a single Discord attachment, extracts its text
+// content, and upserts it as a separate document.
+//
+// The function is a no-op (returns nil) when:
+//   - the attachment exceeds maxAttachmentBytes (size guard from Discord metadata)
+//   - the extension is not in allowedAttachmentExts
+//   - the collector has no docStore configured
+//
+// Non-nil errors are soft — callers should log and continue.
+func (c *DiscordCollector) processAttachment(
+	ctx context.Context,
+	guildID, channelID string,
+	msg *discordgo.Message,
+	att *discordgo.MessageAttachment,
+) error {
+	// Guard: no docStore means nowhere to persist — skip silently.
+	if c.docStore == nil {
+		return nil
+	}
+
+	// Guard: size limit from Discord metadata (avoids even starting the download).
+	if att.Size > maxAttachmentBytes {
+		slog.Info("discord: skipping large attachment",
+			"filename", att.Filename,
+			"size", att.Size,
+			"limit", maxAttachmentBytes)
+		return nil
+	}
+
+	// Guard: positive-list extension filter.
+	ext := strings.ToLower(filepath.Ext(att.Filename))
+	if !allowedAttachmentExts[ext] {
+		slog.Debug("discord: skipping attachment with unsupported extension",
+			"filename", att.Filename,
+			"ext", ext)
+		return nil
+	}
+
+	// Download the attachment with context awareness.
+	data, err := c.downloadAttachment(ctx, att.URL)
+	if err != nil {
+		return fmt.Errorf("download %q: %w", att.Filename, err)
+	}
+
+	// Double-check size after download (Discord metadata may be inaccurate).
+	if len(data) > maxAttachmentBytes {
+		return fmt.Errorf("attachment %q exceeds %d bytes after download (got %d)",
+			att.Filename, maxAttachmentBytes, len(data))
+	}
+
+	// Extract text content.
+	sourceID := fmt.Sprintf("discord:%s:%s:%s:att:%s", guildID, channelID, msg.ID, att.ID)
+	text, err := c.extractAttachmentText(ctx, att.Filename, ext, data)
+	if err != nil {
+		// Record failure for retry pipeline and return error to caller.
+		if c.extractionFailures != nil {
+			_ = c.extractionFailures.Record(ctx, store.ExtractionFailure{
+				SourceType:   "discord",
+				SourceID:     sourceID,
+				FilePath:     att.Filename,
+				ErrorMessage: err.Error(),
+			})
+		}
+		return fmt.Errorf("extract %q: %w", att.Filename, err)
+	}
+
+	if text == "" {
+		slog.Debug("discord: attachment yielded no text content",
+			"filename", att.Filename)
+		return nil
+	}
+
+	// Build and upsert the attachment document.
+	doc := &model.Document{
+		ID:         uuid.New(),
+		SourceType: model.SourceDiscord,
+		SourceID:   sourceID,
+		Title:      att.Filename,
+		Content:    text,
+		Metadata: map[string]any{
+			"guild_id":      guildID,
+			"channel_id":    channelID,
+			"message_id":    msg.ID,
+			"attachment_id": att.ID,
+			"filename":      att.Filename,
+			"size":          att.Size,
+			"content_type":  att.ContentType,
+			"author_id":     msg.Author.ID,
+			"author_name":   msg.Author.Username,
+		},
+		CollectedAt: time.Now().UTC(),
+	}
+	if err := c.docStore.Upsert(ctx, doc); err != nil {
+		return fmt.Errorf("upsert attachment document %q: %w", att.Filename, err)
+	}
+
+	slog.Info("discord: attachment processed",
+		"filename", att.Filename,
+		"size", att.Size,
+		"text_bytes", len(text))
+	return nil
+}
+
+// downloadAttachment fetches the attachment URL and returns its body as bytes.
+// It honours the context deadline and enforces the maxAttachmentBytes cap at
+// the stream level so oversized responses do not fully buffer in memory.
+func (c *DiscordCollector) downloadAttachment(ctx context.Context, url string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("new request: %w", err)
+	}
+
+	client := c.httpClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("http do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected HTTP status %d for %q", resp.StatusCode, url)
+	}
+
+	// Read up to maxAttachmentBytes+1 to detect oversized responses without
+	// fully buffering them.
+	buf := &bytes.Buffer{}
+	if _, err := io.CopyN(buf, resp.Body, int64(maxAttachmentBytes)+1); err != nil && err != io.EOF {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if buf.Len() > maxAttachmentBytes {
+		return nil, fmt.Errorf("response body exceeds %d bytes", maxAttachmentBytes)
+	}
+	return buf.Bytes(), nil
+}
+
+// extractAttachmentText dispatches to the appropriate extraction strategy:
+//   - Plain text extensions (txt, md, csv, json, yaml, yml): decode bytes directly as UTF-8.
+//   - Binary/structured extensions (pdf, docx, xlsx, pptx, html): write a temp file
+//     and call the extractor registry, then remove the temp file.
+func (c *DiscordCollector) extractAttachmentText(
+	ctx context.Context,
+	filename, ext string,
+	data []byte,
+) (string, error) {
+	if plainTextAttachmentExts[ext] {
+		return extractor.SanitizeText(string(data)), nil
+	}
+
+	// Binary formats require a temporary file because the extractor registry
+	// uses file-path-based parsing (zip, PDF, XML readers).
+	ex := c.extractorReg.Find(ext)
+	if ex == nil {
+		// Extension is in allowedAttachmentExts but has no extractor — should
+		// not happen with the current config, but guard defensively.
+		return "", fmt.Errorf("no extractor registered for extension %q", ext)
+	}
+
+	// Write to a temporary file.
+	tmpFile, err := os.CreateTemp("", "discord-att-*"+ext)
+	if err != nil {
+		return "", fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath) // best-effort cleanup
+
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		return "", fmt.Errorf("write temp file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return "", fmt.Errorf("close temp file: %w", err)
+	}
+
+	// Apply per-extraction timeout on top of the caller's context.
+	extractCtx, cancel := context.WithTimeout(ctx, attachmentExtractTimeout)
+	defer cancel()
+
+	text, err := ex.Extract(extractCtx, tmpPath)
+	if err != nil {
+		return "", fmt.Errorf("extract %q: %w", filename, err)
+	}
+	return text, nil
 }
 
 // --- Helpers ---

@@ -891,6 +891,79 @@ const FILTER_OPTIONS: FilterOption[] = [
 | `NEXT_PUBLIC_API_URL` | 선택 | 클라이언트 접근 가능 URL (미사용 권장) |
 | `API_KEY` | 선택 | 백엔드 Bearer 토큰 (서버사이드만 사용) |
 
+### 11.1 cliproxy 통합
+
+**목적**: OpenAI 호환 API 호출(embeddings, chat completions)을 ChatGPT Pro / Claude Pro / Gemini OAuth 기반으로 프록시. second-brain은 cliproxy를 **로컬 HTTP 프록시**로 사용하며, cliproxy 자체가 OAuth 토큰 갱신 · 라우팅 · rate limit을 담당한다.
+
+#### 배포 모델
+
+```mermaid
+flowchart LR
+    pod[second-brain Pod<br/>:9200] -- "HTTP<br/>Bearer inbound key" --> cliproxy[cliproxy<br/>127.0.0.1:8317]
+    cliproxy -- "OAuth access_token<br/>refresh 자동" --> upstream[(OpenAI API<br/>chat.openai.com)]
+
+    subgraph host["host (baekenough-ubuntu24)"]
+      cliproxy
+      auth["~/.cli-proxy-api/<br/>codex-*.json<br/>claude-*.json<br/>gemini-*.json"]
+      cliproxy -.-> auth
+    end
+
+    subgraph minikube["minikube docker driver"]
+      pod
+    end
+
+    pod -->|host.minikube.internal:8317| cliproxy
+```
+
+#### 인증 계층 (2단계)
+
+1. **Inbound (second-brain → cliproxy)**: 정적 API key — cliproxy `config.yaml`의 `api-keys` 리스트에 등록된 값. 환경변수 `LLM_API_KEY`, `EMBEDDING_API_KEY`에 저장.
+2. **Upstream (cliproxy → OpenAI/Claude/Gemini)**: OAuth access_token (`~/.cli-proxy-api/*.json`). cliproxy가 자동 갱신하므로 second-brain은 개입 불필요.
+
+#### 환경변수 매핑
+
+| 변수 | 용도 | 서버 값 예시 |
+|---|---|---|
+| `LLM_API_URL` | chat completions 엔드포인트 | `http://host.minikube.internal:8317/v1` |
+| `LLM_API_KEY` | inbound API key | cliproxy `config.yaml`의 키 |
+| `LLM_MODEL` | 모델 식별자 | `gpt-codex-5.3` |
+| `EMBEDDING_API_URL` | embeddings 엔드포인트 (cliproxy 미지원 시 404 → FTS 폴백) | 동일 |
+| `EMBEDDING_API_KEY` | inbound API key (LLM과 동일 가능) | 동일 |
+| `CLIPROXY_AUTH_FILE` | 폐기 예정 — static key 경로가 우선 | unused |
+
+#### 지원 엔드포인트
+
+| Path | cliproxy | OpenAI 직접 | 현재 second-brain |
+|---|---|---|---|
+| `/v1/chat/completions` | ✅ | ✅ | cliproxy 사용 |
+| `/v1/embeddings` | ❌ (404) | ✅ | FTS 폴백 중, 결정 대기 (#34) |
+| `/v1/models` | ✅ | ✅ | 미사용 |
+
+#### 실패 모드
+
+| 상황 | 증상 | 대응 |
+|---|---|---|
+| cliproxy 다운 | 모든 LLM 호출 실패 → Discord 멘션 응답 에러 | `pm2 restart cli-proxy-api` |
+| inbound key 불일치 | `401 Invalid API key` | `LLM_API_KEY` / `EMBEDDING_API_KEY` 와 cliproxy `config.yaml` 키 일치 확인 |
+| embeddings 호출 | `404 page not found` | 정상 — FTS 폴백으로 처리됨 |
+| OAuth 토큰 만료 | cliproxy가 자동 refresh | second-brain 영향 없음 |
+
+#### 운영 명령
+
+```bash
+# cliproxy 상태 확인
+pm2 list | grep cli-proxy-api
+pm2 logs cli-proxy-api
+
+# cliproxy 재시작
+pm2 restart cli-proxy-api
+
+# systemd user service (현재 disabled, 전환 가능)
+systemctl --user status cliproxy.service
+```
+
+**관련 이슈**: #33 (본 문서화) · #34 (embedding 라우팅 결정) · #4 (JWT 폐기 — cliproxy로 대체됨)
+
 ---
 
 ## 12. 설계 결정 ADR
