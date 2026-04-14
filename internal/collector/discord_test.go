@@ -2,6 +2,7 @@ package collector_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -611,4 +612,90 @@ func TestGateway_OnMessageCreate_NilDocStore_NoOp(t *testing.T) {
 	// persistMessageRealtime is never called, so no goroutine is spawned and
 	// no nil-dereference occurs.
 	collector.ExportGatewayHandleMessageCreate(gw, sess, msg)
+}
+
+// ---------------------------------------------------------------------------
+// resolveChannel — state-miss / REST-fallback regression tests
+//
+// These tests guard against the P0 bug where State.Channel returned an error
+// (because IntentsGuilds was missing) and the handler silently dropped every
+// message. resolveChannel is exercised through stub channelResolver
+// implementations so no live discordgo.Session is required.
+// ---------------------------------------------------------------------------
+
+// stubChannelResolver is a test double for channelResolver.
+// stateErr / restErr control which lookup fails; ch is the returned channel.
+type stubChannelResolver struct {
+	ch       *discordgo.Channel
+	stateErr error
+	restErr  error
+}
+
+func (r *stubChannelResolver) StateChannel(_ string) (*discordgo.Channel, error) {
+	if r.stateErr != nil {
+		return nil, r.stateErr
+	}
+	return r.ch, nil
+}
+
+func (r *stubChannelResolver) RESTChannel(_ string) (*discordgo.Channel, error) {
+	if r.restErr != nil {
+		return nil, r.restErr
+	}
+	return r.ch, nil
+}
+
+// TestResolveChannel_StateHit verifies that a cache-warm lookup returns the
+// channel without calling the REST API.
+func TestResolveChannel_StateHit(t *testing.T) {
+	t.Parallel()
+
+	want := &discordgo.Channel{ID: "ch-1", Type: discordgo.ChannelTypeGuildText}
+	r := &stubChannelResolver{ch: want}
+
+	got, err := collector.ExportResolveChannel(r, "ch-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.ID != want.ID {
+		t.Errorf("got channel %q, want %q", got.ID, want.ID)
+	}
+}
+
+// TestResolveChannel_StateMiss_RESTFallback verifies that a state cache miss
+// triggers the REST API fallback and still returns the channel.
+// This is the regression case for the P0 bug: IntentsGuilds missing → state
+// always empty → every message silently dropped before this fix.
+func TestResolveChannel_StateMiss_RESTFallback(t *testing.T) {
+	t.Parallel()
+
+	want := &discordgo.Channel{ID: "ch-2", Type: discordgo.ChannelTypeGuildText}
+	r := &stubChannelResolver{
+		ch:       want,
+		stateErr: errors.New("state: channel not found"), // simulate cold cache
+	}
+
+	got, err := collector.ExportResolveChannel(r, "ch-2")
+	if err != nil {
+		t.Fatalf("expected successful REST fallback, got error: %v", err)
+	}
+	if got.ID != want.ID {
+		t.Errorf("got channel %q, want %q", got.ID, want.ID)
+	}
+}
+
+// TestResolveChannel_BothLookupsFail verifies that when both state and REST
+// fail, resolveChannel returns a non-nil error (caller logs + returns).
+func TestResolveChannel_BothLookupsFail(t *testing.T) {
+	t.Parallel()
+
+	r := &stubChannelResolver{
+		stateErr: errors.New("state: not found"),
+		restErr:  errors.New("REST: 403 Forbidden"),
+	}
+
+	_, err := collector.ExportResolveChannel(r, "ch-missing")
+	if err == nil {
+		t.Fatal("expected non-nil error when both lookups fail, got nil")
+	}
 }

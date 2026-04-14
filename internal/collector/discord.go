@@ -576,10 +576,16 @@ func (g *DiscordGateway) Run(ctx context.Context) {
 		return
 	}
 
-	// We need the guild-messages intent for mention detection and real-time
-	// collection. GuildMessageReactions is required to receive reaction add events
-	// for the feedback path.
-	sess.Identify.Intents = discordgo.IntentsGuildMessages | discordgo.IntentsGuildMessageReactions
+	// IntentsGuilds is required so the gateway receives GUILD_CREATE events,
+	// which populate the state cache used by s.State.Channel(). Without it the
+	// state cache is always empty and every handleMessageCreate call silently
+	// drops the message at the channel-type guard.
+	// GuildMessages is required for mention detection and real-time collection.
+	// GuildMessageReactions is required to receive reaction add events for the
+	// feedback path.
+	sess.Identify.Intents = discordgo.IntentsGuilds |
+		discordgo.IntentsGuildMessages |
+		discordgo.IntentsGuildMessageReactions
 
 	// Register the MessageCreate handler whenever real-time collection or mention
 	// response is enabled. A single handler covers both code paths to avoid
@@ -631,9 +637,19 @@ func (g *DiscordGateway) handleMessageCreate(s *discordgo.Session, m *discordgo.
 
 	// Guard: only process guild text channels and threads. DM and GroupDM
 	// channels must never be collected (positive-list, mirrors DiscordCollector).
-	channel, err := s.State.Channel(m.ChannelID)
-	if err != nil || !isAllowedChannelType(channel.Type) {
-		// State miss or disallowed channel type — skip silently.
+	//
+	// resolveChannel tries the gateway state cache first and falls back to a REST
+	// call when the cache is cold (e.g. IntentsGuilds was missing at startup).
+	channel, err := resolveChannel(sessionAdapter{s}, m.ChannelID)
+	if err != nil {
+		slog.Warn("discord gateway: channel lookup failed",
+			"channel_id", m.ChannelID,
+			"error", err,
+		)
+		return
+	}
+	if !isAllowedChannelType(channel.Type) {
+		// DM/GroupDM — silent skip is intentional (privacy guard).
 		return
 	}
 
@@ -1376,6 +1392,45 @@ func (c *DiscordCollector) extractAttachmentText(
 }
 
 // --- Helpers ---
+
+// channelResolver abstracts the two channel-lookup paths used by
+// resolveChannel. The interface exists solely for unit testing; production
+// code always passes a sessionAdapter wrapping *discordgo.Session.
+type channelResolver interface {
+	// StateChannel returns the channel from the in-memory gateway state cache.
+	StateChannel(id string) (*discordgo.Channel, error)
+	// RESTChannel fetches the channel from the Discord REST API.
+	RESTChannel(id string) (*discordgo.Channel, error)
+}
+
+// sessionAdapter adapts *discordgo.Session to channelResolver.
+type sessionAdapter struct{ s *discordgo.Session }
+
+func (a sessionAdapter) StateChannel(id string) (*discordgo.Channel, error) {
+	return a.s.State.Channel(id)
+}
+func (a sessionAdapter) RESTChannel(id string) (*discordgo.Channel, error) {
+	return a.s.Channel(id)
+}
+
+// resolveChannel returns the Discord channel for id using a state-first,
+// REST-fallback strategy.  It returns an error only when both lookups fail.
+// A warn-level log is emitted on state miss so that operators can diagnose
+// missing IntentsGuilds without reading source code.
+func resolveChannel(r channelResolver, id string) (*discordgo.Channel, error) {
+	ch, err := r.StateChannel(id)
+	if err == nil {
+		return ch, nil
+	}
+	ch, err = r.RESTChannel(id)
+	if err != nil {
+		return nil, err
+	}
+	slog.Warn("discord gateway: channel resolved via REST (state cache miss — check IntentsGuilds)",
+		"channel_id", id,
+	)
+	return ch, nil
+}
 
 // isAllowedChannelType returns true only for channel types that represent
 // guild text channels or guild public/private threads. This positive-list
