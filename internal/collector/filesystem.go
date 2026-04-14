@@ -38,6 +38,12 @@ const (
 	// (PDF, Office formats). Larger than fileReadTimeout because extraction
 	// involves parsing, not just I/O.
 	extractTimeout = 10 * time.Second
+
+	// maxFilenameBytes is the maximum byte length of a single filename
+	// component (not full path). POSIX, ext4, and 9p/virtio-fs all enforce a
+	// 255-byte limit per component; filenames longer than this cause lstat(2)
+	// to fail on those filesystems (e.g. minikube virtio-fs mounts).
+	maxFilenameBytes = 255
 )
 
 const maxContentBytes = 1 << 20 // 1 MB
@@ -128,6 +134,19 @@ func (c *FilesystemCollector) Collect(_ context.Context, since time.Time) ([]mod
 			return nil // continue
 		}
 
+		if isFilenameTooLong(d.Name()) {
+			nameBytes := len(d.Name())
+			if d.IsDir() {
+				slog.Warn("filesystem: skipping directory with too-long name",
+					"path", path, "bytes", nameBytes)
+				return filepath.SkipDir
+			}
+			slog.Warn("filesystem: skipping file with too-long name",
+				"path", path, "bytes", nameBytes)
+			skipped++
+			return nil
+		}
+
 		if d.IsDir() {
 			if skipDirs[d.Name()] {
 				return filepath.SkipDir
@@ -178,6 +197,18 @@ func (c *FilesystemCollector) ListActiveSourceIDs(_ context.Context) ([]string, 
 	err := filepath.WalkDir(c.rootPath, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			slog.Warn("filesystem: walk error during ID listing, skipping", "path", path, "error", walkErr)
+			return nil
+		}
+
+		if isFilenameTooLong(d.Name()) {
+			nameBytes := len(d.Name())
+			if d.IsDir() {
+				slog.Warn("filesystem: skipping directory with too-long name during ID listing",
+					"path", path, "bytes", nameBytes)
+				return filepath.SkipDir
+			}
+			slog.Warn("filesystem: skipping file with too-long name during ID listing",
+				"path", path, "bytes", nameBytes)
 			return nil
 		}
 
@@ -465,6 +496,18 @@ func isArchiveExt(ext string) bool {
 		return true
 	}
 	return false
+}
+
+// isFilenameTooLong reports whether name (a single path component, not a full
+// path) exceeds maxFilenameBytes bytes. POSIX, ext4, and 9p/virtio-fs all
+// enforce a 255-byte per-component limit; attempting lstat(2) on a longer name
+// fails with ENAMETOOLONG on those filesystems.
+//
+// Note: len(name) counts bytes, not Unicode code points. Korean characters are
+// 3 bytes each in UTF-8, so a 100-character Korean filename is 300 bytes and
+// therefore too long.
+func isFilenameTooLong(name string) bool {
+	return len(name) > maxFilenameBytes
 }
 
 // isBinaryExt and fileTypeName are kept for any future binary formats that
