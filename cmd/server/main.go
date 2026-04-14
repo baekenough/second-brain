@@ -141,6 +141,7 @@ func run() error {
 		BaseURL:     cfg.LLMAPIURL,
 		Model:       cfg.LLMModel,
 		APIKey:      cfg.LLMAPIKey,
+		AuthFile:    cfg.LLMAuthFile,
 		MaxTokens:   cfg.LLMMaxTokens,
 		Temperature: cfg.LLMTemperature,
 	}, nil)

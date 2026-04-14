@@ -13,25 +13,33 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/baekenough/second-brain/internal/auth"
 )
 
 // Client is an OpenAI-compatible chat completion client.
 // It communicates with any endpoint that speaks the /v1/chat/completions protocol
 // (OpenAI, Azure OpenAI, local proxies such as cliproxy, etc.).
 type Client struct {
-	baseURL    string
-	model      string
-	apiKey     string
-	maxTokens  int
+	baseURL     string
+	model       string
+	tokens      auth.TokenSource // nil when no auth configured
+	maxTokens   int
 	temperature float64
-	httpClient *http.Client
+	httpClient  *http.Client
 }
 
 // Config holds the parameters required to construct a Client.
+//
+// Token resolution order:
+//  1. APIKey non-empty → static Bearer token
+//  2. AuthFile non-empty → CliProxyAPI OAuth token (auto-refreshed from disk, 5-min TTL)
+//  3. both empty → no Authorization header sent
 type Config struct {
 	BaseURL     string
 	Model       string
-	APIKey      string
+	APIKey      string // static Bearer token (overrides AuthFile)
+	AuthFile    string // path to CliProxyAPI OAuth JSON (e.g. ~/.cli-proxy-api/user.json)
 	MaxTokens   int
 	Temperature float64
 }
@@ -47,7 +55,7 @@ func New(cfg Config, httpClient *http.Client) *Client {
 	return &Client{
 		baseURL:     baseURL,
 		model:       cfg.Model,
-		apiKey:      cfg.APIKey,
+		tokens:      auth.Resolve(cfg.APIKey, cfg.AuthFile),
 		maxTokens:   cfg.MaxTokens,
 		temperature: cfg.Temperature,
 		httpClient:  httpClient,
@@ -55,9 +63,9 @@ func New(cfg Config, httpClient *http.Client) *Client {
 }
 
 // Enabled reports whether the client has the minimum required configuration
-// to make a request (non-empty base URL and model).
+// to make a request (non-empty base URL, model, and a token source configured).
 func (c *Client) Enabled() bool {
-	return c.baseURL != "" && c.model != ""
+	return c.baseURL != "" && c.model != "" && c.tokens != nil
 }
 
 // message is a single chat message in the OpenAI format.
@@ -158,8 +166,12 @@ func (c *Client) doRequest(ctx context.Context, reqBody chatRequest) (string, er
 		return "", fmt.Errorf("llm: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	if c.tokens != nil {
+		tok, err := c.tokens.Token()
+		if err != nil {
+			return "", fmt.Errorf("llm: token source: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 
 	resp, err := c.httpClient.Do(req)

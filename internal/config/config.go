@@ -25,8 +25,10 @@ type Config struct {
 	// LLM (optional — Discord RAG answer generation; falls back to EmbeddingAPIURL when unset)
 	// LLMAPIURL: LLM_API_URL env var; defaults to EmbeddingAPIURL with /embeddings → /chat/completions suffix fix.
 	// LLMAPIKey: LLM_API_KEY env var; defaults to EmbeddingAPIKey.
+	// LLMAuthFile: LLM_CLIPROXY_AUTH_FILE env var; defaults to CLIPROXY_AUTH_FILE when unset.
 	LLMAPIURL      string
 	LLMAPIKey      string
+	LLMAuthFile    string // path to CliProxyAPI OAuth JSON for LLM requests
 	LLMModel       string
 	LLMMaxTokens   int
 	LLMTemperature float64
@@ -101,6 +103,12 @@ func Load() (*Config, error) {
 		llmAPIKey = embeddingAPIKey
 	}
 
+	// LLM auth file: prefer LLM-specific path, fall back to shared CLIPROXY_AUTH_FILE.
+	llmAuthFile := os.Getenv("LLM_CLIPROXY_AUTH_FILE")
+	if llmAuthFile == "" {
+		llmAuthFile = os.Getenv("CLIPROXY_AUTH_FILE")
+	}
+
 	llmMaxTokens := 1500
 	if v := os.Getenv("LLM_MAX_TOKENS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -126,6 +134,7 @@ func Load() (*Config, error) {
 
 		LLMAPIURL:      llmAPIURL,
 		LLMAPIKey:      llmAPIKey,
+		LLMAuthFile:    llmAuthFile,
 		LLMModel:       getenv("LLM_MODEL", "gpt-4o-mini"),
 		LLMMaxTokens:   llmMaxTokens,
 		LLMTemperature: llmTemperature,

@@ -69,7 +69,8 @@ spec:
             type: DirectoryOrCreate
         - name: cliproxy-auth
           secret:
-            secretName: cliproxy-auth-secret
+            secretName: cliproxy-auth
+            optional: true
             items:
               - key: auth.json
                 path: auth.json
