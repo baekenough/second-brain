@@ -15,11 +15,13 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/baekenough/second-brain/internal/api"
 	"github.com/baekenough/second-brain/internal/collector"
+	"github.com/baekenough/second-brain/internal/collector/extractor"
 	"github.com/baekenough/second-brain/internal/config"
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/scheduler"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
+	"github.com/baekenough/second-brain/internal/worker"
 )
 
 func main() {
@@ -59,7 +61,21 @@ func run() error {
 	}
 
 	docStore := store.NewDocumentStore(pg)
-	extractionFailureStore := store.NewExtractionFailureStore(pg) // TODO(issue#8): wire into retry worker goroutine
+	extractionFailureStore := store.NewExtractionFailureStore(pg)
+	chunkStore := store.NewChunkStore(pg) // issue #9: chunk-based FTS
+
+	// --- Extraction retry worker ---
+	// Periodically re-attempts failed file extractions. Remote-source failures
+	// (Slack/Discord attachments) are skipped — see worker package for details.
+	extractorReg := extractor.NewRegistry()
+	retryWorker := worker.New(worker.Config{
+		FailureStore: extractionFailureStore,
+		DocStore:     docStore,
+		Extractor:    worker.NewRegistryExtractor(extractorReg, 0),
+		Interval:     time.Minute,
+		BatchSize:    20,
+	})
+	go retryWorker.Run(ctx)
 
 	// --- Embedding client ---
 	embedClient := search.NewEmbedClient(cfg.EmbeddingAPIURL, cfg.EmbeddingAPIKey, cfg.CliProxyAuthFile, cfg.EmbeddingModel)
@@ -113,12 +129,12 @@ func run() error {
 			otherCollectors = append(otherCollectors, col)
 		}
 	}
-	sched := scheduler.New(docStore, embedClient, otherCollectors...)
+	sched := scheduler.New(docStore, embedClient, otherCollectors...).WithChunkStore(chunkStore)
 	if err := sched.Register(cfg.CollectInterval); err != nil {
 		return err
 	}
 	if discordCol.Enabled() {
-		discordSched := scheduler.New(docStore, embedClient, discordCol)
+		discordSched := scheduler.New(docStore, embedClient, discordCol).WithChunkStore(chunkStore)
 		if err := discordSched.Register(cfg.DiscordCollectInterval); err != nil {
 			return err
 		}
@@ -139,7 +155,10 @@ func run() error {
 	}
 
 	// --- Search service ---
-	searchSvc := search.NewService(docStore, embedClient)
+	// ChunkStore is attached to enable chunk-based FTS fallback (issue #9).
+	// The embedding code path is preserved; TODO(issue#9-embed) tracks promotion
+	// to per-chunk embeddings once cliproxy /v1/embeddings is confirmed (#34).
+	searchSvc := search.NewService(docStore, embedClient).WithChunkStore(chunkStore)
 
 	// --- LLM client (Discord RAG) ---
 	llmClient := llm.New(llm.Config{
