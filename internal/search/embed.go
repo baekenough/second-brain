@@ -7,68 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"sync"
 	"time"
+
+	"github.com/baekenough/second-brain/internal/auth"
 )
-
-// tokenSource resolves a Bearer token for each request.
-// Implementations may cache tokens with TTL-based refresh.
-type tokenSource interface {
-	token() (string, error)
-}
-
-// staticToken always returns the same pre-configured token.
-type staticToken struct{ t string }
-
-func (s *staticToken) token() (string, error) { return s.t, nil }
-
-// cliProxyToken reads an OAuth access_token from a CliProxyAPI JSON auth file.
-// The file is re-read at most once per cacheTTL to pick up token refreshes
-// performed by CliProxyAPI in the background.
-type cliProxyToken struct {
-	path     string
-	cacheTTL time.Duration
-
-	mu        sync.Mutex
-	cached    string
-	expiresAt time.Time
-}
-
-func newCliProxyToken(path string) *cliProxyToken {
-	return &cliProxyToken{
-		path:     path,
-		cacheTTL: 5 * time.Minute,
-	}
-}
-
-func (c *cliProxyToken) token() (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.cached != "" && time.Now().Before(c.expiresAt) {
-		return c.cached, nil
-	}
-
-	data, err := os.ReadFile(c.path)
-	if err != nil {
-		return "", fmt.Errorf("cliproxy auth file: %w", err)
-	}
-
-	var payload struct {
-		AccessToken string `json:"access_token"`
-	}
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return "", fmt.Errorf("cliproxy auth file parse: %w", err)
-	}
-	if payload.AccessToken == "" {
-		return "", fmt.Errorf("cliproxy auth file: access_token is empty")
-	}
-
-	c.cached = payload.AccessToken
-	c.expiresAt = time.Now().Add(c.cacheTTL)
-	return c.cached, nil
-}
 
 // EmbedClient calls an OpenAI-compatible /v1/embeddings endpoint to produce
 // vector representations of text. When apiURL is empty all methods are no-ops
@@ -82,7 +24,7 @@ type EmbedClient struct {
 	apiURL string
 	model  string
 	client *http.Client
-	tokens tokenSource // nil when no auth configured
+	tokens auth.TokenSource // nil when no auth configured
 }
 
 // NewEmbedClient returns an EmbedClient. When apiURL is empty the client is
@@ -90,19 +32,11 @@ type EmbedClient struct {
 //
 // Token priority: apiKey > authFilePath > no auth.
 func NewEmbedClient(apiURL, apiKey, authFilePath, model string) *EmbedClient {
-	var ts tokenSource
-	switch {
-	case apiKey != "":
-		ts = &staticToken{t: apiKey}
-	case authFilePath != "":
-		ts = newCliProxyToken(authFilePath)
-	}
-
 	return &EmbedClient{
 		apiURL: apiURL,
 		model:  model,
 		client: &http.Client{Timeout: 30 * time.Second},
-		tokens: ts,
+		tokens: auth.Resolve(apiKey, authFilePath),
 	}
 }
 
@@ -225,7 +159,7 @@ func (c *EmbedClient) setAuth(req *http.Request) error {
 	if c.tokens == nil {
 		return nil
 	}
-	tok, err := c.tokens.token()
+	tok, err := c.tokens.Token()
 	if err != nil {
 		return fmt.Errorf("embed auth token: %w", err)
 	}
