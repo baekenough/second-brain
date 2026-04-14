@@ -68,6 +68,14 @@ func (c *Client) Enabled() bool {
 	return c.baseURL != "" && c.model != "" && c.tokens != nil
 }
 
+// Completer is the minimal interface for LLM chat completion.
+// It is satisfied by *Client and can be used by callers that need to
+// inject a mock or alternative implementation for testing.
+type Completer interface {
+	Enabled() bool
+	CompleteWithMessages(ctx context.Context, system string, messages []Message) (string, error)
+}
+
 // Message is a single chat message in the OpenAI format.
 // It is exported so callers can build multi-turn conversation histories
 // for CompleteWithMessages.
