@@ -50,6 +50,12 @@ jobs:
             echo "::error::hardcoded placeholder response in Discord handler"
             exit 1
           fi
+      - name: sync-env_test.sh destructive-command guard (#39)
+        run: |
+          if grep -nE '^[[:space:]]*kubectl[[:space:]]+(apply|create|delete|patch)' scripts/sync-env_test.sh; then
+            echo "::error::sync-env_test.sh must not contain destructive kubectl commands (issue #39)"
+            exit 1
+          fi
 
   docker-build-multiarch:
     name: Docker multi-arch build (no-cache)
