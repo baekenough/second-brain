@@ -6,34 +6,28 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
-	"strconv"
 	"sync/atomic"
 	"time"
 
 	"github.com/robfig/cron/v3"
+	"github.com/baekenough/second-brain/internal/chunker"
 	"github.com/baekenough/second-brain/internal/collector"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/search"
+	"github.com/baekenough/second-brain/internal/store"
 )
 
-// defaultMaxEmbedChars is the default character limit for text passed to the
-// embedding API. Long documents are truncated at this boundary to avoid token
-// limit errors. Override with MAX_EMBED_CHARS env var.
-//
-// TODO(Phase 1): replace with chunk-based embedding using chunks table.
-const defaultMaxEmbedChars = 8000
+// defaultChunkTargetSize is the preferred chunk size in bytes passed to chunker.Split.
+// Documents are split into chunks of approximately this size for FTS indexing.
+// This removes the previous 8 KB hard truncation (issue #3).
+const defaultChunkTargetSize = 2000
 
-// maxEmbedChars returns the configured character limit for embedding text.
-// It reads MAX_EMBED_CHARS from the environment; falls back to defaultMaxEmbedChars.
-func maxEmbedChars() int {
-	if v := os.Getenv("MAX_EMBED_CHARS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return defaultMaxEmbedChars
-}
+// defaultChunkMaxSize is the hard upper bound for a single chunk in bytes.
+const defaultChunkMaxSize = 4000
+
+// defaultChunkOverlap is the number of bytes shared between adjacent chunks
+// so that cross-boundary phrases remain searchable.
+const defaultChunkOverlap = 100
 
 // DocumentUpserter is the subset of the document store used by the scheduler.
 type DocumentUpserter interface {
@@ -45,10 +39,11 @@ type DocumentUpserter interface {
 
 // Scheduler wraps robfig/cron and manages periodic collection runs.
 type Scheduler struct {
-	cron       *cron.Cron
-	collectors []collector.Collector
-	store      DocumentUpserter
-	embed      *search.EmbedClient
+	cron        *cron.Cron
+	collectors  []collector.Collector
+	store       DocumentUpserter
+	embed       *search.EmbedClient
+	chunkStore  *store.ChunkStore // nil when chunk storage is disabled
 
 	// running is set to 1 while a collection cycle is in progress.
 	// CompareAndSwap from 0→1 acts as a non-blocking try-lock so that
@@ -58,6 +53,7 @@ type Scheduler struct {
 }
 
 // New returns a Scheduler with the given collectors and storage backend.
+// Use WithChunkStore to enable chunk-based FTS indexing (issue #9).
 func New(store DocumentUpserter, embed *search.EmbedClient, collectors ...collector.Collector) *Scheduler {
 	c := cron.New(cron.WithSeconds())
 	return &Scheduler{
@@ -66,6 +62,15 @@ func New(store DocumentUpserter, embed *search.EmbedClient, collectors ...collec
 		store:      store,
 		embed:      embed,
 	}
+}
+
+// WithChunkStore attaches a ChunkStore so that each collected document is split
+// into overlapping text chunks and stored in the chunks table for FTS indexing.
+// When not called, chunk storage is disabled and the scheduler behaves as
+// before (full-document FTS via documents.tsv only).
+func (s *Scheduler) WithChunkStore(cs *store.ChunkStore) *Scheduler {
+	s.chunkStore = cs
+	return s
 }
 
 // Register adds a cron job for each enabled collector using the given interval
@@ -161,6 +166,14 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 			continue
 		}
 		count++
+
+		// Persist text chunks for FTS indexing (issue #9).
+		// This replaces the previous 8 KB hard truncation (issue #3):
+		// the full document content is now split into overlapping chunks and
+		// stored in the chunks table. The documents.content column is unchanged.
+		if s.chunkStore != nil {
+			s.persistChunks(ctx, &docs[i])
+		}
 	}
 
 	_ = s.store.RecordCollectionLog(ctx, col.Source(), started, count, nil)
@@ -194,10 +207,16 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 }
 
 // embedDocuments fills the Embedding field of each document by calling the
-// embedding API in chunks to avoid timeout and payload-too-large errors.
+// embedding API in batches to avoid timeout and payload-too-large errors.
+//
+// NOTE: The previous 8 KB hard truncation (issue #3) has been removed.
+// Chunk-based embedding is tracked in TODO(issue#9-embed) below and will be
+// activated once cliproxy /v1/embeddings support is confirmed (issue #34).
+//
+// TODO(issue#9-embed): switch from full-document embedding to per-chunk embedding
+// using the chunks table. Activate after cliproxy /v1/embeddings is confirmed (#34).
 func (s *Scheduler) embedDocuments(ctx context.Context, docs []model.Document) {
 	const batchSize = 20
-	maxLen := maxEmbedChars()
 
 	for start := 0; start < len(docs); start += batchSize {
 		end := start + batchSize
@@ -205,39 +224,63 @@ func (s *Scheduler) embedDocuments(ctx context.Context, docs []model.Document) {
 			end = len(docs)
 		}
 
-		chunk := docs[start:end]
-		texts := make([]string, len(chunk))
-		for i, d := range chunk {
+		batch := docs[start:end]
+		texts := make([]string, len(batch))
+		for i, d := range batch {
 			// Use title + content for a richer embedding context.
-			// Limit text length to avoid token limits.
-			// TODO(Phase 1): replace with chunk-based embedding using chunks table.
-			text := d.Title + "\n\n" + d.Content
-			if len(text) > maxLen {
-				origLen := len(text)
-				text = text[:maxLen]
-				slog.Warn("scheduler: content truncated for embedding",
-					"source_id", d.SourceID,
-					"original_len", origLen,
-					"truncated_to", maxLen,
-					"lost_chars", origLen-maxLen,
-				)
-			}
-			texts[i] = text
+			// No truncation: full text is sent to the embedding API.
+			// If the API returns a token-limit error, the error is logged and
+			// the batch is skipped (FTS fallback remains active).
+			texts[i] = d.Title + "\n\n" + d.Content
 		}
 
 		vecs, err := s.embed.EmbedBatch(ctx, texts)
 		if err != nil {
-			slog.Warn("scheduler: batch embedding chunk failed, skipping chunk",
+			slog.Warn("scheduler: batch embedding failed, skipping batch",
 				"error", err, "start", start, "end", end)
 			continue
 		}
-		for i := range chunk {
+		for i := range batch {
 			if i < len(vecs) {
 				docs[start+i].Embedding = vecs[i]
 			}
 		}
 
-		slog.Info("scheduler: embedded chunk", "start", start, "end", end, "total", len(docs))
+		slog.Info("scheduler: embedded batch", "start", start, "end", end, "total", len(docs))
+	}
+}
+
+// persistChunks splits doc.Content into overlapping text chunks and stores
+// them in the chunks table via ChunkStore.ReplaceDocument. A failure here is
+// non-fatal: the document itself is already persisted in documents; only the
+// chunk-based FTS index is affected.
+func (s *Scheduler) persistChunks(ctx context.Context, doc *model.Document) {
+	texts := chunker.Split(doc.Content, chunker.Options{
+		TargetSize: defaultChunkTargetSize,
+		MaxSize:    defaultChunkMaxSize,
+		Overlap:    defaultChunkOverlap,
+	})
+	if len(texts) == 0 {
+		return
+	}
+
+	chunks := make([]store.Chunk, 0, len(texts))
+	for i, t := range texts {
+		chunks = append(chunks, store.Chunk{
+			DocumentID: doc.ID,
+			ChunkIndex: i,
+			Content:    t,
+			ByteSize:   len(t),
+		})
+	}
+
+	if err := s.chunkStore.ReplaceDocument(ctx, doc.ID, chunks); err != nil {
+		slog.Error("scheduler: chunk persist failed",
+			"err", err,
+			"doc_id", doc.ID,
+			"source_id", doc.SourceID,
+			"chunk_count", len(chunks),
+		)
 	}
 }
 
@@ -333,6 +376,10 @@ func (s *Scheduler) ForceCollectSlackChannel(ctx context.Context, channelID, cha
 			continue
 		}
 		count++
+
+		if s.chunkStore != nil {
+			s.persistChunks(ctx, &docs[i])
+		}
 	}
 
 	_ = s.store.RecordCollectionLog(ctx, sc.Source(), started, count, nil)
