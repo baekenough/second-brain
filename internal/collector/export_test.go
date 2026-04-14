@@ -113,6 +113,17 @@ func ExportProcessAttachment(
 // ExportAllowedAttachmentExts exposes the allowedAttachmentExts map for assertions.
 var ExportAllowedAttachmentExts = allowedAttachmentExts
 
+// ExportResolveChannel exposes resolveChannel for unit tests via the
+// channelResolver interface. Tests inject stub implementations to exercise
+// state-miss and REST-fallback paths without a live discordgo.Session.
+func ExportResolveChannel(r ExportChannelResolver, id string) (*discordgo.Channel, error) {
+	return resolveChannel(r, id)
+}
+
+// ExportChannelResolver is the public alias of channelResolver so that
+// collector_test can implement stub resolvers without importing internal types.
+type ExportChannelResolver = channelResolver
+
 // ExportBuildContextBlock exposes buildContextBlock for testing.
 func ExportBuildContextBlock(results []*model.SearchResult) string {
 	return buildContextBlock(results)
