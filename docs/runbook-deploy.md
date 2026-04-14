@@ -135,12 +135,22 @@ git tag --points-at HEAD
 
 > **중요**: Secret은 `.env` 파일에서 직접 생성한다.
 > kustomize(`kubectl apply -k`)는 Secret을 더미 값으로 덮어쓰므로 **절대 사용 금지** (#29).
+>
+> **권장 (#36)**: 수동 kubectl 명령 대신 `scripts/sync-env.sh`를 사용한다.
+> drift 방지를 위해 `.env` 수정 후에는 **반드시** 이 스크립트를 실행한다.
 
 ```bash
-# 3-1. .env 파일 위치 확인 (서버 홈 디렉토리 또는 프로젝트 루트)
+# 3-1. 자동화 스크립트 사용 (권장)
+cd ~/second-brain
+bash scripts/sync-env.sh          # 기본: second-brain 네임스페이스
+# 또는 rollout restart까지 한번에:
+AUTO_ROLLOUT=true bash scripts/sync-env.sh
+
+# 3-2. 수동 방법 (스크립트 사용 불가 시)
+# .env 파일 위치 확인 (서버 홈 디렉토리 또는 프로젝트 루트)
 ls -la ~/.env 2>/dev/null || ls -la ~/second-brain/.env
 
-# 3-2. .env에서 second-brain-secret 생성/갱신
+# .env에서 second-brain-secret 생성/갱신
 kubectl -n second-brain create secret generic second-brain-secret \
   --from-env-file=.env \
   --dry-run=client -o yaml | kubectl apply -f -

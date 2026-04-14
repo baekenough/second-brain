@@ -59,7 +59,7 @@ func run() error {
 	}
 
 	docStore := store.NewDocumentStore(pg)
-	_ = store.NewExtractionFailureStore(pg) // TODO(issue#8): wire into retry worker goroutine
+	extractionFailureStore := store.NewExtractionFailureStore(pg) // TODO(issue#8): wire into retry worker goroutine
 
 	// --- Embedding client ---
 	embedClient := search.NewEmbedClient(cfg.EmbeddingAPIURL, cfg.EmbeddingAPIKey, cfg.CliProxyAuthFile, cfg.EmbeddingModel)
@@ -90,11 +90,15 @@ func run() error {
 	}
 
 	// Discord collector (optional).
-	discordCol := collector.NewDiscordCollector(
+	// Uses NewDiscordCollectorWithAttachments so that file attachments in messages
+	// are downloaded, text-extracted, and stored as separate documents (issue #27).
+	discordCol := collector.NewDiscordCollectorWithAttachments(
 		cfg.DiscordBotToken,
 		cfg.DiscordApplicationID,
 		cfg.DiscordGuildIDs,
 		cfg.DiscordMentionResponseEnabled,
+		docStore,
+		extractionFailureStore,
 	)
 	if discordCol.Enabled() {
 		collectors = append(collectors, discordCol)
