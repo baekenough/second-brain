@@ -26,7 +26,7 @@ type stubEvalExporter struct {
 type evalPairJSON struct {
 	ID             int64          `json:"id"`
 	Query          string         `json:"query"`
-	RelevantDocIDs []int64        `json:"relevant_doc_ids"`
+	RelevantDocIDs []string       `json:"relevant_doc_ids"`
 	Source         string         `json:"source"`
 	CreatedAt      time.Time      `json:"created_at"`
 	Metadata       map[string]any `json:"metadata,omitempty"`
@@ -94,9 +94,9 @@ func TestEvalExport_WithPairs(t *testing.T) {
 	now := time.Date(2026, 4, 14, 9, 0, 0, 0, time.UTC)
 	stub := &stubEvalExporter{
 		pairs: []evalPairJSON{
-			{ID: 1, Query: "what is RAG?", RelevantDocIDs: []int64{10, 20}, Source: "feedback", CreatedAt: now},
-			{ID: 2, Query: "how does pgvector work?", RelevantDocIDs: []int64{30}, Source: "feedback", CreatedAt: now},
-			{ID: 3, Query: "chunking strategies", RelevantDocIDs: []int64{40, 50}, Source: "feedback", CreatedAt: now},
+			{ID: 1, Query: "what is RAG?", RelevantDocIDs: []string{"0b8ef9a1-0000-0000-0000-000000000010", "0b8ef9a1-0000-0000-0000-000000000020"}, Source: "feedback", CreatedAt: now},
+			{ID: 2, Query: "how does pgvector work?", RelevantDocIDs: []string{"0b8ef9a1-0000-0000-0000-000000000030"}, Source: "feedback", CreatedAt: now},
+			{ID: 3, Query: "chunking strategies", RelevantDocIDs: []string{"0b8ef9a1-0000-0000-0000-000000000040", "0b8ef9a1-0000-0000-0000-000000000050"}, Source: "feedback", CreatedAt: now},
 		},
 	}
 
@@ -171,7 +171,7 @@ func TestEvalExport_ContentTypeNDJSON(t *testing.T) {
 
 	srv := newEvalTestServer(&stubEvalExporter{
 		pairs: []evalPairJSON{
-			{ID: 1, Query: "test", RelevantDocIDs: []int64{1}, Source: "feedback", CreatedAt: time.Now()},
+			{ID: 1, Query: "test", RelevantDocIDs: []string{"0b8ef9a1-0000-0000-0000-000000000001"}, Source: "feedback", CreatedAt: time.Now()},
 		},
 	})
 	rr := doEvalExport(t, srv, "Bearer test-key")

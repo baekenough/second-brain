@@ -11,7 +11,7 @@ import (
 type Feedback struct {
 	ID         int64
 	Query      *string        // nullable — absent for direct doc/chunk rating
-	DocumentID *int64         // nullable FK → documents.id
+	DocumentID *string        // nullable FK → documents.id (UUID)
 	ChunkID    *int64         // nullable FK → chunks.id
 	Source     string         // "search" | "discord_bot" | "api"
 	SessionID  *string        // optional conversation grouping

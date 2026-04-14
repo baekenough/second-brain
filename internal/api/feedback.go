@@ -18,7 +18,7 @@ type FeedbackRecorder interface {
 // FeedbackRequest is the JSON body accepted by POST /api/v1/feedback.
 type FeedbackRequest struct {
 	Query      *string        `json:"query,omitempty"`
-	DocumentID *int64         `json:"document_id,omitempty"`
+	DocumentID *string        `json:"document_id,omitempty"`
 	ChunkID    *int64         `json:"chunk_id,omitempty"`
 	Source     string         `json:"source"`
 	SessionID  *string        `json:"session_id,omitempty"`

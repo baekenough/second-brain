@@ -17,7 +17,7 @@ func TestEvalPair_JSONSerialization(t *testing.T) {
 	original := EvalPair{
 		ID:             7,
 		Query:          "what is RAG?",
-		RelevantDocIDs: []int64{1, 2, 3},
+		RelevantDocIDs: []string{"0b8ef9a1-1234-4abc-8def-000000000001", "0b8ef9a1-1234-4abc-8def-000000000002", "0b8ef9a1-1234-4abc-8def-000000000003"},
 		Source:         "feedback",
 		CreatedAt:      now,
 		Metadata:       map[string]any{"channel": "general"},
@@ -47,7 +47,7 @@ func TestEvalPair_JSONSerialization(t *testing.T) {
 	}
 	for i, id := range original.RelevantDocIDs {
 		if got.RelevantDocIDs[i] != id {
-			t.Errorf("RelevantDocIDs[%d] = %d, want %d", i, got.RelevantDocIDs[i], id)
+			t.Errorf("RelevantDocIDs[%d] = %q, want %q", i, got.RelevantDocIDs[i], id)
 		}
 	}
 	if !got.CreatedAt.Equal(original.CreatedAt) {
@@ -63,7 +63,7 @@ func TestEvalPair_OmitEmptyMetadata(t *testing.T) {
 	p := EvalPair{
 		ID:             1,
 		Query:          "query",
-		RelevantDocIDs: []int64{10},
+		RelevantDocIDs: []string{"0b8ef9a1-1234-4abc-8def-000000000010"},
 		Source:         "feedback",
 		CreatedAt:      time.Now(),
 		// Metadata nil — should be omitted from JSON
@@ -87,7 +87,7 @@ func TestEvalPair_ZeroDocIDs(t *testing.T) {
 	p := EvalPair{
 		ID:             2,
 		Query:          "empty docs",
-		RelevantDocIDs: []int64{},
+		RelevantDocIDs: []string{},
 		Source:         "manual",
 		CreatedAt:      time.Now(),
 	}
@@ -119,9 +119,9 @@ func TestEvalStore_ExportJSONL_Format(t *testing.T) {
 	t.Parallel()
 
 	pairs := []EvalPair{
-		{ID: 1, Query: "alpha", RelevantDocIDs: []int64{10, 20}, Source: "feedback", CreatedAt: time.Now()},
-		{ID: 2, Query: "beta", RelevantDocIDs: []int64{30}, Source: "feedback", CreatedAt: time.Now()},
-		{ID: 3, Query: "gamma", RelevantDocIDs: []int64{40, 50, 60}, Source: "feedback", CreatedAt: time.Now()},
+		{ID: 1, Query: "alpha", RelevantDocIDs: []string{"0b8ef9a1-0000-0000-0000-000000000010", "0b8ef9a1-0000-0000-0000-000000000020"}, Source: "feedback", CreatedAt: time.Now()},
+		{ID: 2, Query: "beta", RelevantDocIDs: []string{"0b8ef9a1-0000-0000-0000-000000000030"}, Source: "feedback", CreatedAt: time.Now()},
+		{ID: 3, Query: "gamma", RelevantDocIDs: []string{"0b8ef9a1-0000-0000-0000-000000000040", "0b8ef9a1-0000-0000-0000-000000000050", "0b8ef9a1-0000-0000-0000-000000000060"}, Source: "feedback", CreatedAt: time.Now()},
 	}
 
 	var buf bytes.Buffer

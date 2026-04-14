@@ -3,7 +3,7 @@
 CREATE TABLE IF NOT EXISTS feedback (
     id              BIGSERIAL PRIMARY KEY,
     query           TEXT,                           -- original query (nullable for direct doc rating)
-    document_id     BIGINT REFERENCES documents(id) ON DELETE SET NULL,
+    document_id     UUID   REFERENCES documents(id) ON DELETE SET NULL,
     chunk_id        BIGINT REFERENCES chunks(id)    ON DELETE SET NULL,
     source          TEXT NOT NULL,                  -- "search", "discord_bot", "api", ...
     session_id      TEXT,                           -- optional conversation/session grouping
