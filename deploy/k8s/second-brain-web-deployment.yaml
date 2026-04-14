@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: second-brain-web
+  namespace: second-brain
+  labels:
+    app: second-brain-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: second-brain-web
+  template:
+    metadata:
+      labels:
+        app: second-brain-web
+    spec:
+      containers:
+        - name: second-brain-web
+          image: second-brain-web:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+              name: http
+          env:
+            - name: BRAIN_API_URL
+              value: "http://second-brain:9200"
+            - name: NEXT_PUBLIC_APP_URL
+              value: "http://localhost:3000"
+            - name: PORT
+              value: "3000"
+            - name: HOSTNAME
+              value: "0.0.0.0"
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: second-brain-secret
+                  key: API_KEY
+                  optional: true
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

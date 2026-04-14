@@ -1,0 +1,39 @@
+{
+  "configVersion": 1,
+  "version": "0.85.0",
+  "language": "en",
+  "installedAt": "2026-04-12T11:45:58.348Z",
+  "lastUpdated": "2026-04-13T00:56:55.469Z",
+  "installedComponents": [
+    "rules",
+    "agents",
+    "skills",
+    "guides",
+    "hooks",
+    "contexts",
+    "ontology",
+    "entry-md"
+  ],
+  "componentVersions": {},
+  "preferences": {
+    "logLevel": "info",
+    "colors": true,
+    "showProgress": true,
+    "confirmPrompts": true,
+    "autoBackup": true
+  },
+  "sourceRepo": "https://github.com/baekenough/oh-my-customcode",
+  "autoUpdate": {
+    "enabled": false,
+    "checkIntervalHours": 24,
+    "autoApplyMinor": false
+  },
+  "preserveFiles": [
+    ".claude/settings.json",
+    ".claude/settings.local.json",
+    ".claude/agent-memory/",
+    ".claude/agent-memory-local/"
+  ],
+  "customComponents": [],
+  "teamMode": false
+}

@@ -1,0 +1,232 @@
+---
+# Wiki Index — second-brain project knowledge base
+# Generated: 2026-04-12
+# Total pages: 207
+# Format: structured catalog for wiki-rag skill and human navigation
+---
+
+meta:
+  project: second-brain
+  generated: "2026-04-12"
+  generator: wiki-curator
+  total_pages: 207
+  categories:
+    agents: 48
+    rules: 22
+    guides: 33
+    skills: 104
+
+agents:
+  - { name: arch-documenter, path: agents/arch-documenter.md, type: agent, description: "Architecture documentation from code analysis" }
+  - { name: arch-speckit-agent, path: agents/arch-speckit-agent.md, type: agent, description: "Spec-driven architecture design" }
+  - { name: be-django-expert, path: agents/be-django-expert.md, type: agent, description: "Django/Python backend specialist" }
+  - { name: be-express-expert, path: agents/be-express-expert.md, type: agent, description: "Express.js Node.js backend specialist" }
+  - { name: be-fastapi-expert, path: agents/be-fastapi-expert.md, type: agent, description: "FastAPI async Python backend specialist" }
+  - { name: be-go-backend-expert, path: agents/be-go-backend-expert.md, type: agent, description: "Go backend services specialist" }
+  - { name: be-nestjs-expert, path: agents/be-nestjs-expert.md, type: agent, description: "NestJS TypeScript backend specialist" }
+  - { name: be-springboot-expert, path: agents/be-springboot-expert.md, type: agent, description: "Spring Boot Java backend specialist" }
+  - { name: db-alembic-expert, path: agents/db-alembic-expert.md, type: agent, description: "Alembic database migration specialist" }
+  - { name: db-postgres-expert, path: agents/db-postgres-expert.md, type: agent, description: "PostgreSQL optimization and schema design" }
+  - { name: db-redis-expert, path: agents/db-redis-expert.md, type: agent, description: "Redis caching and data structures" }
+  - { name: db-supabase-expert, path: agents/db-supabase-expert.md, type: agent, description: "Supabase and PostgreSQL with RLS" }
+  - { name: de-airflow-expert, path: agents/de-airflow-expert.md, type: agent, description: "Apache Airflow DAG orchestration" }
+  - { name: de-dbt-expert, path: agents/de-dbt-expert.md, type: agent, description: "dbt data transformation modeling" }
+  - { name: de-kafka-expert, path: agents/de-kafka-expert.md, type: agent, description: "Apache Kafka event streaming" }
+  - { name: de-pipeline-expert, path: agents/de-pipeline-expert.md, type: agent, description: "Data pipeline architecture and ETL/ELT" }
+  - { name: de-snowflake-expert, path: agents/de-snowflake-expert.md, type: agent, description: "Snowflake cloud data warehouse" }
+  - { name: de-spark-expert, path: agents/de-spark-expert.md, type: agent, description: "Apache Spark distributed processing" }
+  - { name: fe-design-expert, path: agents/fe-design-expert.md, type: agent, description: "Production-grade UI design and anti-AI-slop patterns" }
+  - { name: fe-flutter-agent, path: agents/fe-flutter-agent.md, type: agent, description: "Flutter/Dart cross-platform mobile" }
+  - { name: fe-svelte-agent, path: agents/fe-svelte-agent.md, type: agent, description: "SvelteKit frontend specialist" }
+  - { name: fe-vercel-agent, path: agents/fe-vercel-agent.md, type: agent, description: "Next.js/React Vercel deployment specialist" }
+  - { name: fe-vuejs-agent, path: agents/fe-vuejs-agent.md, type: agent, description: "Vue.js frontend specialist" }
+  - { name: infra-aws-expert, path: agents/infra-aws-expert.md, type: agent, description: "AWS infrastructure and cloud architecture" }
+  - { name: infra-docker-expert, path: agents/infra-docker-expert.md, type: agent, description: "Docker containerization and Compose" }
+  - { name: lang-golang-expert, path: agents/lang-golang-expert.md, type: agent, description: "Go language expert (Effective Go)" }
+  - { name: lang-java21-expert, path: agents/lang-java21-expert.md, type: agent, description: "Modern Java 21 with Virtual Threads and Records" }
+  - { name: lang-kotlin-expert, path: agents/lang-kotlin-expert.md, type: agent, description: "Kotlin idiomatic patterns" }
+  - { name: lang-python-expert, path: agents/lang-python-expert.md, type: agent, description: "Python expert (PEP 8/20)" }
+  - { name: lang-rust-expert, path: agents/lang-rust-expert.md, type: agent, description: "Rust safety and ownership patterns" }
+  - { name: lang-typescript-expert, path: agents/lang-typescript-expert.md, type: agent, description: "TypeScript strict-mode patterns" }
+  - { name: mgr-claude-code-bible, path: agents/mgr-claude-code-bible.md, type: agent, description: "Claude Code official spec compliance verification" }
+  - { name: mgr-creator, path: agents/mgr-creator.md, type: agent, description: "Dynamic agent creation and configuration" }
+  - { name: mgr-gitnerd, path: agents/mgr-gitnerd.md, type: agent, description: "Git operations, commits, PRs, releases" }
+  - { name: mgr-sauron, path: agents/mgr-sauron.md, type: agent, description: "R017 full verification before commit" }
+  - { name: mgr-supplier, path: agents/mgr-supplier.md, type: agent, description: "Agent dependency audit and validation" }
+  - { name: mgr-updater, path: agents/mgr-updater.md, type: agent, description: "Documentation sync and external agent updates" }
+  - { name: qa-engineer, path: agents/qa-engineer.md, type: agent, description: "Test execution and defect reporting" }
+  - { name: qa-planner, path: agents/qa-planner.md, type: agent, description: "Test planning and QA strategy" }
+  - { name: qa-writer, path: agents/qa-writer.md, type: agent, description: "Test case and documentation authoring" }
+  - { name: sec-codeql-expert, path: agents/sec-codeql-expert.md, type: agent, description: "CodeQL security vulnerability scanning" }
+  - { name: slack-cli-expert, path: agents/slack-cli-expert.md, type: agent, description: "Slack CLI and API integration" }
+  - { name: sys-memory-keeper, path: agents/sys-memory-keeper.md, type: agent, description: "Session memory persistence and recall" }
+  - { name: sys-naggy, path: agents/sys-naggy.md, type: agent, description: "TODO tracking and task nudging" }
+  - { name: tool-bun-expert, path: agents/tool-bun-expert.md, type: agent, description: "Bun JavaScript runtime and bundler" }
+  - { name: tool-npm-expert, path: agents/tool-npm-expert.md, type: agent, description: "npm package management and publishing" }
+  - { name: tool-optimizer, path: agents/tool-optimizer.md, type: agent, description: "Bundle size and performance analysis (read-only)" }
+  - { name: wiki-curator, path: agents/wiki-curator.md, type: agent, description: "Wiki CRUD — creates and maintains wiki/ pages" }
+
+rules:
+  - { name: r000, path: rules/r000.md, type: rule, priority: MUST, description: "Language policy and delegation model" }
+  - { name: r001, path: rules/r001.md, type: rule, priority: MUST, description: "Safety rules — prohibited actions" }
+  - { name: r002, path: rules/r002.md, type: rule, priority: MUST, description: "Permission rules — tool tiers and file access" }
+  - { name: r003, path: rules/r003.md, type: rule, priority: SHOULD, description: "Interaction rules — response format and handling" }
+  - { name: r004, path: rules/r004.md, type: rule, priority: SHOULD, description: "Error handling — classification and recovery" }
+  - { name: r005, path: rules/r005.md, type: rule, priority: MAY, description: "Optimization — efficiency and token guidelines" }
+  - { name: r006, path: rules/r006.md, type: rule, priority: MUST, description: "Agent design — structure and separation of concerns" }
+  - { name: r007, path: rules/r007.md, type: rule, priority: MUST, description: "Agent identification — header format" }
+  - { name: r008, path: rules/r008.md, type: rule, priority: MUST, description: "Tool identification — prefix format" }
+  - { name: r009, path: rules/r009.md, type: rule, priority: MUST, description: "Parallel execution — 2+ independent tasks" }
+  - { name: r010, path: rules/r010.md, type: rule, priority: MUST, description: "Orchestrator coordination — delegation rules" }
+  - { name: r011, path: rules/r011.md, type: rule, priority: SHOULD, description: "Memory integration — session persistence" }
+  - { name: r012, path: rules/r012.md, type: rule, priority: SHOULD, description: "HUD statusline — real-time status display" }
+  - { name: r013, path: rules/r013.md, type: rule, priority: SHOULD, description: "Ecomode — token efficiency for batch ops" }
+  - { name: r015, path: rules/r015.md, type: rule, priority: MUST, description: "Intent transparency — routing display format" }
+  - { name: r016, path: rules/r016.md, type: rule, priority: MUST, description: "Continuous improvement — update rules on violations" }
+  - { name: r017, path: rules/r017.md, type: rule, priority: MUST, description: "Sync verification — pre-commit checklist" }
+  - { name: r018, path: rules/r018.md, type: rule, priority: MUST, description: "Agent Teams — conditional peer-to-peer coordination" }
+  - { name: r019, path: rules/r019.md, type: rule, priority: SHOULD, description: "Ontology-RAG routing enrichment" }
+  - { name: r020, path: rules/r020.md, type: rule, priority: MUST, description: "Completion verification — task-type matrix" }
+  - { name: r021, path: rules/r021.md, type: rule, priority: MUST, description: "Enforcement policy — advisory-first model" }
+  - { name: r022, path: rules/r022.md, type: rule, priority: SHOULD, description: "Wiki sync — keep wiki current with source changes" }
+
+guides:
+  - { name: airflow, path: guides/airflow.md, type: guide, description: "Apache Airflow DAG patterns and operators" }
+  - { name: alembic, path: guides/alembic.md, type: guide, description: "Alembic database migration reference" }
+  - { name: aws, path: guides/aws.md, type: guide, description: "AWS services and architecture patterns" }
+  - { name: claude-code, path: guides/claude-code.md, type: guide, description: "Claude Code platform features and hooks" }
+  - { name: dbt, path: guides/dbt.md, type: guide, description: "dbt data modeling and testing reference" }
+  - { name: django-best-practices, path: guides/django-best-practices.md, type: guide, description: "Django production patterns reference" }
+  - { name: docker, path: guides/docker.md, type: guide, description: "Docker containerization reference" }
+  - { name: drizzle-orm, path: guides/drizzle-orm.md, type: guide, description: "Drizzle ORM TypeScript patterns" }
+  - { name: elements-of-style, path: guides/elements-of-style.md, type: guide, description: "Strunk's writing clarity guidelines" }
+  - { name: fastapi, path: guides/fastapi.md, type: guide, description: "FastAPI async API reference" }
+  - { name: flutter, path: guides/flutter.md, type: guide, description: "Flutter/Dart development reference" }
+  - { name: git-worktree-workflow, path: guides/git-worktree-workflow.md, type: guide, description: "Git worktree patterns for parallel development" }
+  - { name: go-backend, path: guides/go-backend.md, type: guide, description: "Go backend service patterns" }
+  - { name: golang, path: guides/golang.md, type: guide, description: "Go language reference (Effective Go)" }
+  - { name: hook-data-flow, path: guides/hook-data-flow.md, type: guide, description: "Claude Code hook event data flow" }
+  - { name: iceberg, path: guides/iceberg.md, type: guide, description: "Apache Iceberg table format reference" }
+  - { name: impeccable-design, path: guides/impeccable-design.md, type: guide, description: "Impeccable design language reference" }
+  - { name: java21, path: guides/java21.md, type: guide, description: "Java 21 language features reference" }
+  - { name: kafka, path: guides/kafka.md, type: guide, description: "Apache Kafka event streaming reference" }
+  - { name: kotlin, path: guides/kotlin.md, type: guide, description: "Kotlin language reference" }
+  - { name: postgres, path: guides/postgres.md, type: guide, description: "PostgreSQL optimization and administration" }
+  - { name: python, path: guides/python.md, type: guide, description: "Python language reference (PEP 8/20)" }
+  - { name: redis, path: guides/redis.md, type: guide, description: "Redis data structures and caching patterns" }
+  - { name: rust, path: guides/rust.md, type: guide, description: "Rust language reference and ownership model" }
+  - { name: skill-bundle-design, path: guides/skill-bundle-design.md, type: guide, description: "Skill bundle architecture and design patterns" }
+  - { name: slack-cli, path: guides/slack-cli.md, type: guide, description: "Slack CLI reference" }
+  - { name: snowflake, path: guides/snowflake.md, type: guide, description: "Snowflake cloud warehouse reference" }
+  - { name: spark, path: guides/spark.md, type: guide, description: "Apache Spark distributed processing reference" }
+  - { name: springboot, path: guides/springboot.md, type: guide, description: "Spring Boot enterprise Java reference" }
+  - { name: supabase-postgres, path: guides/supabase-postgres.md, type: guide, description: "Supabase PostgreSQL patterns" }
+  - { name: typescript, path: guides/typescript.md, type: guide, description: "TypeScript type system reference" }
+  - { name: web-design, path: guides/web-design.md, type: guide, description: "Web UI design principles and accessibility" }
+  - { name: web-scraping, path: guides/web-scraping.md, type: guide, description: "Web scraping patterns and ethical practices" }
+
+skills:
+  - { name: action-validator, path: skills/action-validator.md, type: skill, description: "Pre-action validation gates for destructive operations" }
+  - { name: adaptive-harness, path: skills/adaptive-harness.md, type: skill, description: "Project profile learning and harness optimization" }
+  - { name: adversarial-review, path: skills/adversarial-review.md, type: skill, description: "Red-team adversarial code and design review" }
+  - { name: agora, path: skills/agora.md, type: skill, description: "Multi-perspective deliberation for complex decisions" }
+  - { name: airflow-best-practices, path: skills/airflow-best-practices.md, type: skill, description: "Airflow DAG authoring and scheduling patterns" }
+  - { name: alembic-best-practices, path: skills/alembic-best-practices.md, type: skill, description: "Alembic migration authoring and safety patterns" }
+  - { name: ambiguity-gate, path: skills/ambiguity-gate.md, type: skill, description: "Structured ambiguity detection before task execution" }
+  - { name: audit-agents, path: skills/audit-agents.md, type: skill, description: "Agent dependency audit for missing/broken references" }
+  - { name: aws-best-practices, path: skills/aws-best-practices.md, type: skill, description: "AWS service selection and architecture patterns" }
+  - { name: claude-code-bible, path: skills/claude-code-bible.md, type: skill, description: "Claude Code official spec compliance verification" }
+  - { name: claude-native, path: skills/claude-native.md, type: skill, description: "Native Claude Code features over external tools" }
+  - { name: codex-exec, path: skills/codex-exec.md, type: skill, description: "OpenAI Codex CLI execution in non-interactive mode" }
+  - { name: create-agent, path: skills/create-agent.md, type: skill, description: "New agent file creation with required frontmatter" }
+  - { name: cve-triage, path: skills/cve-triage.md, type: skill, description: "CVE severity assessment and remediation planning" }
+  - { name: dag-orchestration, path: skills/dag-orchestration.md, type: skill, description: "YAML-defined DAG execution with dependency resolution" }
+  - { name: dbt-best-practices, path: skills/dbt-best-practices.md, type: skill, description: "dbt model structure and testing patterns" }
+  - { name: de-lead-routing, path: skills/de-lead-routing.md, type: skill, description: "Data engineering task routing to DE specialist agents" }
+  - { name: deep-plan, path: skills/deep-plan.md, type: skill, description: "Research-validated planning with cross-verification" }
+  - { name: deep-verify, path: skills/deep-verify.md, type: skill, description: "Multi-round technical verification before release" }
+  - { name: dev-lead-routing, path: skills/dev-lead-routing.md, type: skill, description: "Development task routing to language/framework experts" }
+  - { name: dev-refactor, path: skills/dev-refactor.md, type: skill, description: "Structured refactoring via language expert agents" }
+  - { name: dev-review, path: skills/dev-review.md, type: skill, description: "Code review with pre-flight guards and expert delegation" }
+  - { name: django-best-practices, path: skills/django-best-practices.md, type: skill, description: "Django production patterns for models, views, security" }
+  - { name: docker-best-practices, path: skills/docker-best-practices.md, type: skill, description: "Docker multi-stage builds and security patterns" }
+  - { name: evaluator-optimizer, path: skills/evaluator-optimizer.md, type: skill, description: "Iterative quality refinement with configurable rubrics" }
+  - { name: fastapi-best-practices, path: skills/fastapi-best-practices.md, type: skill, description: "FastAPI async patterns and project structure" }
+  - { name: fix-refs, path: skills/fix-refs.md, type: skill, description: "Repair broken agent references and skill paths" }
+  - { name: flutter-best-practices, path: skills/flutter-best-practices.md, type: skill, description: "Flutter widget composition, state management, security" }
+  - { name: gemini-exec, path: skills/gemini-exec.md, type: skill, description: "Google Gemini CLI execution for hybrid workflows" }
+  - { name: go-backend-best-practices, path: skills/go-backend-best-practices.md, type: skill, description: "Go backend Standard Layout and Uber style patterns" }
+  - { name: go-best-practices, path: skills/go-best-practices.md, type: skill, description: "Idiomatic Go from Effective Go" }
+  - { name: harness-eval, path: skills/harness-eval.md, type: skill, description: "15-task SE benchmark with weighted quality scoring" }
+  - { name: help, path: skills/help.md, type: skill, description: "Display help for commands, agents, and rules" }
+  - { name: impeccable-design, path: skills/impeccable-design.md, type: skill, description: "10 steering commands for production-grade UI design" }
+  - { name: intent-detection, path: skills/intent-detection.md, type: skill, description: "Automatic intent detection and agent routing" }
+  - { name: java21-best-practices, path: skills/java21-best-practices.md, type: skill, description: "Modern Java 21 patterns with Virtual Threads and Records" }
+  - { name: jinja2-prompts, path: skills/jinja2-prompts.md, type: skill, description: "Parameterized prompt templates with security sandboxing" }
+  - { name: kafka-best-practices, path: skills/kafka-best-practices.md, type: skill, description: "Kafka idempotent producers and consumer patterns" }
+  - { name: kotlin-best-practices, path: skills/kotlin-best-practices.md, type: skill, description: "Idiomatic Kotlin null-safety and coroutines" }
+  - { name: lists, path: skills/lists.md, type: skill, description: "Display all available slash commands" }
+  - { name: memory-management, path: skills/memory-management.md, type: skill, description: "Core memory persistence operations for sys-memory-keeper" }
+  - { name: memory-recall, path: skills/memory-recall.md, type: skill, description: "Semantic memory search from claude-mem" }
+  - { name: memory-save, path: skills/memory-save.md, type: skill, description: "Save session context to claude-mem" }
+  - { name: model-escalation, path: skills/model-escalation.md, type: skill, description: "Advisory model upgrade on repeated failures" }
+  - { name: monitoring-setup, path: skills/monitoring-setup.md, type: skill, description: "Enable/disable OpenTelemetry console monitoring" }
+  - { name: multi-model-verification, path: skills/multi-model-verification.md, type: skill, description: "Parallel code verification with three model tiers" }
+  - { name: npm-audit, path: skills/npm-audit.md, type: skill, description: "npm dependency security and outdated package audit" }
+  - { name: npm-publish, path: skills/npm-publish.md, type: skill, description: "npm publish with pre-publish checks and validation" }
+  - { name: npm-version, path: skills/npm-version.md, type: skill, description: "Semantic version bump with changelog and git tag" }
+  - { name: omcustom-analysis, path: skills/omcustom-analysis.md, type: skill, description: "Project tech stack analysis and auto-configuration" }
+  - { name: omcustom-auto-improve, path: skills/omcustom-auto-improve.md, type: skill, description: "Apply eval-core suggestions in isolated worktree with PR" }
+  - { name: omcustom-feedback, path: skills/omcustom-feedback.md, type: skill, description: "Submit feedback to oh-my-customcode GitHub" }
+  - { name: omcustom-improve-report, path: skills/omcustom-improve-report.md, type: skill, description: "Read-only eval-core improvement suggestion report" }
+  - { name: omcustom-loop, path: skills/omcustom-loop.md, type: skill, description: "Session auto-continuation via SubagentStop hook" }
+  - { name: omcustom-release-notes, path: skills/omcustom-release-notes.md, type: skill, description: "Generate release notes from git history and issues" }
+  - { name: omcustom-takeover, path: skills/omcustom-takeover.md, type: skill, description: "Reverse-engineer canonical spec from existing agent/skill" }
+  - { name: omcustom-web, path: skills/omcustom-web.md, type: skill, description: "Control built-in Web UI server lifecycle" }
+  - { name: optimize-analyze, path: skills/optimize-analyze.md, type: skill, description: "Bundle composition and performance metrics analysis" }
+  - { name: optimize-bundle, path: skills/optimize-bundle.md, type: skill, description: "Apply bundle size optimizations with dry-run option" }
+  - { name: optimize-report, path: skills/optimize-report.md, type: skill, description: "Comprehensive optimization report with baseline comparison" }
+  - { name: peer-messaging, path: skills/peer-messaging.md, type: skill, description: "Cross-session Claude Code instance coordination" }
+  - { name: pipeline, path: skills/pipeline.md, type: skill, description: "Invoke and resume YAML-defined named pipelines" }
+  - { name: pipeline-architecture-patterns, path: skills/pipeline-architecture-patterns.md, type: skill, description: "ETL/ELT, Lambda/Kappa/Medallion architecture patterns" }
+  - { name: pipeline-guards, path: skills/pipeline-guards.md, type: skill, description: "System-wide safety constraints for pipeline execution" }
+  - { name: post-release-followup, path: skills/post-release-followup.md, type: skill, description: "Post-release unaddressed findings and follow-up actions" }
+  - { name: postgres-best-practices, path: skills/postgres-best-practices.md, type: skill, description: "PostgreSQL indexing, query optimization, HA patterns" }
+  - { name: pr-auto-improve, path: skills/pr-auto-improve.md, type: skill, description: "Opt-in post-PR improvement suggestions (never auto)" }
+  - { name: professor-triage, path: skills/professor-triage.md, type: skill, description: "Codebase-driven GitHub issue triage and prioritization" }
+  - { name: python-best-practices, path: skills/python-best-practices.md, type: skill, description: "Pythonic patterns from PEP 8 and PEP 20" }
+  - { name: qa-lead-routing, path: skills/qa-lead-routing.md, type: skill, description: "QA workflow routing to planner, writer, engineer agents" }
+  - { name: react-best-practices, path: skills/react-best-practices.md, type: skill, description: "React/Next.js 40+ rules for performance and RSC" }
+  - { name: reasoning-sandwich, path: skills/reasoning-sandwich.md, type: skill, description: "Opus pre-reasoning + sonnet action + verification pattern" }
+  - { name: redis-best-practices, path: skills/redis-best-practices.md, type: skill, description: "Redis caching strategies and data structure patterns" }
+  - { name: release-plan, path: skills/release-plan.md, type: skill, description: "Release unit planning from triage-completed issues" }
+  - { name: research, path: skills/research.md, type: skill, description: "10-team parallel deep analysis with ADOPT/ADAPT/AVOID" }
+  - { name: result-aggregation, path: skills/result-aggregation.md, type: skill, description: "Aggregate parallel agent results into batch format" }
+  - { name: rtk-exec, path: skills/rtk-exec.md, type: skill, description: "RTK proxy CLI execution for 60-90% token compression" }
+  - { name: rust-best-practices, path: skills/rust-best-practices.md, type: skill, description: "Idiomatic Rust ownership, errors, concurrency" }
+  - { name: sauron-watch, path: skills/sauron-watch.md, type: skill, description: "Full R017 verification — 5+3 rounds before commit" }
+  - { name: scout, path: skills/scout.md, type: skill, description: "External URL analysis with INTERNALIZE/INTEGRATE/SKIP verdict" }
+  - { name: sdd, path: skills/sdd.md, type: skill, description: "Alias for sdd-dev Spec-Driven Development workflow" }
+  - { name: sdd-dev, path: skills/sdd-dev.md, type: skill, description: "Spec-Driven Development with sdd/ folder hierarchy gates" }
+  - { name: sdd-development, path: skills/sdd-development.md, type: skill, description: "Alias for sdd-dev Spec-Driven Development workflow" }
+  - { name: secretary-routing, path: skills/secretary-routing.md, type: skill, description: "Manager agent routing for creation, audit, git, verification" }
+  - { name: skill-extractor, path: skills/skill-extractor.md, type: skill, description: "Extract reusable SKILL.md candidates from task trajectories" }
+  - { name: skills-sh-search, path: skills/skills-sh-search.md, type: skill, description: "Search and install skills from skills.sh marketplace" }
+  - { name: snowflake-best-practices, path: skills/snowflake-best-practices.md, type: skill, description: "Snowflake warehouse sizing, clustering, cost management" }
+  - { name: spark-best-practices, path: skills/spark-best-practices.md, type: skill, description: "Spark broadcast joins, shuffle minimization, caching" }
+  - { name: springboot-best-practices, path: skills/springboot-best-practices.md, type: skill, description: "Spring Boot layered architecture and injection patterns" }
+  - { name: status, path: skills/status.md, type: skill, description: "System status and health checks display" }
+  - { name: structured-dev-cycle, path: skills/structured-dev-cycle.md, type: skill, description: "6-stage dev cycle with stage-based tool restrictions" }
+  - { name: stuck-recovery, path: skills/stuck-recovery.md, type: skill, description: "Advisory stuck loop detection and recovery strategies" }
+  - { name: supabase-postgres-best-practices, path: skills/supabase-postgres-best-practices.md, type: skill, description: "Supabase RLS, connection pooling, schema patterns" }
+  - { name: systematic-debugging, path: skills/systematic-debugging.md, type: skill, description: "Reproduce-first, root-cause-first debugging discipline" }
+  - { name: task-decomposition, path: skills/task-decomposition.md, type: skill, description: "Large task decomposition into DAG-compatible subtasks" }
+  - { name: typescript-best-practices, path: skills/typescript-best-practices.md, type: skill, description: "Strict TypeScript patterns — discriminated unions, branded types" }
+  - { name: update-docs, path: skills/update-docs.md, type: skill, description: "Sync documentation with project structure" }
+  - { name: update-external, path: skills/update-external.md, type: skill, description: "Update agents/skills from external GitHub sources" }
+  - { name: vercel-deploy, path: skills/vercel-deploy.md, type: skill, description: "Deploy to Vercel with auto-framework detection" }
+  - { name: web-design-guidelines, path: skills/web-design-guidelines.md, type: skill, description: "100+ UI review rules for accessibility and UX" }
+  - { name: wiki, path: skills/wiki.md, type: skill, description: "Incremental wiki generation and maintenance" }
+  - { name: wiki-rag, path: skills/wiki-rag.md, type: skill, description: "Query wiki as RAG knowledge source for codebase questions" }
+  - { name: worker-reviewer-pipeline, path: skills/worker-reviewer-pipeline.md, type: skill, description: "Iterative Worker-Reviewer pipeline for quality-critical code" }
+  - { name: writing-clearly-and-concisely, path: skills/writing-clearly-and-concisely.md, type: skill, description: "Strunk's Elements of Style for any prose" }

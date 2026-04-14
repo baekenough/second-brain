@@ -1,0 +1,82 @@
+# =============================================================================
+# .dockerignore — second-brain
+# Excludes files that are not needed in the Docker build context.
+# Smaller build context = faster docker build + no accidental secret leakage.
+# =============================================================================
+
+# ----- Version control --------------------------------------------------------
+.git
+.gitignore
+.gitattributes
+
+# ----- Environment / secrets --------------------------------------------------
+.env
+.env.*
+*.pem
+*.key
+*.p12
+credentials.json
+service-account*.json
+
+# ----- Frontend build artefacts (not needed in Go server image) ---------------
+web/node_modules
+web/dist
+web/.next
+web/out
+web/.turbo
+web/*.tsbuildinfo
+web/eslint.config.mjs
+
+# ----- Go tooling cache -------------------------------------------------------
+# Keep: go.mod go.sum (needed for go mod download)
+# Exclude: local build output
+bin/
+dist/
+out/
+
+# ----- IDE / editor -----------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ----- Logs and temporary files -----------------------------------------------
+*.log
+*.log.*
+tmp/
+temp/
+
+# ----- Test artefacts ---------------------------------------------------------
+**/*_test.go
+testdata/
+coverage.out
+coverage.html
+*.prof
+
+# ----- Documentation (reduces context size; not used at runtime) ---------------
+*.md
+!README.md
+docs/
+
+# ----- CI/CD / infra configs (not needed in image) ----------------------------
+.github/
+.gitlab-ci.yml
+Makefile
+docker-compose*.yml
+k8s/
+helm/
+*.tf
+*.tfstate
+*.tfvars
+
+# ----- Claude / AI tooling ----------------------------------------------------
+.claude/
+.mcp.json
+guides/
+CLAUDE.md
+
+# ----- Miscellaneous ----------------------------------------------------------
+.omcustom*
+*.lock.json

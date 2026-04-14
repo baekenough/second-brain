@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: second-brain-config
+  namespace: second-brain
+data:
+  COLLECT_INTERVAL: "5m"
+  MAX_EMBED_CHARS: "8000"
+  EMBEDDING_API_URL: "https://api.openai.com/v1"
+  EMBEDDING_MODEL: "text-embedding-3-small"
+  CLIPROXY_AUTH_FILE: "/etc/cliproxy/auth.json"
+  FILESYSTEM_PATH: "/data/drive"
+  FILESYSTEM_ENABLED: "true"
+  PORT: "9200"
+  # Explicit migrations dir: required when binary is built with -trimpath
+  # (runtime.Caller returns module-relative path, not filesystem path)
+  MIGRATIONS_DIR: "/app/migrations"
