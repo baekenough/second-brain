@@ -512,6 +512,10 @@ type DiscordGateway struct {
 	// feedbackStore receives thumbs-up/down reactions on bot replies.
 	// When nil, reaction feedback is silently ignored.
 	feedbackStore FeedbackRecorder
+
+	// metrics collects per-response latency and quality signals.
+	// When nil, metrics recording is a no-op (backward-compatible).
+	metrics *DiscordMetrics
 }
 
 // NewDiscordGateway creates a gateway that connects to the Discord WebSocket and
@@ -546,6 +550,13 @@ func (g *DiscordGateway) SetDocStore(s AttachmentDocumentStore) {
 // do not need feedback collection.
 func (g *DiscordGateway) SetFeedbackStore(r FeedbackRecorder) {
 	g.feedbackStore = r
+}
+
+// SetMetrics injects a DiscordMetrics instance for response-latency tracking.
+// It must be called before Run. When nil (the default), metrics recording is
+// skipped — backward-compatible with callers that do not need metrics.
+func (g *DiscordGateway) SetMetrics(m *DiscordMetrics) {
+	g.metrics = m
 }
 
 // Enabled reports whether the gateway has the minimum required configuration.
@@ -954,6 +965,8 @@ func (g *DiscordGateway) buildReply(
 		return legacyFallbackMessage
 	}
 
+	start := time.Now()
+
 	// 1. Extract query — strip the bot mention token(s).
 	query := stripMention(m.Content, s.State.User.ID)
 	query = strings.TrimSpace(query)
@@ -966,10 +979,14 @@ func (g *DiscordGateway) buildReply(
 
 	// 3. Fetch channel history for conversation context (non-fatal).
 	// beforeID = m.ID so we get messages sent before this one.
+	t1 := time.Now()
 	history, err := s.ChannelMessages(m.ChannelID, 20, m.ID, "", "")
+	historyLatencyMs := time.Since(t1).Milliseconds()
 	if err != nil {
 		slog.Warn("discord gateway: failed to fetch channel history",
-			"channel_id", m.ChannelID, "error", err)
+			"channel_id", m.ChannelID,
+			"error", err,
+			"latency_ms", historyLatencyMs)
 		history = nil // non-fatal — continue without conversation context
 	}
 	// ChannelMessages with beforeID returns messages in descending order
@@ -980,14 +997,17 @@ func (g *DiscordGateway) buildReply(
 
 	// 4. Search knowledge base (best-effort; search is optional context, not a gate).
 	const searchLimit = 10
+	t2 := time.Now()
 	results, err := g.searcher.Search(ctx, model.SearchQuery{
 		Query:          query,
 		Limit:          searchLimit,
 		IncludeDeleted: false,
 	})
+	searchLatencyMs := time.Since(t2).Milliseconds()
 	if err != nil {
 		slog.Warn("discord gateway: search failed, proceeding without context",
-			"error", err, "query", query)
+			"error", err,
+			"latency_ms", searchLatencyMs)
 		results = nil
 	}
 
@@ -1009,9 +1029,40 @@ func (g *DiscordGateway) buildReply(
 	conversationMsgs = append(conversationMsgs, llm.Message{Role: "user", Content: currentTurn})
 
 	// 8. Call LLM with full conversation history.
-	answer, err := g.llmClient.CompleteWithMessages(ctx, discordSystemPrompt, conversationMsgs)
-	if err != nil {
-		slog.Error("discord gateway: LLM completion failed", "error", err)
+	t3 := time.Now()
+	answer, llmErr := g.llmClient.CompleteWithMessages(ctx, discordSystemPrompt, conversationMsgs)
+	llmLatencyMs := time.Since(t3).Milliseconds()
+
+	totalLatency := time.Since(start)
+	zeroResults := len(results) == 0
+
+	// Structured response metrics log. Message content is never logged —
+	// only character/chunk counts and IDs (channel_id, user_id are OK per spec).
+	slog.Info("discord: response metrics",
+		"total_ms", totalLatency.Milliseconds(),
+		"history_ms", historyLatencyMs,
+		"history_count", len(history),
+		"search_ms", searchLatencyMs,
+		"search_hits", len(results),
+		"context_bytes", len(contextBlock),
+		"llm_ms", llmLatencyMs,
+		"reply_chars", utf8.RuneCountInString(answer),
+		"chunks", len(splitForDiscord(answer, 1900)),
+		"query_chars", utf8.RuneCountInString(query),
+		"zero_search_results", zeroResults,
+		"channel_id", m.ChannelID,
+		"user_id", m.Author.ID,
+	)
+
+	// Record into in-memory metrics store when injected.
+	if g.metrics != nil {
+		g.metrics.Record(totalLatency, zeroResults)
+	}
+
+	if llmErr != nil {
+		slog.Error("discord gateway: LLM completion failed",
+			"error", llmErr,
+			"latency_ms", llmLatencyMs)
 		return "답변 생성 중 오류가 발생했어요. 잠시 후 다시 시도해주세요."
 	}
 

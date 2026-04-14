@@ -1168,7 +1168,7 @@ GitHub 이슈로 추적. 단계별 epic은 아래 이슈들로 구성됨.
 | # | 제목 |
 |---|---|
 | [#17](https://github.com/baekenough/second-brain/issues/17) | 사용자 피드백 테이블 + 수집 API |
-| [#18](https://github.com/baekenough/second-brain/issues/18) | eval set 자동 구축 |
+| [#18](https://github.com/baekenough/second-brain/issues/18) | eval set 자동 구축 — `GET /api/v1/eval/export` (JSONL, feedback 기반 query→relevant_doc_ids 쌍) |
 | [#19](https://github.com/baekenough/second-brain/issues/19) | nightly eval + 회귀 감지 파이프라인 |
 | [#20](https://github.com/baekenough/second-brain/issues/20) | 임계치 기반 자동 재인덱싱 |
 

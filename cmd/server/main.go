@@ -64,6 +64,7 @@ func run() error {
 	extractionFailureStore := store.NewExtractionFailureStore(pg)
 	chunkStore := store.NewChunkStore(pg)       // issue #9: chunk-based FTS
 	feedbackStore := store.NewFeedbackStore(pg) // issue #17: user feedback
+	evalStore := store.NewEvalStore(pg)         // issue #18: eval set export
 
 	// --- Extraction retry worker ---
 	// Periodically re-attempts failed file extractions. Remote-source failures
@@ -176,6 +177,11 @@ func run() error {
 		slog.Info("LLM client not configured — Discord RAG disabled, static fallback active")
 	}
 
+	// --- Discord response metrics (issue #41) ---
+	// Shared between the gateway (records per-response latency) and the HTTP
+	// server (exposes snapshot via GET /api/v1/stats/baseline).
+	discordMetrics := &collector.DiscordMetrics{}
+
 	// --- Discord WebSocket gateway (mention responses + real-time collection) ---
 	// The gateway is always-on when the bot token is set, independent of the
 	// cron-based collection cycle.
@@ -201,12 +207,17 @@ func run() error {
 		// and delegates to FeedbackStore.Upsert for toggle/replace semantics.
 		discordGateway.SetFeedbackStore(collector.NewFeedbackStoreAdapter(feedbackStore))
 	}
+	// Always inject metrics so the gateway records latency even when the
+	// Discord collector is disabled (gateway can still be enabled via token).
+	discordGateway.SetMetrics(discordMetrics)
+
 	if discordGateway.Enabled() {
 		go discordGateway.Run(ctx)
 	}
 
 	// --- HTTP server ---
-	srv := api.NewServer(docStore, searchSvc, sched, feedbackStore, cfg.FilesystemPath, cfg.APIKey)
+	srv := api.NewServer(docStore, searchSvc, sched, feedbackStore, evalStore, cfg.FilesystemPath, cfg.APIKey)
+	srv.SetDiscordMetrics(discordMetrics)
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      srv.Handler(),

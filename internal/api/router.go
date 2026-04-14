@@ -35,12 +35,14 @@ type CollectorRegistry interface {
 
 // Server holds the dependencies needed by all handlers.
 type Server struct {
-	docs           DocumentStore
-	search         *search.Service
-	scheduler      *scheduler.Scheduler
-	feedback       FeedbackRecorder
-	filesystemPath string // root directory for filesystem source documents
-	apiKey         string // Bearer token for /api/v1/* routes; empty means disabled
+	docs             DocumentStore
+	search           *search.Service
+	scheduler        *scheduler.Scheduler
+	feedback         FeedbackRecorder
+	eval             EvalExporter
+	discordMetrics   *collector.DiscordMetrics // optional; nil means no Discord metrics
+	filesystemPath   string                    // root directory for filesystem source documents
+	apiKey           string                    // Bearer token for /api/v1/* routes; empty means disabled
 }
 
 // NewServer creates a Server with the provided dependencies.
@@ -49,6 +51,7 @@ func NewServer(
 	svc *search.Service,
 	sched *scheduler.Scheduler,
 	feedback FeedbackRecorder,
+	eval EvalExporter,
 	filesystemPath string,
 	apiKey string,
 ) *Server {
@@ -57,9 +60,17 @@ func NewServer(
 		search:         svc,
 		scheduler:      sched,
 		feedback:       feedback,
+		eval:           eval,
 		filesystemPath: filesystemPath,
 		apiKey:         apiKey,
 	}
+}
+
+// SetDiscordMetrics injects a DiscordMetrics instance for the stats endpoint.
+// It must be called before serving requests. When nil (the default), the
+// discord_bot section is omitted from the baseline stats response.
+func (s *Server) SetDiscordMetrics(m *collector.DiscordMetrics) {
+	s.discordMetrics = m
 }
 
 // Handler builds and returns the root http.Handler for the application.
@@ -95,6 +106,8 @@ func (s *Server) Handler() http.Handler {
 		r.Get("/api/v1/stats/baseline", s.baselineStatsHandler)
 
 		r.Post("/api/v1/feedback", s.feedbackHandler)
+
+		r.Get("/api/v1/eval/export", s.evalExportHandler)
 	})
 
 	return r
