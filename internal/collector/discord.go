@@ -510,7 +510,7 @@ func (g *DiscordGateway) buildReply(
 	// 2. Show typing indicator while we work.
 	_ = s.ChannelTyping(m.ChannelID)
 
-	// 3. Search knowledge base.
+	// 3. Search knowledge base (best-effort; search is optional context, not a gate).
 	const searchLimit = 5
 	results, err := g.searcher.Search(ctx, model.SearchQuery{
 		Query:          query,
@@ -518,26 +518,32 @@ func (g *DiscordGateway) buildReply(
 		IncludeDeleted: false,
 	})
 	if err != nil {
-		slog.Error("discord gateway: search failed", "error", err, "query", query)
-		return "검색 중 오류가 발생했어요. 잠시 후 다시 시도해주세요."
+		// Search failure is non-fatal — log and continue with no context so the
+		// LLM can still answer from its own knowledge.
+		slog.Warn("discord gateway: search failed, proceeding without context",
+			"error", err, "query", query)
+		results = nil
 	}
 
-	// 4. No results — prompt user for alternative query.
-	if len(results) == 0 {
-		return "관련 문서를 찾지 못했어요. 다른 키워드로 시도해볼까요?"
-	}
-
-	// 5. Build the context block for the LLM prompt.
+	// 4. Build the context block for the LLM prompt (may be empty).
 	contextBlock := buildContextBlock(results)
 
-	const systemPrompt = `당신은 팀 지식베이스를 검색하는 AI 어시스턴트입니다.
-사용자의 질문에 대해 아래 검색된 문서를 근거로 한국어로 답변하세요.
-규칙:
-- 문서에 없는 내용은 추측하지 마세요.
-- 답변 말미에 참고 문서 1-3개를 "출처: [제목](링크)" 형식으로 표기하세요.
-- 간결하고 실용적으로 답변하세요. 2000자 이내.`
+	const systemPrompt = `당신은 second-brain 팀의 AI 어시스턴트입니다. 팀 지식베이스(Slack, Discord, GitHub 등)를 RAG로 참조할 수 있지만, 검색 결과가 없더라도 자연스러운 대화와 일반 지식으로 도움을 드립니다.
 
-	userPrompt := fmt.Sprintf("질문: %s\n\n검색 결과:\n%s", query, contextBlock)
+응답 원칙:
+- 내부 문서가 제공되면 우선 참고하여 답변하고, 말미에 "출처: [제목](링크)" 형식으로 1-3개만 표기합니다.
+- 내부 문서가 없거나 관련성이 낮으면 일반 지식으로 답변하되, 그 사실을 티 내지 않고 자연스럽게 답합니다.
+- 모르는 것은 모른다고 말해도 됩니다 — 추측으로 잘못된 정보를 주지 마세요.
+- 한국어로 간결하고 친근하게 답변합니다. 2000자 이내.
+- 코드/명령어 질문은 코드 블록을 사용합니다.`
+
+	// 5. Build user message — include internal docs when available, else ask directly.
+	var userPrompt string
+	if contextBlock == "" {
+		userPrompt = "질문: " + query
+	} else {
+		userPrompt = fmt.Sprintf("질문: %s\n\n참고 가능한 내부 문서:\n%s", query, contextBlock)
+	}
 
 	// 6. Call LLM.
 	answer, err := g.llmClient.Complete(ctx, systemPrompt, userPrompt)
@@ -562,8 +568,14 @@ func stripMention(content, botID string) string {
 
 // buildContextBlock formats a slice of search results into a numbered context
 // block suitable for injection into an LLM prompt.
+// Returns an empty string when results is nil or empty so the caller can
+// branch between "context available" and "no context" user prompts.
 // Total length is capped at 8000 characters to stay within token budgets.
 func buildContextBlock(results []*model.SearchResult) string {
+	if len(results) == 0 {
+		return ""
+	}
+
 	const maxContextLen = 8000
 	const maxSnippetLen = 500
 
