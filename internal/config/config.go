@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -20,6 +21,15 @@ type Config struct {
 	EmbeddingAPIKey  string
 	EmbeddingModel   string
 	CliProxyAuthFile string // path to CliProxyAPI OAuth JSON, e.g. ~/.cli-proxy-api/codex-user@gmail.com-pro.json
+
+	// LLM (optional — Discord RAG answer generation; falls back to EmbeddingAPIURL when unset)
+	// LLMAPIURL: LLM_API_URL env var; defaults to EmbeddingAPIURL with /embeddings → /chat/completions suffix fix.
+	// LLMAPIKey: LLM_API_KEY env var; defaults to EmbeddingAPIKey.
+	LLMAPIURL      string
+	LLMAPIKey      string
+	LLMModel       string
+	LLMMaxTokens   int
+	LLMTemperature float64
 
 	// Slack (optional)
 	SlackBotToken string
@@ -75,14 +85,50 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// LLM config: resolve base URL and API key from dedicated env vars,
+	// falling back to the embedding equivalents when not set.
+	embeddingAPIURL := getenv("EMBEDDING_API_URL", "https://api.openai.com/v1")
+	llmAPIURL := os.Getenv("LLM_API_URL")
+	if llmAPIURL == "" {
+		// Derive from embedding URL: replace /embeddings suffix with /chat/completions root.
+		// Most cliproxy setups expose both under the same base.
+		llmAPIURL = strings.TrimSuffix(embeddingAPIURL, "/embeddings")
+	}
+
+	embeddingAPIKey := os.Getenv("EMBEDDING_API_KEY")
+	llmAPIKey := os.Getenv("LLM_API_KEY")
+	if llmAPIKey == "" {
+		llmAPIKey = embeddingAPIKey
+	}
+
+	llmMaxTokens := 1500
+	if v := os.Getenv("LLM_MAX_TOKENS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			llmMaxTokens = n
+		}
+	}
+
+	llmTemperature := 0.3
+	if v := os.Getenv("LLM_TEMPERATURE"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			llmTemperature = f
+		}
+	}
+
 	return &Config{
 		Port:        getenv("PORT", "9200"),
 		DatabaseURL: getenv("DATABASE_URL", "postgres://brain:brain@localhost:5432/second_brain?sslmode=disable"),
 
-		EmbeddingAPIURL:  getenv("EMBEDDING_API_URL", "https://api.openai.com/v1"),
-		EmbeddingAPIKey:  os.Getenv("EMBEDDING_API_KEY"),
+		EmbeddingAPIURL:  embeddingAPIURL,
+		EmbeddingAPIKey:  embeddingAPIKey,
 		EmbeddingModel:   getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
 		CliProxyAuthFile: os.Getenv("CLIPROXY_AUTH_FILE"),
+
+		LLMAPIURL:      llmAPIURL,
+		LLMAPIKey:      llmAPIKey,
+		LLMModel:       getenv("LLM_MODEL", "gpt-4o-mini"),
+		LLMMaxTokens:   llmMaxTokens,
+		LLMTemperature: llmTemperature,
 
 		SlackBotToken: os.Getenv("SLACK_BOT_TOKEN"),
 		SlackTeamID:   os.Getenv("SLACK_TEAM_ID"),
