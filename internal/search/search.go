@@ -8,6 +8,7 @@ import (
 	"log/slog"
 
 	"github.com/google/uuid"
+	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/store"
 )
@@ -26,10 +27,13 @@ type ChunkSearcher interface {
 // Service performs hybrid search: it enriches queries with embeddings when
 // available, then delegates to the document store. When chunks are available,
 // chunk-based FTS is used as a fallback for full-document FTS.
+// HyDE (Hypothetical Document Embeddings) can be enabled per-request to
+// improve recall for short or ambiguous queries.
 type Service struct {
-	store       DocumentSearcher
-	embed       *EmbedClient
-	chunkStore  ChunkSearcher // nil when chunk FTS is not configured
+	store      DocumentSearcher
+	embed      *EmbedClient
+	chunkStore ChunkSearcher  // nil when chunk FTS is not configured
+	llmClient  llm.Completer  // nil when HyDE is not configured
 }
 
 // NewService returns a search Service.
@@ -52,9 +56,22 @@ func (s *Service) WithChunkStore(cs ChunkSearcher) *Service {
 	return s
 }
 
+// WithLLM attaches an LLM client used for HyDE (Hypothetical Document
+// Embeddings) query expansion. When set, callers may opt in to HyDE
+// by setting UseHyDE in SearchOptions. Safe to call with a nil client.
+func (s *Service) WithLLM(client llm.Completer) *Service {
+	s.llmClient = client
+	return s
+}
+
 // Search executes a search for the given query. If an embedding client is
 // configured, the query text is embedded and the result is used for hybrid
 // (RRF) search; otherwise only full-text search is performed.
+//
+// When q.UseHyDE is true and an LLM client is configured, the query is
+// expanded via HyDE (Hypothetical Document Embeddings) before retrieval.
+// HyDE adds ~1-3 s of latency due to an additional LLM round-trip; it is
+// opt-in and disabled by default.
 //
 // When the primary path returns no results AND a chunk store is configured,
 // chunk-based FTS is attempted as a secondary strategy and the results are
@@ -62,6 +79,13 @@ func (s *Service) WithChunkStore(cs ChunkSearcher) *Service {
 func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.SearchResult, error) {
 	if q.Limit <= 0 {
 		q.Limit = 20
+	}
+
+	// HyDE query expansion: replace the effective query with the original
+	// query plus a LLM-generated hypothetical answer. The Expand function
+	// is a no-op when the client is nil/disabled or on LLM error.
+	if q.UseHyDE {
+		q.Query = Expand(ctx, s.llmClient, q.Query)
 	}
 
 	if s.embed.Enabled() {

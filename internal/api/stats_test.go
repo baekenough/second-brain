@@ -43,7 +43,7 @@ func (s *stubDocumentStore) QueryBaselineStats(_ context.Context) (*store.Baseli
 // --- helpers ---
 
 func newTestServer(docs DocumentStore) *Server {
-	return NewServer(docs, nil, nil, "", "")
+	return NewServer(docs, nil, nil, nil, "", "")
 }
 
 func doGet(t *testing.T, handler http.Handler, path string) *httptest.ResponseRecorder {

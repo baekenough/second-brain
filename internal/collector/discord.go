@@ -457,6 +457,26 @@ type Searcher interface {
 	Search(ctx context.Context, q model.SearchQuery) ([]*model.SearchResult, error)
 }
 
+// FeedbackEntry is the domain type the Discord gateway uses to record reaction
+// feedback. It mirrors store.Feedback but avoids a direct store import so the
+// collector package stays decoupled from persistence details.
+type FeedbackEntry struct {
+	Source    string
+	SessionID *string        // message ID used as session key
+	UserID    *string        // opaque Discord user ID
+	Thumbs    int16          // +1 (👍) or -1 (👎)
+	Comment   *string        // bot answer used as context hint
+	Metadata  map[string]any // guild_id, channel_id, message_id, emoji
+}
+
+// FeedbackRecorder is the minimal interface the gateway requires to persist
+// reaction feedback. store.FeedbackStore satisfies this interface via
+// feedbackStoreAdapter (see feedback_adapter.go) when the Feedback type
+// signatures differ.
+type FeedbackRecorder interface {
+	Record(ctx context.Context, entry FeedbackEntry) (int64, error)
+}
+
 // legacyFallbackMessage is the static reply used when RAG dependencies are not
 // configured. Defined as a constant so tests can assert on the exact value
 // without hardcoding the string in multiple places (#31).
@@ -488,6 +508,10 @@ type DiscordGateway struct {
 	// docStore enables real-time message persistence. When nil, the gateway
 	// only handles mention responses (backward-compatible with existing callers).
 	docStore AttachmentDocumentStore
+
+	// feedbackStore receives thumbs-up/down reactions on bot replies.
+	// When nil, reaction feedback is silently ignored.
+	feedbackStore FeedbackRecorder
 }
 
 // NewDiscordGateway creates a gateway that connects to the Discord WebSocket and
@@ -516,6 +540,14 @@ func (g *DiscordGateway) SetDocStore(s AttachmentDocumentStore) {
 	g.docStore = s
 }
 
+// SetFeedbackStore injects a feedback recorder so that 👍/👎 reactions on bot
+// replies are persisted. It must be called before Run. When nil (the default),
+// reaction feedback is silently ignored — backward-compatible with callers that
+// do not need feedback collection.
+func (g *DiscordGateway) SetFeedbackStore(r FeedbackRecorder) {
+	g.feedbackStore = r
+}
+
 // Enabled reports whether the gateway has the minimum required configuration.
 func (g *DiscordGateway) Enabled() bool { return g.botToken != "" }
 
@@ -533,14 +565,21 @@ func (g *DiscordGateway) Run(ctx context.Context) {
 		return
 	}
 
-	// We need the guild-messages intent for mention detection and real-time collection.
-	sess.Identify.Intents = discordgo.IntentsGuildMessages
+	// We need the guild-messages intent for mention detection and real-time
+	// collection. GuildMessageReactions is required to receive reaction add events
+	// for the feedback path.
+	sess.Identify.Intents = discordgo.IntentsGuildMessages | discordgo.IntentsGuildMessageReactions
 
 	// Register the MessageCreate handler whenever real-time collection or mention
 	// response is enabled. A single handler covers both code paths to avoid
 	// double-processing the same event.
 	if g.mentionResponseEnabled || g.docStore != nil {
 		sess.AddHandler(g.handleMessageCreate)
+	}
+
+	// Register the MessageReactionAdd handler when feedback recording is enabled.
+	if g.feedbackStore != nil {
+		sess.AddHandler(g.onReactionAdd)
 	}
 
 	if err := sess.Open(); err != nil {
@@ -622,19 +661,31 @@ func (g *DiscordGateway) handleMessageCreate(s *discordgo.Session, m *discordgo.
 	ref := m.Reference()
 	reply := g.buildReply(ctx, s, m)
 
-	for _, chunk := range splitForDiscord(reply, 1900) {
-		if _, err := s.ChannelMessageSendReply(m.ChannelID, chunk, ref); err != nil {
+	chunks := splitForDiscord(reply, 1900)
+	for i, chunk := range chunks {
+		sent, err := s.ChannelMessageSendReply(m.ChannelID, chunk, ref)
+		if err != nil {
 			slog.Warn("discord gateway: failed to send reply chunk",
 				"channel_id", m.ChannelID,
 				"error", err,
 			)
 			// Attempt plain send as fallback (original message may have been deleted).
-			if _, err2 := s.ChannelMessageSend(m.ChannelID, chunk); err2 != nil {
+			sent, err = s.ChannelMessageSend(m.ChannelID, chunk)
+			if err != nil {
 				slog.Warn("discord gateway: fallback send also failed",
 					"channel_id", m.ChannelID,
-					"error", err2,
+					"error", err,
 				)
+				continue
 			}
+		}
+
+		// Add 👍/👎 reactions to the first chunk only so users have a single
+		// feedback target per RAG answer. The first chunk is preferred over the
+		// last because it is immediately visible to the user.
+		if i == 0 && g.feedbackStore != nil && sent != nil {
+			_ = s.MessageReactionAdd(sent.ChannelID, sent.ID, "👍")
+			_ = s.MessageReactionAdd(sent.ChannelID, sent.ID, "👎")
 		}
 	}
 }
@@ -747,6 +798,118 @@ func (g *DiscordGateway) processGatewayAttachment(
 		extractorReg: extractor.NewRegistry(),
 	}
 	return adapter.processAttachment(ctx, guildID, channelID, msg, att)
+}
+
+// onReactionAdd is the discordgo event handler for MESSAGE_REACTION_ADD events.
+// It records 👍/👎 reactions on bot reply messages as feedback entries.
+//
+// The handler ignores:
+//   - Reactions added by the bot itself (auto-added thumbs on send).
+//   - Reactions on messages not authored by the bot.
+//   - Emojis other than 👍 and 👎.
+func (g *DiscordGateway) onReactionAdd(s *discordgo.Session, r *discordgo.MessageReactionAdd) {
+	// Retrieve the reacted-to message to verify authorship.
+	msg, err := s.ChannelMessage(r.ChannelID, r.MessageID)
+	if err != nil {
+		// Non-fatal: message may have been deleted or the bot may lack permissions.
+		slog.Debug("discord gateway: could not fetch reacted message",
+			"channel_id", r.ChannelID,
+			"message_id", r.MessageID,
+			"error", err)
+		return
+	}
+
+	ctx := context.Background()
+	processed := processReactionFeedback(
+		ctx,
+		s.State.User.ID,
+		r.UserID,
+		msg.Author.ID,
+		r.Emoji.Name,
+		r.ChannelID,
+		r.MessageID,
+		r.GuildID,
+		msg.Content,
+		g.feedbackStore,
+	)
+	if processed {
+		slog.Info("discord gateway: feedback recorded",
+			"user", r.UserID,
+			"emoji", r.Emoji.Name,
+			"message", r.MessageID)
+	}
+}
+
+// processReactionFeedback is a pure function that encapsulates all reaction
+// feedback logic without referencing *discordgo.Session. This makes it easy
+// to unit-test without mocking the WebSocket session.
+//
+// Returns true when a feedback entry was submitted to the recorder, false when
+// the reaction was filtered out (bot self-reaction, non-bot message, wrong emoji).
+func processReactionFeedback(
+	ctx context.Context,
+	botUserID string,
+	reactorUserID string,
+	msgAuthorID string,
+	emoji string,
+	channelID, messageID, guildID string,
+	msgContent string,
+	recorder FeedbackRecorder,
+) bool {
+	// Ignore reactions added by the bot itself (the automatic 👍/👎 we add on send).
+	if reactorUserID == botUserID {
+		return false
+	}
+
+	// Only record reactions on messages authored by the bot.
+	if msgAuthorID != botUserID {
+		return false
+	}
+
+	// Only record 👍 and 👎; ignore all other emojis.
+	var thumbs int16
+	switch emoji {
+	case "👍":
+		thumbs = 1
+	case "👎":
+		thumbs = -1
+	default:
+		return false
+	}
+
+	// No-op when recorder is not configured.
+	if recorder == nil {
+		return false
+	}
+
+	msgIDCopy := messageID
+	userIDCopy := reactorUserID
+	contentCopy := msgContent
+
+	// Use Upsert semantics: the FeedbackRecorder interface exposes Record so the
+	// adapter layer decides whether to delegate to Record or Upsert on the store.
+	_, err := recorder.Record(ctx, FeedbackEntry{
+		Source:    "discord_bot",
+		SessionID: &msgIDCopy,
+		UserID:    &userIDCopy,
+		Thumbs:    thumbs,
+		Comment:   &contentCopy,
+		Metadata: map[string]any{
+			"guild_id":   guildID,
+			"channel_id": channelID,
+			"message_id": messageID,
+			"emoji":      emoji,
+		},
+	})
+	if err != nil {
+		slog.Warn("discord gateway: failed to record feedback",
+			"user", reactorUserID,
+			"emoji", emoji,
+			"message", messageID,
+			"error", err)
+		return false
+	}
+	return true
 }
 
 // discordSystemPrompt is the system prompt injected into every LLM call.

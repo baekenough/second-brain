@@ -18,7 +18,8 @@ type searchRequest struct {
 	ExcludeSourceTypes []model.SourceType `json:"exclude_source_types"` // source types to exclude
 	Limit              int                `json:"limit"`
 	IncludeDeleted     bool               `json:"include_deleted"`
-	Sort               string             `json:"sort"` // "relevance" (default) | "recent"
+	Sort               string             `json:"sort"`     // "relevance" (default) | "recent"
+	UseHyDE            bool               `json:"use_hyde,omitempty"` // opt-in HyDE query expansion; default false
 }
 
 // searchHandler handles POST /api/v1/search.
@@ -40,6 +41,7 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 		Limit:              req.Limit,
 		IncludeDeleted:     req.IncludeDeleted,
 		Sort:               req.Sort,
+		UseHyDE:            req.UseHyDE,
 	}
 
 	start := time.Now()
