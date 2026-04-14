@@ -62,7 +62,8 @@ func run() error {
 
 	docStore := store.NewDocumentStore(pg)
 	extractionFailureStore := store.NewExtractionFailureStore(pg)
-	chunkStore := store.NewChunkStore(pg) // issue #9: chunk-based FTS
+	chunkStore := store.NewChunkStore(pg)       // issue #9: chunk-based FTS
+	feedbackStore := store.NewFeedbackStore(pg) // issue #17: user feedback
 
 	// --- Extraction retry worker ---
 	// Periodically re-attempts failed file extractions. Remote-source failures
@@ -194,13 +195,18 @@ func run() error {
 		// Share the same docStore as the cron collector so both paths write to
 		// the same table with the same de-duplication semantics.
 		discordGateway.SetDocStore(docStore)
+
+		// Wire the feedback store so that 👍/👎 reactions on bot replies are
+		// persisted. The adapter translates collector.FeedbackEntry → store.Feedback
+		// and delegates to FeedbackStore.Upsert for toggle/replace semantics.
+		discordGateway.SetFeedbackStore(collector.NewFeedbackStoreAdapter(feedbackStore))
 	}
 	if discordGateway.Enabled() {
 		go discordGateway.Run(ctx)
 	}
 
 	// --- HTTP server ---
-	srv := api.NewServer(docStore, searchSvc, sched, cfg.FilesystemPath, cfg.APIKey)
+	srv := api.NewServer(docStore, searchSvc, sched, feedbackStore, cfg.FilesystemPath, cfg.APIKey)
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      srv.Handler(),

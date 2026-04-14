@@ -50,4 +50,5 @@ type SearchQuery struct {
 	Embedding          []float32 // populated by search service when available
 	IncludeDeleted     bool      // when true, search includes deleted/moved docs
 	Sort               string    // "relevance" (default, score DESC) | "recent" (collected_at DESC)
+	UseHyDE            bool      // when true, expand query via HyDE before retrieval
 }

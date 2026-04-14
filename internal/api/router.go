@@ -38,6 +38,7 @@ type Server struct {
 	docs           DocumentStore
 	search         *search.Service
 	scheduler      *scheduler.Scheduler
+	feedback       FeedbackRecorder
 	filesystemPath string // root directory for filesystem source documents
 	apiKey         string // Bearer token for /api/v1/* routes; empty means disabled
 }
@@ -47,6 +48,7 @@ func NewServer(
 	docs DocumentStore,
 	svc *search.Service,
 	sched *scheduler.Scheduler,
+	feedback FeedbackRecorder,
 	filesystemPath string,
 	apiKey string,
 ) *Server {
@@ -54,6 +56,7 @@ func NewServer(
 		docs:           docs,
 		search:         svc,
 		scheduler:      sched,
+		feedback:       feedback,
 		filesystemPath: filesystemPath,
 		apiKey:         apiKey,
 	}
@@ -90,6 +93,8 @@ func (s *Server) Handler() http.Handler {
 
 		r.Get("/api/v1/stats", s.statsHandler)
 		r.Get("/api/v1/stats/baseline", s.baselineStatsHandler)
+
+		r.Post("/api/v1/feedback", s.feedbackHandler)
 	})
 
 	return r
