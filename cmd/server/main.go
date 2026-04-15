@@ -14,14 +14,10 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/baekenough/second-brain/internal/api"
-	"github.com/baekenough/second-brain/internal/collector"
-	"github.com/baekenough/second-brain/internal/collector/extractor"
 	"github.com/baekenough/second-brain/internal/config"
 	"github.com/baekenough/second-brain/internal/llm"
-	"github.com/baekenough/second-brain/internal/scheduler"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
-	"github.com/baekenough/second-brain/internal/worker"
 )
 
 func main() {
@@ -61,23 +57,9 @@ func run() error {
 	}
 
 	docStore := store.NewDocumentStore(pg)
-	extractionFailureStore := store.NewExtractionFailureStore(pg)
 	chunkStore := store.NewChunkStore(pg)       // issue #9: chunk-based FTS
 	feedbackStore := store.NewFeedbackStore(pg) // issue #17: user feedback
 	evalStore := store.NewEvalStore(pg)         // issue #18: eval set export
-
-	// --- Extraction retry worker ---
-	// Periodically re-attempts failed file extractions. Remote-source failures
-	// (Slack/Discord attachments) are skipped — see worker package for details.
-	extractorReg := extractor.NewRegistry()
-	retryWorker := worker.New(worker.Config{
-		FailureStore: extractionFailureStore,
-		DocStore:     docStore,
-		Extractor:    worker.NewRegistryExtractor(extractorReg, 0),
-		Interval:     time.Minute,
-		BatchSize:    20,
-	})
-	go retryWorker.Run(ctx)
 
 	// --- Embedding client ---
 	embedClient := search.NewEmbedClient(cfg.EmbeddingAPIURL, cfg.EmbeddingAPIKey, cfg.CliProxyAuthFile, cfg.EmbeddingModel)
@@ -87,82 +69,11 @@ func run() error {
 		slog.Info("embedding API not configured — full-text search only")
 	}
 
-	// --- Collectors ---
-	collectors := []collector.Collector{
-		collector.NewSlackCollector(cfg.SlackBotToken, cfg.SlackTeamID),
-		collector.NewGitHubCollector(cfg.GitHubToken, cfg.GitHubOrg),
-		collector.NewGDriveCollector(cfg.GDriveCredentialsJSON),
-		// Notion collector disabled — not in use (re-enable by adding NewNotionCollector).
-	}
-	if cfg.FilesystemEnabled && cfg.FilesystemPath != "" {
-		// Attempt to initialise the Drive exporter via ADC. If ADC is not
-		// configured, driveExporter is nil and the filesystem collector falls
-		// back to URL-only metadata for Google Workspace stub files.
-		driveExporter, err := collector.NewDriveExporter(ctx)
-		if err != nil {
-			slog.Warn("filesystem: drive exporter init failed, workspace export disabled", "error", err)
-			driveExporter = nil
-		}
-		collectors = append(collectors,
-			collector.NewFilesystemCollectorWithDriveExport(cfg.FilesystemPath, driveExporter))
-	}
-
-	// Discord collector (optional).
-	// Uses NewDiscordCollectorWithAttachments so that file attachments in messages
-	// are downloaded, text-extracted, and stored as separate documents (issue #27).
-	discordCol := collector.NewDiscordCollectorWithAttachments(
-		cfg.DiscordBotToken,
-		cfg.DiscordApplicationID,
-		cfg.DiscordGuildIDs,
-		cfg.DiscordMentionResponseEnabled,
-		docStore,
-		extractionFailureStore,
-	)
-	if discordCol.Enabled() {
-		collectors = append(collectors, discordCol)
-	}
-
-	// --- Scheduler ---
-	// The Discord collector uses its own interval (DISCORD_COLLECT_INTERVAL)
-	// rather than the shared COLLECT_INTERVAL, so it is registered separately.
-	otherCollectors := make([]collector.Collector, 0, len(collectors))
-	for _, col := range collectors {
-		if col.Source() != "discord" {
-			otherCollectors = append(otherCollectors, col)
-		}
-	}
-	sched := scheduler.New(docStore, embedClient, otherCollectors...).WithChunkStore(chunkStore)
-	if err := sched.Register(cfg.CollectInterval); err != nil {
-		return err
-	}
-	if discordCol.Enabled() {
-		discordSched := scheduler.New(docStore, embedClient, discordCol).WithChunkStore(chunkStore)
-		if err := discordSched.Register(cfg.DiscordCollectInterval); err != nil {
-			return err
-		}
-		discordSched.Start()
-		defer discordSched.Stop()
-	}
-	sched.Start()
-	defer sched.Stop()
-
-	// --- Slack channel watcher ---
-	// When the bot is invited to a new channel, the watcher detects it within
-	// the polling interval (60s) and triggers an immediate full-history
-	// collection rather than waiting for the next cron tick (up to 10m).
-	slackCol := collector.NewSlackCollector(cfg.SlackBotToken, cfg.SlackTeamID)
-	if slackCol.Enabled() {
-		watcher := collector.NewSlackChannelWatcher(slackCol, docStore, embedClient, 60*time.Second)
-		go watcher.Run(ctx)
-	}
-
 	// --- Search service ---
 	// ChunkStore is attached to enable chunk-based FTS fallback (issue #9).
-	// The embedding code path is preserved; TODO(issue#9-embed) tracks promotion
-	// to per-chunk embeddings once cliproxy /v1/embeddings is confirmed (#34).
 	searchSvc := search.NewService(docStore, embedClient).WithChunkStore(chunkStore)
 
-	// --- LLM client (Discord RAG) ---
+	// --- LLM client (curation) ---
 	llmClient := llm.New(llm.Config{
 		BaseURL:     cfg.LLMAPIURL,
 		Model:       cfg.LLMModel,
@@ -174,50 +85,11 @@ func run() error {
 	if llmClient.Enabled() {
 		slog.Info("LLM client configured", "url", cfg.LLMAPIURL, "model", cfg.LLMModel)
 	} else {
-		slog.Info("LLM client not configured — Discord RAG disabled, static fallback active")
-	}
-
-	// --- Discord response metrics (issue #41) ---
-	// Shared between the gateway (records per-response latency) and the HTTP
-	// server (exposes snapshot via GET /api/v1/stats/baseline).
-	discordMetrics := &collector.DiscordMetrics{}
-
-	// --- Discord WebSocket gateway (mention responses + real-time collection) ---
-	// The gateway is always-on when the bot token is set, independent of the
-	// cron-based collection cycle.
-	// searchSvc and llmClient are injected to enable the full RAG pipeline.
-	//
-	// SetDocStore enables the real-time MessageCreate → Upsert path (issue #38).
-	// The 5-minute cron collector continues to run as a backfill for messages
-	// missed during gateway downtime; duplicate source_ids are de-duplicated by
-	// the UNIQUE constraint on documents.source_id.
-	discordGateway := collector.NewDiscordGateway(
-		cfg.DiscordBotToken,
-		cfg.DiscordMentionResponseEnabled,
-		searchSvc,
-		llmClient,
-	)
-	if discordCol.Enabled() {
-		// Share the same docStore as the cron collector so both paths write to
-		// the same table with the same de-duplication semantics.
-		discordGateway.SetDocStore(docStore)
-
-		// Wire the feedback store so that 👍/👎 reactions on bot replies are
-		// persisted. The adapter translates collector.FeedbackEntry → store.Feedback
-		// and delegates to FeedbackStore.Upsert for toggle/replace semantics.
-		discordGateway.SetFeedbackStore(collector.NewFeedbackStoreAdapter(feedbackStore))
-	}
-	// Always inject metrics so the gateway records latency even when the
-	// Discord collector is disabled (gateway can still be enabled via token).
-	discordGateway.SetMetrics(discordMetrics)
-
-	if discordGateway.Enabled() {
-		go discordGateway.Run(ctx)
+		slog.Info("LLM client not configured — curation features disabled")
 	}
 
 	// --- HTTP server ---
-	srv := api.NewServer(docStore, searchSvc, sched, feedbackStore, evalStore, cfg.FilesystemPath, cfg.APIKey)
-	srv.SetDiscordMetrics(discordMetrics)
+	srv := api.NewServer(docStore, searchSvc, feedbackStore, evalStore, llmClient, cfg.FilesystemPath, cfg.APIKey)
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      srv.Handler(),

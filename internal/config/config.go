@@ -124,7 +124,7 @@ func Load() (*Config, error) {
 	}
 
 	return &Config{
-		Port:        getenv("PORT", "9200"),
+		Port:        getenv("PORT", "8080"),
 		DatabaseURL: getenv("DATABASE_URL", "postgres://brain:brain@localhost:5432/second_brain?sslmode=disable"),
 
 		EmbeddingAPIURL:  embeddingAPIURL,
@@ -162,6 +162,18 @@ func Load() (*Config, error) {
 
 		CollectInterval: interval,
 	}, nil
+}
+
+// LoadCollector reads configuration for the collector daemon.
+// It excludes server-only fields (PORT, API_KEY).
+func LoadCollector() (*Config, error) {
+	cfg, err := Load()
+	if err != nil {
+		return nil, err
+	}
+	cfg.Port = ""
+	cfg.APIKey = ""
+	return cfg, nil
 }
 
 func getenv(key, fallback string) string {

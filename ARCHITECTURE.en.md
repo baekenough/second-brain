@@ -1,6 +1,6 @@
 # second-brain Architecture
 
-> Vision: A company-wide RAG infrastructure that consolidates team knowledge from Google Drive, Slack, GitHub, and more into a single vector + full-text search engine, enabling instant natural-language retrieval.
+> Vision: LLM-curated private search engine. A RAG infrastructure that collects and embeds team knowledge from Google Drive, Slack, GitHub, and more, delivering curated search results to AI agents.
 
 ---
 
@@ -29,7 +29,7 @@ second-brain is a team knowledge search platform composed of a Go-based backend 
 
 **Target users**: Team members who need to quickly find documents, Slack conversations, and GitHub issues and PRs. The goal is to provide natural-language access to company-wide knowledge without requiring dedicated data engineering.
 
-**Core design philosophy**: Document-level ingestion → OpenAI embedding vectorization → pgvector + PostgreSQL hybrid search (BM25 + cosine RRF). The system is currently at Phase 0 complete status, embedding entire documents without chunking.
+**Core design philosophy**: Dual binary (API server + collector daemon) → document ingestion → OpenAI embedding vectorization → pgvector + pg_bigm + PostgreSQL hybrid search (BM25 + cosine RRF) → LLM curation (re-ranking + summary). pg_bigm 2-gram indexing enables morphology-independent Korean search, and HyDE query expansion improves search quality.
 
 **Non-functional requirements**:
 
@@ -58,9 +58,9 @@ flowchart TD
 
     subgraph DOCKER["minikube (docker driver)"]
         subgraph NS["Namespace: second-brain"]
-            WEB["vibers-web\nNext.js standalone\nNodePort 30300 → container 3000"]
-            BRAIN["second-brain\nGo HTTP :9200\nNodePort 30920"]
-            PG["postgres StatefulSet\npgvector/pgvector:pg16\nClusterIP :5432\nPVC 10Gi"]
+            SERVER["second-brain\nAPI Server\nGo HTTP :8080\nNodePort 30080"]
+            COLLECTOR["second-brain\nCollector Daemon\nGo"]
+            PG["postgres StatefulSet\npgvector/pgvector:pg16\n+ pg_bigm\nClusterIP :5432\nPVC 10Gi"]
             INIT["initContainer\nwait-for-postgres\nbusybox nc -z postgres 5432"]
             WATCHER["SlackChannelWatcher\ngoroutine 60s poll\ndetects new channels → full history collect"]
             PV["PV hostPath 100Gi\nReadOnlyMany\n/mnt/drive → /data/drive\nuid=10001"]
@@ -74,17 +74,18 @@ flowchart TD
         GDRIVE_API["Google Drive API\nfiles.export (ADC)\noptional activation"]
     end
 
-    BROWSER -->|HTTP| WEB
-    WEB -->|proxy /api/*\nBRAIN_API_URL env| BRAIN
+    BROWSER -->|HTTP| SERVER
     GD -->|"minikube mount\nuid=10001 gid=10001"| PV
-    PV -->|ReadOnly mount\n/data/drive| BRAIN
-    BRAIN --> PG
-    BRAIN -->|"Bearer JWT\n(API Key or CliProxy OAuth)"| OPENAI
-    BRAIN -->|"Bearer SLACK_BOT_TOKEN"| SLACK
-    BRAIN -->|"Bearer GITHUB_TOKEN"| GITHUB
-    BRAIN -.->|when ADC is configured| GDRIVE_API
+    PV -->|ReadOnly mount\n/data/drive| COLLECTOR
+    SERVER --> PG
+    SERVER -->|"LLM curation"| LLM_API["LLM API\n(curation)"]
+    COLLECTOR --> PG
+    COLLECTOR -->|"Bearer JWT\n(API Key or CliProxy OAuth)"| OPENAI
+    COLLECTOR -->|"Bearer SLACK_BOT_TOKEN"| SLACK
+    COLLECTOR -->|"Bearer GITHUB_TOKEN"| GITHUB
+    COLLECTOR -.->|when ADC is configured| GDRIVE_API
     INIT -->|nc polling| PG
-    INIT -->|ready| BRAIN
+    INIT -->|ready| SERVER
     WATCHER -->|goroutine| SLACK
     WATCHER -->|upsert| PG
 ```
@@ -160,7 +161,7 @@ flowchart LR
 ReadTimeout:  15s
 WriteTimeout: 30s
 IdleTimeout:  60s
-Port:         cfg.Port (default 9200, injected from ConfigMap)
+Port:         cfg.Port (default 8080, injected from ConfigMap)
 ```
 
 ---
@@ -670,8 +671,9 @@ flowchart TB
             PGSVC["Service\npostgres\nClusterIP :5432"]
             PGSF["StatefulSet\npostgres\npgvector/pgvector:pg16\nreadiness: pg_isready"]
 
-            BRSVC["Service\nsecond-brain\nNodePort 30920→:9200"]
+            BRSVC["Service\nsecond-brain\nNodePort 30080→:8080"]
             BRDEP["Deployment\nsecond-brain\nsecond-brain:dev ~34.5MB\nrequests: 128Mi/100m\nlimits: 512Mi/500m"]
+            COLDEP["Deployment\nsecond-brain-collector\nsecond-brain-collector:dev ~34.5MB"]
             INIT["initContainer\nwait-for-postgres\nbusybox nc -z postgres 5432"]
 
             WSVC["Service\nvibers-web\nNodePort 30300→:3000"]
@@ -700,7 +702,7 @@ flowchart TB
 | `second-brain-secret.yaml` | Secret | Placeholder values (`POSTGRES_PASSWORD`, `API_KEY`, `SLACK_BOT_TOKEN`, `GITHUB_TOKEN`) |
 | `second-brain-pv.yaml` | PersistentVolume | hostPath `/mnt/drive` 100Gi ReadOnlyMany (cluster-scoped) |
 | `second-brain-deployment.yaml` | Deployment | second-brain app, initContainer, volume mounts, probes |
-| `second-brain-service.yaml` | Service | NodePort 30920 → container 9200 |
+| `second-brain-service.yaml` | Service | NodePort 30080 → container 8080 |
 | `second-brain-web-deployment.yaml` | Deployment | vibers-web, references BRAIN_API_URL |
 | `second-brain-web-service.yaml` | Service | NodePort 30300 → container 3000 |
 | `postgres-statefulset.yaml` | StatefulSet | pgvector:pg16, PVC 10Gi, `pg_isready` probe |
@@ -754,8 +756,8 @@ kubectl port-forward svc/second-brain 30920:8080 -n second-brain
 
 | Container | Probe Type | Endpoint | initialDelay | period |
 |---|---|---|---|---|
-| second-brain | readiness | `GET /health :9200` | 10s | 10s |
-| second-brain | liveness | `GET /health :9200` | 30s | 15s |
+| second-brain | readiness | `GET /health :8080` | 10s | 10s |
+| second-brain | liveness | `GET /health :8080` | 30s | 15s |
 | postgres | readiness | `pg_isready -U brain -d second_brain` | 10s | 5s |
 | postgres | liveness | `pg_isready -U brain -d second_brain` | 30s | 10s |
 
@@ -787,7 +789,7 @@ web/src/app/
 const BACKEND_URL =
   process.env.BRAIN_API_URL          // Priority 1: K8s service URL
   ?? process.env.NEXT_PUBLIC_API_URL // Priority 2: public URL
-  ?? "http://localhost:9200";        // Priority 3: local dev default
+  ?? "http://localhost:8080";        // Priority 3: local dev default
 
 const API_KEY = process.env.API_KEY ?? "";  // Backend Bearer token injected server-side
 ```
@@ -844,7 +846,7 @@ The `getRenderKind(ext)` function determines the rendering method by file extens
 | Environment Variable | Required | Default | Usage Location | Description |
 |---|---|---|---|---|
 | `DATABASE_URL` | Optional | `postgres://brain:brain@localhost:5432/second_brain?sslmode=disable` | `store/postgres.go` | Postgres connection string |
-| `PORT` | Optional | `9200` | `cmd/server/main.go:113` | HTTP server port |
+| `PORT` | Optional | `8080` | `cmd/server/main.go:113` | HTTP server port |
 | `EMBEDDING_API_URL` | Optional | `https://api.openai.com/v1` | `search/embed.go:92` | OpenAI-compatible endpoint |
 | `EMBEDDING_API_KEY` | Optional | — | `search/embed.go:95` | Static API key (priority 1 token) |
 | `EMBEDDING_MODEL` | Optional | `text-embedding-3-small` | `search/embed.go:101` | Embedding model |
@@ -873,7 +875,7 @@ The `getRenderKind(ext)` function determines the rendering method by file extens
 | `CLIPROXY_AUTH_FILE` | `/etc/cliproxy/auth.json` |
 | `FILESYSTEM_PATH` | `/data/drive` |
 | `FILESYSTEM_ENABLED` | `true` |
-| `PORT` | `9200` |
+| `PORT` | `8080` |
 | `MIGRATIONS_DIR` | `/app/migrations` |
 
 ### Secret Management Principles
@@ -887,7 +889,7 @@ The `getRenderKind(ext)` function determines the rendering method by file extens
 
 | Environment Variable | Required | Description |
 |---|---|---|
-| `BRAIN_API_URL` | Optional | Backend service URL (K8s internal: `http://second-brain:9200`) |
+| `BRAIN_API_URL` | Optional | Backend service URL (K8s internal: `http://second-brain:8080`) |
 | `NEXT_PUBLIC_API_URL` | Optional | Client-accessible URL (not recommended for use) |
 | `API_KEY` | Optional | Backend Bearer token (server-side only) |
 
@@ -899,7 +901,7 @@ The `getRenderKind(ext)` function determines the rendering method by file extens
 
 ```mermaid
 flowchart LR
-    pod[second-brain Pod<br/>:9200] -- "HTTP<br/>Bearer inbound key" --> cliproxy[cliproxy<br/>127.0.0.1:8317]
+    pod[second-brain Pod<br/>:8080] -- "HTTP<br/>Bearer inbound key" --> cliproxy[cliproxy<br/>127.0.0.1:8317]
     cliproxy -- "OAuth access_token<br/>auto-refresh" --> upstream[(OpenAI API<br/>chat.openai.com)]
 
     subgraph host["host (baekenough-ubuntu24)"]
@@ -1172,4 +1174,4 @@ Tracked as GitHub issues. Each phase epic is composed of the issues listed below
 
 ---
 
-*Last updated: 2026-04-14*
+*Last updated: 2026-04-15*

@@ -1,6 +1,6 @@
 # second-brain 아키텍처
 
-> 비전: Google Drive, Slack, GitHub 등 팀 지식을 단일 벡터+전문 검색 엔진으로 통합하여 자연어 질의로 즉시 검색할 수 있는 사내 RAG 인프라.
+> 비전: LLM 큐레이션 프라이빗 검색 엔진. Google Drive, Slack, GitHub 등 팀 지식을 수집·임베딩하여 AI 에이전트에게 큐레이션된 검색 결과를 제공하는 RAG 인프라.
 
 ---
 
@@ -29,7 +29,7 @@ second-brain은 Go 기반 백엔드 서비스와 Next.js 기반 프론트엔드 
 
 **대상 사용자**: 팀 내 문서, Slack 대화, GitHub 이슈·PR을 빠르게 찾고 싶은 팀원. 별도 데이터 엔지니어링 없이 자연어로 전사 지식에 접근하는 것이 목표다.
 
-**핵심 설계 철학**: 문서 단위 수집 → OpenAI 임베딩 벡터화 → pgvector + PostgreSQL 하이브리드 검색(BM25+코사인 RRF). 현재는 Phase 0 완료 상태로, 청킹 없이 전체 문서를 임베딩한다.
+**핵심 설계 철학**: 듀얼 바이너리(API 서버 + 수집 데몬) → 문서 수집 → OpenAI 임베딩 벡터화 → pgvector + pg_bigm + PostgreSQL 하이브리드 검색(BM25+코사인 RRF) → LLM 큐레이션(재랭킹 + 요약). pg_bigm 2-gram 인덱스로 한국어 조사/어미 무관 검색을 지원하고, HyDE 쿼리 확장으로 검색 품질을 향상한다.
 
 **비기능 요구사항**:
 
@@ -58,9 +58,9 @@ flowchart TD
 
     subgraph DOCKER["minikube (docker driver)"]
         subgraph NS["Namespace: second-brain"]
-            WEB["vibers-web\nNext.js standalone\nNodePort 30300 → container 3000"]
-            BRAIN["second-brain\nGo HTTP :9200\nNodePort 30920"]
-            PG["postgres StatefulSet\npgvector/pgvector:pg16\nClusterIP :5432\nPVC 10Gi"]
+            SERVER["second-brain\nAPI Server\nGo HTTP :8080\nNodePort 30080"]
+            COLLECTOR["second-brain\nCollector Daemon\nGo"]
+            PG["postgres StatefulSet\npgvector/pgvector:pg16\n+ pg_bigm\nClusterIP :5432\nPVC 10Gi"]
             INIT["initContainer\nwait-for-postgres\nbusybox nc -z postgres 5432"]
             WATCHER["SlackChannelWatcher\ngoroutine 60s poll\nsees new channels → full history collect"]
             PV["PV hostPath 100Gi\nReadOnlyMany\n/mnt/drive → /data/drive\nuid=10001"]
@@ -74,17 +74,18 @@ flowchart TD
         GDRIVE_API["Google Drive API\nfiles.export (ADC)\n선택적 활성화"]
     end
 
-    BROWSER -->|HTTP| WEB
-    WEB -->|proxy /api/*\nBRAIN_API_URL env| BRAIN
+    BROWSER -->|HTTP| SERVER
     GD -->|"minikube mount\nuid=10001 gid=10001"| PV
-    PV -->|ReadOnly mount\n/data/drive| BRAIN
-    BRAIN --> PG
-    BRAIN -->|"Bearer JWT\n(API Key or CliProxy OAuth)"| OPENAI
-    BRAIN -->|"Bearer SLACK_BOT_TOKEN"| SLACK
-    BRAIN -->|"Bearer GITHUB_TOKEN"| GITHUB
-    BRAIN -.->|ADC 설정 시| GDRIVE_API
+    PV -->|ReadOnly mount\n/data/drive| COLLECTOR
+    SERVER --> PG
+    SERVER -->|"LLM curation"| LLM_API["LLM API\n(curation)"]
+    COLLECTOR --> PG
+    COLLECTOR -->|"Bearer JWT\n(API Key or CliProxy OAuth)"| OPENAI
+    COLLECTOR -->|"Bearer SLACK_BOT_TOKEN"| SLACK
+    COLLECTOR -->|"Bearer GITHUB_TOKEN"| GITHUB
+    COLLECTOR -.->|ADC 설정 시| GDRIVE_API
     INIT -->|nc polling| PG
-    INIT -->|ready| BRAIN
+    INIT -->|ready| SERVER
     WATCHER -->|goroutine| SLACK
     WATCHER -->|upsert| PG
 ```
@@ -160,7 +161,7 @@ flowchart LR
 ReadTimeout:  15s
 WriteTimeout: 30s
 IdleTimeout:  60s
-Port:         cfg.Port (기본 9200, ConfigMap에서 주입)
+Port:         cfg.Port (기본 8080, ConfigMap에서 주입)
 ```
 
 ---
@@ -672,8 +673,9 @@ flowchart TB
             PGSVC["Service\npostgres\nClusterIP :5432"]
             PGSF["StatefulSet\npostgres\npgvector/pgvector:pg16\nreadiness: pg_isready"]
 
-            BRSVC["Service\nsecond-brain\nNodePort 30920→:9200"]
+            BRSVC["Service\nsecond-brain\nNodePort 30080→:8080"]
             BRDEP["Deployment\nsecond-brain\nsecond-brain:dev ~34.5MB\nrequests: 128Mi/100m\nlimits: 512Mi/500m"]
+            COLDEP["Deployment\nsecond-brain-collector\nsecond-brain-collector:dev ~34.5MB"]
             INIT["initContainer\nwait-for-postgres\nbusybox nc -z postgres 5432"]
 
             WSVC["Service\nvibers-web\nNodePort 30300→:3000"]
@@ -702,7 +704,7 @@ flowchart TB
 | `second-brain-secret.yaml` | Secret | placeholder (`POSTGRES_PASSWORD`, `API_KEY`, `SLACK_BOT_TOKEN`, `GITHUB_TOKEN`) |
 | `second-brain-pv.yaml` | PersistentVolume | hostPath `/mnt/drive` 100Gi ReadOnlyMany (클러스터 스코프) |
 | `second-brain-deployment.yaml` | Deployment | second-brain 앱, initContainer, volume mounts, probe |
-| `second-brain-service.yaml` | Service | NodePort 30920 → 컨테이너 9200 |
+| `second-brain-service.yaml` | Service | NodePort 30080 → 컨테이너 8080 |
 | `second-brain-web-deployment.yaml` | Deployment | vibers-web, BRAIN_API_URL 참조 |
 | `second-brain-web-service.yaml` | Service | NodePort 30300 → 컨테이너 3000 |
 | `postgres-statefulset.yaml` | StatefulSet | pgvector:pg16, PVC 10Gi, `pg_isready` probe |
@@ -756,8 +758,8 @@ kubectl port-forward svc/second-brain 30920:8080 -n second-brain
 
 | 컨테이너 | Probe 종류 | 엔드포인트 | initialDelay | period |
 |---|---|---|---|---|
-| second-brain | readiness | `GET /health :9200` | 10s | 10s |
-| second-brain | liveness | `GET /health :9200` | 30s | 15s |
+| second-brain | readiness | `GET /health :8080` | 10s | 10s |
+| second-brain | liveness | `GET /health :8080` | 30s | 15s |
 | postgres | readiness | `pg_isready -U brain -d second_brain` | 10s | 5s |
 | postgres | liveness | `pg_isready -U brain -d second_brain` | 30s | 10s |
 
@@ -789,7 +791,7 @@ web/src/app/
 const BACKEND_URL =
   process.env.BRAIN_API_URL          // 1순위: K8s 서비스 URL
   ?? process.env.NEXT_PUBLIC_API_URL // 2순위: 공개 URL
-  ?? "http://localhost:9200";        // 3순위: 로컬 개발 기본값
+  ?? "http://localhost:8080";        // 3순위: 로컬 개발 기본값
 
 const API_KEY = process.env.API_KEY ?? "";  // 백엔드 Bearer 토큰 서버사이드 주입
 ```
@@ -846,7 +848,7 @@ const FILTER_OPTIONS: FilterOption[] = [
 | 환경 변수 | 필수 | 기본값 | 사용 위치 | 설명 |
 |---|---|---|---|---|
 | `DATABASE_URL` | 선택 | `postgres://brain:brain@localhost:5432/second_brain?sslmode=disable` | `store/postgres.go` | Postgres 연결 문자열 |
-| `PORT` | 선택 | `9200` | `cmd/server/main.go:113` | HTTP 서버 포트 |
+| `PORT` | 선택 | `8080` | `cmd/server/main.go:113` | HTTP 서버 포트 |
 | `EMBEDDING_API_URL` | 선택 | `https://api.openai.com/v1` | `search/embed.go:92` | OpenAI 호환 엔드포인트 |
 | `EMBEDDING_API_KEY` | 선택 | — | `search/embed.go:95` | Static API 키 (1순위 토큰) |
 | `EMBEDDING_MODEL` | 선택 | `text-embedding-3-small` | `search/embed.go:101` | 임베딩 모델 |
@@ -875,7 +877,7 @@ const FILTER_OPTIONS: FilterOption[] = [
 | `CLIPROXY_AUTH_FILE` | `/etc/cliproxy/auth.json` |
 | `FILESYSTEM_PATH` | `/data/drive` |
 | `FILESYSTEM_ENABLED` | `true` |
-| `PORT` | `9200` |
+| `PORT` | `8080` |
 | `MIGRATIONS_DIR` | `/app/migrations` |
 
 ### Secret 관리 원칙
@@ -889,7 +891,7 @@ const FILTER_OPTIONS: FilterOption[] = [
 
 | 환경 변수 | 필수 | 설명 |
 |---|---|---|
-| `BRAIN_API_URL` | 선택 | 백엔드 서비스 URL (K8s 내부: `http://second-brain:9200`) |
+| `BRAIN_API_URL` | 선택 | 백엔드 서비스 URL (K8s 내부: `http://second-brain:8080`) |
 | `NEXT_PUBLIC_API_URL` | 선택 | 클라이언트 접근 가능 URL (미사용 권장) |
 | `API_KEY` | 선택 | 백엔드 Bearer 토큰 (서버사이드만 사용) |
 
@@ -901,7 +903,7 @@ const FILTER_OPTIONS: FilterOption[] = [
 
 ```mermaid
 flowchart LR
-    pod[second-brain Pod<br/>:9200] -- "HTTP<br/>Bearer inbound key" --> cliproxy[cliproxy<br/>127.0.0.1:8317]
+    pod[second-brain Pod<br/>:8080] -- "HTTP<br/>Bearer inbound key" --> cliproxy[cliproxy<br/>127.0.0.1:8317]
     cliproxy -- "OAuth access_token<br/>refresh 자동" --> upstream[(OpenAI API<br/>chat.openai.com)]
 
     subgraph host["host (baekenough-ubuntu24)"]
@@ -1174,4 +1176,4 @@ GitHub 이슈로 추적. 단계별 epic은 아래 이슈들로 구성됨.
 
 ---
 
-*Last updated: 2026-04-14*
+*Last updated: 2026-04-15*
