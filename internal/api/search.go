@@ -21,8 +21,9 @@ type searchRequest struct {
 	Limit              int                `json:"limit"`
 	IncludeDeleted     bool               `json:"include_deleted"`
 	Sort               string             `json:"sort"`              // "relevance" (default) | "recent"
-	UseHyDE            bool               `json:"use_hyde,omitempty"` // opt-in HyDE query expansion; default false
-	Curated            bool               `json:"curated,omitempty"` // opt-in LLM curation and re-ranking; default false
+	UseHyDE            bool               `json:"use_hyde,omitempty"`    // opt-in HyDE query expansion; default false
+	UseRerank          bool               `json:"use_rerank,omitempty"`  // opt-in cross-encoder reranking; default false
+	Curated            bool               `json:"curated,omitempty"`     // opt-in LLM curation and re-ranking; default false
 }
 
 // searchHandler handles POST /api/v1/search.
@@ -45,6 +46,7 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 		IncludeDeleted:     req.IncludeDeleted,
 		Sort:               req.Sort,
 		UseHyDE:            req.UseHyDE,
+		UseRerank:          req.UseRerank,
 	}
 
 	start := time.Now()
@@ -105,12 +107,14 @@ func (s *Server) searchGetHandler(w http.ResponseWriter, r *http.Request) {
 
 	curated := r.URL.Query().Get("curated") == "true"
 	useHyDE := r.URL.Query().Get("use_hyde") == "true"
+	useRerank := r.URL.Query().Get("use_rerank") == "true"
 
 	q := model.SearchQuery{
 		Query:      query,
 		SourceType: srcType,
 		Limit:      limit,
 		UseHyDE:    useHyDE,
+		UseRerank:  useRerank,
 	}
 
 	start := time.Now()

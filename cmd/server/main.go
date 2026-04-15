@@ -69,9 +69,17 @@ func run() error {
 		slog.Info("embedding API not configured — full-text search only")
 	}
 
+	// --- Reranker (optional) ---
+	reranker := search.NewHTTPReranker(cfg.RerankURL, cfg.RerankAPIKey, cfg.RerankModel, 0)
+	if reranker.Enabled() {
+		slog.Info("reranker configured", "url", cfg.RerankURL, "model", cfg.RerankModel)
+	}
+
 	// --- Search service ---
 	// ChunkStore is attached to enable chunk-based FTS fallback (issue #9).
-	searchSvc := search.NewService(docStore, embedClient).WithChunkStore(chunkStore)
+	searchSvc := search.NewService(docStore, embedClient).
+		WithChunkStore(chunkStore).
+		WithReranker(reranker)
 
 	// --- LLM client (curation) ---
 	llmClient := llm.New(llm.Config{
