@@ -15,19 +15,36 @@ services:
       timeout: 5s
       retries: 10
 
-  second-brain:
+  server:
     build:
       context: .
       dockerfile: Dockerfile
-    image: second-brain:dev
+      target: server
     depends_on:
       postgres:
         condition: service_healthy
     ports:
-      - "9200:9200"
+      - "8080:8080"
     environment:
       DATABASE_URL: postgres://brain:brain@postgres:5432/second_brain?sslmode=disable
-      COLLECT_INTERVAL: 5m
+      PORT: "8080"
+      MIGRATIONS_DIR: /app/migrations
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  collector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: collector
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://brain:brain@postgres:5432/second_brain?sslmode=disable
+      COLLECT_INTERVAL: 10m
+      MIGRATIONS_DIR: /app/migrations
     env_file:
       - .env
     volumes:

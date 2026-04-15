@@ -124,7 +124,7 @@ func Load() (*Config, error) {
 	}
 
 	return &Config{
-		Port:        getenv("PORT", "9200"),
+		Port:        getenv("PORT", "8080"),
 		DatabaseURL: getenv("DATABASE_URL", "postgres://brain:brain@localhost:5432/second_brain?sslmode=disable"),
 
 		EmbeddingAPIURL:  embeddingAPIURL,
