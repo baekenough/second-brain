@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,6 +17,12 @@ import (
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/store"
 )
+
+// schemaMu guards buildSchema so that package-level graphql type objects
+// (which perform lazy initialization on first use) are never written to by
+// multiple goroutines concurrently. This is required when parallel tests or
+// concurrent requests call Handler() before the schema is cached.
+var schemaMu sync.Mutex
 
 // jsonScalar is a custom scalar that serializes/deserializes arbitrary JSON
 // (map[string]any, []any, or any JSON-compatible value). It is used for
@@ -218,7 +225,13 @@ func optSourceType(s string) *model.SourceType {
 // buildSchema constructs the GraphQL schema with all queries and mutations.
 // It captures s (Server) in closures so resolver functions have full access to
 // application dependencies without global state.
+//
+// schemaMu serialises concurrent calls so that the graphql-go library's lazy
+// field initialisation on the package-level type vars does not race.
 func (s *Server) buildSchema() (graphql.Schema, error) {
+	schemaMu.Lock()
+	defer schemaMu.Unlock()
+
 	queryFields := graphql.Fields{
 
 		// --- search ---
