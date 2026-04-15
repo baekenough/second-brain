@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+	"sync"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -35,6 +36,12 @@ type Server struct {
 	llmClient      llm.Completer
 	filesystemPath string // root directory for filesystem source documents
 	apiKey         string // Bearer token for /api/v1/* routes; empty means disabled
+
+	// handlerOnce ensures buildHandler is called exactly once per Server so
+	// that the graphql-go schema (and its package-level type objects) are
+	// constructed a single time regardless of how many goroutines call Handler.
+	handlerOnce    sync.Once
+	cachedHandler  http.Handler
 }
 
 // NewServer creates a Server with the provided dependencies.
@@ -58,8 +65,19 @@ func NewServer(
 	}
 }
 
-// Handler builds and returns the root http.Handler for the application.
+// Handler returns the root http.Handler for the application. It is safe to
+// call from multiple goroutines: the underlying router is built exactly once
+// via sync.Once and the result is reused for every subsequent call.
 func (s *Server) Handler() http.Handler {
+	s.handlerOnce.Do(func() {
+		s.cachedHandler = s.buildHandler()
+	})
+	return s.cachedHandler
+}
+
+// buildHandler constructs the chi router with all middleware and routes.
+// It must only be called once (enforced by Handler via sync.Once).
+func (s *Server) buildHandler() http.Handler {
 	r := chi.NewRouter()
 
 	// Global middleware
@@ -90,9 +108,9 @@ func (s *Server) Handler() http.Handler {
 
 		r.Post("/api/v1/feedback", s.feedbackHandler)
 
-			r.Handle("/api/v1/graphql", s.graphqlHandler())
+		r.Handle("/api/v1/graphql", s.graphqlHandler())
 
-			r.Get("/api/v1/eval/export", s.evalExportHandler)
+		r.Get("/api/v1/eval/export", s.evalExportHandler)
 	})
 
 	return r
