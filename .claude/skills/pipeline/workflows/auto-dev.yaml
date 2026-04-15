@@ -1,0 +1,269 @@
+name: auto-dev
+description: "Automated development pipeline for second-brain — scoped release unit from triage to deploy"
+version: "1.2.0-second-brain"
+
+# Target: baekenough/second-brain (Go backend + Next.js frontend + Postgres/pgvector + k8s)
+# Release artifacts: git tag + GitHub Release + Docker image (no npm publish)
+# Design rule: each pipeline run produces ONE bounded release unit (3-7 issues), not all open issues.
+
+steps:
+  - name: pre-triage
+    prompt: |
+      Scan open GitHub issues on baekenough/second-brain:
+        gh issue list --repo baekenough/second-brain --state open --limit 100 \
+          --json number,title,labels,body,milestone
+
+      Group by label:
+        - priority/P0 — MUST-fix bugs
+        - priority/P1 — deferred bugs
+        - phase/0..4 — roadmap features
+        - chore + blocker — infra/CI/integrations
+        - decision-needed — blocked on human decision (EXCLUDE)
+
+      For each issue compute:
+        - dependencies: parse "see #N", "depends on #N", "#N 참조" from body
+        - blocked_by_decision: true if body references any decision-needed issue (#25, #26)
+        - effort: XS/S/M/L from scope
+        - order: topological sort over dependencies
+
+      Output: dependency-sorted issue table with blocked_by_decision flag.
+    description: "Scan and dependency-analyze all open issues"
+
+  - name: scope-selection
+    prompt: |
+      Select a single bounded release scope (3-7 issues) for THIS pipeline run.
+
+      Selection rules:
+      1. Determine release tier:
+         - No tags yet → v0.1.0, P0 bugs only
+         - Otherwise: highest-priority open tier (P1 → phase/1 → phase/2 → ...)
+      2. Exclude:
+         - blocked_by_decision == true (e.g., #2 blocked by #25, #12 blocked by #26)
+         - chore/blocker requiring human action (e.g., #4 JWT rotation, #24 gcloud auth) — these are manual
+      3. Sort by dependency: prerequisites before dependents (#9 chunks before #3 truncation)
+      4. Cap at 7 issues; if P0 count < 7, stop at P0 only (don't mix tiers in one release)
+      5. Minimum 1 issue; if 0 eligible, halt with "no eligible issues for auto-dev run"
+
+      Create release milestone:
+        gh api repos/baekenough/second-brain/milestones \
+          -f title="v{X.Y.Z}" \
+          -f description="Auto-dev release unit"
+
+      Assign scoped issues to milestone:
+        for N in scope:
+          gh issue edit $N --milestone "v{X.Y.Z}" --repo baekenough/second-brain
+
+      Output markdown release manifest:
+        | order | # | title | prerequisite | effort |
+
+      Persist manifest as pipeline state for subsequent steps.
+    description: "Pick 3-7 issues as v{X.Y.Z} scope, create milestone, exclude decision-blocked"
+    depends_on: pre-triage
+
+  - name: triage
+    skill: professor-triage
+    description: "Cross-analysis triage against current Go + Next.js codebase (scoped to release manifest)"
+    depends_on: scope-selection
+
+  - name: plan
+    skill: release-plan
+    description: "Release unit plan from the scoped manifest"
+    depends_on: triage
+
+  - name: deep-plan
+    skill: deep-plan
+    description: "Research-validated implementation plan with Go / k8s / Next.js context"
+    depends_on: plan
+
+  - name: implement
+    prompt: |
+      Execute the deep-plan output for the scoped release manifest.
+
+      Per-issue lifecycle:
+      1. Start: `gh issue edit <N> --add-label in-progress --assignee @me --repo baekenough/second-brain`
+      2. Comment: `gh issue comment <N> --body "Implementation started via auto-dev pipeline (v{X.Y.Z})"`
+      3. Dispatch specialist per file domain:
+         - internal/**/*.go or cmd/**/*.go      → be-go-backend-expert / lang-golang-expert
+         - migrations/*.sql                      → db-postgres-expert
+         - Dockerfile, docker-compose.yml        → infra-docker-expert
+         - deploy/k8s/**.yaml                    → infra-docker-expert
+         - web/src/**                             → fe-vercel-agent
+         - ARCHITECTURE*.md / README*.md         → arch-documenter
+      4. TDD via superpowers:test-driven-development when tests apply
+      5. Commit via mgr-gitnerd with `Fixes #<N>` trailer in body
+      6. On success: remove `in-progress`, add `verify-ready`
+      7. On failure: remove `in-progress`, add `needs-review`, comment error summary, halt this issue (pipeline continues with others)
+
+      Rules:
+      - Parallel execution per R009 (max 4 concurrent, respect dependencies)
+      - Issues whose prerequisites failed in-run MUST be skipped (log reason)
+      - No direct orchestrator writes (R010)
+    description: "Per-issue TDD impl with lifecycle (assign → fix → commit with trailer)"
+    depends_on: deep-plan
+
+  - name: verify-build
+    prompt: |
+      Build and test verification for second-brain.
+
+      Delegate to lang-golang-expert / infra-docker-expert to run in order (halt on first failure):
+        1. go build ./...
+        2. go vet ./...
+        3. go test ./... -count=1 -race
+           # existing tests: internal/collector/extractor/extractor_test.go
+        4. docker build -t second-brain:verify .
+        5. kubectl --dry-run=client apply -k deploy/k8s/
+           # fallback: for f in deploy/k8s/*.yaml; do kubectl --dry-run=client apply -f $f; done
+        6. cd web && pnpm install --frozen-lockfile && pnpm run build
+        7. Migration safety check:
+           - Latest migration file should be forward-only
+           - No DROP/ALTER COLUMN on existing columns without explicit review comment
+           - Delegate: db-postgres-expert reads migrations/*.sql and reports risks
+
+      On failure: halt, report exact command + stderr + delegated agent's findings, do NOT proceed to release.
+      Do NOT run sauron-watch — that targets .claude/ harness, not project code.
+    description: "Go build/vet/test/race + Docker + k8s + Next.js + migration safety"
+    depends_on: implement
+
+  - name: deep-verify
+    skill: deep-verify
+    description: "Multi-angle release quality review by expert teams (scoped to this release unit)"
+    depends_on: verify-build
+
+  - name: release
+    prompt: |
+      Create a GitHub Release for second-brain.
+
+      1. Version:
+         - No existing tags → v0.1.0 (first release)
+         - Otherwise: semver bump (patch for bugfix-only, minor if any feature/enhancement in scope)
+      2. Release notes via omcustom-release-notes skill:
+         - Source: git log since last tag + closed issues in current milestone
+         - Sections: Bug Fixes (P0/P1), Features (phase/*), Chores, Known Issues (deferred)
+      3. Delegate to mgr-gitnerd:
+         - git tag -a v{version} -m "Release v{version}"
+         - git push origin v{version}
+         - gh release create v{version} --title "v{version}" --notes-file <path> --repo baekenough/second-brain
+      4. Close the milestone:
+           gh api repos/baekenough/second-brain/milestones/<id> -X PATCH -f state=closed
+      5. Close release-manifest issues:
+           for N in manifest where verify-ready label:
+             gh issue close $N -c "Fixed in v{version}" --repo baekenough/second-brain
+           for N in manifest where needs-review label:
+             gh issue comment $N --body "Deferred from v{version} — requires review"
+
+      NO npm publish — Go + Docker project.
+      NO PR creation — trunk-based direct tagging on main.
+    description: "Git tag + GitHub Release + close milestone/issues with fixed/deferred split"
+    depends_on: deep-verify
+
+  - name: ci-check
+    prompt: |
+      Post-release CI verification (conditional on CI being configured).
+
+      1. Check if .github/workflows/ exists and has any YAML files:
+           test -d .github/workflows && ls .github/workflows/*.yml 2>/dev/null | head -1
+         If NOT found: print "CI not yet configured (tracked in issue #21). Skipping post-release CI verification."
+         Return success and advance.
+
+      2. If CI IS configured:
+         a. gh run list --repo baekenough/second-brain --limit 5 --branch main
+         b. Wait up to 15 min for runs to complete for the new tag
+         c. If failures found:
+            - gh run view <id> --log-failed
+            - Diagnose root cause
+            - Delegate fix to appropriate specialist
+            - Commit fix via mgr-gitnerd (Fixes build, not a new issue)
+            - Re-run verify-build step
+         d. On success: verify Docker image pushed to registry (if configured)
+      3. Report final CI status.
+    description: "Post-release CI fix loop (skip if CI not configured — #21)"
+    depends_on: release
+
+  - name: post-release-followup
+    skill: post-release-followup
+    description: "Register follow-ups from this release as new issues (link to milestone)"
+    depends_on: ci-check
+
+  - name: deploy-ubuntu-ext
+    prompt: |
+      Deploy the tagged release to the home server via SSH.
+
+      Target: ubuntu24_home_server-ext (SSH alias → 125.133.87.236:9416, user baekenough)
+      Host: baekenough-ubuntu24 (Ubuntu 24, kernel 6.8)
+      Environment: minikube on docker driver (running node container)
+      Fresh deployment: server has no existing ~/second-brain dir, no collected data yet.
+
+      Pre-flight checks (halt on any failure):
+      1. SSH reachable: `ssh ubuntu24_home_server-ext hostname` (expect: baekenough-ubuntu24)
+      2. minikube running: `ssh ubuntu24_home_server-ext 'minikube status'`
+         - If "Stopped": `ssh ubuntu24_home_server-ext 'minikube start'`
+      3. Git remote HTTPS accessible from server (public repo, no auth needed)
+
+      Known blocker (issue #6):
+      - Current k8s PV (deploy/k8s/second-brain-pv.yaml) requires hostPath `/mnt/drive`
+      - Linux server has no Google Drive sync — Drive Desktop is macOS-only
+      - This step MUST halt with instructions if the release manifest does NOT include #6 fix
+      - Acceptable resolutions:
+        (a) rclone mount gdrive: /mnt/drive (pre-setup on server)
+        (b) PV removed or replaced with emptyDir
+        (c) Drive collector disabled via ConfigMap
+
+      Deployment steps (delegate SSH to infra-docker-expert):
+
+      Step 1 — Clone project (first deploy):
+        ssh ubuntu24_home_server-ext bash <<'EOF'
+          set -e
+          if [ ! -d ~/second-brain ]; then
+            git clone https://github.com/baekenough/second-brain.git ~/second-brain
+          fi
+          cd ~/second-brain
+          git fetch --all --tags
+          git checkout v{version}
+        EOF
+
+      Step 2 — Secrets file check:
+        ssh ubuntu24_home_server-ext 'test -f ~/second-brain/.env'
+        - If missing: HALT with instructions — "Create ~/second-brain/.env on server with production secrets (EMBEDDING_API_KEY, API_KEY, SLACK_TOKEN, etc.)"
+        - Do NOT scp .env from local (local .env may contain dev-only values)
+
+      Step 3 — Build image inside minikube docker:
+        ssh ubuntu24_home_server-ext bash <<'EOF'
+          set -e
+          cd ~/second-brain
+          eval $(minikube docker-env)
+          docker build -t second-brain:{version} -t second-brain:latest .
+          docker images | grep second-brain | head -3
+        EOF
+
+      Step 4 — Apply k8s manifests:
+        ssh ubuntu24_home_server-ext bash <<'EOF'
+          set -e
+          cd ~/second-brain
+          kubectl apply -k deploy/k8s/ 2>/dev/null || kubectl apply -f deploy/k8s/
+          kubectl -n second-brain rollout status deployment/second-brain --timeout=5m
+        EOF
+
+      Step 5 — Post-deploy verification:
+        ssh ubuntu24_home_server-ext bash <<'EOF'
+          set -e
+          kubectl -n second-brain get pods -o wide
+          kubectl -n second-brain logs deployment/second-brain --tail=50
+          kubectl -n second-brain get svc,deploy,configmap
+        EOF
+
+      Step 6 — Health endpoint smoke test:
+        ssh ubuntu24_home_server-ext bash <<'EOF'
+          kubectl -n second-brain port-forward svc/second-brain 9200:9200 &
+          PF_PID=$!
+          sleep 3
+          curl -sf http://localhost:9200/health || echo "HEALTH CHECK FAILED"
+          kill $PF_PID 2>/dev/null || true
+        EOF
+
+      On success: comment on the GitHub Release with "Deployed to baekenough-ubuntu24 at {timestamp}".
+      On failure: collect logs, report, and advise rollback via `kubectl rollout undo`.
+
+      **Rollback plan**: if health check fails, execute
+        ssh ubuntu24_home_server-ext 'kubectl -n second-brain rollout undo deployment/second-brain'
+    description: "SSH deploy to ubuntu24_home_server-ext via minikube + k8s rollout (fresh first deploy)"
+    depends_on: post-release-followup

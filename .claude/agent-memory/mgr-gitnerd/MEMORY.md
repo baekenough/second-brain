@@ -1,0 +1,1 @@
+- [second-brain retro issues batch](project_retro_second_brain.md) — 2026-04-14 세션 회고 이슈 #28~#37, 재발 방지 패턴 10건
