@@ -77,6 +77,7 @@ func (s *Server) Handler() http.Handler {
 		r.Use(requireAPIKey(s.apiKey))
 
 		r.Post("/api/v1/search", s.searchHandler)
+		r.Get("/api/v1/search", s.searchGetHandler)
 
 		r.Get("/api/v1/documents", s.listDocumentsHandler)
 		r.Get("/api/v1/documents/{id}", s.getDocumentHandler)
