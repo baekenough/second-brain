@@ -246,6 +246,7 @@ func (s *Server) buildSchema() (graphql.Schema, error) {
 				"includeDeleted":     {Type: graphql.Boolean},
 				"sort":               {Type: graphql.String},
 				"useHyDE":            {Type: graphql.Boolean},
+				"useRerank":          {Type: graphql.Boolean},
 				"curated":            {Type: graphql.Boolean},
 			},
 			Resolve: func(p graphql.ResolveParams) (interface{}, error) {
@@ -267,6 +268,7 @@ func (s *Server) buildSchema() (graphql.Schema, error) {
 				includeDeleted, _ := p.Args["includeDeleted"].(bool)
 				sort, _ := p.Args["sort"].(string)
 				useHyDE, _ := p.Args["useHyDE"].(bool)
+				useRerank, _ := p.Args["useRerank"].(bool)
 				curated, _ := p.Args["curated"].(bool)
 				sourceType, _ := p.Args["sourceType"].(string)
 
@@ -278,6 +280,7 @@ func (s *Server) buildSchema() (graphql.Schema, error) {
 					IncludeDeleted:     includeDeleted,
 					Sort:               sort,
 					UseHyDE:            useHyDE,
+					UseRerank:          useRerank,
 				}
 
 				start := time.Now()

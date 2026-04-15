@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/baekenough/second-brain/internal/llm"
@@ -32,9 +33,10 @@ type ChunkSearcher interface {
 type Service struct {
 	store      DocumentSearcher
 	embed      *EmbedClient
-	chunkStore ChunkSearcher     // nil when chunk FTS is not configured
-	llmClient  llm.Completer     // nil when HyDE is not configured
+	chunkStore ChunkSearcher       // nil when chunk FTS is not configured
+	llmClient  llm.Completer       // nil when HyDE is not configured
 	weights    model.SearchWeights // zero value uses defaults (k=60, equal weights)
+	reranker   Reranker            // nil when reranking is not configured
 }
 
 // NewService returns a search Service.
@@ -71,6 +73,14 @@ func (s *Service) WithLLM(client llm.Completer) *Service {
 // affect the store configuration directly.
 func (s *Service) WithWeights(w model.SearchWeights) *Service {
 	s.weights = w
+	return s
+}
+
+// WithReranker attaches a cross-encoder reranker that post-processes search
+// results when q.UseRerank is true. Safe to call with nil — reranking is
+// silently skipped when the reranker is nil or disabled.
+func (s *Service) WithReranker(r Reranker) *Service {
+	s.reranker = r
 	return s
 }
 
@@ -134,10 +144,54 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 			)
 			return results, nil
 		}
-		return chunkResults, nil
+		results = chunkResults
+	}
+
+	// Cross-encoder reranking: opt-in per-request via UseRerank.
+	// Failure is non-fatal — original order is preserved on error.
+	if q.UseRerank && s.reranker != nil && s.reranker.Enabled() && len(results) > 1 {
+		reranked, rerr := s.applyRerank(ctx, q.Query, results)
+		if rerr != nil {
+			slog.Warn("search: rerank failed, using original order", "error", rerr)
+		} else {
+			results = reranked
+		}
 	}
 
 	return results, nil
+}
+
+// applyRerank calls the cross-encoder reranker with truncated title+content
+// text for each result and returns results reordered by descending score.
+// Documents are truncated to 1000 runes to stay within typical API limits.
+func (s *Service) applyRerank(ctx context.Context, query string, results []*model.SearchResult) ([]*model.SearchResult, error) {
+	const maxDocRunes = 1000
+
+	docs := make([]string, len(results))
+	for i, r := range results {
+		text := r.Title + "\n" + r.Content
+		if utf8.RuneCountInString(text) > maxDocRunes {
+			runes := []rune(text)
+			text = string(runes[:maxDocRunes])
+		}
+		docs[i] = text
+	}
+
+	ranked, err := s.reranker.Rerank(ctx, query, docs)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]*model.SearchResult, 0, len(ranked))
+	for _, rr := range ranked {
+		if rr.Index < 0 || rr.Index >= len(results) {
+			continue
+		}
+		res := *results[rr.Index] // shallow copy to avoid mutating original
+		res.Score = rr.Score
+		out = append(out, &res)
+	}
+	return out, nil
 }
 
 // searchChunksFTS queries the chunks table for matching text chunks, then

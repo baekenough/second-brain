@@ -79,4 +79,5 @@ type SearchQuery struct {
 	Sort               string       // "relevance" (default, score DESC) | "recent" (collected_at DESC)
 	UseHyDE            bool         // when true, expand query via HyDE before retrieval
 	Weights            SearchWeights // zero value uses defaults (k=60, equal weights)
+	UseRerank          bool         `json:"use_rerank,omitempty"` // when true, apply cross-encoder reranking post-retrieval
 }

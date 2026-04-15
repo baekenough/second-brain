@@ -58,6 +58,11 @@ type Config struct {
 	TelegramBotToken string
 	TelegramChatIDs  []int64
 
+	// Reranker (optional — cross-encoder post-retrieval reranking disabled when empty)
+	RerankURL    string // RERANKER_URL — Jina-compatible /rerank endpoint base URL
+	RerankAPIKey string // RERANKER_API_KEY — Bearer token for the reranker API
+	RerankModel  string // RERANKER_MODEL — model identifier sent in the request body
+
 	// API authentication (optional — disabled when empty, for dev backward compat)
 	APIKey string // API_KEY — Bearer token required for /api/v1/* routes
 
@@ -172,6 +177,10 @@ func Load() (*Config, error) {
 
 		TelegramBotToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
 		TelegramChatIDs:  telegramChatIDs,
+
+		RerankURL:    os.Getenv("RERANKER_URL"),
+		RerankAPIKey: os.Getenv("RERANKER_API_KEY"),
+		RerankModel:  getenv("RERANKER_MODEL", "jina-reranker-v2-base-multilingual"),
 
 		APIKey: os.Getenv("API_KEY"),
 
