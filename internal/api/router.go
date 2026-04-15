@@ -11,9 +11,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
-	"github.com/baekenough/second-brain/internal/collector"
+	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
-	"github.com/baekenough/second-brain/internal/scheduler"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
 )
@@ -27,50 +26,36 @@ type DocumentStore interface {
 	QueryBaselineStats(ctx context.Context) (*store.BaselineStats, error)
 }
 
-// CollectorRegistry exposes collector status to the API.
-type CollectorRegistry interface {
-	TriggerAll(ctx context.Context)
-	Collectors() []collector.Collector
-}
-
 // Server holds the dependencies needed by all handlers.
 type Server struct {
-	docs             DocumentStore
-	search           *search.Service
-	scheduler        *scheduler.Scheduler
-	feedback         FeedbackRecorder
-	eval             EvalExporter
-	discordMetrics   *collector.DiscordMetrics // optional; nil means no Discord metrics
-	filesystemPath   string                    // root directory for filesystem source documents
-	apiKey           string                    // Bearer token for /api/v1/* routes; empty means disabled
+	docs           DocumentStore
+	search         *search.Service
+	feedback       FeedbackRecorder
+	eval           EvalExporter
+	llmClient      llm.Completer
+	filesystemPath string // root directory for filesystem source documents
+	apiKey         string // Bearer token for /api/v1/* routes; empty means disabled
 }
 
 // NewServer creates a Server with the provided dependencies.
 func NewServer(
 	docs DocumentStore,
 	svc *search.Service,
-	sched *scheduler.Scheduler,
 	feedback FeedbackRecorder,
 	eval EvalExporter,
+	llmClient llm.Completer,
 	filesystemPath string,
 	apiKey string,
 ) *Server {
 	return &Server{
 		docs:           docs,
 		search:         svc,
-		scheduler:      sched,
 		feedback:       feedback,
 		eval:           eval,
+		llmClient:      llmClient,
 		filesystemPath: filesystemPath,
 		apiKey:         apiKey,
 	}
-}
-
-// SetDiscordMetrics injects a DiscordMetrics instance for the stats endpoint.
-// It must be called before serving requests. When nil (the default), the
-// discord_bot section is omitted from the baseline stats response.
-func (s *Server) SetDiscordMetrics(m *collector.DiscordMetrics) {
-	s.discordMetrics = m
 }
 
 // Handler builds and returns the root http.Handler for the application.
@@ -96,9 +81,6 @@ func (s *Server) Handler() http.Handler {
 		r.Get("/api/v1/documents", s.listDocumentsHandler)
 		r.Get("/api/v1/documents/{id}", s.getDocumentHandler)
 		r.Get("/api/v1/documents/{id}/raw", s.getDocumentRawHandler)
-
-		r.Post("/api/v1/collect/trigger", s.triggerCollectHandler)
-		r.Post("/api/v1/collect/slack/channel", s.collectSlackChannelHandler)
 
 		r.Get("/api/v1/sources", s.listSourcesHandler)
 
