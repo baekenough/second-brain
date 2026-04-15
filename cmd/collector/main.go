@@ -88,7 +88,8 @@ func run() error {
 		collector.NewSlackCollector(cfg.SlackBotToken, cfg.SlackTeamID),
 		collector.NewGitHubCollector(cfg.GitHubToken, cfg.GitHubOrg),
 		collector.NewGDriveCollector(cfg.GDriveCredentialsJSON),
-		// Notion collector disabled — not in use (re-enable by adding NewNotionCollector).
+		collector.NewNotionCollector(cfg.NotionToken),
+		collector.NewTelegramCollector(cfg.TelegramBotToken, cfg.TelegramChatIDs),
 	}
 	if cfg.FilesystemEnabled && cfg.FilesystemPath != "" {
 		// Attempt to initialise the Drive exporter via ADC. If ADC is not

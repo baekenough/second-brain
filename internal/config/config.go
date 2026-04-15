@@ -54,6 +54,10 @@ type Config struct {
 	// Notion (optional)
 	NotionToken string
 
+	// Telegram (optional)
+	TelegramBotToken string
+	TelegramChatIDs  []int64
+
 	// API authentication (optional — disabled when empty, for dev backward compat)
 	APIKey string // API_KEY — Bearer token required for /api/v1/* routes
 
@@ -83,6 +87,17 @@ func Load() (*Config, error) {
 		for _, id := range strings.Split(raw, ",") {
 			if trimmed := strings.TrimSpace(id); trimmed != "" {
 				discordGuildIDs = append(discordGuildIDs, trimmed)
+			}
+		}
+	}
+
+	var telegramChatIDs []int64
+	if raw := os.Getenv("TELEGRAM_CHAT_IDS"); raw != "" {
+		for _, id := range strings.Split(raw, ",") {
+			if trimmed := strings.TrimSpace(id); trimmed != "" {
+				if n, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+					telegramChatIDs = append(telegramChatIDs, n)
+				}
 			}
 		}
 	}
@@ -154,6 +169,9 @@ func Load() (*Config, error) {
 		GDriveCredentialsJSON: os.Getenv("GDRIVE_CREDENTIALS_JSON"),
 
 		NotionToken: os.Getenv("NOTION_TOKEN"),
+
+		TelegramBotToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
+		TelegramChatIDs:  telegramChatIDs,
 
 		APIKey: os.Getenv("API_KEY"),
 
