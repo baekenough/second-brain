@@ -5,7 +5,7 @@
 > **외부 URL**: `https://second-brain.baekenough.com`
 > **네임스페이스**: `second-brain`
 > **책임자**: @sang2-tpm (or rotation)
-> **최종 갱신**: 2026-04-14
+> **최종 갱신**: 2026-04-15
 > **관련 이슈**: #6 #21 #28 #29 #34 #35 #36 #37
 
 ---
@@ -55,8 +55,8 @@
         ▼
 baekenough-ubuntu24 (minikube + docker driver)
   ├── minikube namespace: second-brain
-  │   ├── Deployment/second-brain      (port 9200, NodePort 30920)
-  │   ├── Deployment/second-brain-web  (port 3000, NodePort 30300)
+  │   ├── Deployment/second-brain         (API server, port 8080, NodePort 30080)
+  │   ├── Deployment/second-brain-collector (collector daemon)
   │   ├── StatefulSet/postgres
   │   ├── ConfigMap/second-brain-config
   │   └── Secret/second-brain-secret
@@ -68,7 +68,7 @@ baekenough-ubuntu24 (minikube + docker driver)
 | 이미지 | 태그 | 예시 |
 |--------|------|------|
 | `second-brain` | 배포 태그 또는 `dev` | `second-brain:v0.1.5` |
-| `second-brain-web` | 배포 태그 또는 `dev` | `second-brain-web:v0.1.5` |
+| `second-brain-collector` | 배포 태그 또는 `dev` | `second-brain-collector:v0.1.5` |
 
 > minikube docker 환경 내부에 이미지를 빌드하므로 레지스트리 push 불필요.
 > `imagePullPolicy: IfNotPresent` — 이미지 태그가 같으면 pull 시도 없음.
@@ -187,39 +187,42 @@ eval $(minikube docker-env)
 docker info | grep "Name:"
 # 출력에 minikube 포함되어야 함
 
-# 4-3. Backend 이미지 빌드 (--no-cache 필수)
+# 4-3. API Server 이미지 빌드 (--no-cache 필수)
 export TAG=v0.1.6
 cd ~/second-brain   # 프로젝트 루트 (Dockerfile 위치)
 
 docker build \
   --no-cache \
   --platform linux/amd64 \
+  --target server \
   -t second-brain:${TAG} \
   -t second-brain:dev \
   -f Dockerfile \
   .
 
-# 4-4. Web 이미지 빌드 (--no-cache 필수)
+# 4-4. Collector 이미지 빌드 (--no-cache 필수)
 docker build \
   --no-cache \
   --platform linux/amd64 \
-  -t second-brain-web:${TAG} \
-  -t second-brain-web:dev \
-  -f web/Dockerfile \
-  web/
+  --target collector \
+  -t second-brain-collector:${TAG} \
+  -t second-brain-collector:dev \
+  -f Dockerfile \
+  .
 
 # 4-5. 이미지 확인
 docker images | grep second-brain
 # 예상 출력:
-# second-brain      v0.1.6   <ID>   2 minutes ago   ...
-# second-brain      dev      <ID>   2 minutes ago   ...
-# second-brain-web  v0.1.6   <ID>   1 minute ago    ...
-# second-brain-web  dev      <ID>   1 minute ago    ...
+# second-brain            v0.1.6   <ID>   2 minutes ago   ...
+# second-brain            dev      <ID>   2 minutes ago   ...
+# second-brain-collector  v0.1.6   <ID>   1 minute ago    ...
+# second-brain-collector  dev      <ID>   1 minute ago    ...
 ```
 
-> **빌드 소요 시간**: Backend ~3-5분, Web ~2-3분 (초기 deps 다운로드 포함).
+> **빌드 소요 시간**: Server ~3-5분, Collector ~3-5분 (초기 deps 다운로드 포함).
 > `--no-cache`를 사용하더라도 go mod download는 Docker layer cache가 아닌
 > Go module cache를 사용하므로 재사용 가능 (정상 동작).
+> **참고**: Dockerfile은 멀티 타겟 빌드를 지원합니다. `--target server` 또는 `--target collector`로 빌드 대상을 선택합니다.
 
 ---
 
@@ -263,19 +266,19 @@ kubectl apply -f second-brain-web-service.yaml
 ### Step 6: 서버 — Rollout 재시작
 
 ```bash
-# 6-1. Backend rollout restart
+# 6-1. Server rollout restart
 kubectl rollout restart deployment/second-brain -n second-brain
 
-# 6-2. Web rollout restart
-kubectl rollout restart deployment/second-brain-web -n second-brain
+# 6-2. Collector rollout restart
+kubectl rollout restart deployment/second-brain-collector -n second-brain
 
 # 6-3. Rollout 완료 대기 (최대 3분)
 kubectl rollout status deployment/second-brain -n second-brain --timeout=180s
-kubectl rollout status deployment/second-brain-web -n second-brain --timeout=180s
+kubectl rollout status deployment/second-brain-collector -n second-brain --timeout=180s
 
 # 기대 출력:
 # deployment "second-brain" successfully rolled out
-# deployment "second-brain-web" successfully rolled out
+# deployment "second-brain-collector" successfully rolled out
 ```
 
 ---
@@ -287,14 +290,14 @@ kubectl rollout status deployment/second-brain-web -n second-brain --timeout=180
 kubectl get pods -n second-brain
 # 모든 Pod STATUS: Running, READY: 1/1
 
-# 7-2. Backend 헬스체크
-curl -sf http://$(minikube ip):30920/health
+# 7-2. Server 헬스체크
+curl -sf http://$(minikube ip):30080/health
 # 또는 서비스 내부에서:
 kubectl exec -n second-brain deploy/second-brain -- \
-  wget -qO- http://localhost:9200/health
+  wget -qO- http://localhost:8080/health
 
-# 7-3. Web 헬스체크
-curl -sf http://$(minikube ip):30300/
+# 7-3. Collector 상태 확인
+kubectl logs -n second-brain deploy/second-brain-collector --tail=10
 
 # 7-4. 외부 URL 검증
 curl -sf https://second-brain.baekenough.com/health
@@ -373,19 +376,19 @@ docker build -t second-brain:dev .   # NEVER (without --no-cache)
 ### 즉각 롤백 (이전 revision으로)
 
 ```bash
-# Backend 롤백
+# Server 롤백
 kubectl rollout undo deployment/second-brain -n second-brain
 
-# Web 롤백
-kubectl rollout undo deployment/second-brain-web -n second-brain
+# Collector 롤백
+kubectl rollout undo deployment/second-brain-collector -n second-brain
 
 # 롤백 상태 확인
 kubectl rollout status deployment/second-brain -n second-brain
-kubectl rollout status deployment/second-brain-web -n second-brain
+kubectl rollout status deployment/second-brain-collector -n second-brain
 
 # revision 이력 확인
 kubectl rollout history deployment/second-brain -n second-brain
-kubectl rollout history deployment/second-brain-web -n second-brain
+kubectl rollout history deployment/second-brain-collector -n second-brain
 ```
 
 ### 특정 태그로 재배포 (완전 롤백)
@@ -400,15 +403,17 @@ git checkout ${PREV_TAG}
 # 2. 이미지 재빌드 (--no-cache 필수)
 eval $(minikube docker-env)
 docker build --no-cache --platform linux/amd64 \
+  --target server \
   -t second-brain:${PREV_TAG} -t second-brain:dev \
   -f Dockerfile .
 docker build --no-cache --platform linux/amd64 \
-  -t second-brain-web:${PREV_TAG} -t second-brain-web:dev \
-  -f web/Dockerfile web/
+  --target collector \
+  -t second-brain-collector:${PREV_TAG} -t second-brain-collector:dev \
+  -f Dockerfile .
 
 # 3. Rollout restart
 kubectl rollout restart deployment/second-brain -n second-brain
-kubectl rollout restart deployment/second-brain-web -n second-brain
+kubectl rollout restart deployment/second-brain-collector -n second-brain
 
 # 4. 검증 (Step 7 동일)
 kubectl get pods -n second-brain
@@ -546,7 +551,7 @@ docker images | grep second-brain
 
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
-| `PORT` | `9200` | Backend HTTP 포트 |
+| `PORT` | `8080` | API Server HTTP 포트 |
 | `COLLECT_INTERVAL` | `5m` | 수집 주기 |
 | `MAX_EMBED_CHARS` | `8000` | 임베딩 최대 문자 수 |
 | `EMBEDDING_API_URL` | `https://api.openai.com/v1` | Embedding API 엔드포인트 |
@@ -578,7 +583,7 @@ docker images | grep second-brain
 
 | 변수 | 값 | 설명 |
 |------|-----|------|
-| `BRAIN_API_URL` | `http://second-brain:9200` | Backend 서비스 URL (클러스터 내부) |
+| `BRAIN_API_URL` | `http://second-brain:8080` | API Server 서비스 URL (클러스터 내부) |
 | `NEXT_PUBLIC_APP_URL` | `http://localhost:3000` | 공개 App URL |
 | `PORT` | `3000` | Next.js 포트 |
 | `HOSTNAME` | `0.0.0.0` | 바인딩 호스트 |
