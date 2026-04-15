@@ -42,14 +42,41 @@ type SearchResult struct {
 	MatchType string  `json:"match_type"` // "fulltext", "vector", or "hybrid"
 }
 
+// SearchWeights controls RRF fusion behaviour.
+// Zero values fall back to hardcoded defaults (backward compatible).
+type SearchWeights struct {
+	FTSWeight  float64 `json:"fts_weight"`
+	VecWeight  float64 `json:"vec_weight"`
+	BigmWeight float64 `json:"bigm_weight"`
+	RRFK       float64 `json:"rrf_k"`
+}
+
+// Defaults returns a copy with zero fields replaced by defaults.
+func (w SearchWeights) Defaults() SearchWeights {
+	if w.RRFK == 0 {
+		w.RRFK = 60.0
+	}
+	if w.FTSWeight == 0 {
+		w.FTSWeight = 1.0
+	}
+	if w.VecWeight == 0 {
+		w.VecWeight = 1.0
+	}
+	if w.BigmWeight == 0 {
+		w.BigmWeight = 1.0
+	}
+	return w
+}
+
 // SearchQuery describes a search request.
 type SearchQuery struct {
 	Query              string
 	SourceType         *SourceType  // nil means all sources
 	ExcludeSourceTypes []SourceType // source types to exclude from results
 	Limit              int
-	Embedding          []float32 // populated by search service when available
-	IncludeDeleted     bool      // when true, search includes deleted/moved docs
-	Sort               string    // "relevance" (default, score DESC) | "recent" (collected_at DESC)
-	UseHyDE            bool      // when true, expand query via HyDE before retrieval
+	Embedding          []float32    // populated by search service when available
+	IncludeDeleted     bool         // when true, search includes deleted/moved docs
+	Sort               string       // "relevance" (default, score DESC) | "recent" (collected_at DESC)
+	UseHyDE            bool         // when true, expand query via HyDE before retrieval
+	Weights            SearchWeights // zero value uses defaults (k=60, equal weights)
 }

@@ -270,13 +270,16 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		args = append(args, query.ExcludeSourceTypes)
 	}
 
-	// RRF formula: 1 / (k + rank), k=60 is the standard constant.
+	// RRF formula: w / (k + rank), where w is the per-signal weight and k
+	// prevents very high scores for top-ranked results (standard k=60).
 	// Three CTEs (fts, vec, bigm) are merged via FULL OUTER JOIN. Each CTE shares
 	// the same statusFilter/sourceFilter/excludeFilter snippets; args are appended
 	// once and referenced by the same positional parameters in all three CTEs.
 	// bigm uses pg_bigm's gin_bigm_ops index via LIKE '%%' || $1 || '%%'.
-	// SQL '%%' in fmt.Sprintf produces a literal '%' in the final query string,
-	// which is what pg_bigm needs for a substring LIKE pattern.
+	// SQL '%%%%' in fmt.Sprintf produces a literal '%%' which pg_bigm needs.
+	// Weight parameters are injected as Go-formatted literals (not SQL params)
+	// because they are floats under our control, never from user input.
+	w := query.Weights.Defaults()
 	q := fmt.Sprintf(`
 		WITH fts AS (
 			SELECT id,
@@ -306,8 +309,8 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 			SELECT id,
 			       row_number() OVER () AS rank
 			FROM documents
-			WHERE (content LIKE '%%' || $1 || '%%'
-			    OR title   LIKE '%%' || $1 || '%%')
+			WHERE (content LIKE '%%%%' || $1 || '%%%%'
+			    OR title   LIKE '%%%%' || $1 || '%%%%')
 			%s
 			%s
 			%s
@@ -316,9 +319,9 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		rrf AS (
 			SELECT
 				COALESCE(fts.id, vec.id, bigm.id) AS id,
-				COALESCE(1.0/(60.0 + fts.rank),  0)
-				+ COALESCE(1.0/(60.0 + vec.rank),  0)
-				+ COALESCE(1.0/(60.0 + bigm.rank), 0) AS score
+				COALESCE(%g/(%g + fts.rank),  0)
+				+ COALESCE(%g/(%g + vec.rank),  0)
+				+ COALESCE(%g/(%g + bigm.rank), 0) AS score
 			FROM fts
 			FULL OUTER JOIN vec  ON fts.id = vec.id
 			FULL OUTER JOIN bigm ON COALESCE(fts.id, vec.id) = bigm.id
@@ -333,6 +336,9 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		statusFilter, sourceFilter, excludeFilter,
 		statusFilter, sourceFilter, excludeFilter,
 		statusFilter, sourceFilter, excludeFilter,
+		w.FTSWeight, w.RRFK,
+		w.VecWeight, w.RRFK,
+		w.BigmWeight, w.RRFK,
 		sortOrder(query.Sort))
 
 	rows, err := s.pg.pool.Query(ctx, q, args...)

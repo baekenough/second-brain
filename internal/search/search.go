@@ -32,8 +32,9 @@ type ChunkSearcher interface {
 type Service struct {
 	store      DocumentSearcher
 	embed      *EmbedClient
-	chunkStore ChunkSearcher  // nil when chunk FTS is not configured
-	llmClient  llm.Completer  // nil when HyDE is not configured
+	chunkStore ChunkSearcher     // nil when chunk FTS is not configured
+	llmClient  llm.Completer     // nil when HyDE is not configured
+	weights    model.SearchWeights // zero value uses defaults (k=60, equal weights)
 }
 
 // NewService returns a search Service.
@@ -64,6 +65,15 @@ func (s *Service) WithLLM(client llm.Completer) *Service {
 	return s
 }
 
+// WithWeights sets the RRF fusion weights applied to every search request
+// issued through this service. Zero fields fall back to defaults (k=60,
+// all signal weights = 1.0). Weights are applied per-request and do not
+// affect the store configuration directly.
+func (s *Service) WithWeights(w model.SearchWeights) *Service {
+	s.weights = w
+	return s
+}
+
 // Search executes a search for the given query. If an embedding client is
 // configured, the query text is embedded and the result is used for hybrid
 // (RRF) search; otherwise only full-text search is performed.
@@ -79,6 +89,13 @@ func (s *Service) WithLLM(client llm.Completer) *Service {
 func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.SearchResult, error) {
 	if q.Limit <= 0 {
 		q.Limit = 20
+	}
+
+	// Apply service-level weights when the caller has not set explicit weights.
+	// A zero-value Weights field means "use defaults", so we only overwrite
+	// when the service weights are non-zero (i.e. explicitly configured).
+	if q.Weights == (model.SearchWeights{}) {
+		q.Weights = s.weights
 	}
 
 	// HyDE query expansion: replace the effective query with the original
