@@ -90,7 +90,9 @@ func (s *Server) Handler() http.Handler {
 
 		r.Post("/api/v1/feedback", s.feedbackHandler)
 
-		r.Get("/api/v1/eval/export", s.evalExportHandler)
+			r.Handle("/api/v1/graphql", s.graphqlHandler())
+
+			r.Get("/api/v1/eval/export", s.evalExportHandler)
 	})
 
 	return r

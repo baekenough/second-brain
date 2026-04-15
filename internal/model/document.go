@@ -16,6 +16,7 @@ const (
 	SourceNotion     SourceType = "notion"
 	SourceFilesystem SourceType = "filesystem"
 	SourceDiscord    SourceType = "discord"
+	SourceTelegram   SourceType = "telegram"
 )
 
 // Document represents a piece of content collected from an external source.
