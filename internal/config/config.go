@@ -164,6 +164,18 @@ func Load() (*Config, error) {
 	}, nil
 }
 
+// LoadCollector reads configuration for the collector daemon.
+// It excludes server-only fields (PORT, API_KEY).
+func LoadCollector() (*Config, error) {
+	cfg, err := Load()
+	if err != nil {
+		return nil, err
+	}
+	cfg.Port = ""
+	cfg.APIKey = ""
+	return cfg, nil
+}
+
 func getenv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
