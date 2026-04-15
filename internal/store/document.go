@@ -193,6 +193,8 @@ func sortOrder(sort string) string {
 }
 
 // fulltextSearch uses PostgreSQL ts_rank against the pre-computed tsvector column.
+// pg_bigm LIKE matching is added as an OR condition so that Korean queries lacking
+// morphological tsvector coverage are still retrieved via 2-gram index.
 func (s *DocumentStore) fulltextSearch(ctx context.Context, query model.SearchQuery) ([]*model.SearchResult, error) {
 	args := []interface{}{query.Query, query.Limit}
 
@@ -213,6 +215,9 @@ func (s *DocumentStore) fulltextSearch(ctx context.Context, query model.SearchQu
 		args = append(args, query.ExcludeSourceTypes)
 	}
 
+	// The LIKE pattern uses SQL string concatenation ('%%' || $1 || '%%') so that
+	// pg_bigm's gin_bigm_ops index is used automatically without embedding literal
+	// percent signs in the Go format string (which would require '%%%%').
 	q := fmt.Sprintf(`
 		SELECT id, source_type, source_id, title, content, metadata, embedding,
 		       status, deleted_at, collected_at, created_at, updated_at,
@@ -222,7 +227,9 @@ func (s *DocumentStore) fulltextSearch(ctx context.Context, query model.SearchQu
 		       ) AS score
 		FROM documents
 		WHERE (tsv @@ plainto_tsquery('simple', $1)
-		   OR tsv @@ plainto_tsquery('english', $1))
+		   OR tsv @@ plainto_tsquery('english', $1)
+		   OR content LIKE '%%' || $1 || '%%'
+		   OR title   LIKE '%%' || $1 || '%%')
 		%s
 		%s
 		%s
@@ -264,9 +271,12 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 	}
 
 	// RRF formula: 1 / (k + rank), k=60 is the standard constant.
-	// Both fts and vec CTEs share the same statusFilter, sourceFilter, and
-	// excludeFilter snippets; each arg is appended once and referenced by the
-	// same positional parameter in both CTEs.
+	// Three CTEs (fts, vec, bigm) are merged via FULL OUTER JOIN. Each CTE shares
+	// the same statusFilter/sourceFilter/excludeFilter snippets; args are appended
+	// once and referenced by the same positional parameters in all three CTEs.
+	// bigm uses pg_bigm's gin_bigm_ops index via LIKE '%%' || $1 || '%%'.
+	// SQL '%%' in fmt.Sprintf produces a literal '%' in the final query string,
+	// which is what pg_bigm needs for a substring LIKE pattern.
 	q := fmt.Sprintf(`
 		WITH fts AS (
 			SELECT id,
@@ -292,12 +302,26 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 			%s
 			LIMIT $3
 		),
+		bigm AS (
+			SELECT id,
+			       row_number() OVER () AS rank
+			FROM documents
+			WHERE (content LIKE '%%' || $1 || '%%'
+			    OR title   LIKE '%%' || $1 || '%%')
+			%s
+			%s
+			%s
+			LIMIT $3
+		),
 		rrf AS (
 			SELECT
-				COALESCE(fts.id, vec.id) AS id,
-				COALESCE(1.0/(60.0 + fts.rank), 0) + COALESCE(1.0/(60.0 + vec.rank), 0) AS score
+				COALESCE(fts.id, vec.id, bigm.id) AS id,
+				COALESCE(1.0/(60.0 + fts.rank),  0)
+				+ COALESCE(1.0/(60.0 + vec.rank),  0)
+				+ COALESCE(1.0/(60.0 + bigm.rank), 0) AS score
 			FROM fts
-			FULL OUTER JOIN vec ON fts.id = vec.id
+			FULL OUTER JOIN vec  ON fts.id = vec.id
+			FULL OUTER JOIN bigm ON COALESCE(fts.id, vec.id) = bigm.id
 		)
 		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
 		       d.embedding, d.status, d.deleted_at, d.collected_at, d.created_at, d.updated_at,
@@ -306,6 +330,7 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		JOIN documents d ON d.id = rrf.id
 		ORDER BY %s
 		LIMIT $3`,
+		statusFilter, sourceFilter, excludeFilter,
 		statusFilter, sourceFilter, excludeFilter,
 		statusFilter, sourceFilter, excludeFilter,
 		sortOrder(query.Sort))
