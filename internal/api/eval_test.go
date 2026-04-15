@@ -50,7 +50,7 @@ func (s *stubEvalExporter) ExportJSONL(_ context.Context, w io.Writer) (int, err
 // newEvalTestServer creates a Server wired with the given stub EvalExporter.
 // All other dependencies are nil — the eval handler does not use them.
 func newEvalTestServer(eval EvalExporter) *Server {
-	return NewServer(nil, nil, nil, nil, eval, "", "test-key")
+	return NewServer(nil, nil, nil, eval, nil, "", "test-key")
 }
 
 // doEvalExport sends a GET /api/v1/eval/export request through the full chi router.

@@ -28,7 +28,7 @@ func (s *stubFeedbackRecorder) Record(_ context.Context, _ store.Feedback) (int6
 // newFeedbackTestServer creates a Server wired with the given stub FeedbackRecorder.
 // DocumentStore and EvalExporter are nil — feedback handler does not use them.
 func newFeedbackTestServer(fb FeedbackRecorder) *Server {
-	return NewServer(nil, nil, nil, fb, nil, "", "test-key")
+	return NewServer(nil, nil, fb, nil, nil, "", "test-key")
 }
 
 // doFeedbackPost sends a POST /api/v1/feedback request through the full chi router.
