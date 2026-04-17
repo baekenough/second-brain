@@ -63,6 +63,9 @@ type Config struct {
 	RerankAPIKey string // RERANKER_API_KEY — Bearer token for the reranker API
 	RerankModel  string // RERANKER_MODEL — model identifier sent in the request body
 
+	// Alerting (optional — Slack/Discord webhook for eval regression alerts)
+	AlertWebhookURL string // ALERT_WEBHOOK_URL — Slack-compatible incoming webhook URL
+
 	// API authentication (optional — disabled when empty, for dev backward compat)
 	APIKey string // API_KEY — Bearer token required for /api/v1/* routes
 
@@ -181,6 +184,8 @@ func Load() (*Config, error) {
 		RerankURL:    os.Getenv("RERANKER_URL"),
 		RerankAPIKey: os.Getenv("RERANKER_API_KEY"),
 		RerankModel:  getenv("RERANKER_MODEL", "jina-reranker-v2-base-multilingual"),
+
+		AlertWebhookURL: os.Getenv("ALERT_WEBHOOK_URL"),
 
 		APIKey: os.Getenv("API_KEY"),
 

@@ -17,6 +17,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -312,6 +313,7 @@ func sendWebhookAlert(webhookURL string, out evalOutput) {
 		return
 	}
 	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode >= 400 {
 		slog.Warn("eval: webhook: alert returned non-2xx status", "status", resp.StatusCode)
