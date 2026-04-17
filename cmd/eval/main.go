@@ -7,11 +7,13 @@
 //
 //	0 — success (metrics within acceptable bounds, or no baseline exists yet)
 //	1 — regression detected (any metric dropped more than 5% relative to baseline)
+//	2 — reindex recommended (--check-reindex flag set and thresholds breached)
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -40,10 +42,11 @@ func main() {
 
 // evalOutput is the JSON report written to stdout.
 type evalOutput struct {
-	Current    metricsSnapshot    `json:"current"`
-	Baseline   *metricsSnapshot   `json:"baseline"`
-	Regression bool               `json:"regression"`
-	Deltas     map[string]float64 `json:"deltas,omitempty"`
+	Current    metricsSnapshot              `json:"current"`
+	Baseline   *metricsSnapshot             `json:"baseline"`
+	Regression bool                         `json:"regression"`
+	Deltas     map[string]float64           `json:"deltas,omitempty"`
+	Reindex    *search.ReindexRecommendation `json:"reindex,omitempty"` // populated when --check-reindex is set
 }
 
 type metricsSnapshot struct {
@@ -54,6 +57,12 @@ type metricsSnapshot struct {
 }
 
 func run() error {
+	// Parse flags before doing any work so that --help works cleanly.
+	checkReindex := flag.Bool("check-reindex", false,
+		"evaluate reindex thresholds after computing eval metrics and include "+
+			"the recommendation in the JSON output (exit code 2 when reindex is recommended)")
+	flag.Parse()
+
 	// Load .env file if present (ignore error — env vars may be set directly).
 	_ = godotenv.Load()
 
@@ -193,6 +202,35 @@ func run() error {
 		out.Deltas, out.Regression = computeDeltas(current, base)
 	}
 
+	// --- Optional: reindex threshold check ---
+	if *checkReindex {
+		stateStore := store.NewReindexStateStore(pg)
+		checker := search.NewReindexChecker(
+			search.DefaultReindexConfig(),
+			metricsStore,
+			docStore,
+			stateStore,
+		)
+
+		var rec search.ReindexRecommendation
+		var recErr error
+		if baseline != nil && out.Baseline != nil {
+			// Use CheckWithBaseline to also evaluate eval regression.
+			rec, recErr = checker.CheckWithBaseline(ctx,
+				current.NDCG5, out.Baseline.NDCG5,
+				current.NDCG10, out.Baseline.NDCG10,
+				current.MRR10, out.Baseline.MRR10,
+			)
+		} else {
+			rec, recErr = checker.Check(ctx)
+		}
+		if recErr != nil {
+			slog.Warn("reindex check failed", "error", recErr)
+		} else {
+			out.Reindex = &rec
+		}
+	}
+
 	// --- Write JSON report to stdout ---
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
@@ -203,6 +241,11 @@ func run() error {
 	if out.Regression {
 		slog.Error("eval: regression detected", "deltas", out.Deltas)
 		os.Exit(1)
+	}
+
+	if out.Reindex != nil && out.Reindex.ShouldReindex {
+		slog.Warn("eval: reindex recommended", "reasons", out.Reindex.Reasons)
+		os.Exit(2)
 	}
 
 	slog.Info("eval: completed successfully")
