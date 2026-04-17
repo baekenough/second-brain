@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
@@ -85,6 +86,11 @@ func run() error {
 		"evaluate reindex thresholds after computing eval metrics and include "+
 			"the recommendation in the JSON output (exit code 2 when reindex is recommended)")
 	flag.Parse()
+
+	// wg tracks any background goroutines (e.g. webhook alert) so that deferred
+	// cleanup waits for them before run() returns and os.Exit may be called.
+	var wg sync.WaitGroup
+	defer wg.Wait()
 
 	// Load .env file if present (ignore error — env vars may be set directly).
 	_ = godotenv.Load()
@@ -264,9 +270,16 @@ func run() error {
 		if baseline != nil && out.Baseline != nil {
 			// Use CheckWithBaseline to also evaluate eval regression.
 			rec, recErr = checker.CheckWithBaseline(ctx,
-				current.NDCG5, out.Baseline.NDCG5,
-				current.NDCG10, out.Baseline.NDCG10,
-				current.MRR10, out.Baseline.MRR10,
+				search.EvalSnapshot{
+					NDCG5:  current.NDCG5,
+					NDCG10: current.NDCG10,
+					MRR10:  current.MRR10,
+				},
+				search.EvalSnapshot{
+					NDCG5:  out.Baseline.NDCG5,
+					NDCG10: out.Baseline.NDCG10,
+					MRR10:  out.Baseline.MRR10,
+				},
 			)
 		} else {
 			rec, recErr = checker.Check(ctx)
@@ -287,8 +300,14 @@ func run() error {
 
 	// --- Webhook alert (non-blocking) ---
 	// Send an alert when a regression is detected and a webhook URL is configured.
+	// Runs in a goroutine so it does not block the eval exit path; wg.Wait() in the
+	// deferred call above ensures the goroutine finishes before os.Exit is called.
 	if out.Regression && cfg.AlertWebhookURL != "" {
-		sendWebhookAlert(cfg.AlertWebhookURL, out)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sendWebhookAlert(cfg.AlertWebhookURL, out)
+		}()
 	}
 
 	// --- Determine exit condition ---

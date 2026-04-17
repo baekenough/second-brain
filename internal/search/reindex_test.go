@@ -169,9 +169,8 @@ func TestReindexChecker_EvalRegression_Recommends(t *testing.T) {
 	// Simulate a 10% regression on ndcg5 (0.8 → 0.72, drop = 10% > 5% threshold)
 	rec, err := checker.CheckWithBaseline(
 		context.Background(),
-		0.72, 0.80, // ndcg5: current, baseline
-		0.80, 0.80, // ndcg10: no change
-		0.75, 0.75, // mrr10: no change
+		EvalSnapshot{NDCG5: 0.72, NDCG10: 0.80, MRR10: 0.75},
+		EvalSnapshot{NDCG5: 0.80, NDCG10: 0.80, MRR10: 0.75},
 	)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -194,9 +193,8 @@ func TestReindexChecker_NoRegressionBelowThreshold(t *testing.T) {
 	// 3% drop — below the 5% regression threshold
 	rec, err := checker.CheckWithBaseline(
 		context.Background(),
-		0.776, 0.80, // ndcg5: 3% drop
-		0.80, 0.80,  // ndcg10: no change
-		0.75, 0.75,  // mrr10: no change
+		EvalSnapshot{NDCG5: 0.776, NDCG10: 0.80, MRR10: 0.75},
+		EvalSnapshot{NDCG5: 0.80, NDCG10: 0.80, MRR10: 0.75},
 	)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -226,9 +224,8 @@ func TestReindexChecker_MultipleReasons(t *testing.T) {
 	// Also add eval regression
 	rec, err := checker.CheckWithBaseline(
 		context.Background(),
-		0.70, 0.80, // ndcg5: 12.5% drop
-		0.80, 0.80,
-		0.75, 0.75,
+		EvalSnapshot{NDCG5: 0.70, NDCG10: 0.80, MRR10: 0.75},
+		EvalSnapshot{NDCG5: 0.80, NDCG10: 0.80, MRR10: 0.75},
 	)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -293,21 +290,25 @@ func TestEvalRegressionReason(t *testing.T) {
 	cases := []struct {
 		name      string
 		threshold float64
-		cur, base float64 // ndcg5 only for simplicity; others pass same values
+		cur, base float64 // ndcg5 only for simplicity; ndcg10 and mrr10 are held constant
 		wantEmpty bool
 	}{
 		{"no regression", 0.05, 0.80, 0.80, true},
-		{"below threshold", 0.05, 0.776, 0.80, true},   // 3% drop
-		{"at threshold exactly", 0.05, 0.76, 0.80, false}, // 5% drop — triggers
-		{"above threshold", 0.05, 0.70, 0.80, false},    // 12.5% drop
-		{"zero baseline skipped", 0.05, 0.0, 0.0, true}, // no valid denominator
+		{"below threshold", 0.05, 0.776, 0.80, true},      // 3% drop
+		{"at threshold exactly", 0.05, 0.76, 0.80, false},  // 5% drop — triggers
+		{"above threshold", 0.05, 0.70, 0.80, false},       // 12.5% drop
+		{"zero baseline skipped", 0.05, 0.0, 0.0, true},    // no valid denominator
 	}
 
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			reason := evalRegressionReason(tc.threshold, tc.cur, tc.base, tc.base, tc.base, tc.base, tc.base)
+			reason := evalRegressionReason(
+				tc.threshold,
+				EvalSnapshot{NDCG5: tc.cur, NDCG10: tc.base, MRR10: tc.base},
+				EvalSnapshot{NDCG5: tc.base, NDCG10: tc.base, MRR10: tc.base},
+			)
 			if tc.wantEmpty && reason != "" {
 				t.Errorf("expected empty reason, got %q", reason)
 			}
