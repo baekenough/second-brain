@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 
 	"github.com/baekenough/second-brain/internal/store"
@@ -54,6 +55,8 @@ func (s *Server) WithReindexState(rs ReindexStateRecorder) *Server {
 //
 //	{"status": "reindex_recorded", "doc_count": N, "reason": "..."}
 func (s *Server) reindexHandler(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+
 	if s.reindexState == nil {
 		writeError(w, http.StatusServiceUnavailable, "reindex not configured")
 		return
@@ -71,7 +74,8 @@ func (s *Server) reindexHandler(w http.ResponseWriter, r *http.Request) {
 	// Get current document count.
 	counts, err := s.docs.CountBySource(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		slog.Error("reindex: count failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to query document count")
 		return
 	}
 	total := 0
@@ -85,7 +89,8 @@ func (s *Server) reindexHandler(w http.ResponseWriter, r *http.Request) {
 		TriggerReason:     req.Reason,
 	}
 	if err := s.reindexState.Save(r.Context(), state); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		slog.Error("reindex: save failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to record reindex state")
 		return
 	}
 

@@ -236,7 +236,7 @@ func evalRegressionReason(
 			continue
 		}
 		drop := (ch.baseline - ch.cur) / ch.baseline
-		if drop > threshold {
+		if drop >= threshold {
 			return fmt.Sprintf("eval regression detected: %s dropped %.1f%% (threshold: %.1f%%)",
 				ch.name, drop*100, threshold*100)
 		}
