@@ -195,6 +195,16 @@ func TestAggregate_Empty(t *testing.T) {
 	}
 }
 
+func TestAggregate_LengthMismatch(t *testing.T) {
+	t.Parallel()
+	results := [][]string{{"a"}, {"b"}}
+	relevant := []map[string]bool{{"a": true}} // length 1 vs 2
+	m := search.Aggregate(results, relevant)
+	if m.Pairs != 0 {
+		t.Fatalf("mismatched input: want zero metrics, got %+v", m)
+	}
+}
+
 func TestAggregate_SinglePerfect(t *testing.T) {
 	t.Parallel()
 

@@ -1,6 +1,7 @@
 package model
 
 import (
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -51,18 +52,18 @@ type SearchWeights struct {
 	RRFK       float64 `json:"rrf_k"`
 }
 
-// Defaults returns a copy with zero fields replaced by defaults.
+// Defaults returns a copy with zero, NaN, or Inf fields replaced by defaults.
 func (w SearchWeights) Defaults() SearchWeights {
-	if w.RRFK == 0 {
+	if w.RRFK == 0 || math.IsNaN(w.RRFK) || math.IsInf(w.RRFK, 0) {
 		w.RRFK = 60.0
 	}
-	if w.FTSWeight == 0 {
+	if w.FTSWeight == 0 || math.IsNaN(w.FTSWeight) || math.IsInf(w.FTSWeight, 0) {
 		w.FTSWeight = 1.0
 	}
-	if w.VecWeight == 0 {
+	if w.VecWeight == 0 || math.IsNaN(w.VecWeight) || math.IsInf(w.VecWeight, 0) {
 		w.VecWeight = 1.0
 	}
-	if w.BigmWeight == 0 {
+	if w.BigmWeight == 0 || math.IsNaN(w.BigmWeight) || math.IsInf(w.BigmWeight, 0) {
 		w.BigmWeight = 1.0
 	}
 	return w
