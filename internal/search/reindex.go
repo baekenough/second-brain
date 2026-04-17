@@ -52,6 +52,13 @@ type ReindexStateProvider interface {
 	Latest(ctx context.Context) (*store.ReindexState, error)
 }
 
+// EvalSnapshot holds a point-in-time snapshot of eval metrics for comparison.
+type EvalSnapshot struct {
+	NDCG5  float64
+	NDCG10 float64
+	MRR10  float64
+}
+
 // ReindexRecommendation is the output of the threshold check.
 // ShouldReindex is true when at least one threshold has been breached.
 // Reasons lists a human-readable description for each breached threshold.
@@ -134,13 +141,15 @@ func (c *ReindexChecker) Check(ctx context.Context) (ReindexRecommendation, erro
 			formatDocGrowthReason(delta, c.config.NewDocThreshold))
 	}
 
-	// --- Check 4: Eval regression ---
-	latest, err := c.evalMetrics.Latest(ctx)
-	if err != nil {
-		return ReindexRecommendation{}, err
-	}
-	if regressionReason := c.checkEvalRegression(ctx, latest); regressionReason != "" {
-		reasons = append(reasons, regressionReason)
+	// --- Check 4: Eval regression (skipped when provider is nil or stub) ---
+	if c.evalMetrics != nil {
+		latest, err := c.evalMetrics.Latest(ctx)
+		if err != nil {
+			return ReindexRecommendation{}, err
+		}
+		if regressionReason := c.checkEvalRegression(ctx, latest); regressionReason != "" {
+			reasons = append(reasons, regressionReason)
+		}
 	}
 
 	return ReindexRecommendation{
@@ -172,9 +181,7 @@ func (c *ReindexChecker) checkEvalRegression(ctx context.Context, latest *store.
 // This is the typical path used by cmd/eval.
 func (c *ReindexChecker) CheckWithBaseline(
 	ctx context.Context,
-	currentNDCG5, baselineNDCG5 float64,
-	currentNDCG10, baselineNDCG10 float64,
-	currentMRR10, baselineMRR10 float64,
+	current, baseline EvalSnapshot,
 ) (ReindexRecommendation, error) {
 	rec, err := c.Check(ctx)
 	if err != nil {
@@ -182,12 +189,7 @@ func (c *ReindexChecker) CheckWithBaseline(
 	}
 
 	// Append regression reason if any metric drops by more than the threshold.
-	if reason := evalRegressionReason(
-		c.config.EvalRegressionThreshold,
-		currentNDCG5, baselineNDCG5,
-		currentNDCG10, baselineNDCG10,
-		currentMRR10, baselineMRR10,
-	); reason != "" {
+	if reason := evalRegressionReason(c.config.EvalRegressionThreshold, current, baseline); reason != "" {
 		rec.Reasons = append(rec.Reasons, reason)
 		rec.ShouldReindex = true
 	}
@@ -216,26 +218,21 @@ func formatDocGrowthReason(delta, threshold int) string {
 
 // evalRegressionReason checks whether any eval metric dropped by more than
 // threshold relative to its baseline. Returns "" when no regression is detected.
-func evalRegressionReason(
-	threshold float64,
-	curNDCG5, baseNDCG5 float64,
-	curNDCG10, baseNDCG10 float64,
-	curMRR10, baseMRR10 float64,
-) string {
+func evalRegressionReason(threshold float64, current, baseline EvalSnapshot) string {
 	type check struct {
 		name          string
-		cur, baseline float64
+		cur, base float64
 	}
 	checks := []check{
-		{"ndcg5", curNDCG5, baseNDCG5},
-		{"ndcg10", curNDCG10, baseNDCG10},
-		{"mrr10", curMRR10, baseMRR10},
+		{"ndcg5", current.NDCG5, baseline.NDCG5},
+		{"ndcg10", current.NDCG10, baseline.NDCG10},
+		{"mrr10", current.MRR10, baseline.MRR10},
 	}
 	for _, ch := range checks {
-		if ch.baseline == 0 {
+		if ch.base == 0 {
 			continue
 		}
-		drop := (ch.baseline - ch.cur) / ch.baseline
+		drop := (ch.base - ch.cur) / ch.base
 		if drop >= threshold {
 			return fmt.Sprintf("eval regression detected: %s dropped %.1f%% (threshold: %.1f%%)",
 				ch.name, drop*100, threshold*100)
