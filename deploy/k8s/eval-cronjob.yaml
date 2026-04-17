@@ -27,7 +27,7 @@ spec:
               command: ['sh', '-c', 'until nc -z postgres 5432; do echo "waiting for postgres"; sleep 2; done']
           containers:
             - name: eval-runner
-              image: second-brain:latest
+              image: second-brain:dev
               imagePullPolicy: IfNotPresent
               command: ["/app/eval"]
               env:

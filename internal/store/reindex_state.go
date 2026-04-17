@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -50,7 +51,7 @@ func (s *ReindexStateStore) Latest(ctx context.Context) (*ReindexState, error) {
 		 LIMIT 1`,
 	).Scan(&st.ID, &st.LastReindexAt, &st.DocCountAtReindex, &st.TriggerReason)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("reindex state: latest: %w", err)

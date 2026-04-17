@@ -11,16 +11,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"syscall"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/baekenough/second-brain/internal/config"
@@ -29,14 +33,31 @@ import (
 	"github.com/baekenough/second-brain/internal/store"
 )
 
+// errRegression is returned by run() when a metric regression is detected.
+// main() maps this to os.Exit(1) so that deferred cleanup runs normally.
+var errRegression = errors.New("regression detected")
+
+// errReindexRecommended is returned by run() when a reindex is recommended.
+// main() maps this to os.Exit(2).
+var errReindexRecommended = errors.New("reindex recommended")
+
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})))
 
 	if err := run(); err != nil {
-		slog.Error("eval failed", "error", err)
-		os.Exit(1)
+		switch {
+		case errors.Is(err, errRegression):
+			// Regression already logged inside run(); exit with code 1.
+			os.Exit(1)
+		case errors.Is(err, errReindexRecommended):
+			// Reindex recommendation already logged inside run(); exit with code 2.
+			os.Exit(2)
+		default:
+			slog.Error("eval failed", "error", err)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -238,18 +259,63 @@ func run() error {
 		return fmt.Errorf("encode output: %w", err)
 	}
 
+	// --- Webhook alert (non-blocking) ---
+	// Send an alert when a regression is detected and a webhook URL is configured.
+	if out.Regression && cfg.AlertWebhookURL != "" {
+		sendWebhookAlert(cfg.AlertWebhookURL, out)
+	}
+
+	// --- Determine exit condition ---
+	// Check reindex recommendation and regression AFTER all output is written and
+	// all deferred cleanup (pg.Close, cancel) can run via normal return paths.
 	if out.Regression {
 		slog.Error("eval: regression detected", "deltas", out.Deltas)
-		os.Exit(1)
+		return errRegression
 	}
 
 	if out.Reindex != nil && out.Reindex.ShouldReindex {
 		slog.Warn("eval: reindex recommended", "reasons", out.Reindex.Reasons)
-		os.Exit(2)
+		return errReindexRecommended
 	}
 
 	slog.Info("eval: completed successfully")
 	return nil
+}
+
+// webhookPayload is a Slack-compatible incoming webhook message.
+type webhookPayload struct {
+	Text string `json:"text"`
+}
+
+// sendWebhookAlert POSTs a Slack-compatible alert to webhookURL.
+// It is non-blocking: failures are logged but do not affect the eval exit code.
+func sendWebhookAlert(webhookURL string, out evalOutput) {
+	text := fmt.Sprintf(
+		":warning: *Eval regression detected*\n"+
+			"NDCG@5: %.4f (Δ %.4f) | NDCG@10: %.4f (Δ %.4f) | MRR@10: %.4f (Δ %.4f)",
+		out.Current.NDCG5, out.Deltas["ndcg5"],
+		out.Current.NDCG10, out.Deltas["ndcg10"],
+		out.Current.MRR10, out.Deltas["mrr10"],
+	)
+
+	payload := webhookPayload{Text: text}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		slog.Warn("eval: webhook: failed to marshal payload", "error", err)
+		return
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(webhookURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		slog.Warn("eval: webhook: failed to send alert", "error", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		slog.Warn("eval: webhook: alert returned non-2xx status", "status", resp.StatusCode)
+	}
 }
 
 // regressionThreshold is the maximum allowed relative metric drop (5%).
@@ -279,7 +345,7 @@ func computeDeltas(current, baseline metricsSnapshot) (map[string]float64, bool)
 			continue
 		}
 		relativeDrop := (p.base - p.cur) / p.base
-		if relativeDrop > regressionThreshold {
+		if relativeDrop >= regressionThreshold {
 			regression = true
 			break
 		}
