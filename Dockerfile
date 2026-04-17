@@ -89,6 +89,21 @@ RUN GOTOOLCHAIN=auto CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
       ./cmd/collector
 
 # -----------------------------------------------------------------------------
+# Stage 3c — Build eval binary
+# -----------------------------------------------------------------------------
+FROM builder AS build-eval
+
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
+RUN GOTOOLCHAIN=auto CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build \
+      -trimpath \
+      -ldflags="-s -w" \
+      -o /out/eval \
+      ./cmd/eval
+
+# -----------------------------------------------------------------------------
 # Stage 4 — Runtime base
 # -----------------------------------------------------------------------------
 # alpine:3.21 is chosen over distroless because:
@@ -204,3 +219,15 @@ USER appuser:appgroup
 VOLUME ["/data/drive"]
 
 ENTRYPOINT ["/app/collector"]
+
+# -----------------------------------------------------------------------------
+# Target: eval — Eval runner (no port, no healthcheck)
+# -----------------------------------------------------------------------------
+FROM runtime-base AS eval
+
+COPY --from=build-eval /out/eval /app/eval
+COPY --from=build-eval /workspace/migrations /app/migrations
+
+USER appuser:appgroup
+
+ENTRYPOINT ["/app/eval"]
