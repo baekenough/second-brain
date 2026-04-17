@@ -37,11 +37,15 @@ type Server struct {
 	filesystemPath string // root directory for filesystem source documents
 	apiKey         string // Bearer token for /api/v1/* routes; empty means disabled
 
+	// reindexState is optional. When non-nil, the /api/v1/reindex route is
+	// registered. Set via WithReindexState before calling Handler().
+	reindexState ReindexStateRecorder
+
 	// handlerOnce ensures buildHandler is called exactly once per Server so
 	// that the graphql-go schema (and its package-level type objects) are
 	// constructed a single time regardless of how many goroutines call Handler.
-	handlerOnce    sync.Once
-	cachedHandler  http.Handler
+	handlerOnce   sync.Once
+	cachedHandler http.Handler
 }
 
 // NewServer creates a Server with the provided dependencies.
@@ -111,6 +115,10 @@ func (s *Server) buildHandler() http.Handler {
 		r.Handle("/api/v1/graphql", s.graphqlHandler())
 
 		r.Get("/api/v1/eval/export", s.evalExportHandler)
+
+		if s.reindexState != nil {
+			r.Post("/api/v1/reindex", s.reindexHandler)
+		}
 	})
 
 	return r
