@@ -12,3 +12,4 @@ resources:
   - second-brain-service.yaml
   - second-brain-web-deployment.yaml
   - second-brain-web-service.yaml
+  - eval-cronjob.yaml
