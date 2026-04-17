@@ -78,6 +78,9 @@ func Aggregate(results [][]string, relevant []map[string]bool) EvalMetrics {
 	if n == 0 {
 		return EvalMetrics{}
 	}
+	if len(results) != len(relevant) {
+		return EvalMetrics{}
+	}
 
 	var ndcg5, ndcg10, mrr10 float64
 	for i := 0; i < n; i++ {
