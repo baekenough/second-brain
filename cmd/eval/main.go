@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+	"golang.org/x/sync/errgroup"
 	"github.com/baekenough/second-brain/internal/config"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/search"
@@ -148,35 +149,59 @@ func run() error {
 		return fmt.Errorf("load baseline metrics: %w", err)
 	}
 
-	// --- Run search for each pair ---
-	results := make([][]string, 0, len(pairs))
-	relevantSets := make([]map[string]bool, 0, len(pairs))
+	// --- Run search for each pair (bounded parallel) ---
+	type evalResult struct {
+		docIDs   []string
+		relevant map[string]bool
+	}
+
+	resultsCh := make(chan evalResult, len(pairs))
+
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(10) // max 10 concurrent searches
 
 	for _, pair := range pairs {
-		q := model.SearchQuery{
-			Query: pair.Query,
-			Limit: 10, // evaluate top-10
-		}
+		pair := pair // capture loop variable
+		g.Go(func() error {
+			q := model.SearchQuery{
+				Query: pair.Query,
+				Limit: 10, // evaluate top-10
+			}
 
-		searchResults, err := searchSvc.Search(ctx, q)
-		if err != nil {
-			// Non-fatal: log and skip the pair rather than aborting the whole run.
-			slog.Warn("eval: search failed for pair", "query", pair.Query, "error", err)
-			continue
-		}
+			searchResults, err := searchSvc.Search(gCtx, q)
+			if err != nil {
+				// Non-fatal: log and skip the pair rather than aborting the whole run.
+				slog.Warn("eval: search failed for pair", "query", pair.Query, "error", err)
+				return nil
+			}
 
-		docIDs := make([]string, 0, len(searchResults))
-		for _, r := range searchResults {
-			docIDs = append(docIDs, r.ID.String())
-		}
+			docIDs := make([]string, 0, len(searchResults))
+			for _, r := range searchResults {
+				docIDs = append(docIDs, r.ID.String())
+			}
 
-		relevant := make(map[string]bool, len(pair.RelevantDocIDs))
-		for _, id := range pair.RelevantDocIDs {
-			relevant[id] = true
-		}
+			relevant := make(map[string]bool, len(pair.RelevantDocIDs))
+			for _, id := range pair.RelevantDocIDs {
+				relevant[id] = true
+			}
 
-		results = append(results, docIDs)
-		relevantSets = append(relevantSets, relevant)
+			resultsCh <- evalResult{docIDs: docIDs, relevant: relevant}
+			return nil
+		})
+	}
+
+	// Close the channel once all goroutines finish.
+	go func() {
+		_ = g.Wait()
+		close(resultsCh)
+	}()
+
+	// Collect results from the channel.
+	results := make([][]string, 0, len(pairs))
+	relevantSets := make([]map[string]bool, 0, len(pairs))
+	for r := range resultsCh {
+		results = append(results, r.docIDs)
+		relevantSets = append(relevantSets, r.relevant)
 	}
 
 	if len(results) == 0 {
