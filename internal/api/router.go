@@ -41,6 +41,14 @@ type Server struct {
 	// registered. Set via WithReindexState before calling Handler().
 	reindexState ReindexStateRecorder
 
+	// evalMetrics is optional. When non-nil, the GET /api/v1/eval/metrics route
+	// is registered. Set via WithEvalMetrics before calling Handler().
+	evalMetrics EvalMetricsLister
+
+	// reindexCheck is optional. When non-nil, the GET /api/v1/reindex/check route
+	// is registered. Set via WithReindexCheck before calling Handler().
+	reindexCheck ReindexRecommender
+
 	// handlerOnce ensures buildHandler is called exactly once per Server so
 	// that the graphql-go schema (and its package-level type objects) are
 	// constructed a single time regardless of how many goroutines call Handler.
@@ -116,6 +124,12 @@ func (s *Server) buildHandler() http.Handler {
 
 		r.Get("/api/v1/eval/export", s.evalExportHandler)
 
+		if s.evalMetrics != nil {
+			r.Get("/api/v1/eval/metrics", s.evalMetricsHandler)
+		}
+		if s.reindexCheck != nil {
+			r.Get("/api/v1/reindex/check", s.reindexCheckHandler)
+		}
 		if s.reindexState != nil {
 			r.Post("/api/v1/reindex", s.reindexHandler)
 		}

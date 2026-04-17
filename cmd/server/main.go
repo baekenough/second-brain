@@ -57,9 +57,11 @@ func run() error {
 	}
 
 	docStore := store.NewDocumentStore(pg)
-	chunkStore := store.NewChunkStore(pg)       // issue #9: chunk-based FTS
-	feedbackStore := store.NewFeedbackStore(pg) // issue #17: user feedback
-	evalStore := store.NewEvalStore(pg)         // issue #18: eval set export
+	chunkStore := store.NewChunkStore(pg)           // issue #9: chunk-based FTS
+	feedbackStore := store.NewFeedbackStore(pg)     // issue #17: user feedback
+	evalStore := store.NewEvalStore(pg)             // issue #18: eval set export
+	metricsStore := store.NewEvalMetricsStore(pg)   // issue #19: eval metrics history
+	reindexStateStore := store.NewReindexStateStore(pg) // issue #20: reindex state tracking
 
 	// --- Embedding client ---
 	embedClient := search.NewEmbedClient(cfg.EmbeddingAPIURL, cfg.EmbeddingAPIKey, cfg.CliProxyAuthFile, cfg.EmbeddingModel)
@@ -97,7 +99,15 @@ func run() error {
 	}
 
 	// --- HTTP server ---
-	srv := api.NewServer(docStore, searchSvc, feedbackStore, evalStore, llmClient, cfg.FilesystemPath, cfg.APIKey)
+	srv := api.NewServer(docStore, searchSvc, feedbackStore, evalStore, llmClient, cfg.FilesystemPath, cfg.APIKey).
+		WithReindexState(reindexStateStore).
+		WithEvalMetrics(metricsStore).
+		WithReindexCheck(search.NewReindexChecker(
+			search.DefaultReindexConfig(),
+			metricsStore,
+			docStore,
+			reindexStateStore,
+		))
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      srv.Handler(),
