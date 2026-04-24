@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: second-brain-collector
+  namespace: second-brain
+  labels:
+    app: second-brain-collector
+spec:
+  replicas: 1
+  strategy:
+    # Filesystem collector maintains no in-memory state that must be drained,
+    # and uses a single-writer pattern against Postgres. Recreate is safer
+    # than rolling update (avoids two collectors racing on the same doc set).
+    type: Recreate
+  selector:
+    matchLabels:
+      app: second-brain-collector
+  template:
+    metadata:
+      labels:
+        app: second-brain-collector
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z postgres 5432; do echo "waiting for postgres"; sleep 2; done']
+      containers:
+        - name: collector
+          image: second-brain-collector:dev
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: second-brain-config
+            - secretRef:
+                name: second-brain-secret
+          # Bind individual ubuntu1 host directories under /data/drive/<source>/<subdir>.
+          # Root-level auth token files (auth.json, oauth_creds.json,
+          # google_accounts.json) are deliberately outside every mount path —
+          # they cannot reach the container by construction.
+          volumeMounts:
+            - { name: host-workspace,      mountPath: /data/drive/workspace,         readOnly: true }
+            - { name: host-claude-skills,  mountPath: /data/drive/claude/skills,     readOnly: true }
+            - { name: host-codex-sessions, mountPath: /data/drive/codex/sessions,    readOnly: true }
+            - { name: host-codex-memories, mountPath: /data/drive/codex/memories,    readOnly: true }
+            - { name: host-codex-skills,   mountPath: /data/drive/codex/skills,      readOnly: true }
+            - { name: host-codex-plugins,  mountPath: /data/drive/codex/plugins,     readOnly: true }
+            - { name: host-gemini-history, mountPath: /data/drive/gemini/history,    readOnly: true }
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+      volumes:
+        - name: host-workspace
+          hostPath:
+            path: /home/baekenough/workspace
+            type: DirectoryOrCreate
+        - name: host-claude-skills
+          hostPath:
+            path: /home/baekenough/.claude/skills
+            type: DirectoryOrCreate
+        - name: host-codex-sessions
+          hostPath:
+            path: /home/baekenough/.codex/sessions
+            type: DirectoryOrCreate
+        - name: host-codex-memories
+          hostPath:
+            path: /home/baekenough/.codex/memories
+            type: DirectoryOrCreate
+        - name: host-codex-skills
+          hostPath:
+            path: /home/baekenough/.codex/skills
+            type: DirectoryOrCreate
+        - name: host-codex-plugins
+          hostPath:
+            path: /home/baekenough/.codex/plugins
+            type: DirectoryOrCreate
+        - name: host-gemini-history
+          hostPath:
+            path: /home/baekenough/.gemini/history
+            type: DirectoryOrCreate

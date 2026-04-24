@@ -70,11 +70,18 @@ type Config struct {
 	APIKey string // API_KEY — Bearer token required for /api/v1/* routes
 
 	// Filesystem (optional)
-	FilesystemPath    string // FILESYSTEM_PATH — directory to scan
-	FilesystemEnabled bool   // FILESYSTEM_ENABLED — default false
+	FilesystemPath         string   // FILESYSTEM_PATH — directory to scan
+	FilesystemEnabled      bool     // FILESYSTEM_ENABLED — default false
+	FilesystemExcludeDirs  []string // FILESYSTEM_EXCLUDE_DIRS — comma-separated dir names to skip (merged with built-in defaults)
+	FilesystemExcludeExts  []string // FILESYSTEM_EXCLUDE_EXTS — comma-separated file extensions to skip (merged with built-in defaults)
 
 	// Scheduler
 	CollectInterval time.Duration
+
+	// CollectorInstance is the per-host identifier used to key the
+	// collector_state watermark table. Defaults to os.Hostname() (or
+	// "default" when that fails) when COLLECTOR_INSTANCE is unset.
+	CollectorInstance string
 }
 
 // Load reads configuration from environment variables and returns a Config.
@@ -139,6 +146,15 @@ func Load() (*Config, error) {
 		}
 	}
 
+	collectorInstance := os.Getenv("COLLECTOR_INSTANCE")
+	if collectorInstance == "" {
+		if hn, err := os.Hostname(); err == nil && hn != "" {
+			collectorInstance = hn
+		} else {
+			collectorInstance = "default"
+		}
+	}
+
 	llmTemperature := 0.3
 	if v := os.Getenv("LLM_TEMPERATURE"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
@@ -189,10 +205,13 @@ func Load() (*Config, error) {
 
 		APIKey: os.Getenv("API_KEY"),
 
-		FilesystemPath:    os.Getenv("FILESYSTEM_PATH"),
-		FilesystemEnabled: os.Getenv("FILESYSTEM_ENABLED") == "true",
+		FilesystemPath:        os.Getenv("FILESYSTEM_PATH"),
+		FilesystemEnabled:     os.Getenv("FILESYSTEM_ENABLED") == "true",
+		FilesystemExcludeDirs: splitCSV(os.Getenv("FILESYSTEM_EXCLUDE_DIRS")),
+		FilesystemExcludeExts: normalizeExts(splitCSV(os.Getenv("FILESYSTEM_EXCLUDE_EXTS"))),
 
-		CollectInterval: interval,
+		CollectInterval:   interval,
+		CollectorInstance: collectorInstance,
 	}, nil
 }
 
@@ -213,4 +232,38 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// splitCSV splits a comma-separated env value into a trimmed, non-empty list.
+func splitCSV(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if s := strings.TrimSpace(p); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// normalizeExts ensures every extension starts with a leading dot and is lowercase.
+func normalizeExts(exts []string) []string {
+	if len(exts) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(exts))
+	for _, e := range exts {
+		e = strings.ToLower(strings.TrimSpace(e))
+		if e == "" {
+			continue
+		}
+		if !strings.HasPrefix(e, ".") {
+			e = "." + e
+		}
+		out = append(out, e)
+	}
+	return out
 }

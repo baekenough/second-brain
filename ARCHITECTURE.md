@@ -50,7 +50,26 @@ second-brain은 Go 기반 백엔드 서비스와 Next.js 기반 프론트엔드 
 ## 2. 시스템 구성도
 
 ```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#faf7f2",
+    "primaryColor": "#faf7f2",
+    "primaryTextColor": "#1c1917",
+    "primaryBorderColor": "#1c1917",
+    "lineColor": "#57534e",
+    "secondaryColor": "#f0ebe3",
+    "tertiaryColor": "#faf7f2",
+    "fontFamily": "-apple-system, BlinkMacSystemFont, Geist, Inter, sans-serif",
+    "fontSize": "13px"
+  }
+}}%%
 flowchart TD
+    classDef focal fill:#b5523a,stroke:#b5523a,color:#faf7f2,stroke-width:1px;
+    classDef muted fill:#f0ebe3,stroke:#57534e,color:#57534e,stroke-width:1px;
+    classDef data fill:#faf7f2,stroke:#1c1917,color:#1c1917,stroke-width:1.2px;
+    classDef ext fill:#faf7f2,stroke:#57534e,color:#1c1917,stroke-width:1px,stroke-dasharray:4 3;
+
     subgraph HOST["macOS Host"]
         GD["~/Google Drive\n공유 드라이브/Vibers.AI"]
         BROWSER["Browser\nlocalhost:30300 또는 port-forward"]
@@ -88,6 +107,11 @@ flowchart TD
     INIT -->|ready| SERVER
     WATCHER -->|goroutine| SLACK
     WATCHER -->|upsert| PG
+
+    class SERVER,COLLECTOR focal;
+    class PG data;
+    class OPENAI,SLACK,GITHUB,GDRIVE_API,LLM_API ext;
+    class INIT,WATCHER,PV,GD,BROWSER muted;
 ```
 
 ### 마운트 경로 상세
@@ -113,7 +137,26 @@ Pod 경로:     /etc/cliproxy/auth.json
 ### 백엔드 패키지 의존 관계
 
 ```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#faf7f2",
+    "primaryColor": "#faf7f2",
+    "primaryTextColor": "#1c1917",
+    "primaryBorderColor": "#1c1917",
+    "lineColor": "#57534e",
+    "secondaryColor": "#f0ebe3",
+    "tertiaryColor": "#faf7f2",
+    "fontFamily": "-apple-system, BlinkMacSystemFont, Geist, Inter, sans-serif",
+    "fontSize": "13px"
+  }
+}}%%
 flowchart LR
+    classDef focal fill:#b5523a,stroke:#b5523a,color:#faf7f2,stroke-width:1px;
+    classDef muted fill:#f0ebe3,stroke:#57534e,color:#57534e,stroke-width:1px;
+    classDef data fill:#faf7f2,stroke:#1c1917,color:#1c1917,stroke-width:1.2px;
+    classDef ext fill:#faf7f2,stroke:#57534e,color:#1c1917,stroke-width:1px,stroke-dasharray:4 3;
+
     MAIN["cmd/server/main.go\nDI 조립, 시그널 처리"]
     CFG["internal/config\nConfig.Load()"]
     API["internal/api\nchi Router\n9개 엔드포인트"]
@@ -139,6 +182,10 @@ flowchart LR
     STORE --> MODEL
     COL --> MODEL
     API --> MODEL
+
+    class MAIN focal;
+    class STORE data;
+    class MODEL muted;
 ```
 
 ### 패키지별 책임 및 주요 심볼
@@ -171,6 +218,20 @@ Port:         cfg.Port (기본 8080, ConfigMap에서 주입)
 ### ERD
 
 ```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#faf7f2",
+    "primaryColor": "#faf7f2",
+    "primaryTextColor": "#1c1917",
+    "primaryBorderColor": "#1c1917",
+    "lineColor": "#57534e",
+    "secondaryColor": "#f0ebe3",
+    "tertiaryColor": "#faf7f2",
+    "fontFamily": "-apple-system, BlinkMacSystemFont, Geist, Inter, sans-serif",
+    "fontSize": "13px"
+  }
+}}%%
 erDiagram
     documents {
         uuid id PK "gen_random_uuid()"
@@ -254,6 +315,20 @@ setweight(to_tsvector('simple',  coalesce(content, '')), 'B')
 ### 전체 흐름 시퀀스
 
 ```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#faf7f2",
+    "primaryColor": "#faf7f2",
+    "primaryTextColor": "#1c1917",
+    "primaryBorderColor": "#1c1917",
+    "lineColor": "#57534e",
+    "secondaryColor": "#f0ebe3",
+    "tertiaryColor": "#faf7f2",
+    "fontFamily": "-apple-system, BlinkMacSystemFont, Geist, Inter, sans-serif",
+    "fontSize": "13px"
+  }
+}}%%
 sequenceDiagram
     participant CRON as cron.Cron (robfig/cron)<br/>또는 POST /collect/trigger
     participant SCHED as Scheduler.run()
@@ -316,6 +391,20 @@ type Scheduler struct {
 ### SlackChannelWatcher (`internal/collector/slack_watcher.go`)
 
 ```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#faf7f2",
+    "primaryColor": "#faf7f2",
+    "primaryTextColor": "#1c1917",
+    "primaryBorderColor": "#1c1917",
+    "lineColor": "#57534e",
+    "secondaryColor": "#f0ebe3",
+    "tertiaryColor": "#faf7f2",
+    "fontFamily": "-apple-system, BlinkMacSystemFont, Geist, Inter, sans-serif",
+    "fontSize": "13px"
+  }
+}}%%
 sequenceDiagram
     participant MAIN as main.go (goroutine)
     participant W as SlackChannelWatcher.Run()
@@ -490,6 +579,20 @@ func NewEmbedClient(apiURL, apiKey, authFilePath, model string) *EmbedClient {
 ### EmbedBatch 흐름 (`internal/scheduler/scheduler.go:198`)
 
 ```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#faf7f2",
+    "primaryColor": "#faf7f2",
+    "primaryTextColor": "#1c1917",
+    "primaryBorderColor": "#1c1917",
+    "lineColor": "#57534e",
+    "secondaryColor": "#f0ebe3",
+    "tertiaryColor": "#faf7f2",
+    "fontFamily": "-apple-system, BlinkMacSystemFont, Geist, Inter, sans-serif",
+    "fontSize": "13px"
+  }
+}}%%
 sequenceDiagram
     participant SCHED as embedDocuments()
     participant EMBED as EmbedClient.EmbedBatch()
@@ -658,7 +761,26 @@ LIMIT $3
 ### Kubernetes 리소스 맵
 
 ```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#faf7f2",
+    "primaryColor": "#faf7f2",
+    "primaryTextColor": "#1c1917",
+    "primaryBorderColor": "#1c1917",
+    "lineColor": "#57534e",
+    "secondaryColor": "#f0ebe3",
+    "tertiaryColor": "#faf7f2",
+    "fontFamily": "-apple-system, BlinkMacSystemFont, Geist, Inter, sans-serif",
+    "fontSize": "13px"
+  }
+}}%%
 flowchart TB
+    classDef focal fill:#b5523a,stroke:#b5523a,color:#faf7f2,stroke-width:1px;
+    classDef muted fill:#f0ebe3,stroke:#57534e,color:#57534e,stroke-width:1px;
+    classDef data fill:#faf7f2,stroke:#1c1917,color:#1c1917,stroke-width:1.2px;
+    classDef ext fill:#faf7f2,stroke:#57534e,color:#1c1917,stroke-width:1px,stroke-dasharray:4 3;
+
     subgraph Cluster["minikube Cluster"]
         NS["Namespace: second-brain"]
 
@@ -693,6 +815,10 @@ flowchart TB
     BRDEP --> BRSVC
     WDEP --> WSVC
     BRSVC -->|BRAIN_API_URL| WDEP
+
+    class BRDEP,COLDEP focal;
+    class PGSF,PV,PVC_PG data;
+    class CM,SEC1,SEC2,INIT muted;
 ```
 
 ### K8s 리소스 목록 (`deploy/k8s/`)
@@ -902,7 +1028,26 @@ const FILTER_OPTIONS: FilterOption[] = [
 #### 배포 모델
 
 ```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#faf7f2",
+    "primaryColor": "#faf7f2",
+    "primaryTextColor": "#1c1917",
+    "primaryBorderColor": "#1c1917",
+    "lineColor": "#57534e",
+    "secondaryColor": "#f0ebe3",
+    "tertiaryColor": "#faf7f2",
+    "fontFamily": "-apple-system, BlinkMacSystemFont, Geist, Inter, sans-serif",
+    "fontSize": "13px"
+  }
+}}%%
 flowchart LR
+    classDef focal fill:#b5523a,stroke:#b5523a,color:#faf7f2,stroke-width:1px;
+    classDef muted fill:#f0ebe3,stroke:#57534e,color:#57534e,stroke-width:1px;
+    classDef data fill:#faf7f2,stroke:#1c1917,color:#1c1917,stroke-width:1.2px;
+    classDef ext fill:#faf7f2,stroke:#57534e,color:#1c1917,stroke-width:1px,stroke-dasharray:4 3;
+
     pod[second-brain Pod<br/>:8080] -- "HTTP<br/>Bearer inbound key" --> cliproxy[cliproxy<br/>127.0.0.1:8317]
     cliproxy -- "OAuth access_token<br/>refresh 자동" --> upstream[(OpenAI API<br/>chat.openai.com)]
 
@@ -917,6 +1062,10 @@ flowchart LR
     end
 
     pod -->|host.minikube.internal:8317| cliproxy
+
+    class pod focal;
+    class upstream ext;
+    class auth muted;
 ```
 
 #### 인증 계층 (2단계)

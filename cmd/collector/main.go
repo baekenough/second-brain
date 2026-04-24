@@ -101,11 +101,15 @@ func run() error {
 			driveExporter = nil
 		}
 		collectors = append(collectors,
-			collector.NewFilesystemCollectorWithDriveExport(cfg.FilesystemPath, driveExporter))
+			collector.NewFilesystemCollectorWithDriveExport(cfg.FilesystemPath, driveExporter).
+				WithExcludes(cfg.FilesystemExcludeDirs, cfg.FilesystemExcludeExts))
 	}
 
 	// --- Scheduler ---
-	sched := scheduler.New(docStore, embedClient, collectors...).WithChunkStore(chunkStore)
+	sched := scheduler.New(docStore, embedClient, collectors...).
+		WithChunkStore(chunkStore).
+		WithInstance(cfg.CollectorInstance)
+	slog.Info("collector instance", "id", cfg.CollectorInstance)
 	if err := sched.Register(cfg.CollectInterval); err != nil {
 		return err
 	}

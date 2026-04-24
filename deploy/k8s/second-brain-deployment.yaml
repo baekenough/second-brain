@@ -24,26 +24,16 @@ spec:
           image: second-brain:dev
           imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 9200
+            - containerPort: 8080
           envFrom:
             - configMapRef:
                 name: second-brain-config
             - secretRef:
                 name: second-brain-secret
-          volumeMounts:
-            # drive: emptyDir by default (collector disabled via FILESYSTEM_ENABLED=false).
-            # To activate Drive collection, replace the volume with a hostPath and set
-            # FILESYSTEM_ENABLED=true — see docs/runbook-deploy.md for full instructions.
-            - name: drive
-              mountPath: /data/drive
-              readOnly: true
-            - name: cliproxy-auth
-              mountPath: /etc/cliproxy
-              readOnly: true
           readinessProbe:
             httpGet:
               path: /health
-              port: 9200
+              port: 8080
             initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 5
@@ -51,7 +41,7 @@ spec:
           livenessProbe:
             httpGet:
               path: /health
-              port: 9200
+              port: 8080
             initialDelaySeconds: 30
             periodSeconds: 15
             timeoutSeconds: 5
@@ -63,25 +53,3 @@ spec:
             limits:
               memory: "512Mi"
               cpu: "500m"
-      volumes:
-        # drive: defaults to emptyDir so kubectl apply succeeds on servers without
-        # a Google Drive host mount. The filesystem collector is disabled via
-        # FILESYSTEM_ENABLED=false, so an empty volume is safe.
-        #
-        # To enable Drive collection on a host that has /mnt/drive mounted:
-        #   kubectl -n second-brain patch deployment/second-brain --type=json -p='[
-        #     {"op":"replace","path":"/spec/template/spec/volumes/0",
-        #      "value":{"name":"drive","hostPath":{"path":"/mnt/drive","type":"Directory"}}}]'
-        #   kubectl -n second-brain set env deployment/second-brain FILESYSTEM_ENABLED=true
-        #   kubectl -n second-brain rollout restart deployment/second-brain
-        #
-        # Full instructions: docs/runbook-deploy.md "Filesystem collector 활성화"
-        - name: drive
-          emptyDir: {}
-        - name: cliproxy-auth
-          secret:
-            secretName: cliproxy-auth
-            optional: true
-            items:
-              - key: auth.json
-                path: auth.json

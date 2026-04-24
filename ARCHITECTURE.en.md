@@ -50,7 +50,26 @@ second-brain is a team knowledge search platform composed of a Go-based backend 
 ## 2. System Architecture Diagram
 
 ```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#faf7f2",
+    "primaryColor": "#faf7f2",
+    "primaryTextColor": "#1c1917",
+    "primaryBorderColor": "#1c1917",
+    "lineColor": "#57534e",
+    "secondaryColor": "#f0ebe3",
+    "tertiaryColor": "#faf7f2",
+    "fontFamily": "-apple-system, BlinkMacSystemFont, Geist, Inter, sans-serif",
+    "fontSize": "13px"
+  }
+}}%%
 flowchart TD
+    classDef focal fill:#b5523a,stroke:#b5523a,color:#faf7f2,stroke-width:1px;
+    classDef muted fill:#f0ebe3,stroke:#57534e,color:#57534e,stroke-width:1px;
+    classDef data fill:#faf7f2,stroke:#1c1917,color:#1c1917,stroke-width:1.2px;
+    classDef ext fill:#faf7f2,stroke:#57534e,color:#1c1917,stroke-width:1px,stroke-dasharray:4 3;
+
     subgraph HOST["macOS Host"]
         GD["~/Google Drive\nShared Drive/Vibers.AI"]
         BROWSER["Browser\nlocalhost:30300 or port-forward"]
@@ -88,6 +107,11 @@ flowchart TD
     INIT -->|ready| SERVER
     WATCHER -->|goroutine| SLACK
     WATCHER -->|upsert| PG
+
+    class SERVER,COLLECTOR focal;
+    class PG data;
+    class OPENAI,SLACK,GITHUB,GDRIVE_API,LLM_API ext;
+    class INIT,WATCHER,PV,GD,BROWSER muted;
 ```
 
 ### Mount Path Details
@@ -113,7 +137,26 @@ Config var:   CLIPROXY_AUTH_FILE=/etc/cliproxy/auth.json (ConfigMap)
 ### Backend Package Dependency Graph
 
 ```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#faf7f2",
+    "primaryColor": "#faf7f2",
+    "primaryTextColor": "#1c1917",
+    "primaryBorderColor": "#1c1917",
+    "lineColor": "#57534e",
+    "secondaryColor": "#f0ebe3",
+    "tertiaryColor": "#faf7f2",
+    "fontFamily": "-apple-system, BlinkMacSystemFont, Geist, Inter, sans-serif",
+    "fontSize": "13px"
+  }
+}}%%
 flowchart LR
+    classDef focal fill:#b5523a,stroke:#b5523a,color:#faf7f2,stroke-width:1px;
+    classDef muted fill:#f0ebe3,stroke:#57534e,color:#57534e,stroke-width:1px;
+    classDef data fill:#faf7f2,stroke:#1c1917,color:#1c1917,stroke-width:1.2px;
+    classDef ext fill:#faf7f2,stroke:#57534e,color:#1c1917,stroke-width:1px,stroke-dasharray:4 3;
+
     MAIN["cmd/server/main.go\nDI wiring, signal handling"]
     CFG["internal/config\nConfig.Load()"]
     API["internal/api\nchi Router\n9 endpoints"]
@@ -139,6 +182,10 @@ flowchart LR
     STORE --> MODEL
     COL --> MODEL
     API --> MODEL
+
+    class MAIN focal;
+    class STORE data;
+    class MODEL muted;
 ```
 
 ### Package Responsibilities and Key Symbols
@@ -171,6 +218,20 @@ Port:         cfg.Port (default 8080, injected from ConfigMap)
 ### ERD
 
 ```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#faf7f2",
+    "primaryColor": "#faf7f2",
+    "primaryTextColor": "#1c1917",
+    "primaryBorderColor": "#1c1917",
+    "lineColor": "#57534e",
+    "secondaryColor": "#f0ebe3",
+    "tertiaryColor": "#faf7f2",
+    "fontFamily": "-apple-system, BlinkMacSystemFont, Geist, Inter, sans-serif",
+    "fontSize": "13px"
+  }
+}}%%
 erDiagram
     documents {
         uuid id PK "gen_random_uuid()"
@@ -254,6 +315,20 @@ One row is inserted per collection run. The `started_at`, `finished_at`, `docume
 ### End-to-End Sequence
 
 ```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#faf7f2",
+    "primaryColor": "#faf7f2",
+    "primaryTextColor": "#1c1917",
+    "primaryBorderColor": "#1c1917",
+    "lineColor": "#57534e",
+    "secondaryColor": "#f0ebe3",
+    "tertiaryColor": "#faf7f2",
+    "fontFamily": "-apple-system, BlinkMacSystemFont, Geist, Inter, sans-serif",
+    "fontSize": "13px"
+  }
+}}%%
 sequenceDiagram
     participant CRON as cron.Cron (robfig/cron)<br/>or POST /collect/trigger
     participant SCHED as Scheduler.run()
@@ -316,6 +391,20 @@ type Scheduler struct {
 ### SlackChannelWatcher (`internal/collector/slack_watcher.go`)
 
 ```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#faf7f2",
+    "primaryColor": "#faf7f2",
+    "primaryTextColor": "#1c1917",
+    "primaryBorderColor": "#1c1917",
+    "lineColor": "#57534e",
+    "secondaryColor": "#f0ebe3",
+    "tertiaryColor": "#faf7f2",
+    "fontFamily": "-apple-system, BlinkMacSystemFont, Geist, Inter, sans-serif",
+    "fontSize": "13px"
+  }
+}}%%
 sequenceDiagram
     participant MAIN as main.go (goroutine)
     participant W as SlackChannelWatcher.Run()
@@ -490,6 +579,20 @@ func NewEmbedClient(apiURL, apiKey, authFilePath, model string) *EmbedClient {
 ### EmbedBatch Flow (`internal/scheduler/scheduler.go:198`)
 
 ```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#faf7f2",
+    "primaryColor": "#faf7f2",
+    "primaryTextColor": "#1c1917",
+    "primaryBorderColor": "#1c1917",
+    "lineColor": "#57534e",
+    "secondaryColor": "#f0ebe3",
+    "tertiaryColor": "#faf7f2",
+    "fontFamily": "-apple-system, BlinkMacSystemFont, Geist, Inter, sans-serif",
+    "fontSize": "13px"
+  }
+}}%%
 sequenceDiagram
     participant SCHED as embedDocuments()
     participant EMBED as EmbedClient.EmbedBatch()
@@ -656,7 +759,26 @@ Falls back to fulltext mode automatically on embedding failure (search.go:40-46)
 ### Kubernetes Resource Map
 
 ```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#faf7f2",
+    "primaryColor": "#faf7f2",
+    "primaryTextColor": "#1c1917",
+    "primaryBorderColor": "#1c1917",
+    "lineColor": "#57534e",
+    "secondaryColor": "#f0ebe3",
+    "tertiaryColor": "#faf7f2",
+    "fontFamily": "-apple-system, BlinkMacSystemFont, Geist, Inter, sans-serif",
+    "fontSize": "13px"
+  }
+}}%%
 flowchart TB
+    classDef focal fill:#b5523a,stroke:#b5523a,color:#faf7f2,stroke-width:1px;
+    classDef muted fill:#f0ebe3,stroke:#57534e,color:#57534e,stroke-width:1px;
+    classDef data fill:#faf7f2,stroke:#1c1917,color:#1c1917,stroke-width:1.2px;
+    classDef ext fill:#faf7f2,stroke:#57534e,color:#1c1917,stroke-width:1px,stroke-dasharray:4 3;
+
     subgraph Cluster["minikube Cluster"]
         NS["Namespace: second-brain"]
 
@@ -691,6 +813,10 @@ flowchart TB
     BRDEP --> BRSVC
     WDEP --> WSVC
     BRSVC -->|BRAIN_API_URL| WDEP
+
+    class BRDEP,COLDEP focal;
+    class PGSF,PV,PVC_PG data;
+    class CM,SEC1,SEC2,INIT muted;
 ```
 
 ### K8s Resource List (`deploy/k8s/`)
@@ -900,7 +1026,26 @@ The `getRenderKind(ext)` function determines the rendering method by file extens
 #### Deployment Model
 
 ```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#faf7f2",
+    "primaryColor": "#faf7f2",
+    "primaryTextColor": "#1c1917",
+    "primaryBorderColor": "#1c1917",
+    "lineColor": "#57534e",
+    "secondaryColor": "#f0ebe3",
+    "tertiaryColor": "#faf7f2",
+    "fontFamily": "-apple-system, BlinkMacSystemFont, Geist, Inter, sans-serif",
+    "fontSize": "13px"
+  }
+}}%%
 flowchart LR
+    classDef focal fill:#b5523a,stroke:#b5523a,color:#faf7f2,stroke-width:1px;
+    classDef muted fill:#f0ebe3,stroke:#57534e,color:#57534e,stroke-width:1px;
+    classDef data fill:#faf7f2,stroke:#1c1917,color:#1c1917,stroke-width:1.2px;
+    classDef ext fill:#faf7f2,stroke:#57534e,color:#1c1917,stroke-width:1px,stroke-dasharray:4 3;
+
     pod[second-brain Pod<br/>:8080] -- "HTTP<br/>Bearer inbound key" --> cliproxy[cliproxy<br/>127.0.0.1:8317]
     cliproxy -- "OAuth access_token<br/>auto-refresh" --> upstream[(OpenAI API<br/>chat.openai.com)]
 
@@ -915,6 +1060,10 @@ flowchart LR
     end
 
     pod -->|host.minikube.internal:8317| cliproxy
+
+    class pod focal;
+    class upstream ext;
+    class auth muted;
 ```
 
 #### Authentication Layers (2-Stage)

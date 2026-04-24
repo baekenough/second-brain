@@ -1,6 +1,17 @@
+# ⚠ DEPRECATED 2026-04-24
+# This file is retained ONLY for building images (`docker compose build server collector`).
+# Do NOT run `docker compose up` with this file — the postgres + server services
+# defined here are superseded by the k8s deployment on ubuntu1.
+# For the active laptop-side collector, use docker-compose.laptop-collector.yml.
+# See TODO.md → "Cleanup of obsolete laptop docker-compose.yml" for background.
+
+# ⚠ DEPRECATED — do not `docker compose up` with this file (build-only).
+name: second-brain-deprecated-build-only
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    build:
+      context: deploy/postgres
+    image: second-brain-postgres:dev
     ports:
       - "5432:5432"
     environment:
@@ -43,12 +54,32 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgres://brain:brain@postgres:5432/second_brain?sslmode=disable
-      COLLECT_INTERVAL: 10m
+      COLLECT_INTERVAL: 30s
       MIGRATIONS_DIR: /app/migrations
     env_file:
       - .env
     volumes:
-      - "/Users/sangyi/Google Drive/공유 드라이브/Vibers.AI:/data/drive:ro"
+      # Brain sources — mounted as subdirectories of /data/drive so the single
+      # FILESYSTEM_PATH=/data/drive walks all of them in one pass.
+      #
+      # Security: individual subdirectories of ~/.claude, ~/.codex, ~/.gemini
+      # are mounted explicitly so that auth token files at the root of each
+      # (auth.json, oauth_creds.json, .claude.json) never enter the container.
+      #
+      # Notes vault (full)
+      - "/Users/sangyi/workspace:/data/drive/workspace:ro"
+      # Claude Code: sessions, project history, transcripts
+      - "/Users/sangyi/.claude/sessions:/data/drive/claude/sessions:ro"
+      - "/Users/sangyi/.claude/projects:/data/drive/claude/projects:ro"
+      - "/Users/sangyi/.claude/transcripts:/data/drive/claude/transcripts:ro"
+      # Codex CLI: sessions, archived sessions, history, memories
+      - "/Users/sangyi/.codex/sessions:/data/drive/codex/sessions:ro"
+      - "/Users/sangyi/.codex/archived_sessions:/data/drive/codex/archived_sessions:ro"
+      - "/Users/sangyi/.codex/history.jsonl:/data/drive/codex/history.jsonl:ro"
+      - "/Users/sangyi/.codex/memories:/data/drive/codex/memories:ro"
+      # Gemini CLI: history only (oauth_creds.json and google_accounts.json at
+      # the ~/.gemini root are intentionally not mounted).
+      - "/Users/sangyi/.gemini/history:/data/drive/gemini/history:ro"
     restart: unless-stopped
 
 volumes:

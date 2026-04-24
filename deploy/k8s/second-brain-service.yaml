@@ -6,11 +6,13 @@ metadata:
   labels:
     app: second-brain
 spec:
+  # NodePort 30080 → container 8080. Cloudflared on the host routes
+  # secondbrain.baekenough.com to http://localhost:30080.
   type: NodePort
   selector:
     app: second-brain
   ports:
-    - port: 9200
-      targetPort: 9200
-      nodePort: 30920
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30080
       protocol: TCP

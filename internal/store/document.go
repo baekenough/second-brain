@@ -372,17 +372,41 @@ func (s *DocumentStore) RecordCollectionLog(ctx context.Context, sourceType mode
 	return err
 }
 
-// LastCollectedAt returns the most recent collected_at timestamp for a source,
-// or the given fallback when no documents exist yet.
-func (s *DocumentStore) LastCollectedAt(ctx context.Context, src model.SourceType, fallback time.Time) time.Time {
+// LastCollectedAt returns the last collection watermark for the given
+// (instance_id, source_type) pair, or the fallback when no row exists yet.
+//
+// Per-instance state decouples collectors that share a source_type (e.g.,
+// filesystem scans on laptop, ubuntu1, ubuntu2) so one instance's recent scan
+// cannot suppress older files seen by another instance.
+func (s *DocumentStore) LastCollectedAt(ctx context.Context, instanceID string, src model.SourceType, fallback time.Time) time.Time {
 	var t time.Time
 	err := s.pg.pool.QueryRow(ctx,
-		`SELECT MAX(collected_at) FROM documents WHERE source_type = $1`, src,
+		`SELECT last_collected_at FROM collector_state
+		 WHERE instance_id = $1 AND source_type = $2`,
+		instanceID, src,
 	).Scan(&t)
 	if err != nil || t.IsZero() {
 		return fallback
 	}
 	return t
+}
+
+// UpdateCollectorState upserts the watermark for (instance_id, source_type).
+// Callers should only invoke this on a successful collection cycle so that
+// failed runs are retried from the previous watermark on the next tick.
+func (s *DocumentStore) UpdateCollectorState(ctx context.Context, instanceID string, src model.SourceType, lastCollectedAt time.Time) error {
+	_, err := s.pg.pool.Exec(ctx, `
+		INSERT INTO collector_state (instance_id, source_type, last_collected_at, updated_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (instance_id, source_type) DO UPDATE SET
+			last_collected_at = EXCLUDED.last_collected_at,
+			updated_at        = now()`,
+		instanceID, src, lastCollectedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("update collector state (%s/%s): %w", instanceID, src, err)
+	}
+	return nil
 }
 
 // MarkDeleted marks documents as deleted for source IDs not present in activeIDs.

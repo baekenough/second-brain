@@ -4,10 +4,13 @@ metadata:
   name: postgres
   namespace: second-brain
 spec:
-  type: ClusterIP
+  # NodePort so laptop/ubuntu2 remote collectors can reach the DB over LAN.
+  # Home-LAN-only; authentication is still enforced via POSTGRES_PASSWORD.
+  type: NodePort
   selector:
     app: postgres
   ports:
     - port: 5432
       targetPort: 5432
+      nodePort: 30032
       protocol: TCP

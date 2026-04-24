@@ -16,7 +16,10 @@ spec:
     spec:
       containers:
         - name: postgres
-          image: pgvector/pgvector:pg16
+          # Custom image: pgvector + pg_bigm. Built locally on the node and
+          # imported into microk8s containerd — IfNotPresent (never pull).
+          image: second-brain-postgres:dev
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 5432
           env:

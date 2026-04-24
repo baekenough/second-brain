@@ -32,7 +32,8 @@ const defaultChunkOverlap = 100
 // DocumentUpserter is the subset of the document store used by the scheduler.
 type DocumentUpserter interface {
 	Upsert(ctx context.Context, doc *model.Document) error
-	LastCollectedAt(ctx context.Context, src model.SourceType, fallback time.Time) time.Time
+	LastCollectedAt(ctx context.Context, instanceID string, src model.SourceType, fallback time.Time) time.Time
+	UpdateCollectorState(ctx context.Context, instanceID string, src model.SourceType, lastCollectedAt time.Time) error
 	RecordCollectionLog(ctx context.Context, src model.SourceType, started time.Time, count int, err error) error
 	MarkDeleted(ctx context.Context, sourceType model.SourceType, activeIDs []string) (int, error)
 }
@@ -44,6 +45,7 @@ type Scheduler struct {
 	store       DocumentUpserter
 	embed       *search.EmbedClient
 	chunkStore  *store.ChunkStore // nil when chunk storage is disabled
+	instanceID  string            // per-instance watermark key (e.g., "laptop", "ubuntu1", "ubuntu2")
 
 	// running is set to 1 while a collection cycle is in progress.
 	// CompareAndSwap from 0→1 acts as a non-blocking try-lock so that
@@ -61,7 +63,18 @@ func New(store DocumentUpserter, embed *search.EmbedClient, collectors ...collec
 		collectors: collectors,
 		store:      store,
 		embed:      embed,
+		instanceID: "default",
 	}
+}
+
+// WithInstance sets the collector instance identifier used to key per-instance
+// watermark state. Defaults to "default" when not called.
+func (s *Scheduler) WithInstance(id string) *Scheduler {
+	if id == "" {
+		id = "default"
+	}
+	s.instanceID = id
+	return s
 }
 
 // WithChunkStore attaches a ChunkStore so that each collected document is split
@@ -136,51 +149,84 @@ func (s *Scheduler) run(ctx context.Context, col collector.Collector) {
 func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 	started := time.Now()
 	defaultSince := time.Time{} // zero time = collect all files on first run
-	since := s.store.LastCollectedAt(ctx, col.Source(), defaultSince)
+	since := s.store.LastCollectedAt(ctx, s.instanceID, col.Source(), defaultSince)
 
 	slog.Info("scheduler: starting collection",
 		"collector", col.Name(),
+		"instance", s.instanceID,
 		"since", since.Format(time.RFC3339),
 	)
 
-	docs, err := col.Collect(ctx, since)
-	if err != nil {
+	var (
+		count    int
+		totalSeen int
+	)
+
+	processBatch := func(batch []model.Document) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		totalSeen += len(batch)
+
+		// Optionally enrich documents with embeddings before upserting.
+		if s.embed.Enabled() && len(batch) > 0 {
+			s.embedDocuments(ctx, batch)
+		}
+
+		for i := range batch {
+			if err := s.store.Upsert(ctx, &batch[i]); err != nil {
+				slog.Warn("scheduler: upsert failed",
+					"collector", col.Name(),
+					"source_id", batch[i].SourceID,
+					"error", err)
+				continue
+			}
+			count++
+
+			// Persist text chunks for FTS indexing (issue #9).
+			// This replaces the previous 8 KB hard truncation (issue #3):
+			// the full document content is now split into overlapping chunks and
+			// stored in the chunks table. The documents.content column is unchanged.
+			if s.chunkStore != nil {
+				s.persistChunks(ctx, &batch[i])
+			}
+		}
+		return nil
+	}
+
+	var collectErr error
+	if sc, ok := col.(collector.StreamingCollector); ok {
+		collectErr = sc.CollectStream(ctx, since, processBatch)
+	} else {
+		docs, err := col.Collect(ctx, since)
+		if err != nil {
+			collectErr = err
+		} else if len(docs) > 0 {
+			collectErr = processBatch(docs)
+		}
+	}
+	if collectErr != nil {
 		slog.Error("scheduler: collection failed",
-			"collector", col.Name(), "error", err)
-		_ = s.store.RecordCollectionLog(ctx, col.Source(), started, 0, err)
+			"collector", col.Name(), "error", collectErr)
+		_ = s.store.RecordCollectionLog(ctx, col.Source(), started, count, collectErr)
 		return
 	}
 
-	// Optionally enrich documents with embeddings before upserting.
-	if s.embed.Enabled() && len(docs) > 0 {
-		s.embedDocuments(ctx, docs)
-	}
-
-	count := 0
-	for i := range docs {
-		if err := s.store.Upsert(ctx, &docs[i]); err != nil {
-			slog.Warn("scheduler: upsert failed",
-				"collector", col.Name(),
-				"source_id", docs[i].SourceID,
-				"error", err)
-			continue
-		}
-		count++
-
-		// Persist text chunks for FTS indexing (issue #9).
-		// This replaces the previous 8 KB hard truncation (issue #3):
-		// the full document content is now split into overlapping chunks and
-		// stored in the chunks table. The documents.content column is unchanged.
-		if s.chunkStore != nil {
-			s.persistChunks(ctx, &docs[i])
-		}
-	}
-
 	_ = s.store.RecordCollectionLog(ctx, col.Source(), started, count, nil)
+
+	// Persist the per-instance watermark so the next tick on this host picks up
+	// incremental changes only. Using the run start time (rather than per-doc
+	// max) is simpler and race-free: any document written during the run has
+	// collected_at <= started, so the next scan with since=started is correct.
+	if err := s.store.UpdateCollectorState(ctx, s.instanceID, col.Source(), started); err != nil {
+		slog.Warn("scheduler: update collector state failed",
+			"collector", col.Name(), "instance", s.instanceID, "error", err)
+	}
+
 	slog.Info("scheduler: collection complete",
 		"collector", col.Name(),
 		"upserted", count,
-		"total", len(docs),
+		"total", totalSeen,
 		"elapsed", time.Since(started).Round(time.Millisecond),
 	)
 

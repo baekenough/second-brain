@@ -1,0 +1,36 @@
+# laptop-side collector pushing into ubuntu1 Postgres (NodePort 30032 on 192.168.0.21).
+# Will silently fail/retry on the next scheduler tick (10m) when the laptop is off-LAN.
+# DO NOT confuse with docker-compose.yml in this directory — that one is the old
+# local full-stack setup (postgres + server + collector) and must not be started.
+#
+# Secrets are supplied out-of-band via .env.laptop-collector (git-ignored). Copy
+# .env.laptop-collector.example to .env.laptop-collector, fill in real values,
+# and run:
+#   docker compose --env-file .env.laptop-collector -f docker-compose.laptop-collector.yml up -d
+
+services:
+  collector:
+    image: second-brain-collector:dev
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://brain:${POSTGRES_PASSWORD:-brain}@host.docker.internal:30032/second_brain?sslmode=disable
+      MIGRATIONS_DIR: /app/migrations
+      COLLECT_INTERVAL: 10m
+      COLLECTOR_INSTANCE: laptop
+      EMBEDDING_API_URL: ""
+      EMBEDDING_API_KEY: "${EMBEDDING_API_KEY:-}"
+      CLIPROXY_AUTH_FILE: ""
+      FILESYSTEM_PATH: /data/drive
+      FILESYSTEM_ENABLED: "true"
+      FILESYSTEM_EXCLUDE_DIRS: "keys,.venv,.obsidian,.omx,.omcustom,.github,vendor,__pycache__,.pytest_cache,.mypy_cache,.ruff_cache,target,build,.gradle,.idea,.turbo,.cache,.parcel-cache,.svelte-kit,.vercel,.pnpm-store,.yarn,coverage,.nyc_output,.claude-backup-2026-03-13T09-03-25-712Z,.claude-backup-2026-04-15T11-12-36-843Z,statsig,telemetry,cache,caches,tmp,.tmp,paste-cache,file-history,usage-data,session-env,session-state,shell-snapshots,shell_snapshots,chrome,plugins.bak,debug,sqlite,vercel-plugin-telemetry-preference,stats-cache,mcp-needs-auth-cache,backups,ide,vendor_imports"
+      FILESYSTEM_EXCLUDE_EXTS: ".js,.ts,.tsx,.py,.sh,.sqlite,.sqlite-shm,.sqlite-wal,.db,.lock"
+    volumes:
+      - /Users/sangyi/workspace:/data/drive/workspace:ro
+      - /Users/sangyi/.claude/sessions:/data/drive/claude/sessions:ro
+      - /Users/sangyi/.claude/projects:/data/drive/claude/projects:ro
+      - /Users/sangyi/.claude/transcripts:/data/drive/claude/transcripts:ro
+      - /Users/sangyi/.codex/sessions:/data/drive/codex/sessions:ro
+      - /Users/sangyi/.codex/archived_sessions:/data/drive/codex/archived_sessions:ro
+      - /Users/sangyi/.codex/history.jsonl:/data/drive/codex/history.jsonl:ro
+      - /Users/sangyi/.codex/memories:/data/drive/codex/memories:ro
+      - /Users/sangyi/.gemini/history:/data/drive/gemini/history:ro

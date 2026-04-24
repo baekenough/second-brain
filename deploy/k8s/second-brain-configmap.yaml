@@ -4,16 +4,31 @@ metadata:
   name: second-brain-config
   namespace: second-brain
 data:
-  COLLECT_INTERVAL: "5m"
+  # --- Server ---
+  PORT: "8080"
+  MIGRATIONS_DIR: "/app/migrations"
+
+  # --- Scheduler ---
+  COLLECT_INTERVAL: "10m"
   MAX_EMBED_CHARS: "8000"
+
+  # --- Per-instance watermark key (collector_state.instance_id) ---
+  # Must differ across collectors that share a source_type (e.g., filesystem).
+  COLLECTOR_INSTANCE: "ubuntu1"
+
+  # --- Embedding (disabled — path B, BM25 only) ---
+  # Real values are set via Secret to enable path A. When EMBEDDING_API_KEY
+  # is empty AND CLIPROXY_AUTH_FILE unset, the embed client self-disables
+  # (see internal/search/embed.go NewEmbedClient).
   EMBEDDING_API_URL: "https://api.openai.com/v1"
   EMBEDDING_MODEL: "text-embedding-3-small"
-  CLIPROXY_AUTH_FILE: "/etc/cliproxy/auth.json"
+  CLIPROXY_AUTH_FILE: ""
+
+  # --- Filesystem collector ---
   FILESYSTEM_PATH: "/data/drive"
-  # Default: disabled — enable only when the host has a Drive mount at /mnt/drive.
-  # See docs/runbook-deploy.md "Filesystem collector 활성화" for instructions.
-  FILESYSTEM_ENABLED: "false"
-  PORT: "9200"
-  # Explicit migrations dir: required when binary is built with -trimpath
-  # (runtime.Caller returns module-relative path, not filesystem path)
-  MIGRATIONS_DIR: "/app/migrations"
+  FILESYSTEM_ENABLED: "true"
+  # Union'd with built-in skipDirs (.git, node_modules, dist, .next, .omc,
+  # .sisyphus, .claude). Security-critical: keys, auth.json, oauth_creds.json
+  # are additionally blocked via mount selection (only safe subdirs bind-mounted).
+  FILESYSTEM_EXCLUDE_DIRS: "keys,.venv,.obsidian,.omx,.omcustom,.github,vendor,__pycache__,.pytest_cache,.mypy_cache,.ruff_cache,target,build,.gradle,.idea,.turbo,.cache,.parcel-cache,.svelte-kit,.vercel,.pnpm-store,.yarn,coverage,.nyc_output,statsig,telemetry,cache,caches,tmp,.tmp,paste-cache,file-history,usage-data,session-env,session-state,shell-snapshots,shell_snapshots,chrome,plugins.bak,debug,sqlite,vercel-plugin-telemetry-preference,stats-cache,mcp-needs-auth-cache,backups,ide,vendor_imports"
+  FILESYSTEM_EXCLUDE_EXTS: ".js,.ts,.tsx,.py,.sh,.sqlite,.sqlite-shm,.sqlite-wal,.db,.lock"
