@@ -26,6 +26,7 @@ vendor/
 .env
 .env.local
 .env.*.local
+.env.laptop-collector
 
 # IDE and editor files
 .idea/

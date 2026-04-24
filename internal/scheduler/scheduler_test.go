@@ -26,8 +26,12 @@ func (m *mockStore) Upsert(_ context.Context, _ *model.Document) error {
 	return nil
 }
 
-func (m *mockStore) LastCollectedAt(_ context.Context, _ model.SourceType, fallback time.Time) time.Time {
+func (m *mockStore) LastCollectedAt(_ context.Context, _ string, _ model.SourceType, fallback time.Time) time.Time {
 	return fallback
+}
+
+func (m *mockStore) UpdateCollectorState(_ context.Context, _ string, _ model.SourceType, _ time.Time) error {
+	return nil
 }
 
 func (m *mockStore) RecordCollectionLog(_ context.Context, _ model.SourceType, _ time.Time, _ int, _ error) error {

@@ -40,7 +40,26 @@ LLM-curated private search engine. Collects and embeds knowledge from diverse so
 ## Architecture Overview
 
 ```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#faf7f2",
+    "primaryColor": "#faf7f2",
+    "primaryTextColor": "#1c1917",
+    "primaryBorderColor": "#1c1917",
+    "lineColor": "#57534e",
+    "secondaryColor": "#f0ebe3",
+    "tertiaryColor": "#faf7f2",
+    "fontFamily": "-apple-system, BlinkMacSystemFont, Geist, Inter, sans-serif",
+    "fontSize": "13px"
+  }
+}}%%
 flowchart LR
+    classDef focal fill:#b5523a,stroke:#b5523a,color:#faf7f2,stroke-width:1px;
+    classDef muted fill:#f0ebe3,stroke:#57534e,color:#57534e,stroke-width:1px;
+    classDef data fill:#faf7f2,stroke:#1c1917,color:#1c1917,stroke-width:1.2px;
+    classDef ext fill:#faf7f2,stroke:#57534e,color:#1c1917,stroke-width:1px,stroke-dasharray:4 3;
+
     Agent["AI Agent\n(MCP / HTTP)"]
     Server["second-brain\nAPI Server\nGo 1.25\n:8080"]
     Collector["second-brain\nCollector Daemon\nGo 1.25"]
@@ -61,6 +80,11 @@ flowchart LR
     Collector -->|collect| Slack
     Collector -->|collect| GH
     Collector -->|collect| GD
+
+    class Server,Collector focal;
+    class PG data;
+    class LLM,OpenAI,Slack,GH,GD,FS ext;
+    class Agent muted;
 ```
 
 The server (API) and collector are separate binaries. The collector runs on a configurable schedule (default: 1 hour). Collected text is truncated to a maximum of 8,000 characters before embedding, then stored in a `pgvector` column.

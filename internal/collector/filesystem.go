@@ -62,15 +62,16 @@ var skipDirs = map[string]bool{
 // fullContentExts are extensions whose full text is read (up to maxContentBytes).
 // Note: .html is intentionally excluded — it is handled by the extractor registry.
 var fullContentExts = map[string]bool{
-	".md":  true,
-	".txt": true,
-	".csv": true,
-	".json": true,
-	".js":  true,
-	".ts":  true,
-	".tsx": true,
-	".py":  true,
-	".sh":  true,
+	".md":    true,
+	".txt":   true,
+	".csv":   true,
+	".json":  true,
+	".jsonl": true, // Claude/Codex session transcripts are newline-delimited JSON.
+	".js":    true,
+	".ts":    true,
+	".tsx":   true,
+	".py":    true,
+	".sh":    true,
 }
 
 // extractorRegistry is the shared extractor registry for binary/structured formats.
@@ -96,11 +97,67 @@ var skipExts = map[string]bool{
 
 var urlRegexp = regexp.MustCompile(`https?://[^\s"']+`)
 
+// defaultFilesystemBatchSize is the fallback batch size used by CollectStream
+// when no explicit size has been configured on the collector.
+const defaultFilesystemBatchSize = 200
+
 // FilesystemCollector walks a local directory tree and indexes files.
 // It is strictly read-only; it never acquires file locks.
 type FilesystemCollector struct {
 	rootPath      string
 	driveExporter *DriveExporter
+	extraSkipDirs map[string]bool
+	extraSkipExts map[string]bool
+	batchSize     int
+}
+
+// WithBatchSize overrides the streaming batch size used by CollectStream.
+// Values <= 0 are ignored and the default (defaultFilesystemBatchSize) is used.
+func (c *FilesystemCollector) WithBatchSize(n int) *FilesystemCollector {
+	if n > 0 {
+		c.batchSize = n
+	}
+	return c
+}
+
+// WithExcludes registers additional directory names and file extensions to
+// skip, on top of the built-in skipDirs/skipExts defaults. Both lists are
+// merged (union), not replaced, so security-critical defaults (.git, etc.)
+// cannot be silently disabled by configuration. Extensions must be lowercase
+// and include the leading dot (e.g. ".pem"); callers are expected to normalize
+// beforehand (see config.normalizeExts).
+func (c *FilesystemCollector) WithExcludes(dirs, exts []string) *FilesystemCollector {
+	if len(dirs) > 0 {
+		c.extraSkipDirs = make(map[string]bool, len(dirs))
+		for _, d := range dirs {
+			c.extraSkipDirs[d] = true
+		}
+	}
+	if len(exts) > 0 {
+		c.extraSkipExts = make(map[string]bool, len(exts))
+		for _, e := range exts {
+			c.extraSkipExts[e] = true
+		}
+	}
+	return c
+}
+
+// shouldSkipDir reports whether a directory entry should be skipped based on
+// the union of built-in skipDirs and user-configured extras.
+func (c *FilesystemCollector) shouldSkipDir(name string) bool {
+	if skipDirs[name] {
+		return true
+	}
+	return c.extraSkipDirs[name]
+}
+
+// shouldSkipExt reports whether a file extension should be skipped based on
+// the union of built-in skipExts and user-configured extras.
+func (c *FilesystemCollector) shouldSkipExt(ext string) bool {
+	if skipExts[ext] {
+		return true
+	}
+	return c.extraSkipExts[ext]
 }
 
 // NewFilesystemCollector returns a FilesystemCollector rooted at rootPath.
@@ -122,12 +179,58 @@ func (c *FilesystemCollector) Enabled() bool            { return c.rootPath != "
 
 // Collect walks the root directory and returns documents for files modified
 // after since. Individual file errors are logged and skipped.
-func (c *FilesystemCollector) Collect(_ context.Context, since time.Time) ([]model.Document, error) {
-	start := time.Now()
+//
+// Collect is retained for backward compatibility and is implemented as a thin
+// accumulator around CollectStream. Callers expecting to process very large
+// result sets should use CollectStream directly to avoid memory blow-up.
+func (c *FilesystemCollector) Collect(ctx context.Context, since time.Time) ([]model.Document, error) {
 	var docs []model.Document
-	var skipped int
+	err := c.CollectStream(ctx, since, func(batch []model.Document) error {
+		docs = append(docs, batch...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return docs, nil
+}
+
+// CollectStream walks the root directory and emits documents in batches via
+// onBatch. Memory usage stays bounded at roughly batchSize documents regardless
+// of total file count. The context is checked between batches so that SIGTERM
+// during a long scan exits promptly.
+func (c *FilesystemCollector) CollectStream(ctx context.Context, since time.Time, onBatch func([]model.Document) error) error {
+	if onBatch == nil {
+		return fmt.Errorf("filesystem: CollectStream requires non-nil onBatch")
+	}
+	batchSize := c.batchSize
+	if batchSize <= 0 {
+		batchSize = defaultFilesystemBatchSize
+	}
+
+	start := time.Now()
+	batch := make([]model.Document, 0, batchSize)
+	var collected, skipped int
+
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := onBatch(batch); err != nil {
+			return err
+		}
+		// Reset length but keep capacity so the next batch reuses the backing array.
+		batch = batch[:0]
+		return nil
+	}
 
 	err := filepath.WalkDir(c.rootPath, func(path string, d fs.DirEntry, walkErr error) error {
+		// Check for cancellation between filesystem entries so a SIGTERM during
+		// a long scan exits quickly without completing the whole walk.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		if walkErr != nil {
 			slog.Warn("filesystem: walk error, skipping", "path", path, "error", walkErr)
 			skipped++
@@ -148,7 +251,7 @@ func (c *FilesystemCollector) Collect(_ context.Context, since time.Time) ([]mod
 		}
 
 		if d.IsDir() {
-			if skipDirs[d.Name()] {
+			if c.shouldSkipDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -170,22 +273,34 @@ func (c *FilesystemCollector) Collect(_ context.Context, since time.Time) ([]mod
 			skipped++
 			return nil
 		}
-		docs = append(docs, doc)
-		if len(docs)%100 == 0 {
-			slog.Info("filesystem: progress", "collected", len(docs), "skipped", skipped)
+		batch = append(batch, doc)
+		collected++
+		if collected%100 == 0 {
+			slog.Info("filesystem: progress", "collected", collected, "skipped", skipped)
+		}
+		if len(batch) >= batchSize {
+			if err := flush(); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("filesystem: walk %q: %w", c.rootPath, err)
+		return fmt.Errorf("filesystem: walk %q: %w", c.rootPath, err)
+	}
+
+	// Flush any remaining documents from the final partial batch.
+	if err := flush(); err != nil {
+		return err
 	}
 
 	slog.Info("filesystem: collected documents",
-		"count", len(docs),
+		"count", collected,
 		"skipped", skipped,
+		"batch_size", batchSize,
 		"elapsed", time.Since(start).Round(time.Millisecond),
 		"root", c.rootPath)
-	return docs, nil
+	return nil
 }
 
 // ListActiveSourceIDs walks the entire root directory and returns the relative
@@ -213,7 +328,7 @@ func (c *FilesystemCollector) ListActiveSourceIDs(_ context.Context) ([]string, 
 		}
 
 		if d.IsDir() {
-			if skipDirs[d.Name()] {
+			if c.shouldSkipDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -226,7 +341,7 @@ func (c *FilesystemCollector) ListActiveSourceIDs(_ context.Context) ([]string, 
 		}
 
 		ext := strings.ToLower(filepath.Ext(info.Name()))
-		if skipExts[ext] || info.Name() == ".DS_Store" {
+		if c.shouldSkipExt(ext) || info.Name() == ".DS_Store" {
 			return nil
 		}
 
@@ -249,7 +364,7 @@ func (c *FilesystemCollector) ListActiveSourceIDs(_ context.Context) ([]string, 
 func (c *FilesystemCollector) buildDocument(absPath string, info fs.FileInfo) (model.Document, bool) {
 	ext := strings.ToLower(filepath.Ext(info.Name()))
 
-	if skipExts[ext] || info.Name() == ".DS_Store" {
+	if c.shouldSkipExt(ext) || info.Name() == ".DS_Store" {
 		return model.Document{}, false
 	}
 

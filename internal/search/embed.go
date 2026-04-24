@@ -31,7 +31,15 @@ type EmbedClient struct {
 // disabled — Embed and EmbedBatch return nil results without error.
 //
 // Token priority: apiKey > authFilePath > no auth.
+//
+// As a convenience, when neither apiKey nor authFilePath is set we force the
+// client into the disabled state regardless of apiURL. This lets operators
+// disable embeddings by clearing EMBEDDING_API_KEY/CLIPROXY_AUTH_FILE without
+// also having to override the default EMBEDDING_API_URL.
 func NewEmbedClient(apiURL, apiKey, authFilePath, model string) *EmbedClient {
+	if apiKey == "" && authFilePath == "" {
+		apiURL = ""
+	}
 	return &EmbedClient{
 		apiURL: apiURL,
 		model:  model,
