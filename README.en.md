@@ -471,6 +471,32 @@ Migration files live in `migrations/` and are applied automatically in order whe
 
 ---
 
+## Interactive Diagrams
+
+Each diagram mirrors the corresponding section in ARCHITECTURE.en.md and can be edited interactively on [eraser.io](https://app.eraser.io).
+
+### 1. System Runtime Topology
+![System Runtime Topology](docs/diagrams/01-system-runtime-topology.png)
+([Open in eraser.io](https://app.eraser.io/workspace/PyHgjPmM97MYtJNoVD5H?diagram=CSpF8N1BRvdpM3l5TW2nd))
+
+### 2. Service Layer Map
+![Service Layer Map](docs/diagrams/02-service-layer-map.png)
+([Open in eraser.io](https://app.eraser.io/workspace/Z8JviN6EySSKzjgtXNp4?diagram=o4bbcT5wpMrwh3nMRPRLm))
+
+### 3. Data Model ERD
+![Data Model ERD](docs/diagrams/03-data-model-erd.png)
+([Open in eraser.io](https://app.eraser.io/workspace/O901Iet3HpcIaldLfQ1e?diagram=fo1U7OVZh_I9mVe6OaLfV))
+
+### 4. Collection Pipeline Sequence
+![Collection Pipeline Sequence](docs/diagrams/04-collection-pipeline-sequence.png)
+([Open in eraser.io](https://app.eraser.io/workspace/2NzpSSDbSx4Oh3gCs6DV?diagram=UT0aD63tuIkrRiqLEUgKr))
+
+### 5. Hybrid Search Pipeline RRF
+![Hybrid Search Pipeline RRF](docs/diagrams/05-hybrid-search-rrf.png)
+([Open in eraser.io](https://app.eraser.io/workspace/K10FmwBysYGTBVp8E9Wb?diagram=xJgZnmmbfRJL2Ox_bMd_i))
+
+---
+
 ## Related Documentation
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — Detailed architecture reference

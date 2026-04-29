@@ -49,6 +49,10 @@ second-brain is a team knowledge search platform composed of a Go-based backend 
 
 ## 2. System Architecture Diagram
 
+![System Runtime Topology](docs/diagrams/01-system-runtime-topology.png)
+
+> Interactive edit: [Open in eraser.io](https://app.eraser.io/workspace/PyHgjPmM97MYtJNoVD5H?diagram=CSpF8N1BRvdpM3l5TW2nd)
+
 ```mermaid
 %%{init: {
   "theme": "base",
@@ -134,6 +138,10 @@ Config var:   CLIPROXY_AUTH_FILE=/etc/cliproxy/auth.json (ConfigMap)
 
 ## 3. Service Layer Map
 
+![Service Layer Map](docs/diagrams/02-service-layer-map.png)
+
+> Interactive edit: [Open in eraser.io](https://app.eraser.io/workspace/Z8JviN6EySSKzjgtXNp4?diagram=o4bbcT5wpMrwh3nMRPRLm)
+
 ### Backend Package Dependency Graph
 
 ```mermaid
@@ -214,6 +222,10 @@ Port:         cfg.Port (default 8080, injected from ConfigMap)
 ---
 
 ## 4. Data Model
+
+![Data Model ERD](docs/diagrams/03-data-model-erd.png)
+
+> Interactive edit: [Open in eraser.io](https://app.eraser.io/workspace/O901Iet3HpcIaldLfQ1e?diagram=fo1U7OVZh_I9mVe6OaLfV)
 
 ### ERD
 
@@ -311,6 +323,10 @@ One row is inserted per collection run. The `started_at`, `finished_at`, `docume
 ---
 
 ## 5. Collection Pipeline
+
+![Collection Pipeline Sequence](docs/diagrams/04-collection-pipeline-sequence.png)
+
+> Interactive edit: [Open in eraser.io](https://app.eraser.io/workspace/2NzpSSDbSx4Oh3gCs6DV?diagram=UT0aD63tuIkrRiqLEUgKr)
 
 ### End-to-End Sequence
 
@@ -640,6 +656,10 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 ---
 
 ## 8. Search Pipeline
+
+![Hybrid Search Pipeline RRF](docs/diagrams/05-hybrid-search-rrf.png)
+
+> Interactive edit: [Open in eraser.io](https://app.eraser.io/workspace/K10FmwBysYGTBVp8E9Wb?diagram=xJgZnmmbfRJL2Ox_bMd_i)
 
 ### API Endpoint
 

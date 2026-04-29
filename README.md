@@ -471,6 +471,32 @@ gofmt -w .
 
 ---
 
+## 인터랙티브 다이어그램
+
+각 다이어그램은 ARCHITECTURE.md의 해당 섹션과 동일하며, [eraser.io](https://app.eraser.io)에서 인터랙티브 편집이 가능합니다.
+
+### 1. 시스템 런타임 토폴로지
+![시스템 런타임 토폴로지](docs/diagrams/01-system-runtime-topology.png)
+([eraser.io에서 열기](https://app.eraser.io/workspace/PyHgjPmM97MYtJNoVD5H?diagram=CSpF8N1BRvdpM3l5TW2nd))
+
+### 2. 서비스 레이어 맵
+![서비스 레이어 맵](docs/diagrams/02-service-layer-map.png)
+([eraser.io에서 열기](https://app.eraser.io/workspace/Z8JviN6EySSKzjgtXNp4?diagram=o4bbcT5wpMrwh3nMRPRLm))
+
+### 3. 데이터 모델 ERD
+![데이터 모델 ERD](docs/diagrams/03-data-model-erd.png)
+([eraser.io에서 열기](https://app.eraser.io/workspace/O901Iet3HpcIaldLfQ1e?diagram=fo1U7OVZh_I9mVe6OaLfV))
+
+### 4. 수집 파이프라인 시퀀스
+![수집 파이프라인 시퀀스](docs/diagrams/04-collection-pipeline-sequence.png)
+([eraser.io에서 열기](https://app.eraser.io/workspace/2NzpSSDbSx4Oh3gCs6DV?diagram=UT0aD63tuIkrRiqLEUgKr))
+
+### 5. 하이브리드 검색 파이프라인 RRF
+![하이브리드 검색 파이프라인 RRF](docs/diagrams/05-hybrid-search-rrf.png)
+([eraser.io에서 열기](https://app.eraser.io/workspace/K10FmwBysYGTBVp8E9Wb?diagram=xJgZnmmbfRJL2Ox_bMd_i))
+
+---
+
 ## 관련 문서
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — 아키텍처 상세 설명

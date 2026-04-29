@@ -49,6 +49,10 @@ second-brain은 Go 기반 백엔드 서비스와 Next.js 기반 프론트엔드 
 
 ## 2. 시스템 구성도
 
+![시스템 런타임 토폴로지](docs/diagrams/01-system-runtime-topology.png)
+
+> 인터랙티브 편집: [eraser.io에서 열기](https://app.eraser.io/workspace/PyHgjPmM97MYtJNoVD5H?diagram=CSpF8N1BRvdpM3l5TW2nd)
+
 ```mermaid
 %%{init: {
   "theme": "base",
@@ -134,6 +138,10 @@ Pod 경로:     /etc/cliproxy/auth.json
 
 ## 3. 서비스 레이어 맵
 
+![서비스 레이어 맵](docs/diagrams/02-service-layer-map.png)
+
+> 인터랙티브 편집: [eraser.io에서 열기](https://app.eraser.io/workspace/Z8JviN6EySSKzjgtXNp4?diagram=o4bbcT5wpMrwh3nMRPRLm)
+
 ### 백엔드 패키지 의존 관계
 
 ```mermaid
@@ -214,6 +222,10 @@ Port:         cfg.Port (기본 8080, ConfigMap에서 주입)
 ---
 
 ## 4. 데이터 모델
+
+![데이터 모델 ERD](docs/diagrams/03-data-model-erd.png)
+
+> 인터랙티브 편집: [eraser.io에서 열기](https://app.eraser.io/workspace/O901Iet3HpcIaldLfQ1e?diagram=fo1U7OVZh_I9mVe6OaLfV)
 
 ### ERD
 
@@ -311,6 +323,10 @@ setweight(to_tsvector('simple',  coalesce(content, '')), 'B')
 ---
 
 ## 5. 수집 파이프라인
+
+![수집 파이프라인 시퀀스](docs/diagrams/04-collection-pipeline-sequence.png)
+
+> 인터랙티브 편집: [eraser.io에서 열기](https://app.eraser.io/workspace/2NzpSSDbSx4Oh3gCs6DV?diagram=UT0aD63tuIkrRiqLEUgKr)
 
 ### 전체 흐름 시퀀스
 
@@ -640,6 +656,10 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 ---
 
 ## 8. 검색 파이프라인
+
+![하이브리드 검색 파이프라인 RRF](docs/diagrams/05-hybrid-search-rrf.png)
+
+> 인터랙티브 편집: [eraser.io에서 열기](https://app.eraser.io/workspace/K10FmwBysYGTBVp8E9Wb?diagram=xJgZnmmbfRJL2Ox_bMd_i)
 
 ### API 엔드포인트
 
