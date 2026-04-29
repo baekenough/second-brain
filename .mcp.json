@@ -10,6 +10,10 @@
       "env": {
         "ONTOLOGY_DIR": ".claude/ontology"
       }
+    },
+    "eraser": {
+      "type": "http",
+      "url": "https://app.eraser.io/api/mcp"
     }
   }
 }
