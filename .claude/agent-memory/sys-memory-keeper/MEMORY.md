@@ -1,6 +1,6 @@
 # sys-memory-keeper — Memory Index
 
-Last updated: 2026-04-15
+Last updated: 2026-04-29
 
 ## Project Context
 
@@ -37,3 +37,4 @@ Last updated: 2026-04-15
 ## Reference
 
 - [second-brain GitHub 저장소](reference-second-brain-github.md) — https://github.com/baekenough/second-brain, baekenough SSH alias, v0.1.14
+- [Eraser MCP 다이어그램 패턴](reference-eraser-mcp-diagrams.md) — 5개 second-brain 다이어그램 fileID, generate→get→update 워크플로우, DSL 취약성 패턴 (2026-04-29)
