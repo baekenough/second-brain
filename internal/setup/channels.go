@@ -15,6 +15,7 @@ type EnvVar struct {
 	Description string
 
 	// Secret marks the value as sensitive; the wizard masks input.
+	// Secret is ignored when Multiline is true: huh.Text has no EchoMode.
 	Secret bool
 
 	// Multiline allows multi-line paste (used for JSON credentials).

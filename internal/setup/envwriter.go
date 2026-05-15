@@ -80,6 +80,11 @@ func WriteEnv(dest string, pairs map[string]string, order []string) error {
 		return fmt.Errorf("write temp file: %w", err)
 	}
 
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temp file: %w", err)
+	}
+
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp file: %w", err)
 	}

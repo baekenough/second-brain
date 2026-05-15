@@ -106,6 +106,9 @@ func Run(args []string) error {
 			values[v.Key] = &val
 
 			if v.Multiline {
+				if v.Secret {
+					fmt.Fprintf(os.Stderr, "⚠ %s: input will be visible while pasting (multiline secret cannot be masked). Paste in a private terminal.\n", v.Key)
+				}
 				f := huh.NewText().
 					Title(v.Label).
 					Description(v.Description).

@@ -1,4 +1,7 @@
-.PHONY: sync-env sync-env-dry-run sync-env-test deploy-secret
+.PHONY: sync-env sync-env-dry-run sync-env-test deploy-secret tidy
+
+tidy:
+	go mod tidy -tags setup
 
 # Dry-run sync (safe — prints rendered secret without applying)
 sync-env-dry-run:
