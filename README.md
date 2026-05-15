@@ -426,6 +426,29 @@ docker compose up -d
 
 ---
 
+## Contributor Setup
+
+리포에 push 권한이 있다면 한 번만 실행:
+
+```bash
+make install-hooks
+```
+
+이 명령은 git이 `.githooks/` 의 pre-push hook을 사용하도록 설정합니다. push 시 자동으로:
+
+- `scripts/ci-checks.sh` (kustomization secret 가드, discord placeholder, sync-env destructive 가드, secret 노출 검사, .env 추적 검사)
+- `go vet` / `go build` / `go test` (race detector는 CI에서)
+
+가 실행됩니다. 응급 우회는 `git push --no-verify` (사고 책임은 우회한 사람).
+
+로컬에서 CI와 동일한 hygiene 검사만 돌리려면:
+
+```bash
+make check
+```
+
+---
+
 ## 개발
 
 ### 사전 요구사항

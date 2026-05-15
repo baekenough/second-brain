@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Pre-push gate. Mirrors CI hygiene + go vet/build/test (race off for speed).
+# Bypass with --no-verify only in emergencies.
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+echo "==> ci-checks (hygiene)"
+bash scripts/ci-checks.sh
+
+echo "==> go vet"
+go vet ./...
+
+echo "==> go build"
+go build ./...
+
+echo "==> go test (no -race for speed; CI runs full -race)"
+go test -count=1 ./...
+
+echo ""
+echo "Pre-push checks passed. Pushing."
