@@ -44,14 +44,19 @@ func detectLang() string {
 	return "en"
 }
 
-// msg returns the localised string for key, falling back to English.
+// msg returns the localised string for key, falling back to English, and
+// finally to the key itself when the key is missing from both the current
+// language map and the English map.
 func msg(key string) string {
 	if m, ok := messages[lang]; ok {
 		if s, ok := m[key]; ok {
 			return s
 		}
 	}
-	return messages["en"][key]
+	if s, ok := messages["en"][key]; ok {
+		return s
+	}
+	return key
 }
 
 // messages holds UI strings keyed by language code then message key.

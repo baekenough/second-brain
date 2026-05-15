@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -24,7 +25,11 @@ import (
 func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "setup" {
 		if err := setup.Run(os.Args[2:]); err != nil {
-			slog.Error("setup failed", "error", err)
+			// Use fmt.Fprintf instead of slog: slog.SetDefault has not been
+			// called yet at this point, so slog would use the default text
+			// handler — inconsistent with the daemon's JSON handler. The setup
+			// subcommand is a CLI tool for humans; plain stderr is correct.
+			fmt.Fprintf(os.Stderr, "setup failed: %v\n", err)
 			os.Exit(1)
 		}
 		return

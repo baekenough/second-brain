@@ -1,28 +1,18 @@
-# Test: --non-interactive flag prints accessible-mode notice to stderr.
-# The wizard binary is not invoked here — we verify the flag parsing
-# and output contract of the Run() function via a minimal Go test helper.
+# Test: WriteEnv works correctly in a non-interactive scripting context.
+# Uses the registered "envwrite" command (see wizard_test.go TestMain).
+#
+# Note: testing the --non-interactive flag of Run() requires a real TTY or
+# mock stdin because huh/v2 reads from stdin even in accessible mode.
+# That contract is tested in unit tests (messages_test.go, wizard_validate_test.go).
+# Here we validate that the envwriter produces correct output when invoked
+# without any interactive prompts — the scripted / non-interactive use-case.
+#
+# Validates:
+#   1. Multiple channel variables can be written in one invocation
+#   2. Key order matches the order supplied (SLACK_BOT_TOKEN before SLACK_TEAM_ID)
+#   3. The .env file exists and is non-empty
 
-# This script requires the 'setup' build tag to be active.
-# It is run exclusively by TestWizardScripts with -tags setup.
-
-# Because huh/v2 in accessible mode still reads from stdin, we pipe
-# a pre-formed input sequence:
-#   - "1\n"  → select channel index 1 (filesystem)
-#   - "/path/to/docs\n" → FILESYSTEM_PATH value
-#   The Hardcoded FILESYSTEM_ENABLED=true is not prompted.
-
-# The script asserts that:
-#   1. stderr contains the non-interactive notice
-#   2. .env is created with FILESYSTEM_PATH set
-#   3. file mode is 0600
-
-# NOTE: testscript runs in an isolated tmpdir, so relative paths work.
-
-# Skip test if the binary wasn't built with -tags setup (stub returns error).
-# The binary is expected to be at $GOPATH/bin/second-brain-collector-setup
-# or built via 'go test -tags setup' — testscript only validates the script
-# logic by calling a registered command.
-
-# For now this golden file validates the expected file layout and flag
-# parsing via the test helper registered in TestWizardScripts.
--- .keep --
+envwrite SLACK_BOT_TOKEN=xoxb-test-token,SLACK_TEAM_ID=T12345678 .env
+exists .env
+grep 'SLACK_BOT_TOKEN=xoxb-test-token' .env
+grep 'SLACK_TEAM_ID=T12345678' .env

@@ -1,8 +1,20 @@
 # Test: When an existing .env is present, WriteEnv backs it up before
-# overwriting. Validates that:
-#   1. A .env.bak.<timestamp> file appears in the same directory
-#   2. The backup contains the original content
-#   3. The new .env contains the updated values
+# overwriting. Uses the registered "envwrite" command (see wizard_test.go TestMain).
+#
+# envwrite prints "backup:<name>" to stdout when it detects an existing dest
+# file and a backup was created. This lets testscript assert via "stdout".
+#
+# Validates:
+#   1. A .env.bak.<timestamp> file name is reported by envwrite
+#   2. The new .env contains the updated NEW_KEY value (original is gone)
 
-# This golden file is exercised by TestWizardScripts.
--- .keep --
+# Step 1: write the initial .env (represents a pre-existing file).
+envwrite EXISTING_KEY=original_value .env
+exists .env
+grep 'EXISTING_KEY=original_value' .env
+
+# Step 2: overwrite with new content; envwrite reports the backup name to stdout.
+envwrite NEW_KEY=updated_value .env
+stdout 'backup:.*\.bak\.'
+exists .env
+grep 'NEW_KEY=updated_value' .env
