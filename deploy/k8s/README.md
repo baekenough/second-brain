@@ -26,8 +26,20 @@ docker build -t second-brain:dev .
 
 ## 4. Configure secrets
 
-`second-brain-secret.yaml`의 `CHANGE_ME` 값을 실제 값으로 교체하거나,
-kubectl로 직접 생성합니다:
+`second-brain-secret.yaml`은 **kustomize resources에 포함되지 않습니다** (issue #29: kustomize 번들링 시 운영 Secret 덮어쓰기 사고 방지).
+Secret은 반드시 **out-of-band**로 별도 적용해야 합니다.
+
+**방법 A — 파일 직접 적용 (operator-managed):**
+
+`second-brain-secret.yaml`의 `CHANGE_ME` 값을 실제 값으로 교체한 뒤 독립적으로 적용합니다.
+이 파일은 레포에 참조용으로 보관되지만 `kubectl apply -k`로는 절대 배포되지 않습니다.
+
+```bash
+# 실제 값으로 편집 후 적용 (kustomize와 독립적으로 실행)
+kubectl apply -f deploy/k8s/second-brain-secret.yaml
+```
+
+**방법 B — kubectl create secret (권장):**
 
 ```bash
 kubectl create secret generic second-brain-secret \
@@ -37,6 +49,9 @@ kubectl create secret generic second-brain-secret \
   --from-literal=EMBEDDING_API_KEY="<실제 키>" \
   -n second-brain
 ```
+
+**장기 계획:** External Secrets Operator, SOPS, 또는 sealed-secrets로 마이그레이션 예정.
+`kubectl apply -k deploy/k8s/`에 Secret을 포함하지 마십시오.
 
 ## 5. Apply manifests
 
