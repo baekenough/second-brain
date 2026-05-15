@@ -16,11 +16,20 @@ import (
 	"github.com/baekenough/second-brain/internal/config"
 	"github.com/baekenough/second-brain/internal/scheduler"
 	"github.com/baekenough/second-brain/internal/search"
+	"github.com/baekenough/second-brain/internal/setup"
 	"github.com/baekenough/second-brain/internal/store"
 	"github.com/baekenough/second-brain/internal/worker"
 )
 
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == "setup" {
+		if err := setup.Run(os.Args[2:]); err != nil {
+			slog.Error("setup failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})))

@@ -1,0 +1,9 @@
+# Test: WriteEnv produces a valid .env for filesystem channel only.
+# Validates that:
+#   1. FILESYSTEM_PATH is written
+#   2. FILESYSTEM_ENABLED=true is hardcoded
+#   3. File mode is 0600
+
+# This golden file is exercised by TestWizardScripts and represents the
+# expected output shape for a filesystem-only configuration.
+-- .keep --

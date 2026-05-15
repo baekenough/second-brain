@@ -102,7 +102,10 @@ The server (API) and collector are separate binaries. The collector runs on a co
 ## Quick Start
 
 ```bash
-# 1. Set up environment variables
+# 1. Generate .env with the setup wizard (recommended)
+go run -tags setup ./cmd/collector/ setup
+
+# Or configure manually
 cp .env.example .env
 # Edit .env with required values (DATABASE_URL, EMBEDDING_API_KEY, etc.)
 
@@ -117,6 +120,8 @@ curl -X POST http://localhost:8080/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{"query": "onboarding guide", "limit": 5}'
 ```
+
+> **Note**: The wizard requires the `-tags setup` build tag. Production Docker images (built without the tag) do not include the wizard binary.
 
 ---
 
