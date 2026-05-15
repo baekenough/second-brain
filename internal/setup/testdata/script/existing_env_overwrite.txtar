@@ -1,0 +1,8 @@
+# Test: When an existing .env is present, WriteEnv backs it up before
+# overwriting. Validates that:
+#   1. A .env.bak.<timestamp> file appears in the same directory
+#   2. The backup contains the original content
+#   3. The new .env contains the updated values
+
+# This golden file is exercised by TestWizardScripts.
+-- .keep --

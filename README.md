@@ -102,7 +102,10 @@ flowchart LR
 ## 빠른 시작
 
 ```bash
-# 1. 환경 변수 설정
+# 1. 설정 마법사로 .env 생성 (권장)
+go run -tags setup ./cmd/collector/ setup
+
+# 또는 수동 설정
 cp .env.example .env
 # .env 파일을 편집하여 필수 값 설정 (DATABASE_URL, EMBEDDING_API_KEY 등)
 
@@ -117,6 +120,8 @@ curl -X POST http://localhost:8080/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{"query": "온보딩 가이드", "limit": 5}'
 ```
+
+> **참고**: 마법사는 `-tags setup` 빌드 태그로 빌드된 바이너리에서만 동작합니다. 프로덕션 Docker 이미지(태그 없이 빌드)에는 마법사가 포함되지 않습니다.
 
 ---
 
