@@ -1,12 +1,16 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: second-brain
+# NOTE: second-brain-secret.yaml is intentionally excluded from kustomize resources.
+# Bundling it caused production Secret overwrite (closed issue #29).
+# Apply Secrets out-of-band:
+#   kubectl apply -f deploy/k8s/second-brain-secret.yaml  # operator-managed, NOT via kustomize
+# Long-term: migrate to External Secrets / SOPS / sealed-secrets.
 resources:
   - namespace.yaml
   - postgres-statefulset.yaml
   - postgres-service.yaml
   - second-brain-configmap.yaml
-  - second-brain-secret.yaml
   - second-brain-deployment.yaml
   - second-brain-service.yaml
   - collector-deployment.yaml
