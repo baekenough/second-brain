@@ -426,6 +426,29 @@ When the token expires or `auth.json` is replaced, restart the Collector.
 
 ---
 
+## Contributor Setup
+
+If you have push access to this repository, run once per clone:
+
+```bash
+make install-hooks
+```
+
+This tells git to use the pre-push hook in `.githooks/`. On every push, the following run automatically:
+
+- `scripts/ci-checks.sh` (kustomization secret guard, discord placeholder check, sync-env destructive-command guard, secret-leak detection, .env tracking detection)
+- `go vet` / `go build` / `go test` (race detector runs in CI)
+
+Emergency bypass: `git push --no-verify` (the person who bypasses owns the consequences).
+
+To run the same hygiene checks locally without pushing:
+
+```bash
+make check
+```
+
+---
+
 ## Development
 
 ### Prerequisites
