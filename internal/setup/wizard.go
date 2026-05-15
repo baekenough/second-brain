@@ -5,6 +5,7 @@ package setup
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"charm.land/huh/v2"
@@ -15,12 +16,18 @@ import (
 //
 // Flags:
 //
-//	--non-interactive   Run in accessible (plain-text) mode; useful for CI
-//	                    or when there is no interactive terminal.
-//	--output <path>     Write .env to <path> instead of ".env" (default).
+//	--non-interactive        Run in accessible (plain-text) mode; useful for CI
+//	                         or when there is no interactive terminal.
+//	--output <path>          Write .env to <path> instead of ".env" (default).
+//	--channels <id,id,...>   Comma-separated channel IDs to configure. Skips the
+//	                         interactive multi-select form; useful for scripting.
+//	--value KEY=VALUE        Pre-set a channel variable; may be repeated. Skips
+//	                         the per-channel prompt for the given key.
 func Run(args []string) error {
 	nonInteractive := false
 	outputPath := EnvFilePath()
+	var channelFlag string                 // comma-separated channel IDs (--channels)
+	presetValues := make(map[string]string) // KEY=VALUE pairs from --value flags
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -32,7 +39,28 @@ func Run(args []string) error {
 			}
 			i++
 			outputPath = args[i]
+		case "--channels":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--channels requires a comma-separated list of channel IDs")
+			}
+			i++
+			channelFlag = args[i]
+		case "--value":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--value requires a KEY=VALUE argument")
+			}
+			i++
+			kv := args[i]
+			idx := strings.IndexByte(kv, '=')
+			if idx < 1 {
+				return fmt.Errorf("--value %q: expected KEY=VALUE format", kv)
+			}
+			presetValues[kv[:idx]] = kv[idx+1:]
 		}
+	}
+
+	if err := validateOutputPath(outputPath); err != nil {
+		return fmt.Errorf("invalid --output path: %w", err)
 	}
 
 	if nonInteractive {
@@ -40,31 +68,42 @@ func Run(args []string) error {
 	}
 
 	// --- Channel selection ---
-	channelIDs := make([]string, 0, len(Registry))
-	var channelOptions []huh.Option[string]
-	for _, ch := range Registry {
-		channelOptions = append(channelOptions, huh.NewOption(ch.Label, ch.ID))
-	}
-
-	channelForm := huh.NewForm(
-		huh.NewGroup(
-			huh.NewNote().
-				Title(msg("welcome")).
-				Description(msg("welcome_desc")),
-			huh.NewMultiSelect[string]().
-				Title(msg("channel_title")).
-				Description(msg("channel_desc")).
-				Options(channelOptions...).
-				Value(&channelIDs),
-		),
-	).WithAccessible(nonInteractive)
-
-	if err := channelForm.Run(); err != nil {
-		if isAbort(err) {
-			fmt.Fprintln(os.Stderr, msg("aborted"))
-			return nil
+	// When --channels is provided, skip the interactive multi-select form.
+	var channelIDs []string
+	if channelFlag != "" {
+		for _, id := range strings.Split(channelFlag, ",") {
+			id = strings.TrimSpace(id)
+			if id != "" {
+				channelIDs = append(channelIDs, id)
+			}
 		}
-		return fmt.Errorf("channel selection: %w", err)
+	} else {
+		channelIDs = make([]string, 0, len(Registry))
+		var channelOptions []huh.Option[string]
+		for _, ch := range Registry {
+			channelOptions = append(channelOptions, huh.NewOption(ch.Label, ch.ID))
+		}
+
+		channelForm := huh.NewForm(
+			huh.NewGroup(
+				huh.NewNote().
+					Title(msg("welcome")).
+					Description(msg("welcome_desc")),
+				huh.NewMultiSelect[string]().
+					Title(msg("channel_title")).
+					Description(msg("channel_desc")).
+					Options(channelOptions...).
+					Value(&channelIDs),
+			),
+		).WithAccessible(nonInteractive)
+
+		if err := channelForm.Run(); err != nil {
+			if isAbort(err) {
+				fmt.Fprintln(os.Stderr, msg("aborted"))
+				return nil
+			}
+			return fmt.Errorf("channel selection: %w", err)
+		}
 	}
 
 	if len(channelIDs) == 0 {
@@ -98,6 +137,13 @@ func Run(args []string) error {
 		for _, v := range ch.Vars {
 			if v.Hardcoded {
 				pairs[v.Key] = v.DefaultValue
+				order = append(order, v.Key)
+				continue
+			}
+
+			// If --value KEY=VALUE was supplied, skip the interactive prompt.
+			if preset, ok := presetValues[v.Key]; ok {
+				pairs[v.Key] = preset
 				order = append(order, v.Key)
 				continue
 			}
@@ -171,4 +217,53 @@ func isAbort(err error) bool {
 	return err == huh.ErrUserAborted ||
 		strings.Contains(err.Error(), "aborted") ||
 		strings.Contains(err.Error(), "interrupt")
+}
+
+// validateOutputPath rejects paths that escape the current working directory
+// or point to sensitive system locations. Valid paths must be relative or
+// resolve to a location inside the current working directory.
+//
+// Rejected:
+//   - Absolute paths outside cwd (e.g. /etc/passwd, /tmp/x.env)
+//   - Paths containing ".." that escape cwd
+//   - Paths under /etc, /root, /usr, /bin, /sbin, /sys, /proc
+func validateOutputPath(path string) error {
+	// Reject paths with ".." components before any resolution to catch
+	// obvious traversal attempts early.
+	if strings.Contains(path, "..") {
+		return fmt.Errorf("path %q must not contain '..'", path)
+	}
+
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("cannot resolve path %q: %w", path, err)
+	}
+
+	// Deny well-known sensitive system directories regardless of cwd.
+	sensitivePrefixes := []string{
+		"/etc/", "/etc",
+		"/root/", "/root",
+		"/usr/", "/usr",
+		"/bin/", "/bin",
+		"/sbin/", "/sbin",
+		"/sys/", "/sys",
+		"/proc/", "/proc",
+	}
+	for _, prefix := range sensitivePrefixes {
+		if abs == prefix || strings.HasPrefix(abs, prefix+"/") || abs == strings.TrimSuffix(prefix, "/") {
+			return fmt.Errorf("path %q resolves to a restricted system location", path)
+		}
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("cannot determine working directory: %w", err)
+	}
+
+	// The resolved path must be inside the current working directory.
+	if !strings.HasPrefix(abs, cwd+string(filepath.Separator)) && abs != cwd {
+		return fmt.Errorf("path %q (resolved: %s) escapes the working directory %s", path, abs, cwd)
+	}
+
+	return nil
 }
