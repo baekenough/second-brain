@@ -1,0 +1,110 @@
+# =============================================================================
+# second-brain — 로컬 풀스택 Compose (macOS arm64)
+# =============================================================================
+# 용도: 로컬 개발 / 검증. 프로덕션 k8s 와 무관.
+# 사전 조건:
+#   - .env.local 이 이 디렉토리에 존재해야 합니다.
+#     (.env.local.example 을 복사해 OpenAI 키를 채우세요)
+# 실행:
+#   docker compose -f docker-compose.local.yml up -d --build
+# 중지/정리:
+#   docker compose -f docker-compose.local.yml down
+#   docker compose -f docker-compose.local.yml down -v   # 볼륨 포함 삭제
+# =============================================================================
+
+name: second-brain-local
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # postgres — pgvector + pg_bigm 이 포함된 커스텀 PostgreSQL 16 이미지
+  # ---------------------------------------------------------------------------
+  postgres:
+    build:
+      context: deploy/postgres
+    image: second-brain-postgres:local
+    environment:
+      POSTGRES_DB: second_brain
+      POSTGRES_USER: brain
+      POSTGRES_PASSWORD: brain
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U brain -d second_brain"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # server — API 서버 (포트 8080). DB 마이그레이션을 직접 적용한다.
+  # ---------------------------------------------------------------------------
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: server
+    image: second-brain-server:local
+    ports:
+      - "8081:8080"
+    env_file:
+      - .env.local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # collector — 소스 데이터 수집 데몬 (포트 없음).
+  #   호스트의 SQLite 원본을 직접 ro 마운트한다. collector DSN 의 immutable=1
+  #   이 WAL/-shm 보조파일 접근을 피하므로 VirtioFS readonly 충돌 없이
+  #   호스트 원본의 변경을 매 사이클 반영하는 증분 수집이 가능하다.
+  # ---------------------------------------------------------------------------
+  collector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: collector
+    image: second-brain-collector:local
+    env_file:
+      - .env.local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - /Users/user/workspace/private/secretary/assistant/secretary.db:/data/secretary.db:ro
+      - /Users/user/workspace/llm-memory/data/memory.sqlite:/data/llm-memory.sqlite:ro
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # mcp — MCP streamable HTTP 서버 (포트 8090).
+  #   마이그레이션은 server 가 적용하므로, server 가 기동된 뒤 시작한다.
+  #   (server 는 depends_on postgres healthy 로 마이그레이션 완료를 보장)
+  # ---------------------------------------------------------------------------
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: mcp
+    image: second-brain-mcp:local
+    ports:
+      - "8090:8090"
+    env_file:
+      - .env.local
+    environment:
+      MCP_BIND_ADDR: "0.0.0.0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      server:
+        condition: service_started
+    restart: unless-stopped
+
+# -----------------------------------------------------------------------------
+# Named volumes
+# -----------------------------------------------------------------------------
+volumes:
+  pgdata:
+    # macOS arm64 에서 PostgreSQL 데이터 디렉토리를 호스트 bind-mount 하면
+    # 파일시스템 권한 충돌이 발생할 수 있으므로 named volume 을 사용한다.

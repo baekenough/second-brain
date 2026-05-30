@@ -75,6 +75,12 @@ type Config struct {
 	FilesystemExcludeDirs  []string // FILESYSTEM_EXCLUDE_DIRS — comma-separated dir names to skip (merged with built-in defaults)
 	FilesystemExcludeExts  []string // FILESYSTEM_EXCLUDE_EXTS — comma-separated file extensions to skip (merged with built-in defaults)
 
+	// Secretary SQLite (optional — disabled when empty)
+	SecretaryDBPath string // SECRETARY_DB_PATH — path to secretary.db (e.g. /data/secretary.db)
+
+	// LLM Memory SQLite (optional — disabled when empty)
+	LLMMemoryDBPath string // LLM_MEMORY_DB_PATH — path to llm-memory.sqlite (e.g. /data/llm-memory.sqlite)
+
 	// Scheduler
 	CollectInterval time.Duration
 
@@ -209,6 +215,9 @@ func Load() (*Config, error) {
 		FilesystemEnabled:     os.Getenv("FILESYSTEM_ENABLED") == "true",
 		FilesystemExcludeDirs: splitCSV(os.Getenv("FILESYSTEM_EXCLUDE_DIRS")),
 		FilesystemExcludeExts: normalizeExts(splitCSV(os.Getenv("FILESYSTEM_EXCLUDE_EXTS"))),
+
+		SecretaryDBPath: os.Getenv("SECRETARY_DB_PATH"),
+		LLMMemoryDBPath: os.Getenv("LLM_MEMORY_DB_PATH"),
 
 		CollectInterval:   interval,
 		CollectorInstance: collectorInstance,

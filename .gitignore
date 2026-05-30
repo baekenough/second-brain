@@ -3,6 +3,7 @@
 /eval
 /server
 /collector
+/mcp
 *.exe
 *.exe~
 *.dll

@@ -36,6 +36,10 @@ type DocumentUpserter interface {
 	UpdateCollectorState(ctx context.Context, instanceID string, src model.SourceType, lastCollectedAt time.Time) error
 	RecordCollectionLog(ctx context.Context, src model.SourceType, started time.Time, count int, err error) error
 	MarkDeleted(ctx context.Context, sourceType model.SourceType, activeIDs []string) (int, error)
+	// ListUnembedded returns up to limit active documents with a NULL embedding.
+	ListUnembedded(ctx context.Context, limit int) ([]*model.Document, error)
+	// UpdateEmbedding persists the embedding vector for a single document.
+	UpdateEmbedding(ctx context.Context, doc *model.Document) error
 }
 
 // Scheduler wraps robfig/cron and manages periodic collection runs.
@@ -250,6 +254,76 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 				"collector", col.Name(), "count", deleted)
 		}
 	}
+
+	// Backfill embeddings for documents that were previously skipped due to
+	// rate-limit errors. This runs once per collection cycle so that each
+	// scheduler tick makes incremental progress through the NULL-embedding
+	// backlog without requiring a full re-collection.
+	s.backfillEmbeddings(ctx)
+}
+
+// backfillBatchSize is the number of unembedded documents processed per
+// backfill cycle. Kept small enough to fit within OpenAI's rate limits:
+// text-embedding-3-small allows 3,000 RPM; one batch of 200 documents costs
+// one API call, so a single backfill pass is far below that ceiling.
+// Raise this value only after verifying that the embedding endpoint can sustain
+// the resulting request rate without triggering 429 errors.
+const backfillBatchSize = 200
+
+// backfillEmbeddings queries for active documents with a NULL embedding and
+// embeds them in batches of backfillBatchSize. It is called at the end of
+// every collection cycle so that documents that were skipped earlier (e.g.
+// because of an OpenAI 429 rate-limit) are retried on subsequent ticks.
+//
+// On any EmbedBatch failure (including 429) the entire cycle is aborted and
+// retried on the next scheduler tick.  Documents that already have an
+// embedding are never returned by ListUnembedded and are therefore not
+// re-processed.
+func (s *Scheduler) backfillEmbeddings(ctx context.Context) {
+	if !s.embed.Enabled() {
+		return
+	}
+
+	docs, err := s.store.ListUnembedded(ctx, backfillBatchSize)
+	if err != nil {
+		slog.Warn("scheduler: backfill list unembedded failed", "error", err)
+		return
+	}
+	if len(docs) == 0 {
+		return
+	}
+
+	texts := make([]string, len(docs))
+	for i, d := range docs {
+		texts[i] = d.Title + "\n\n" + d.Content
+	}
+
+	vecs, err := s.embed.EmbedBatch(ctx, texts)
+	if err != nil {
+		// Rate-limit or transient API error: skip this cycle and retry next tick.
+		slog.Warn("scheduler: backfill embedding failed, will retry next cycle",
+			"error", err, "count", len(docs))
+		return
+	}
+
+	succeeded := 0
+	for i, doc := range docs {
+		if i >= len(vecs) || len(vecs[i]) == 0 {
+			continue
+		}
+		doc.Embedding = vecs[i]
+		if err := s.store.UpdateEmbedding(ctx, doc); err != nil {
+			slog.Warn("scheduler: backfill update embedding failed",
+				"doc_id", doc.ID, "error", err)
+			continue
+		}
+		succeeded++
+	}
+
+	slog.Info("scheduler: backfill embeddings complete",
+		"processed", len(docs),
+		"succeeded", succeeded,
+	)
 }
 
 // embedDocuments fills the Embedding field of each document by calling the

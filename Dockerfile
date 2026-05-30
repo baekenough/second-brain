@@ -89,7 +89,22 @@ RUN GOTOOLCHAIN=auto CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
       ./cmd/collector
 
 # -----------------------------------------------------------------------------
-# Stage 3c — Build eval binary
+# Stage 3c — Build mcp binary
+# -----------------------------------------------------------------------------
+FROM builder AS build-mcp
+
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
+RUN GOTOOLCHAIN=auto CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build \
+      -trimpath \
+      -ldflags="-s -w" \
+      -o /out/mcp \
+      ./cmd/mcp
+
+# -----------------------------------------------------------------------------
+# Stage 3d — Build eval binary
 # -----------------------------------------------------------------------------
 FROM builder AS build-eval
 
@@ -231,3 +246,24 @@ COPY --from=build-eval /workspace/migrations /app/migrations
 USER appuser:appgroup
 
 ENTRYPOINT ["/app/eval"]
+
+# -----------------------------------------------------------------------------
+# Target: mcp — MCP server (streamable HTTP, port 8090)
+# -----------------------------------------------------------------------------
+# Environment variable documentation:
+#   DATABASE_URL       — PostgreSQL DSN (required)
+#   MCP_PORT           — HTTP port for MCP server (default: 8090)
+#   EMBEDDING_API_URL  — Base URL of the embedding API (optional)
+#   EMBEDDING_API_KEY  — Bearer token for the embedding API (optional)
+#   EMBEDDING_MODEL    — Embedding model name (optional, default: text-embedding-3-small)
+#   CLIPROXY_AUTH_FILE — Path to CliProxyAPI OAuth JSON (optional)
+# NOTE: Migrations are NOT run by this target; the server target applies them.
+FROM runtime-base AS mcp
+
+COPY --from=build-mcp /out/mcp /app/mcp
+
+USER appuser:appgroup
+
+EXPOSE 8090
+
+ENTRYPOINT ["/app/mcp"]
