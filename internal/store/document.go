@@ -35,15 +35,22 @@ func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
 		embeddingArg = pgvector.NewVector(doc.Embedding)
 	}
 
+	// occurred_at is the original event time (email date, calendar start, etc.).
+	// NULL is stored when the collector has no event-time concept; COALESCE
+	// in ORDER BY clauses falls back to collected_at for those rows.
+	// On conflict we update occurred_at only when the incoming value is non-NULL
+	// so that a re-collection without a timestamp does not erase a previously
+	// parsed value.
 	const q = `
 		INSERT INTO documents
-			(source_type, source_id, title, content, metadata, embedding, collected_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+			(source_type, source_id, title, content, metadata, embedding, occurred_at, collected_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (source_type, source_id) DO UPDATE SET
 			title        = EXCLUDED.title,
 			content      = EXCLUDED.content,
 			metadata     = EXCLUDED.metadata,
 			embedding    = COALESCE(EXCLUDED.embedding, documents.embedding),
+			occurred_at  = COALESCE(EXCLUDED.occurred_at, documents.occurred_at),
 			collected_at = EXCLUDED.collected_at,
 			status       = 'active',
 			deleted_at   = NULL,
@@ -57,6 +64,7 @@ func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
 		doc.Content,
 		meta,
 		embeddingArg,
+		doc.OccurredAt,
 		doc.CollectedAt,
 	)
 	return row.Scan(&doc.ID, &doc.CreatedAt, &doc.UpdatedAt)
@@ -66,7 +74,7 @@ func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
 func (s *DocumentStore) GetByID(ctx context.Context, id uuid.UUID) (*model.Document, error) {
 	const q = `
 		SELECT id, source_type, source_id, title, content, metadata, embedding,
-		       status, deleted_at, collected_at, created_at, updated_at
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at
 		FROM documents WHERE id = $1`
 
 	row := s.pg.pool.QueryRow(ctx, q, id)
@@ -77,7 +85,10 @@ func (s *DocumentStore) GetByID(ctx context.Context, id uuid.UUID) (*model.Docum
 	return doc, nil
 }
 
-// ListBySource returns active documents of a given source type, ordered by collected_at DESC.
+// ListBySource returns active documents of a given source type, ordered by the
+// original event time (occurred_at) when available, falling back to collected_at
+// for rows that have no event-time concept. NULLS LAST ensures untagged rows
+// appear after all event-timestamped rows.
 // When src is empty, all active documents are returned regardless of source type.
 func (s *DocumentStore) ListBySource(ctx context.Context, src model.SourceType, limit, offset int) ([]*model.Document, error) {
 	var (
@@ -87,10 +98,10 @@ func (s *DocumentStore) ListBySource(ctx context.Context, src model.SourceType, 
 	if src == "" {
 		const q = `
 			SELECT id, source_type, source_id, title, content, metadata, embedding,
-			       status, deleted_at, collected_at, created_at, updated_at
+			       status, deleted_at, occurred_at, collected_at, created_at, updated_at
 			FROM documents
 			WHERE status = 'active'
-			ORDER BY collected_at DESC
+			ORDER BY COALESCE(occurred_at, collected_at) DESC
 			LIMIT $1 OFFSET $2`
 		rows, err = s.pg.pool.Query(ctx, q, limit, offset)
 		if err != nil {
@@ -99,11 +110,11 @@ func (s *DocumentStore) ListBySource(ctx context.Context, src model.SourceType, 
 	} else {
 		const q = `
 			SELECT id, source_type, source_id, title, content, metadata, embedding,
-			       status, deleted_at, collected_at, created_at, updated_at
+			       status, deleted_at, occurred_at, collected_at, created_at, updated_at
 			FROM documents
 			WHERE source_type = $1
 			  AND status = 'active'
-			ORDER BY collected_at DESC
+			ORDER BY COALESCE(occurred_at, collected_at) DESC
 			LIMIT $2 OFFSET $3`
 		rows, err = s.pg.pool.Query(ctx, q, src, limit, offset)
 		if err != nil {
@@ -115,8 +126,11 @@ func (s *DocumentStore) ListBySource(ctx context.Context, src model.SourceType, 
 	return collectDocuments(rows)
 }
 
-// ListRecent returns active documents ordered by collected_at DESC, with
-// optional include/exclude source type filters.
+// ListRecent returns active documents ordered by the original event time
+// (occurred_at) when available, falling back to collected_at for rows that
+// have no event-time concept. This ensures "most recent" reflects when the
+// underlying event actually happened (email sent, call placed, etc.) rather
+// than when second-brain ingested the document.
 //
 // When includeSrc is non-empty, only documents of that source type are returned.
 // excludeSrcs lists source types to omit from results; it is applied after
@@ -152,10 +166,10 @@ func (s *DocumentStore) ListRecent(ctx context.Context, includeSrc model.SourceT
 
 	q := fmt.Sprintf(`
 		SELECT id, source_type, source_id, title, content, metadata, embedding,
-		       status, deleted_at, collected_at, created_at, updated_at
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at
 		FROM documents
 		%s
-		ORDER BY collected_at DESC
+		ORDER BY COALESCE(occurred_at, collected_at) DESC
 		LIMIT $%d OFFSET $%d`, where, limitIdx, offsetIdx)
 
 	rows, err := s.pg.pool.Query(ctx, q, args...)
@@ -185,9 +199,22 @@ func (s *DocumentStore) Search(ctx context.Context, query model.SearchQuery) ([]
 // Only the whitelisted literal "recent" changes the order; all other values
 // (including "" and "relevance") fall back to relevance (score DESC).
 // This whitelist comparison prevents SQL injection.
-func sortOrder(sort string) string {
+//
+// tableAlias is the SQL table alias used in the calling query ("d" for hybrid
+// search which aliases documents as d, "" for fulltext search which uses the
+// bare column names). When tableAlias is non-empty a dot-prefix is added.
+//
+// For "recent", we order by the original event time (occurred_at) when
+// available, falling back to collected_at — the same COALESCE strategy used
+// in ListRecent / ListBySource — so that "latest gmail" returns the most
+// recently sent email, not the most recently ingested one.
+func sortOrder(sort string, tableAlias string) string {
+	prefix := ""
+	if tableAlias != "" {
+		prefix = tableAlias + "."
+	}
 	if sort == "recent" {
-		return "collected_at DESC"
+		return fmt.Sprintf("COALESCE(%soccurred_at, %scollected_at) DESC", prefix, prefix)
 	}
 	return "score DESC"
 }
@@ -220,7 +247,7 @@ func (s *DocumentStore) fulltextSearch(ctx context.Context, query model.SearchQu
 	// percent signs in the Go format string (which would require '%%%%').
 	q := fmt.Sprintf(`
 		SELECT id, source_type, source_id, title, content, metadata, embedding,
-		       status, deleted_at, collected_at, created_at, updated_at,
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
 		       GREATEST(
 		           ts_rank(tsv, plainto_tsquery('simple', $1)),
 		           ts_rank(tsv, plainto_tsquery('english', $1))
@@ -234,7 +261,7 @@ func (s *DocumentStore) fulltextSearch(ctx context.Context, query model.SearchQu
 		%s
 		%s
 		ORDER BY %s
-		LIMIT $2`, statusFilter, sourceFilter, excludeFilter, sortOrder(query.Sort))
+		LIMIT $2`, statusFilter, sourceFilter, excludeFilter, sortOrder(query.Sort, ""))
 
 	rows, err := s.pg.pool.Query(ctx, q, args...)
 	if err != nil {
@@ -327,7 +354,7 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 			FULL OUTER JOIN bigm ON COALESCE(fts.id, vec.id) = bigm.id
 		)
 		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
-		       d.embedding, d.status, d.deleted_at, d.collected_at, d.created_at, d.updated_at,
+		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
 		       rrf.score
 		FROM rrf
 		JOIN documents d ON d.id = rrf.id
@@ -339,7 +366,7 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		w.FTSWeight, w.RRFK,
 		w.VecWeight, w.RRFK,
 		w.BigmWeight, w.RRFK,
-		sortOrder(query.Sort))
+		sortOrder(query.Sort, "d"))
 
 	rows, err := s.pg.pool.Query(ctx, q, args...)
 	if err != nil {
@@ -691,6 +718,51 @@ func (s *DocumentStore) queryCollectionStats(ctx context.Context) (BaselineColle
 	}, nil
 }
 
+// ListUnembedded returns up to limit active documents whose embedding column is
+// NULL, ordered by collected_at ASC (oldest first) so backfill progresses
+// forward in time.
+//
+// Soft-deleted documents are excluded because they are never served in search
+// results and re-embedding them would waste API quota.
+func (s *DocumentStore) ListUnembedded(ctx context.Context, limit int) ([]*model.Document, error) {
+	const q = `
+		SELECT id, source_type, source_id, title, content, metadata, embedding,
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at
+		FROM documents
+		WHERE embedding IS NULL
+		  AND status = 'active'
+		ORDER BY collected_at ASC
+		LIMIT $1`
+
+	rows, err := s.pg.pool.Query(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list unembedded: %w", err)
+	}
+	defer rows.Close()
+
+	return collectDocuments(rows)
+}
+
+// UpdateEmbedding writes the given embedding vector for a single document
+// identified by its primary key. Only the embedding column is touched so that
+// other fields (title, content, collected_at …) remain unchanged.
+func (s *DocumentStore) UpdateEmbedding(ctx context.Context, doc *model.Document) error {
+	if len(doc.Embedding) == 0 {
+		return fmt.Errorf("UpdateEmbedding: empty embedding for document %s", doc.ID)
+	}
+	_, err := s.pg.pool.Exec(ctx, `
+		UPDATE documents
+		SET embedding = $1, updated_at = now()
+		WHERE id = $2`,
+		pgvector.NewVector(doc.Embedding),
+		doc.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("update embedding %s: %w", doc.ID, err)
+	}
+	return nil
+}
+
 // ListActiveSourceIDs returns all source_ids for active documents of a given source type.
 func (s *DocumentStore) ListActiveSourceIDs(ctx context.Context, sourceType model.SourceType) ([]string, error) {
 	rows, err := s.pg.pool.Query(ctx, `
@@ -730,7 +802,7 @@ func scanDocument(row scannable) (*model.Document, error) {
 		&doc.ID, &doc.SourceType, &doc.SourceID,
 		&doc.Title, &doc.Content, &metaJSON, &vec,
 		&doc.Status, &doc.DeletedAt,
-		&doc.CollectedAt, &doc.CreatedAt, &doc.UpdatedAt,
+		&doc.OccurredAt, &doc.CollectedAt, &doc.CreatedAt, &doc.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -768,7 +840,7 @@ func collectResults(rows pgx.Rows, matchType string) ([]*model.SearchResult, err
 			&r.ID, &r.SourceType, &r.SourceID,
 			&r.Title, &r.Content, &metaJSON, &vec,
 			&r.Status, &r.DeletedAt,
-			&r.CollectedAt, &r.CreatedAt, &r.UpdatedAt,
+			&r.OccurredAt, &r.CollectedAt, &r.CreatedAt, &r.UpdatedAt,
 			&r.Score,
 		)
 		if err != nil {

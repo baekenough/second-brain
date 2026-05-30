@@ -118,6 +118,12 @@ func run() error {
 			collector.NewFilesystemCollectorWithDriveExport(cfg.FilesystemPath, driveExporter).
 				WithExcludes(cfg.FilesystemExcludeDirs, cfg.FilesystemExcludeExts))
 	}
+	if cfg.SecretaryDBPath != "" {
+		collectors = append(collectors, collector.NewSecretaryCollector(cfg.SecretaryDBPath))
+	}
+	if cfg.LLMMemoryDBPath != "" {
+		collectors = append(collectors, collector.NewLLMMemoryCollector(cfg.LLMMemoryDBPath))
+	}
 
 	// --- Scheduler ---
 	sched := scheduler.New(docStore, embedClient, collectors...).

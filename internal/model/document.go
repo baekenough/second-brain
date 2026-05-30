@@ -18,6 +18,8 @@ const (
 	SourceFilesystem SourceType = "filesystem"
 	SourceDiscord    SourceType = "discord"
 	SourceTelegram   SourceType = "telegram"
+	SourceSecretary  SourceType = "secretary"
+	SourceLLMMemory  SourceType = "llm-memory"
 )
 
 // Document represents a piece of content collected from an external source.
@@ -31,6 +33,13 @@ type Document struct {
 	Embedding   []float32      `json:"embedding,omitempty"`  // nil when not embedded
 	Status      string         `json:"status"`               // "active", "deleted", "moved"
 	DeletedAt   *time.Time     `json:"deleted_at,omitempty"` // nil for active documents
+	// OccurredAt is the timestamp of the original event: email sent date,
+	// calendar event start time, SMS/call time, etc.  It is distinct from
+	// CollectedAt (when second-brain ingested the document).  Nil when the
+	// collector has no event-time concept or the value could not be parsed.
+	// "Latest" queries sort by COALESCE(occurred_at, collected_at) DESC so
+	// documents without OccurredAt degrade gracefully to ingest order.
+	OccurredAt  *time.Time     `json:"occurred_at,omitempty"`
 	CollectedAt time.Time      `json:"collected_at"`
 	CreatedAt   time.Time      `json:"created_at"`
 	UpdatedAt   time.Time      `json:"updated_at"`

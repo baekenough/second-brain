@@ -24,6 +24,11 @@ Go module: `github.com/baekenough/second-brain`
 ## Collector pattern
 
 - Implement `Collector` interface: `Name()`, `Source()`, `Enabled()`, `Collect(ctx, since)`
+- **SecretaryCollector incremental strategy**: filter by `indexed_at > since`, NOT `timestamp > since`.
+  - `timestamp` = original event time (email sent date, call time) — can be years in the past.
+  - `indexed_at` = secretary's ingest time — monotonically increasing, correct cursor.
+  - Using `timestamp > since` caused permanent blind spots: after the first full collection, the watermark (run start time) advanced to ~now, so any newly-indexed record with a past event timestamp was silently skipped forever.
+  - `secretary.db` schema: `documents(id, source, ..., indexed_at TEXT NOT NULL)`
 - `DiscordCollector` is separate from `DiscordGateway` (WebSocket)
 - Collectors return `[]model.Document` from `Collect()`; attachment docs are upserted inline
 - `DiscordGateway` now has real-time collection via `SetDocStore(AttachmentDocumentStore)` (issue #38)

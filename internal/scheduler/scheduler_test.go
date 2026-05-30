@@ -42,6 +42,14 @@ func (m *mockStore) MarkDeleted(_ context.Context, _ model.SourceType, _ []strin
 	return 0, nil
 }
 
+func (m *mockStore) ListUnembedded(_ context.Context, _ int) ([]*model.Document, error) {
+	return nil, nil
+}
+
+func (m *mockStore) UpdateEmbedding(_ context.Context, _ *model.Document) error {
+	return nil
+}
+
 // slowCollector blocks for the given duration then returns zero documents.
 // Enabled() always returns true so the scheduler will run it.
 type slowCollector struct {
