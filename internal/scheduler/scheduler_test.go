@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baekenough/second-brain/internal/collector"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/search"
 )
@@ -48,6 +49,20 @@ func (m *mockStore) ListUnembedded(_ context.Context, _ int) ([]*model.Document,
 
 func (m *mockStore) UpdateEmbedding(_ context.Context, _ *model.Document) error {
 	return nil
+}
+
+func (m *mockStore) ActiveSourceIDSet(_ context.Context, _ model.SourceType) (map[string]struct{}, error) {
+	return map[string]struct{}{}, nil
+}
+
+// mockStoreErrorIDs is like mockStore but returns an error from ActiveSourceIDSet,
+// simulating a transient store failure during the indexed-ID pre-load.
+type mockStoreErrorIDs struct {
+	mockStore
+}
+
+func (m *mockStoreErrorIDs) ActiveSourceIDSet(_ context.Context, _ model.SourceType) (map[string]struct{}, error) {
+	return nil, errors.New("store unavailable")
 }
 
 // slowCollector blocks for the given duration then returns zero documents.
@@ -207,5 +222,37 @@ func TestScheduler_PanicInRun_ReleasesLock(t *testing.T) {
 
 	if sched.running.Load() {
 		t.Error("running flag should be false after second run completes")
+	}
+}
+
+// TestScheduler_ActiveSourceIDSet_Error_ResetsCollector verifies that when
+// ActiveSourceIDSet returns an error the scheduler calls WithIndexedIDs(nil) on
+// the FilesystemCollector, clearing any stale indexedIDs map left over from a
+// previous successful run.  The observable consequence is that the run still
+// completes (non-fatal path) and the running flag is released normally.
+func TestScheduler_ActiveSourceIDSet_Error_ResetsCollector(t *testing.T) {
+	t.Parallel()
+
+	// Build a real temporary filesystem collector and prime it with a non-nil
+	// indexedIDs set — simulating a successful prior run that populated the map.
+	tmpDir := t.TempDir()
+	fsc := collector.NewFilesystemCollector(tmpDir)
+	fsc.WithIndexedIDs(map[string]struct{}{"stale-entry": {}})
+
+	store := &mockStoreErrorIDs{}
+	sched := New(store, disabledEmbed(), fsc)
+
+	ctx := context.Background()
+	// run() must complete without panic and release the running flag.
+	sched.run(ctx, fsc)
+
+	if sched.running.Load() {
+		t.Error("running flag should be false after run with ActiveSourceIDSet error")
+	}
+	// A second run must also succeed — confirming the scheduler is not broken
+	// by the error path.
+	sched.run(ctx, fsc)
+	if sched.running.Load() {
+		t.Error("running flag should be false after second run")
 	}
 }

@@ -109,6 +109,14 @@ type FilesystemCollector struct {
 	extraSkipDirs map[string]bool
 	extraSkipExts map[string]bool
 	batchSize     int
+
+	// indexedIDs is an optional set of source_ids that are already active in the
+	// store. When non-nil, CollectStream uses it to detect files that are present
+	// on disk but not yet indexed (regardless of their mtime vs the cursor), which
+	// fixes the case where a file is copied with a preserved old mtime that predates
+	// the last-collection watermark. The set is populated by the scheduler before
+	// each run via WithIndexedIDs.
+	indexedIDs map[string]struct{}
 }
 
 // WithBatchSize overrides the streaming batch size used by CollectStream.
@@ -117,6 +125,24 @@ func (c *FilesystemCollector) WithBatchSize(n int) *FilesystemCollector {
 	if n > 0 {
 		c.batchSize = n
 	}
+	return c
+}
+
+// WithIndexedIDs provides the collector with a pre-loaded set of source_ids
+// that are already active in the store. When set, CollectStream treats any
+// file whose relative path is NOT in this set as "new" and collects it
+// unconditionally, regardless of whether its mtime predates the cursor. Files
+// that ARE in the set are still skipped by the normal mtime guard so that
+// already-indexed, unchanged files are not re-processed on every run.
+//
+// The scheduler calls this at the start of each filesystem collection cycle
+// (after loading the set from store.ActiveSourceIDSet) to fix the bug where
+// files copied with a preserved old mtime are silently skipped on their first
+// encounter. Passing nil disables the store-aware new-file detection and
+// restores the previous mtime-only behaviour (used in tests that do not need a
+// store).
+func (c *FilesystemCollector) WithIndexedIDs(ids map[string]struct{}) *FilesystemCollector {
+	c.indexedIDs = ids
 	return c
 }
 
@@ -264,8 +290,38 @@ func (c *FilesystemCollector) CollectStream(ctx context.Context, since time.Time
 			return nil
 		}
 
+		// Determine the relative path first so we can check the indexed-ID set.
+		// This mirrors the same computation done inside buildDocument; we accept
+		// the minor duplication to keep the guard logic inline and clear.
+		relPath, relErr := filepath.Rel(c.rootPath, path)
+		if relErr != nil {
+			relPath = path
+		}
+
+		// Skip criterion: the file has not changed since the last collection run.
+		//
+		// A file is considered "already up-to-date" only when BOTH conditions hold:
+		//   1. Its mtime is not after the cursor (no modification since last run).
+		//   2. It is already present in the store (it was indexed in a previous run).
+		//
+		// Condition (2) is checked via the indexedIDs set loaded by the scheduler
+		// before the walk. When indexedIDs is nil (e.g. in tests without a store),
+		// we fall back to the original mtime-only guard to preserve backward
+		// compatibility.
+		//
+		// This fixes the bug where a file copied with a preserved old mtime (older
+		// than the cursor) is silently skipped on its first encounter even though it
+		// has never been indexed. Such files fail condition (2) and are collected.
 		if !info.ModTime().After(since) {
-			return nil
+			if c.indexedIDs == nil {
+				// No store-backed set available; use original mtime-only behaviour.
+				return nil
+			}
+			if _, alreadyIndexed := c.indexedIDs[relPath]; alreadyIndexed {
+				// File is unmodified AND already in the store — safe to skip.
+				return nil
+			}
+			// File not in store (new file with old mtime) — fall through to collect.
 		}
 
 		doc, ok := c.buildDocument(path, info)

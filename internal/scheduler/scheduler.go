@@ -40,6 +40,10 @@ type DocumentUpserter interface {
 	ListUnembedded(ctx context.Context, limit int) ([]*model.Document, error)
 	// UpdateEmbedding persists the embedding vector for a single document.
 	UpdateEmbedding(ctx context.Context, doc *model.Document) error
+	// ActiveSourceIDSet returns the set of source_ids currently active in the
+	// store for the given source type. Used by the filesystem collector to detect
+	// files that have never been indexed regardless of their mtime.
+	ActiveSourceIDSet(ctx context.Context, sourceType model.SourceType) (map[string]struct{}, error)
 }
 
 // Scheduler wraps robfig/cron and manages periodic collection runs.
@@ -160,6 +164,29 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 		"instance", s.instanceID,
 		"since", since.Format(time.RFC3339),
 	)
+
+	// For the filesystem collector, pre-load the set of already-indexed source_ids
+	// so that the collector can detect files that are new (never indexed) even when
+	// their mtime predates the cursor. This fixes the bug where a file copied with
+	// a preserved old mtime is silently skipped on its first encounter.
+	//
+	// We load the set once per run (not per-file) so the per-file cost is an O(1)
+	// map lookup rather than a round-trip to the database.
+	if fsc, ok := col.(*collector.FilesystemCollector); ok && !since.IsZero() {
+		indexedIDs, err := s.store.ActiveSourceIDSet(ctx, col.Source())
+		if err != nil {
+			// Non-fatal: fall back to mtime-only behaviour for this run.
+			// Explicitly clear any stale indexedIDs from a previous successful run
+			// so the collector does not silently carry over a stale set.
+			fsc.WithIndexedIDs(nil)
+			slog.Warn("scheduler: could not load indexed source IDs, falling back to mtime-only",
+				"collector", col.Name(), "error", err)
+		} else {
+			fsc.WithIndexedIDs(indexedIDs)
+			slog.Debug("scheduler: loaded indexed source IDs for filesystem collector",
+				"collector", col.Name(), "count", len(indexedIDs))
+		}
+	}
 
 	var (
 		count    int
