@@ -46,8 +46,10 @@ func main() {
 }
 
 func run() error {
-	// Load .env file if present (ignore error — env vars may be set directly).
-	_ = godotenv.Load()
+	// Overload .env file if present (ignore error — env vars may be set directly).
+	// Overload() forces .env values to win over pre-existing env vars, preventing
+	// stale/empty values (e.g. empty ANTHROPIC_API_KEY) from causing 401 failures.
+	_ = godotenv.Overload()
 
 	cfg, err := config.LoadCollector()
 	if err != nil {
@@ -66,7 +68,7 @@ func run() error {
 
 	// Run migrations from the migrations/ directory relative to the binary.
 	migrationsDir := migrationsPath()
-	if err := pg.RunMigrations(ctx, migrationsDir); err != nil {
+	if err := pg.RunMigrations(ctx, migrationsDir, cfg.EmbeddingDim); err != nil {
 		return err
 	}
 

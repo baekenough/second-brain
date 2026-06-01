@@ -48,9 +48,11 @@ func main() {
 }
 
 func run() error {
-	// Load .env file when present; ignore error because env vars may be
-	// injected directly (Docker, k8s, etc.).
-	_ = godotenv.Load()
+	// Overload .env file when present; unlike Load(), Overload() forces .env
+	// values to win over pre-existing env vars, preventing stale/empty values
+	// (e.g. empty ANTHROPIC_API_KEY) from causing 401 auth failures.
+	// Ignore error because env vars may be injected directly (Docker, k8s, etc.).
+	_ = godotenv.Overload()
 
 	cfg, err := config.Load()
 	if err != nil {
