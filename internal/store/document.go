@@ -786,6 +786,32 @@ func (s *DocumentStore) ListActiveSourceIDs(ctx context.Context, sourceType mode
 	return ids, rows.Err()
 }
 
+// ActiveSourceIDSet returns a set of all source_ids that are currently active
+// for the given source type. The returned map is keyed by source_id and is
+// safe to use for O(1) membership tests. It is used by the filesystem collector
+// to detect files that are new (not yet indexed) regardless of their mtime.
+func (s *DocumentStore) ActiveSourceIDSet(ctx context.Context, sourceType model.SourceType) (map[string]struct{}, error) {
+	rows, err := s.pg.pool.Query(ctx, `
+		SELECT source_id FROM documents
+		WHERE source_type = $1 AND status = 'active'`,
+		sourceType,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("active source ID set for %s: %w", sourceType, err)
+	}
+	defer rows.Close()
+
+	set := make(map[string]struct{})
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		set[id] = struct{}{}
+	}
+	return set, rows.Err()
+}
+
 // --- scan helpers ---
 
 type scannable interface {

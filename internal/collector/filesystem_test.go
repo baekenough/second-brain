@@ -157,6 +157,113 @@ func TestFilesystemListActiveSourceIDs_SkipsLongFilenames(t *testing.T) {
 	}
 }
 
+// TestFilesystemCollect_OldMtimeNewFile verifies that a file copied with an old
+// mtime (predating the cursor) is collected when WithIndexedIDs indicates it has
+// never been indexed, but is skipped when it is already in the indexed set.
+func TestFilesystemCollect_OldMtimeNewFile(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+
+	// Create two files with the current time so we can then rewind their mtime.
+	newUnindexed := filepath.Join(root, "new_unindexed.md")
+	alreadyIndexed := filepath.Join(root, "already_indexed.md")
+	if err := os.WriteFile(newUnindexed, []byte("# new file"), 0o644); err != nil {
+		t.Fatalf("write new_unindexed: %v", err)
+	}
+	if err := os.WriteFile(alreadyIndexed, []byte("# indexed file"), 0o644); err != nil {
+		t.Fatalf("write already_indexed: %v", err)
+	}
+
+	// Rewind both files' mtime to well before the cursor.
+	oldTime := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(newUnindexed, oldTime, oldTime); err != nil {
+		t.Fatalf("chtimes new_unindexed: %v", err)
+	}
+	if err := os.Chtimes(alreadyIndexed, oldTime, oldTime); err != nil {
+		t.Fatalf("chtimes already_indexed: %v", err)
+	}
+
+	// Set the cursor to a recent time so both files' mtime is before it.
+	since := time.Now().Add(-1 * time.Hour)
+
+	// Simulate the indexed-IDs set: only already_indexed.md is in the store.
+	indexedIDs := map[string]struct{}{
+		"already_indexed.md": {},
+	}
+
+	c := NewFilesystemCollector(root)
+	c.WithIndexedIDs(indexedIDs)
+
+	docs, err := c.Collect(t.Context(), since)
+	if err != nil {
+		t.Fatalf("Collect returned error: %v", err)
+	}
+
+	sourceIDs := make(map[string]bool, len(docs))
+	for _, d := range docs {
+		sourceIDs[d.SourceID] = true
+	}
+
+	// new_unindexed.md must be collected despite its old mtime (not in store).
+	if !sourceIDs["new_unindexed.md"] {
+		t.Errorf("new_unindexed.md with old mtime should be collected when not in indexedIDs; got source IDs: %v", sourceIDs)
+	}
+
+	// already_indexed.md must be skipped (old mtime + already in store).
+	if sourceIDs["already_indexed.md"] {
+		t.Errorf("already_indexed.md with old mtime should be skipped when in indexedIDs; got source IDs: %v", sourceIDs)
+	}
+}
+
+// TestFilesystemCollect_NilIndexedIDs_FallsBackToMtime verifies that when
+// WithIndexedIDs is not called (indexedIDs == nil), the original mtime-only
+// behaviour is preserved: files with mtime <= cursor are skipped.
+func TestFilesystemCollect_NilIndexedIDs_FallsBackToMtime(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+
+	oldFile := filepath.Join(root, "old.md")
+	newFile := filepath.Join(root, "new.md")
+	if err := os.WriteFile(oldFile, []byte("old"), 0o644); err != nil {
+		t.Fatalf("write old.md: %v", err)
+	}
+
+	// new.md will naturally have a recent mtime.
+	if err := os.WriteFile(newFile, []byte("new"), 0o644); err != nil {
+		t.Fatalf("write new.md: %v", err)
+	}
+
+	// Rewind old.md to before the cursor.
+	oldTime := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(oldFile, oldTime, oldTime); err != nil {
+		t.Fatalf("chtimes old.md: %v", err)
+	}
+
+	since := time.Now().Add(-1 * time.Hour)
+
+	// No WithIndexedIDs — original mtime-only behaviour.
+	c := NewFilesystemCollector(root)
+
+	docs, err := c.Collect(t.Context(), since)
+	if err != nil {
+		t.Fatalf("Collect returned error: %v", err)
+	}
+
+	sourceIDs := make(map[string]bool, len(docs))
+	for _, d := range docs {
+		sourceIDs[d.SourceID] = true
+	}
+
+	if sourceIDs["old.md"] {
+		t.Errorf("old.md should be skipped by mtime guard when indexedIDs is nil")
+	}
+	if !sourceIDs["new.md"] {
+		t.Errorf("new.md should be collected (mtime after cursor)")
+	}
+}
+
 // TestFilesystemCollect_WalkErrorContinues verifies that a walk error on a
 // single entry (e.g. permission denied sub-directory) does not abort the
 // overall walk — other files are still collected.
