@@ -67,19 +67,19 @@ services:
       # (auth.json, oauth_creds.json, .claude.json) never enter the container.
       #
       # Notes vault (full)
-      - "/Users/user/workspace:/data/drive/workspace:ro"
+      - "${WORKSPACE_DIR:-/Users/user/workspace}:/data/drive/workspace:ro"
       # Claude Code: sessions, project history, transcripts
-      - "/Users/user/.claude/sessions:/data/drive/claude/sessions:ro"
-      - "/Users/user/.claude/projects:/data/drive/claude/projects:ro"
-      - "/Users/user/.claude/transcripts:/data/drive/claude/transcripts:ro"
+      - "${HOST_HOME:-/Users/user}/.claude/sessions:/data/drive/claude/sessions:ro"
+      - "${HOST_HOME:-/Users/user}/.claude/projects:/data/drive/claude/projects:ro"
+      - "${HOST_HOME:-/Users/user}/.claude/transcripts:/data/drive/claude/transcripts:ro"
       # Codex CLI: sessions, archived sessions, history, memories
-      - "/Users/user/.codex/sessions:/data/drive/codex/sessions:ro"
-      - "/Users/user/.codex/archived_sessions:/data/drive/codex/archived_sessions:ro"
-      - "/Users/user/.codex/history.jsonl:/data/drive/codex/history.jsonl:ro"
-      - "/Users/user/.codex/memories:/data/drive/codex/memories:ro"
+      - "${HOST_HOME:-/Users/user}/.codex/sessions:/data/drive/codex/sessions:ro"
+      - "${HOST_HOME:-/Users/user}/.codex/archived_sessions:/data/drive/codex/archived_sessions:ro"
+      - "${HOST_HOME:-/Users/user}/.codex/history.jsonl:/data/drive/codex/history.jsonl:ro"
+      - "${HOST_HOME:-/Users/user}/.codex/memories:/data/drive/codex/memories:ro"
       # Gemini CLI: history only (oauth_creds.json and google_accounts.json at
       # the ~/.gemini root are intentionally not mounted).
-      - "/Users/user/.gemini/history:/data/drive/gemini/history:ro"
+      - "${HOST_HOME:-/Users/user}/.gemini/history:/data/drive/gemini/history:ro"
     restart: unless-stopped
 
 volumes:

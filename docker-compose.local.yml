@@ -73,8 +73,8 @@ services:
       postgres:
         condition: service_healthy
     volumes:
-      - /Users/user/workspace/private/secretary/assistant/secretary.db:/data/secretary.db:ro
-      - /Users/user/workspace/llm-memory/data/memory.sqlite:/data/llm-memory.sqlite:ro
+      - ${SECRETARY_DB_HOST_PATH:-/Users/user/workspace/private/secretary/assistant/secretary.db}:/data/secretary.db:ro
+      - ${LLM_MEMORY_DB_HOST_PATH:-/Users/user/workspace/llm-memory/data/memory.sqlite}:/data/llm-memory.sqlite:ro
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------

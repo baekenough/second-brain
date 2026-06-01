@@ -25,12 +25,12 @@ services:
       FILESYSTEM_EXCLUDE_DIRS: "keys,.venv,.obsidian,.omx,.omcustom,.github,vendor,__pycache__,.pytest_cache,.mypy_cache,.ruff_cache,target,build,.gradle,.idea,.turbo,.cache,.parcel-cache,.svelte-kit,.vercel,.pnpm-store,.yarn,coverage,.nyc_output,.claude-backup-2026-03-13T09-03-25-712Z,.claude-backup-2026-04-15T11-12-36-843Z,statsig,telemetry,cache,caches,tmp,.tmp,paste-cache,file-history,usage-data,session-env,session-state,shell-snapshots,shell_snapshots,chrome,plugins.bak,debug,sqlite,vercel-plugin-telemetry-preference,stats-cache,mcp-needs-auth-cache,backups,ide,vendor_imports"
       FILESYSTEM_EXCLUDE_EXTS: ".js,.ts,.tsx,.py,.sh,.sqlite,.sqlite-shm,.sqlite-wal,.db,.lock"
     volumes:
-      - /Users/user/workspace:/data/drive/workspace:ro
-      - /Users/user/.claude/sessions:/data/drive/claude/sessions:ro
-      - /Users/user/.claude/projects:/data/drive/claude/projects:ro
-      - /Users/user/.claude/transcripts:/data/drive/claude/transcripts:ro
-      - /Users/user/.codex/sessions:/data/drive/codex/sessions:ro
-      - /Users/user/.codex/archived_sessions:/data/drive/codex/archived_sessions:ro
-      - /Users/user/.codex/history.jsonl:/data/drive/codex/history.jsonl:ro
-      - /Users/user/.codex/memories:/data/drive/codex/memories:ro
-      - /Users/user/.gemini/history:/data/drive/gemini/history:ro
+      - ${WORKSPACE_DIR:-/Users/user/workspace}:/data/drive/workspace:ro
+      - ${HOST_HOME:-/Users/user}/.claude/sessions:/data/drive/claude/sessions:ro
+      - ${HOST_HOME:-/Users/user}/.claude/projects:/data/drive/claude/projects:ro
+      - ${HOST_HOME:-/Users/user}/.claude/transcripts:/data/drive/claude/transcripts:ro
+      - ${HOST_HOME:-/Users/user}/.codex/sessions:/data/drive/codex/sessions:ro
+      - ${HOST_HOME:-/Users/user}/.codex/archived_sessions:/data/drive/codex/archived_sessions:ro
+      - ${HOST_HOME:-/Users/user}/.codex/history.jsonl:/data/drive/codex/history.jsonl:ro
+      - ${HOST_HOME:-/Users/user}/.codex/memories:/data/drive/codex/memories:ro
+      - ${HOST_HOME:-/Users/user}/.gemini/history:/data/drive/gemini/history:ro
