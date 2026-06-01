@@ -67,7 +67,18 @@ func NewPostgres(ctx context.Context, databaseURL string) (*Postgres, error) {
 // RunMigrations executes all *.sql files inside the given directory in
 // lexicographic order. Files already applied are safe to re-run because each
 // migration is idempotent (CREATE TABLE IF NOT EXISTS, etc.).
-func (pg *Postgres) RunMigrations(ctx context.Context, migrationsDir string) error {
+//
+// embeddingDim is the configured vector dimension (from EMBEDDING_DIM env var,
+// default 1536). When a migration file is named "011_configurable_embedding_dim.sql",
+// RunMigrations acquires a dedicated connection, opens a transaction, and runs
+//
+//	SET LOCAL app.embedding_dim = <embeddingDim>
+//
+// immediately before executing that file's SQL — all on the same connection and
+// within the same transaction. SET LOCAL ensures the GUC is visible only to that
+// transaction, which is exactly what migration 011 reads via current_setting().
+// Any other migration file is executed via the pool as before.
+func (pg *Postgres) RunMigrations(ctx context.Context, migrationsDir string, embeddingDim int) error {
 	entries, err := os.ReadDir(migrationsDir)
 	if err != nil {
 		return fmt.Errorf("read migrations dir %q: %w", migrationsDir, err)
@@ -86,12 +97,52 @@ func (pg *Postgres) RunMigrations(ctx context.Context, migrationsDir string) err
 		if err != nil {
 			return fmt.Errorf("read migration %q: %w", f, err)
 		}
-		if _, err := pg.pool.Exec(ctx, string(sql)); err != nil {
-			return fmt.Errorf("execute migration %q: %w", f, err)
+
+		base := filepath.Base(f)
+		if base == "011_configurable_embedding_dim.sql" && embeddingDim > 0 {
+			// Acquire a single connection so that SET LOCAL and the migration SQL
+			// execute on the same underlying PostgreSQL backend process.
+			if err := pg.runMigration011(ctx, string(sql), embeddingDim); err != nil {
+				return fmt.Errorf("execute migration %q: %w", f, err)
+			}
+		} else {
+			if _, err := pg.pool.Exec(ctx, string(sql)); err != nil {
+				return fmt.Errorf("execute migration %q: %w", f, err)
+			}
 		}
-		slog.Info("migration applied", "file", filepath.Base(f))
+		slog.Info("migration applied", "file", base)
 	}
 	return nil
+}
+
+// runMigration011 runs migration 011 on a dedicated connection inside a
+// transaction. SET LOCAL scopes app.embedding_dim to the transaction, which
+// guarantees that current_setting('app.embedding_dim') inside the DO block
+// reads the configured value — not NULL — regardless of pool connection reuse.
+func (pg *Postgres) runMigration011(ctx context.Context, sql string, embeddingDim int) error {
+	conn, err := pg.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire connection: %w", err)
+	}
+	defer conn.Release()
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// SET LOCAL is transaction-scoped: the GUC reverts automatically on
+	// commit/rollback, which is safe for a session-local parameter.
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.embedding_dim = %d", embeddingDim)); err != nil {
+		return fmt.Errorf("set app.embedding_dim: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, sql); err != nil {
+		return fmt.Errorf("execute sql: %w", err)
+	}
+
+	return tx.Commit(ctx)
 }
 
 // Pool returns the underlying pgx pool for use by store implementations.

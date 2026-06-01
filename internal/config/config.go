@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -20,6 +21,7 @@ type Config struct {
 	EmbeddingAPIURL  string
 	EmbeddingAPIKey  string
 	EmbeddingModel   string
+	EmbeddingDim     int    // EMBEDDING_DIM — vector dimension; must match the model output. Default 1536.
 	CliProxyAuthFile string // path to CliProxyAPI OAuth JSON, e.g. ~/.cli-proxy-api/codex-user@gmail.com-pro.json
 
 	// LLM (optional — Discord RAG answer generation; falls back to EmbeddingAPIURL when unset)
@@ -168,6 +170,21 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// EmbeddingDim: default 1536 (text-embedding-3-small).
+	// Set EMBEDDING_DIM=384 for multilingual-e5-small-ko or other 384-d models.
+	embeddingDim := 1536
+	if v := os.Getenv("EMBEDDING_DIM"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			slog.Warn("config: EMBEDDING_DIM is invalid; using default 1536",
+				"value", v,
+				"error", err,
+			)
+		} else {
+			embeddingDim = n
+		}
+	}
+
 	return &Config{
 		Port:        getenv("PORT", "8080"),
 		DatabaseURL: getenv("DATABASE_URL", "postgres://brain:brain@localhost:5432/second_brain?sslmode=disable"),
@@ -175,6 +192,7 @@ func Load() (*Config, error) {
 		EmbeddingAPIURL:  embeddingAPIURL,
 		EmbeddingAPIKey:  embeddingAPIKey,
 		EmbeddingModel:   getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
+		EmbeddingDim:     embeddingDim,
 		CliProxyAuthFile: os.Getenv("CLIPROXY_AUTH_FILE"),
 
 		LLMAPIURL:      llmAPIURL,
