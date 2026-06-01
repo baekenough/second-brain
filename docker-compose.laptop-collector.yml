@@ -25,12 +25,12 @@ services:
       FILESYSTEM_EXCLUDE_DIRS: "keys,.venv,.obsidian,.omx,.omcustom,.github,vendor,__pycache__,.pytest_cache,.mypy_cache,.ruff_cache,target,build,.gradle,.idea,.turbo,.cache,.parcel-cache,.svelte-kit,.vercel,.pnpm-store,.yarn,coverage,.nyc_output,.claude-backup-2026-03-13T09-03-25-712Z,.claude-backup-2026-04-15T11-12-36-843Z,statsig,telemetry,cache,caches,tmp,.tmp,paste-cache,file-history,usage-data,session-env,session-state,shell-snapshots,shell_snapshots,chrome,plugins.bak,debug,sqlite,vercel-plugin-telemetry-preference,stats-cache,mcp-needs-auth-cache,backups,ide,vendor_imports"
       FILESYSTEM_EXCLUDE_EXTS: ".js,.ts,.tsx,.py,.sh,.sqlite,.sqlite-shm,.sqlite-wal,.db,.lock"
     volumes:
-      - /Users/sangyi/workspace:/data/drive/workspace:ro
-      - /Users/sangyi/.claude/sessions:/data/drive/claude/sessions:ro
-      - /Users/sangyi/.claude/projects:/data/drive/claude/projects:ro
-      - /Users/sangyi/.claude/transcripts:/data/drive/claude/transcripts:ro
-      - /Users/sangyi/.codex/sessions:/data/drive/codex/sessions:ro
-      - /Users/sangyi/.codex/archived_sessions:/data/drive/codex/archived_sessions:ro
-      - /Users/sangyi/.codex/history.jsonl:/data/drive/codex/history.jsonl:ro
-      - /Users/sangyi/.codex/memories:/data/drive/codex/memories:ro
-      - /Users/sangyi/.gemini/history:/data/drive/gemini/history:ro
+      - ${WORKSPACE_DIR:-/Users/sangyi/workspace}:/data/drive/workspace:ro
+      - ${HOST_HOME:-/Users/sangyi}/.claude/sessions:/data/drive/claude/sessions:ro
+      - ${HOST_HOME:-/Users/sangyi}/.claude/projects:/data/drive/claude/projects:ro
+      - ${HOST_HOME:-/Users/sangyi}/.claude/transcripts:/data/drive/claude/transcripts:ro
+      - ${HOST_HOME:-/Users/sangyi}/.codex/sessions:/data/drive/codex/sessions:ro
+      - ${HOST_HOME:-/Users/sangyi}/.codex/archived_sessions:/data/drive/codex/archived_sessions:ro
+      - ${HOST_HOME:-/Users/sangyi}/.codex/history.jsonl:/data/drive/codex/history.jsonl:ro
+      - ${HOST_HOME:-/Users/sangyi}/.codex/memories:/data/drive/codex/memories:ro
+      - ${HOST_HOME:-/Users/sangyi}/.gemini/history:/data/drive/gemini/history:ro
