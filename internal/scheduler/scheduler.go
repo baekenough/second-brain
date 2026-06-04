@@ -17,18 +17,6 @@ import (
 	"github.com/baekenough/second-brain/internal/store"
 )
 
-// defaultChunkTargetSize is the preferred chunk size in bytes passed to chunker.Split.
-// Documents are split into chunks of approximately this size for FTS indexing.
-// This removes the previous 8 KB hard truncation (issue #3).
-const defaultChunkTargetSize = 2000
-
-// defaultChunkMaxSize is the hard upper bound for a single chunk in bytes.
-const defaultChunkMaxSize = 4000
-
-// defaultChunkOverlap is the number of bytes shared between adjacent chunks
-// so that cross-boundary phrases remain searchable.
-const defaultChunkOverlap = 100
-
 // DocumentUpserter is the subset of the document store used by the scheduler.
 type DocumentUpserter interface {
 	Upsert(ctx context.Context, doc *model.Document) error
@@ -401,13 +389,13 @@ func (s *Scheduler) embedDocuments(ctx context.Context, docs []model.Document) {
 // them in the chunks table via ChunkStore.ReplaceDocument. A failure here is
 // non-fatal: the document itself is already persisted in documents; only the
 // chunk-based FTS index is affected.
+//
+// Chunking strategy is selected per document by chunker.SelectOptions (issue #60).
+// Long-form structured sources (filesystem, notion, github, gdrive) continue to
+// use the heading-aware defaults (Target 2000 / Max 4000 / Overlap 100), so
+// there is no behavioural regression for those sources.
 func (s *Scheduler) persistChunks(ctx context.Context, doc *model.Document) {
-	texts := chunker.Split(doc.Content, chunker.Options{
-		TargetSize:   defaultChunkTargetSize,
-		MaxSize:      defaultChunkMaxSize,
-		Overlap:      defaultChunkOverlap,
-		HeadingAware: true,
-	})
+	texts := chunker.Split(doc.Content, chunker.SelectOptions(*doc))
 	if len(texts) == 0 {
 		return
 	}
