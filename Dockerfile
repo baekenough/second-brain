@@ -13,11 +13,10 @@
 #   eval       — Eval runner (no port, no healthcheck)
 #   mcp        — MCP server (port 8090)
 #
-# NOTE: go.mod declares `go 1.25.0`. As of this writing, golang:1.25-alpine
-# is not yet available on Docker Hub (Go 1.25 is in RC). We use golang:1.24-
-# alpine which fully satisfies the toolchain requirement for the declared
-# module graph. Update the FROM tag to golang:1.25-alpine once the image is
-# published.
+# NOTE: go.mod declares `go 1.26.4` with `toolchain go1.26.4`. The builder
+# image uses golang:1.26-alpine so the bundled toolchain matches the module
+# requirement exactly — no runtime download is needed and the build works in
+# air-gapped / GOTOOLCHAIN=local environments.
 #
 # NOTE (poppler / OCR — Phase 2, implemented):
 #   The collector shells out to pdftotext / pdfinfo (poppler-utils),
@@ -30,7 +29,7 @@
 # -----------------------------------------------------------------------------
 # Stage 1 — Dependency download (separate layer for cache efficiency)
 # -----------------------------------------------------------------------------
-FROM golang:1.24-alpine AS deps
+FROM golang:1.26-alpine AS deps
 
 WORKDIR /workspace
 
@@ -41,7 +40,7 @@ RUN GOTOOLCHAIN=auto go mod download
 # -----------------------------------------------------------------------------
 # Stage 2 — Source copy
 # -----------------------------------------------------------------------------
-FROM golang:1.24-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 # BuildKit injects TARGETOS/TARGETARCH automatically when using
 # `docker buildx build --platform linux/amd64,linux/arm64`.

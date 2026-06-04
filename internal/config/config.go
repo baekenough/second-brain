@@ -13,16 +13,31 @@ type Config struct {
 	Port        string
 	DatabaseURL string
 
-	// Embedding (optional — vector search disabled when empty)
+	// Embedding (optional — vector search disabled when EMBEDDING_API_KEY and
+	// CLIPROXY_AUTH_FILE are both empty; FTS remains the graceful fallback).
+	//
+	// Routing decision (issue #34): embeddings use OpenAI directly via a
+	// dedicated sk- key (EMBEDDING_API_KEY).  cliproxy is chat-only — it
+	// returns 404 on /v1/embeddings and is therefore NOT suitable for this
+	// path.  Setting EMBEDDING_API_KEY disables CLIPROXY_AUTH_FILE for the
+	// embedding path (apiKey takes priority).
+	//
 	// Token resolution order:
-	//   1. EmbeddingAPIKey (manual override)
-	//   2. CliProxyAuthFile (auto-read OAuth token from CliProxyAPI)
-	//   3. No auth (some self-hosted endpoints don't require it)
+	//   1. EMBEDDING_API_KEY non-empty → static Bearer token (OpenAI direct)
+	//   2. CLIPROXY_AUTH_FILE non-empty → CliProxyAPI OAuth token (legacy; chat proxies only)
+	//   3. Both empty → disabled (FTS-only mode, no embeddings generated)
+	//
+	// Default EMBEDDING_API_URL: https://api.openai.com/v1
+	// Default EMBEDDING_MODEL:   text-embedding-3-small
+	// Default EMBEDDING_DIM:     1536 (matches text-embedding-3-small output)
 	EmbeddingAPIURL  string
+	// EmbeddingAPIKey is a dedicated OpenAI API key (EMBEDDING_API_KEY env var).
+	// Use a separate key from any chat/LLM key so embedding costs are tracked
+	// independently and the key can be rotated without affecting chat traffic.
 	EmbeddingAPIKey  string
 	EmbeddingModel   string
 	EmbeddingDim     int    // EMBEDDING_DIM — vector dimension; must match the model output. Default 1536.
-	CliProxyAuthFile string // path to CliProxyAPI OAuth JSON, e.g. ~/.cli-proxy-api/codex-user@gmail.com-pro.json
+	CliProxyAuthFile string // CLIPROXY_AUTH_FILE — CliProxyAPI OAuth JSON path (chat proxies only; NOT used for embeddings when EMBEDDING_API_KEY is set)
 
 	// LLM (optional — Discord RAG answer generation; falls back to EmbeddingAPIURL when unset)
 	// LLMAPIURL: LLM_API_URL env var; defaults to EmbeddingAPIURL with /embeddings → /chat/completions suffix fix.
