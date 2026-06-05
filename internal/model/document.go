@@ -2,6 +2,8 @@ package model
 
 import (
 	"math"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -59,16 +61,62 @@ type SearchResult struct {
 }
 
 // SearchWeights controls RRF fusion behaviour.
-// Zero values fall back to hardcoded defaults (backward compatible).
+//
+// Zero-value contract:
+//   - A zero SearchWeights{} means "use all defaults" — Defaults() replaces
+//     zero/NaN/Inf fields with their canonical values.
+//   - To disable the SummaryVec signal explicitly, set DisableSummaryVec=true.
+//     Defaults() then forces SummaryVec to 0.0 regardless of the SummaryVec field,
+//     bypassing the coverage gate entirely (#63).
+//   - To let the coverage gate decide, leave both SummaryVec and DisableSummaryVec
+//     at their zero values.
+//   - To force a specific weight (bypassing the gate), set SummaryVec to the
+//     desired value with DisableSummaryVec=false.
 type SearchWeights struct {
 	FTSWeight  float64 `json:"fts_weight"`
 	VecWeight  float64 `json:"vec_weight"`
 	BigmWeight float64 `json:"bigm_weight"`
-	SummaryVec float64 `json:"summary_vec_weight"` // weight for summary_embedding CTE in hybrid search
-	RRFK       float64 `json:"rrf_k"`
+	// SummaryVec is the RRF weight for the summary_embedding CTE in hybrid search.
+	// When zero (the default / unset) and DisableSummaryVec is false, the coverage
+	// gate in hybridSearch decides the effective weight based on SummaryCoverageRatio (see #63).
+	// When explicitly set to a positive value by the caller (and DisableSummaryVec is false),
+	// that value is used directly and the coverage gate is bypassed.
+	SummaryVec float64 `json:"summary_vec_weight"`
+	// DisableSummaryVec, when true, forces SummaryVec to 0.0 after Defaults(),
+	// bypassing the coverage gate. Use this when the caller explicitly wants to
+	// exclude the summary-embedding lane from hybrid search (#63).
+	// This disambiguates "I haven't set SummaryVec" (zero, gate applies) from
+	// "I explicitly want SummaryVec disabled" (DisableSummaryVec=true).
+	DisableSummaryVec bool `json:"disable_summary_vec,omitempty"`
+	RRFK              float64 `json:"rrf_k"`
+}
+
+// DefaultSummaryVecWeight is the weight used for the summary_embedding RRF
+// signal once summary coverage exceeds SummaryVecCoverageThreshold.
+const DefaultSummaryVecWeight = 0.8
+
+// SummaryVecCoverageThreshold returns the minimum fraction (0–1) of active
+// documents that must have a non-NULL summary_embedding before the summvec
+// RRF lane is enabled in hybrid search.
+//
+// The threshold is read from SUMMARY_VEC_COVERAGE_THRESHOLD env var (float in
+// [0, 1]).  Defaults to 0.80 when unset or invalid.
+func SummaryVecCoverageThreshold() float64 {
+	if v := os.Getenv("SUMMARY_VEC_COVERAGE_THRESHOLD"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 && f <= 1 {
+			return f
+		}
+	}
+	return 0.80
 }
 
 // Defaults returns a copy with zero, NaN, Inf, or negative fields replaced by defaults.
+//
+// SummaryVec semantics (#63):
+//   - DisableSummaryVec=true  → SummaryVec is forced to 0.0 (explicit disable, bypasses gate).
+//   - SummaryVec==0 (unset)   → Zero is preserved so hybridSearch can apply the coverage gate.
+//   - SummaryVec>0 (explicit) → Value is preserved; coverage gate is bypassed by caller.
+//   - SummaryVec<0 or NaN/Inf → Invalid; replaced with DefaultSummaryVecWeight.
 func (w SearchWeights) Defaults() SearchWeights {
 	if w.RRFK == 0 || math.IsNaN(w.RRFK) || math.IsInf(w.RRFK, 0) {
 		w.RRFK = 60.0
@@ -82,9 +130,21 @@ func (w SearchWeights) Defaults() SearchWeights {
 	if w.BigmWeight == 0 || math.IsNaN(w.BigmWeight) || math.IsInf(w.BigmWeight, 0) {
 		w.BigmWeight = 1.0
 	}
-	// SummaryVec: default 0.8; guard negative values (negative weight is nonsensical).
-	if w.SummaryVec == 0 || math.IsNaN(w.SummaryVec) || math.IsInf(w.SummaryVec, 0) || w.SummaryVec < 0 {
-		w.SummaryVec = 0.8
+	// DisableSummaryVec=true: caller explicitly wants the summary-embedding lane
+	// disabled. Force SummaryVec to 0.0 regardless of its current value.
+	// This resolves the ambiguity between "unset (gate applies)" and "explicitly
+	// disabled" that a plain zero field cannot express (#63).
+	if w.DisableSummaryVec {
+		w.SummaryVec = 0.0
+		return w
+	}
+	// SummaryVec: NaN/Inf are invalid; replace with the default weight.
+	// Negative values are replaced with the default (negative weight is nonsensical).
+	// Zero is preserved: it signals "unset by caller → apply coverage gate"
+	// in hybridSearch.  The coverage gate then sets the effective weight to
+	// DefaultSummaryVecWeight (0.8) when coverage is sufficient, or 0.0 when not.
+	if math.IsNaN(w.SummaryVec) || math.IsInf(w.SummaryVec, 0) || w.SummaryVec < 0 {
+		w.SummaryVec = DefaultSummaryVecWeight
 	}
 	return w
 }

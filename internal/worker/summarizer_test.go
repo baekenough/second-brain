@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,7 +17,7 @@ import (
 // Mock implementations
 // ---------------------------------------------------------------------------
 
-// mockSummaryStore satisfies SummaryStore.
+// mockSummaryStore satisfies SummaryStore using ListUnsummarized (#64 simplified).
 type mockSummaryStore struct {
 	unsummarized []*model.Document
 	listErr      error
@@ -35,10 +36,11 @@ func (m *mockSummaryStore) ListUnsummarized(_ context.Context, limit int) ([]*mo
 	if m.listErr != nil {
 		return nil, m.listErr
 	}
-	if len(m.unsummarized) > limit {
-		return m.unsummarized[:limit], nil
+	docs := m.unsummarized
+	if len(docs) > limit {
+		docs = docs[:limit]
 	}
-	return m.unsummarized, nil
+	return docs, nil
 }
 
 func (m *mockSummaryStore) UpdateSummary(_ context.Context, id uuid.UUID, titleSummary, bulletSummary string, summaryEmbedding []float32) error {
@@ -50,6 +52,9 @@ func (m *mockSummaryStore) UpdateSummary(_ context.Context, id uuid.UUID, titleS
 	})
 	return m.updateErr
 }
+
+// Verify at compile time that mockSummaryStore implements SummaryStore.
+var _ SummaryStore = (*mockSummaryStore)(nil)
 
 // mockLLM satisfies llm.Completer.
 type mockLLM struct {
@@ -146,6 +151,9 @@ func TestSummarizerWorker_tick_happyPath(t *testing.T) {
 }
 
 func TestSummarizerWorker_tick_llmDisabled(t *testing.T) {
+	// When LLM is disabled, Run() emits a log and waits; tick() is never called
+	// in production, but we test that even if called directly it handles gracefully.
+	// LLM disabled → generateSummary always errors → no UpdateSummary.
 	st := &mockSummaryStore{unsummarized: []*model.Document{makeDoc("content")}}
 	lm := &mockLLM{enabled: false}
 
@@ -313,12 +321,86 @@ func TestSummarizerWorker_tick_updateErr_continues(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Tests: context cancellation
+// Tests: tick timeout (#65) — tick must complete within maxTickDuration
+// ---------------------------------------------------------------------------
+
+// TestSummarizerWorker_tick_respectsTimeout verifies that tick() honours its
+// context deadline and does not block indefinitely when the LLM is slow.
+func TestSummarizerWorker_tick_respectsTimeout(t *testing.T) {
+	// slowLLM blocks until its context is cancelled.
+	slowLLM := &slowLLMClient{}
+
+	doc := makeDoc("slow content")
+	st := &mockSummaryStore{unsummarized: []*model.Document{doc}}
+
+	w := NewSummarizerWorker(SummarizerConfig{Store: st, LLM: slowLLM, BatchSize: 10})
+
+	// Use a very short deadline to keep the test fast.
+	const tickDeadline = 50 * time.Millisecond
+	tickCtx, cancel := context.WithTimeout(context.Background(), tickDeadline)
+	defer cancel()
+
+	start := time.Now()
+	w.tick(tickCtx)
+	elapsed := time.Since(start)
+
+	// The tick must have returned within a reasonable margin of the deadline.
+	if elapsed > tickDeadline*5 {
+		t.Errorf("tick did not respect context deadline: elapsed %s, deadline %s", elapsed, tickDeadline)
+	}
+	// The slow LLM must not have produced an UpdateSummary call.
+	if len(st.updateCalls) != 0 {
+		t.Errorf("expected no UpdateSummary call when LLM is cancelled, got %d", len(st.updateCalls))
+	}
+}
+
+// slowLLMClient blocks CompleteWithMessages until ctx is cancelled.
+type slowLLMClient struct{}
+
+func (s *slowLLMClient) Enabled() bool { return true }
+func (s *slowLLMClient) CompleteWithMessages(ctx context.Context, _ string, _ []llm.Message) (string, error) {
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+// TestSummarizerWorker_runTick_boundedByMaxTickDuration verifies that runTick
+// returns within the configured MaxTickDuration even when the LLM is slow.
+func TestSummarizerWorker_runTick_boundedByMaxTickDuration(t *testing.T) {
+	slowLLM := &slowLLMClient{}
+	doc := makeDoc("content")
+	st := &mockSummaryStore{unsummarized: []*model.Document{doc}}
+
+	// Use a short MaxTickDuration so the test completes quickly.
+	const shortTick = 50 * time.Millisecond
+	w := NewSummarizerWorker(SummarizerConfig{
+		Store:           st,
+		LLM:             slowLLM,
+		BatchSize:       10,
+		MaxTickDuration: shortTick,
+	})
+
+	// Parent context is already cancelled — runTick must still return within
+	// MaxTickDuration (bounded by context.WithTimeout(WithoutCancel(ctx), MaxTickDuration)).
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	start := time.Now()
+	w.runTick(cancelledCtx)
+	elapsed := time.Since(start)
+
+	// Must complete well within shortTick (with 10× tolerance for slow CI).
+	if elapsed > shortTick*10 {
+		t.Errorf("runTick exceeded expected bound: elapsed %s, MaxTickDuration %s", elapsed, shortTick)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tests: context cancellation + WaitGroup drain (#65)
 // ---------------------------------------------------------------------------
 
 func TestSummarizerWorker_Run_stopOnContextCancel(t *testing.T) {
 	st := &mockSummaryStore{}
-	lm := &mockLLM{enabled: false}
+	lm := &mockLLM{enabled: false} // disabled → Run waits on ctx.Done()
 
 	w := NewSummarizerWorker(SummarizerConfig{
 		Store:    st,
@@ -343,8 +425,87 @@ func TestSummarizerWorker_Run_stopOnContextCancel(t *testing.T) {
 	}
 }
 
+// TestSummarizerWorker_Run_drainWindow verifies that goroutines launched via
+// sync.WaitGroup drain within the bounded timeout window after context cancel.
+// This mirrors the drain pattern in cmd/collector/main.go (#65).
+func TestSummarizerWorker_Run_drainWindow(t *testing.T) {
+	st := &mockSummaryStore{}
+	lm := &mockLLM{enabled: false}
+
+	w := NewSummarizerWorker(SummarizerConfig{
+		Store:    st,
+		LLM:      lm,
+		Interval: 10 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		w.Run(ctx)
+	}()
+
+	cancel()
+
+	drainDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(drainDone)
+	}()
+
+	const drainTimeout = 10 * time.Second
+	select {
+	case <-drainDone:
+		// Worker drained within timeout — ok.
+	case <-time.After(drainTimeout):
+		t.Fatalf("SummarizerWorker goroutine did not drain within %s", drainTimeout)
+	}
+}
+
 // ---------------------------------------------------------------------------
-// Tests: SearchWeights.Defaults() — SummaryVec guard
+// Tests: #64 — idempotency guard prevents duplicate work
+// Two concurrent tick() calls may both call UpdateSummary for the same doc,
+// but the real store's WHERE title_summary IS NULL guard makes the second a
+// no-op. Here we verify the tick contract: UpdateSummary is called once per
+// doc per tick, with the correct data. The store-level guard is tested in
+// store integration tests.
+// ---------------------------------------------------------------------------
+
+func TestSummarizerWorker_tick_idempotencyGuard_concurrentTicks(t *testing.T) {
+	// Two workers share a doc. Both call UpdateSummary; the real DB guard makes
+	// the second call a no-op. We verify that each tick independently calls
+	// UpdateSummary exactly once.
+	doc := makeDoc("shared content")
+	wantTitle, wantBullets := "Title", "• Bullet"
+
+	// Two separate mock stores each listing the same doc (simulating two instances).
+	st1 := &mockSummaryStore{unsummarized: []*model.Document{doc}}
+	st2 := &mockSummaryStore{unsummarized: []*model.Document{doc}}
+	lm := &mockLLM{enabled: true, response: validSummaryJSON(wantTitle, wantBullets)}
+
+	w1 := NewSummarizerWorker(SummarizerConfig{Store: st1, LLM: lm, BatchSize: 10})
+	w2 := NewSummarizerWorker(SummarizerConfig{Store: st2, LLM: lm, BatchSize: 10})
+
+	// Both tick concurrently.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); w1.tick(context.Background()) }()
+	go func() { defer wg.Done(); w2.tick(context.Background()) }()
+	wg.Wait()
+
+	// Each instance made exactly 1 UpdateSummary call.
+	if len(st1.updateCalls) != 1 {
+		t.Errorf("instance 1: expected 1 UpdateSummary call, got %d", len(st1.updateCalls))
+	}
+	if len(st2.updateCalls) != 1 {
+		t.Errorf("instance 2: expected 1 UpdateSummary call, got %d", len(st2.updateCalls))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tests: SearchWeights.Defaults() — SummaryVec semantics (#63)
 // ---------------------------------------------------------------------------
 
 func TestSearchWeights_Defaults_summaryVec(t *testing.T) {
@@ -354,9 +515,10 @@ func TestSearchWeights_Defaults_summaryVec(t *testing.T) {
 		wantVec float64
 	}{
 		{
-			name:    "zero_uses_default",
+			// Zero is preserved — coverage gate in hybridSearch decides.
+			name:    "zero_preserved_for_coverage_gate",
 			input:   model.SearchWeights{},
-			wantVec: 0.8,
+			wantVec: 0.0,
 		},
 		{
 			name:    "explicit_positive_preserved",
@@ -364,8 +526,14 @@ func TestSearchWeights_Defaults_summaryVec(t *testing.T) {
 			wantVec: 0.5,
 		},
 		{
+			// Negative is invalid → replaced with DefaultSummaryVecWeight.
 			name:    "negative_reset_to_default",
 			input:   model.SearchWeights{SummaryVec: -1.0},
+			wantVec: model.DefaultSummaryVecWeight,
+		},
+		{
+			name:    "explicit_full_weight_preserved",
+			input:   model.SearchWeights{SummaryVec: 0.8},
 			wantVec: 0.8,
 		},
 	}
@@ -379,6 +547,40 @@ func TestSearchWeights_Defaults_summaryVec(t *testing.T) {
 	}
 }
 
+// TestSearchWeights_DisableSummaryVec verifies that DisableSummaryVec=true
+// forces SummaryVec to 0.0 after Defaults() regardless of the SummaryVec field (#63).
+func TestSearchWeights_DisableSummaryVec(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   model.SearchWeights
+		wantVec float64
+	}{
+		{
+			name:    "disable_overrides_zero_default",
+			input:   model.SearchWeights{DisableSummaryVec: true},
+			wantVec: 0.0,
+		},
+		{
+			name:    "disable_overrides_positive_weight",
+			input:   model.SearchWeights{SummaryVec: 0.8, DisableSummaryVec: true},
+			wantVec: 0.0,
+		},
+		{
+			name:    "disable_false_preserves_zero_for_gate",
+			input:   model.SearchWeights{DisableSummaryVec: false},
+			wantVec: 0.0, // zero → coverage gate, not forced disable
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.input.Defaults()
+			if got.SummaryVec != tt.wantVec {
+				t.Errorf("SummaryVec = %v, want %v (DisableSummaryVec=%v)", got.SummaryVec, tt.wantVec, tt.input.DisableSummaryVec)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Tests: NULL summary scan regression
 // ---------------------------------------------------------------------------
@@ -386,17 +588,8 @@ func TestSearchWeights_Defaults_summaryVec(t *testing.T) {
 // TestNullSummaryScan verifies that a Document with NULL summary fields
 // (as returned by a freshly inserted row before the summarizer runs)
 // can be scanned without error and produces empty string fields.
-// This is a compile-time regression guard: the store's pgtype.Text scan
-// path must handle NULL gracefully.
-//
-// We test the model layer here; the store's SQL scan path is exercised in
-// the integration tests (store/postgres_embedding_test.go).
 func TestNullSummaryScan_modelFieldsAreEmptyString(t *testing.T) {
-	// Simulates what scanDocument produces for a row with NULL summary columns.
-	doc := &model.Document{
-		// TitleSummary and BulletSummary are not set → zero values.
-		// SummaryEmbedding is not set → nil.
-	}
+	doc := &model.Document{}
 
 	if doc.TitleSummary != "" {
 		t.Errorf("TitleSummary should be empty string for NULL DB value, got %q", doc.TitleSummary)

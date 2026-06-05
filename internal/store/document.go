@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,9 +14,19 @@ import (
 	"github.com/baekenough/second-brain/internal/model"
 )
 
+// summaryCoverageCache is a process-level cache for SummaryCoverageRatio results.
+// It avoids a per-query COUNT(*) on large tables while keeping the gate responsive
+// to backfill progress. TTL is 60 s by default; see summaryCoverageTTL.
+const summaryCoverageTTL = 60 * time.Second
+
 // DocumentStore provides document persistence and search operations.
 type DocumentStore struct {
 	pg *Postgres
+
+	// coverage cache fields — protects SummaryCoverageRatio from per-query scans.
+	coverageMu        sync.Mutex
+	coverageRatio     float64
+	coverageFetchedAt time.Time
 }
 
 // NewDocumentStore returns a DocumentStore backed by the given Postgres instance.
@@ -313,7 +324,35 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 	// summvec uses the same query embedding ($2) as vec for consistency.
 	// Weight parameters are injected as Go-formatted literals (not SQL params)
 	// because they are floats under our control, never from user input.
+	//
+	// Coverage gate (#63): SummaryVec is disabled when summary_embedding coverage
+	// is below the configured threshold (default 80%).  Without the gate, the
+	// +26.7% score ceiling for summarised documents causes systematic ranking
+	// bias during backfill — un-summarised documents are demoted even when they
+	// are more content-relevant.  Once the corpus reaches the threshold the
+	// weight activates automatically via the cached ratio (TTL 60 s).
+	// Callers may force-enable by setting query.Weights.SummaryVec explicitly.
 	w := query.Weights.Defaults()
+	// Coverage gate: apply only when the caller has not explicitly set a weight
+	// and has not explicitly disabled the summary-vec lane (#63).
+	// - DisableSummaryVec=true → Defaults() already set w.SummaryVec=0.0; skip gate.
+	// - SummaryVec>0 (explicit) → caller bypasses gate; use the value as-is.
+	// - SummaryVec==0 (unset)   → apply gate: enable when corpus coverage is sufficient.
+	if !query.Weights.DisableSummaryVec && query.Weights.SummaryVec == 0 {
+		// Coverage gate: "decide based on corpus coverage".  Defaults() preserved
+		// zero, so we resolve the effective weight here.
+		//
+		// - Coverage >= threshold → enable at DefaultSummaryVecWeight (0.8).
+		// - Coverage <  threshold → disable (0.0) to prevent systematic demotion
+		//   of un-summarised documents during backfill.
+		// - Coverage query error  → disable (safe fallback; avoids bias on error).
+		coverage, coverageErr := s.SummaryCoverageRatio(ctx)
+		if coverageErr == nil && coverage >= model.SummaryVecCoverageThreshold() {
+			w.SummaryVec = model.DefaultSummaryVecWeight
+		} else {
+			w.SummaryVec = 0.0
+		}
+	}
 	q := fmt.Sprintf(`
 		WITH fts AS (
 			SELECT id,
@@ -341,7 +380,7 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		),
 		bigm AS (
 			SELECT id,
-			       row_number() OVER () AS rank
+			       row_number() OVER (ORDER BY length(content) DESC, id ASC) AS rank
 			FROM documents
 			WHERE (content LIKE '%%%%' || $1 || '%%%%'
 			    OR title   LIKE '%%%%' || $1 || '%%%%')
@@ -791,6 +830,38 @@ func (s *DocumentStore) ListUnsummarized(ctx context.Context, limit int) ([]*mod
 	return collectDocuments(rows)
 }
 
+// SummaryCoverageRatio returns the fraction of active documents that have a
+// summary_embedding (non-NULL).  The result is cached for summaryCoverageTTL
+// (60 s) to avoid a per-search COUNT(*) on large tables.
+//
+// Used by hybridSearch to gate the SummaryVec signal (#63): when coverage is
+// below model.SummaryVecCoverageThreshold() the weight is set to 0 so that
+// un-summarised documents are not systematically demoted during backfill.
+func (s *DocumentStore) SummaryCoverageRatio(ctx context.Context) (float64, error) {
+	s.coverageMu.Lock()
+	defer s.coverageMu.Unlock()
+
+	if time.Since(s.coverageFetchedAt) < summaryCoverageTTL {
+		return s.coverageRatio, nil
+	}
+
+	var ratio float64
+	err := s.pg.pool.QueryRow(ctx, `
+		SELECT COALESCE(
+			COUNT(*) FILTER (WHERE summary_embedding IS NOT NULL)::float
+			/ NULLIF(COUNT(*), 0),
+		0)
+		FROM documents
+		WHERE status = 'active'`).Scan(&ratio)
+	if err != nil {
+		return 0, fmt.Errorf("summary coverage ratio: %w", err)
+	}
+
+	s.coverageRatio = ratio
+	s.coverageFetchedAt = time.Now()
+	return ratio, nil
+}
+
 // UpdateSummary writes the LLM-generated summary fields for a single document
 // identified by its primary key. Only title_summary, bullet_summary, and
 // summary_embedding are touched; other fields remain unchanged.
@@ -798,6 +869,10 @@ func (s *DocumentStore) ListUnsummarized(ctx context.Context, limit int) ([]*mod
 // summaryEmbedding may be nil when the embedder is disabled or failed — in
 // that case the column is set to NULL, leaving the document out of
 // summary-vector search until a subsequent run embeds it.
+//
+// Idempotency guard: the UPDATE is a no-op when title_summary is already set
+// (WHERE title_summary IS NULL).  This prevents a racing concurrent instance
+// from overwriting a completed summary with its own version (#64).
 func (s *DocumentStore) UpdateSummary(ctx context.Context, id uuid.UUID, titleSummary, bulletSummary string, summaryEmbedding []float32) error {
 	var vecArg interface{}
 	if len(summaryEmbedding) > 0 {
@@ -809,7 +884,8 @@ func (s *DocumentStore) UpdateSummary(ctx context.Context, id uuid.UUID, titleSu
 		    bullet_summary    = $2,
 		    summary_embedding = $3,
 		    updated_at        = now()
-		WHERE id = $4`,
+		WHERE id = $4
+		  AND title_summary IS NULL`,
 		titleSummary,
 		bulletSummary,
 		vecArg,
