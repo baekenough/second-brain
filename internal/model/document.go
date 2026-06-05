@@ -30,7 +30,7 @@ type Document struct {
 	Title       string         `json:"title"`
 	Content     string         `json:"content"`
 	Metadata    map[string]any `json:"metadata"`
-	Embedding   []float32      `json:"embedding,omitempty"`  // nil when not embedded
+	Embedding   []float32      `json:"-"`                    // omit from REST: large vector
 	Status      string         `json:"status"`               // "active", "deleted", "moved"
 	DeletedAt   *time.Time     `json:"deleted_at,omitempty"` // nil for active documents
 	// OccurredAt is the timestamp of the original event: email sent date,
@@ -43,6 +43,12 @@ type Document struct {
 	CollectedAt time.Time      `json:"collected_at"`
 	CreatedAt   time.Time      `json:"created_at"`
 	UpdatedAt   time.Time      `json:"updated_at"`
+
+	// LLM-generated summary fields (populated asynchronously by SummarizerWorker).
+	// NULL in DB until the worker processes the document.
+	TitleSummary    string    `json:"title_summary,omitempty"`
+	BulletSummary   string    `json:"bullet_summary,omitempty"`
+	SummaryEmbedding []float32 `json:"-"` // omit from REST: large vector
 }
 
 // SearchResult wraps a Document with relevance scoring metadata.
@@ -58,10 +64,11 @@ type SearchWeights struct {
 	FTSWeight  float64 `json:"fts_weight"`
 	VecWeight  float64 `json:"vec_weight"`
 	BigmWeight float64 `json:"bigm_weight"`
+	SummaryVec float64 `json:"summary_vec_weight"` // weight for summary_embedding CTE in hybrid search
 	RRFK       float64 `json:"rrf_k"`
 }
 
-// Defaults returns a copy with zero, NaN, or Inf fields replaced by defaults.
+// Defaults returns a copy with zero, NaN, Inf, or negative fields replaced by defaults.
 func (w SearchWeights) Defaults() SearchWeights {
 	if w.RRFK == 0 || math.IsNaN(w.RRFK) || math.IsInf(w.RRFK, 0) {
 		w.RRFK = 60.0
@@ -74,6 +81,10 @@ func (w SearchWeights) Defaults() SearchWeights {
 	}
 	if w.BigmWeight == 0 || math.IsNaN(w.BigmWeight) || math.IsInf(w.BigmWeight, 0) {
 		w.BigmWeight = 1.0
+	}
+	// SummaryVec: default 0.8; guard negative values (negative weight is nonsensical).
+	if w.SummaryVec == 0 || math.IsNaN(w.SummaryVec) || math.IsInf(w.SummaryVec, 0) || w.SummaryVec < 0 {
+		w.SummaryVec = 0.8
 	}
 	return w
 }
