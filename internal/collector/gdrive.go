@@ -8,20 +8,32 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
+
 	"github.com/baekenough/second-brain/internal/model"
 )
+
+const gDriveReadonlyScope = "https://www.googleapis.com/auth/drive.readonly"
 
 // GDriveCollector collects documents from Google Drive using a service account.
 //
 // It uses the Drive REST API v3 with a service-account access token obtained
-// via the Google OAuth2 token endpoint (JWT grant). For a PoC this is kept
-// simple — production use should use the official google.golang.org/api client.
+// via golang.org/x/oauth2/google. Two credential paths are supported:
+//   - GDRIVE_CREDENTIALS_JSON: service account JSON inline (takes priority).
+//   - ADC (GOOGLE_APPLICATION_CREDENTIALS or GCP metadata): Application Default Credentials.
 type GDriveCollector struct {
 	credentialsJSON string
 	client          *http.Client
+
+	// tokenMu guards cachedToken.
+	tokenMu     sync.Mutex
+	cachedToken *oauth2.Token
+	tokenSource oauth2.TokenSource
 }
 
 // NewGDriveCollector returns a GDriveCollector. When credentialsJSON is empty
@@ -146,22 +158,68 @@ func (c *GDriveCollector) exportText(ctx context.Context, token, fileID string) 
 	return string(body), err
 }
 
-// getAccessToken exchanges the service account JSON credentials for a Bearer token.
-// This is a simplified JWT flow; production code should use google.golang.org/api/google.
+// getAccessToken returns a valid OAuth2 Bearer token for the Drive API.
+//
+// Priority:
+//  1. GDRIVE_CREDENTIALS_JSON (service account JSON) — parsed via google.CredentialsFromJSON.
+//  2. ADC (GOOGLE_APPLICATION_CREDENTIALS env var or GCP metadata server).
+//
+// Tokens are cached and reused until they expire; a new token is fetched
+// automatically when the cached one is within 10 seconds of expiry.
 func (c *GDriveCollector) getAccessToken(ctx context.Context) (string, error) {
-	var creds struct {
-		ClientEmail string `json:"client_email"`
-		PrivateKey  string `json:"private_key"`
-		TokenURI    string `json:"token_uri"`
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+
+	// Reuse a cached token that is still valid (with 10 s buffer).
+	if c.cachedToken != nil && c.cachedToken.Valid() {
+		return c.cachedToken.AccessToken, nil
 	}
-	if err := json.Unmarshal([]byte(c.credentialsJSON), &creds); err != nil {
-		return "", fmt.Errorf("parse credentials JSON: %w", err)
+
+	// Build a token source once; reuse it across calls.
+	// Use context.Background() so the token source's lifetime is tied to the
+	// collector instance, not to the first caller's (potentially short-lived)
+	// request context. The JWT source captures the context it receives and
+	// reuses it for every future token refresh — a cancelled request context
+	// would silently break all subsequent refreshes.
+	if c.tokenSource == nil {
+		ts, err := c.buildTokenSource(context.Background())
+		if err != nil {
+			return "", err
+		}
+		c.tokenSource = ts
 	}
-	// NOTE: A production implementation would sign a JWT with creds.PrivateKey
-	// and POST it to creds.TokenURI (https://oauth2.googleapis.com/token).
-	// For PoC, callers should pre-set GOOGLE_APPLICATION_CREDENTIALS and use
-	// the Application Default Credentials flow from google.golang.org/api.
-	return "", fmt.Errorf("gdrive: full OAuth2 JWT flow not implemented in PoC — set GOOGLE_APPLICATION_CREDENTIALS and use ADC")
+
+	tok, err := c.tokenSource.Token()
+	if err != nil {
+		return "", fmt.Errorf("gdrive: fetch access token: %w", err)
+	}
+	c.cachedToken = tok
+	return tok.AccessToken, nil
+}
+
+// buildTokenSource constructs an oauth2.TokenSource from the available credentials.
+// It is called at most once per GDriveCollector instance.
+func (c *GDriveCollector) buildTokenSource(ctx context.Context) (oauth2.TokenSource, error) {
+	if c.credentialsJSON != "" {
+		creds, err := google.CredentialsFromJSON(
+			ctx,
+			[]byte(c.credentialsJSON),
+			gDriveReadonlyScope,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("gdrive: parse service account credentials JSON: %w", err)
+		}
+		slog.Info("gdrive: using service account credentials from GDRIVE_CREDENTIALS_JSON")
+		return creds.TokenSource, nil
+	}
+
+	// Fall back to Application Default Credentials.
+	creds, err := google.FindDefaultCredentials(ctx, gDriveReadonlyScope)
+	if err != nil {
+		return nil, fmt.Errorf("gdrive: no credentials available (set GDRIVE_CREDENTIALS_JSON or GOOGLE_APPLICATION_CREDENTIALS): %w", err)
+	}
+	slog.Info("gdrive: using Application Default Credentials")
+	return creds.TokenSource, nil
 }
 
 func (c *GDriveCollector) doRequest(ctx context.Context, token, method, u string, body io.Reader, dest interface{}) error {
