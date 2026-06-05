@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
@@ -77,6 +78,17 @@ func run() error {
 	extractionFailureStore := store.NewExtractionFailureStore(pg)
 	chunkStore := store.NewChunkStore(pg)
 
+	// wg tracks long-running background goroutines that need a graceful drain
+	// window on SIGTERM before the process exits (#65).
+	var wg sync.WaitGroup
+
+	// drainTimeout is the maximum time to wait for in-flight ticks to finish
+	// after the shutdown signal is received.  10 s is long enough to let a
+	// running UpdateSummary or embedding call complete; if the LLM is slow the
+	// tick exits cleanly because it uses context.WithoutCancel internally and
+	// the WaitGroup drain acts as the hard ceiling.
+	const drainTimeout = 10 * time.Second
+
 	// --- Extraction retry worker ---
 	// Periodically re-attempts failed file extractions. Remote-source failures
 	// (Slack attachments) are skipped — see worker package for details.
@@ -88,7 +100,11 @@ func run() error {
 		Interval:     time.Minute,
 		BatchSize:    20,
 	})
-	go retryWorker.Run(ctx)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		retryWorker.Run(ctx)
+	}()
 
 	// --- Embedding client ---
 	embedClient := search.NewEmbedClient(cfg.EmbeddingAPIURL, cfg.EmbeddingAPIKey, cfg.CliProxyAuthFile, cfg.EmbeddingModel)
@@ -110,9 +126,18 @@ func run() error {
 
 	// --- Summarizer worker ---
 	// Backfills LLM-generated title_summary / bullet_summary / summary_embedding
-	// for documents that have not yet been summarized. The worker polls
-	// ListUnsummarized at a fixed interval and is safe to run concurrently with
-	// the collector and embedding workers.
+	// for documents that have not yet been summarized.  The worker uses
+	// FOR UPDATE SKIP LOCKED so multiple collector instances share the work
+	// without duplicate LLM calls (#64).
+	//
+	// SUMMARIZER_ENABLED=false disables the worker entirely on replicas that
+	// should not run summarization (e.g. when you want a single dedicated
+	// summarizer pod in k8s).  The worker itself logs a diagnostic message
+	// when the LLM is not configured (#67).
+	summarizerEnabled := os.Getenv("SUMMARIZER_ENABLED") != "false"
+	if !summarizerEnabled {
+		slog.Info("summarizer worker disabled via SUMMARIZER_ENABLED=false")
+	}
 	summarizerWorker := worker.NewSummarizerWorker(worker.SummarizerConfig{
 		Store:     docStore,
 		LLM:       llmClient,
@@ -120,7 +145,16 @@ func run() error {
 		Interval:  5 * time.Minute,
 		BatchSize: 10,
 	})
-	go summarizerWorker.Run(ctx)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if !summarizerEnabled {
+			// Block until shutdown so the WaitGroup stays balanced.
+			<-ctx.Done()
+			return
+		}
+		summarizerWorker.Run(ctx)
+	}()
 
 	// --- Collectors ---
 	// Discord is intentionally excluded from the collector daemon; it is handled
@@ -175,7 +209,29 @@ func run() error {
 
 	slog.Info("collector daemon started")
 	<-ctx.Done()
-	slog.Info("shutdown complete")
+
+	// Bounded drain: give in-flight goroutines (summarizer, retry worker) time
+	// to finish their current tick before the process exits.
+	//
+	// SummarizerWorker uses maxTickDuration (8 s) which is shorter than
+	// drainTimeout (10 s), so in-flight ticks always complete before the
+	// drain window closes (#65).
+	//
+	// The drainDone channel is buffered so that the wg.Wait() goroutine can
+	// send without blocking even when the drain timeout fires first — this
+	// prevents the goroutine from leaking after process exit.
+	drainDone := make(chan struct{}, 1)
+	go func() {
+		wg.Wait()
+		drainDone <- struct{}{}
+	}()
+	select {
+	case <-drainDone:
+		slog.Info("shutdown complete — all workers drained cleanly")
+	case <-time.After(drainTimeout):
+		slog.Warn("shutdown: drain timeout exceeded, forcing exit",
+			"timeout", drainTimeout)
+	}
 	return nil
 }
 
