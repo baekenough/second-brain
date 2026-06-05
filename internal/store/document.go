@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/pgvector/pgvector-go"
 	"github.com/baekenough/second-brain/internal/model"
 )
@@ -74,7 +75,8 @@ func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
 func (s *DocumentStore) GetByID(ctx context.Context, id uuid.UUID) (*model.Document, error) {
 	const q = `
 		SELECT id, source_type, source_id, title, content, metadata, embedding,
-		       status, deleted_at, occurred_at, collected_at, created_at, updated_at
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding
 		FROM documents WHERE id = $1`
 
 	row := s.pg.pool.QueryRow(ctx, q, id)
@@ -98,7 +100,8 @@ func (s *DocumentStore) ListBySource(ctx context.Context, src model.SourceType, 
 	if src == "" {
 		const q = `
 			SELECT id, source_type, source_id, title, content, metadata, embedding,
-			       status, deleted_at, occurred_at, collected_at, created_at, updated_at
+			       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+			       title_summary, bullet_summary, summary_embedding
 			FROM documents
 			WHERE status = 'active'
 			ORDER BY COALESCE(occurred_at, collected_at) DESC
@@ -110,7 +113,8 @@ func (s *DocumentStore) ListBySource(ctx context.Context, src model.SourceType, 
 	} else {
 		const q = `
 			SELECT id, source_type, source_id, title, content, metadata, embedding,
-			       status, deleted_at, occurred_at, collected_at, created_at, updated_at
+			       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+			       title_summary, bullet_summary, summary_embedding
 			FROM documents
 			WHERE source_type = $1
 			  AND status = 'active'
@@ -166,7 +170,8 @@ func (s *DocumentStore) ListRecent(ctx context.Context, includeSrc model.SourceT
 
 	q := fmt.Sprintf(`
 		SELECT id, source_type, source_id, title, content, metadata, embedding,
-		       status, deleted_at, occurred_at, collected_at, created_at, updated_at
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding
 		FROM documents
 		%s
 		ORDER BY COALESCE(occurred_at, collected_at) DESC
@@ -248,6 +253,7 @@ func (s *DocumentStore) fulltextSearch(ctx context.Context, query model.SearchQu
 	q := fmt.Sprintf(`
 		SELECT id, source_type, source_id, title, content, metadata, embedding,
 		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding,
 		       GREATEST(
 		           ts_rank(tsv, plainto_tsquery('simple', $1)),
 		           ts_rank(tsv, plainto_tsquery('english', $1))
@@ -299,11 +305,12 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 
 	// RRF formula: w / (k + rank), where w is the per-signal weight and k
 	// prevents very high scores for top-ranked results (standard k=60).
-	// Three CTEs (fts, vec, bigm) are merged via FULL OUTER JOIN. Each CTE shares
-	// the same statusFilter/sourceFilter/excludeFilter snippets; args are appended
-	// once and referenced by the same positional parameters in all three CTEs.
+	// Four CTEs (fts, vec, bigm, summvec) are merged via FULL OUTER JOIN.
+	// Each CTE shares the same statusFilter/sourceFilter/excludeFilter snippets;
+	// args are appended once and referenced by the same positional parameters.
 	// bigm uses pg_bigm's gin_bigm_ops index via LIKE '%%' || $1 || '%%'.
 	// SQL '%%%%' in fmt.Sprintf produces a literal '%%' which pg_bigm needs.
+	// summvec uses the same query embedding ($2) as vec for consistency.
 	// Weight parameters are injected as Go-formatted literals (not SQL params)
 	// because they are floats under our control, never from user input.
 	w := query.Weights.Defaults()
@@ -343,18 +350,31 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 			%s
 			LIMIT $3
 		),
+		summvec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE summary_embedding IS NOT NULL
+			%s
+			%s
+			%s
+			LIMIT $3
+		),
 		rrf AS (
 			SELECT
-				COALESCE(fts.id, vec.id, bigm.id) AS id,
-				COALESCE(%g/(%g + fts.rank),  0)
-				+ COALESCE(%g/(%g + vec.rank),  0)
-				+ COALESCE(%g/(%g + bigm.rank), 0) AS score
+				COALESCE(fts.id, vec.id, bigm.id, summvec.id) AS id,
+				COALESCE(%g/(%g + fts.rank),     0)
+				+ COALESCE(%g/(%g + vec.rank),     0)
+				+ COALESCE(%g/(%g + bigm.rank),    0)
+				+ COALESCE(%g/(%g + summvec.rank), 0) AS score
 			FROM fts
-			FULL OUTER JOIN vec  ON fts.id = vec.id
-			FULL OUTER JOIN bigm ON COALESCE(fts.id, vec.id) = bigm.id
+			FULL OUTER JOIN vec     ON fts.id = vec.id
+			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
+			FULL OUTER JOIN summvec ON COALESCE(fts.id, vec.id, bigm.id) = summvec.id
 		)
 		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
 		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
+		       d.title_summary, d.bullet_summary, d.summary_embedding,
 		       rrf.score
 		FROM rrf
 		JOIN documents d ON d.id = rrf.id
@@ -363,9 +383,11 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		statusFilter, sourceFilter, excludeFilter,
 		statusFilter, sourceFilter, excludeFilter,
 		statusFilter, sourceFilter, excludeFilter,
+		statusFilter, sourceFilter, excludeFilter,
 		w.FTSWeight, w.RRFK,
 		w.VecWeight, w.RRFK,
 		w.BigmWeight, w.RRFK,
+		w.SummaryVec, w.RRFK,
 		sortOrder(query.Sort, "d"))
 
 	rows, err := s.pg.pool.Query(ctx, q, args...)
@@ -727,7 +749,8 @@ func (s *DocumentStore) queryCollectionStats(ctx context.Context) (BaselineColle
 func (s *DocumentStore) ListUnembedded(ctx context.Context, limit int) ([]*model.Document, error) {
 	const q = `
 		SELECT id, source_type, source_id, title, content, metadata, embedding,
-		       status, deleted_at, occurred_at, collected_at, created_at, updated_at
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding
 		FROM documents
 		WHERE embedding IS NULL
 		  AND status = 'active'
@@ -741,6 +764,61 @@ func (s *DocumentStore) ListUnembedded(ctx context.Context, limit int) ([]*model
 	defer rows.Close()
 
 	return collectDocuments(rows)
+}
+
+// ListUnsummarized returns up to limit active documents whose title_summary
+// column is NULL, ordered by collected_at ASC (oldest first) so backfill
+// progresses forward in time.
+//
+// Soft-deleted documents are excluded; there is no value in summarizing them.
+func (s *DocumentStore) ListUnsummarized(ctx context.Context, limit int) ([]*model.Document, error) {
+	const q = `
+		SELECT id, source_type, source_id, title, content, metadata, embedding,
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding
+		FROM documents
+		WHERE title_summary IS NULL
+		  AND status = 'active'
+		ORDER BY collected_at ASC
+		LIMIT $1`
+
+	rows, err := s.pg.pool.Query(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list unsummarized: %w", err)
+	}
+	defer rows.Close()
+
+	return collectDocuments(rows)
+}
+
+// UpdateSummary writes the LLM-generated summary fields for a single document
+// identified by its primary key. Only title_summary, bullet_summary, and
+// summary_embedding are touched; other fields remain unchanged.
+//
+// summaryEmbedding may be nil when the embedder is disabled or failed — in
+// that case the column is set to NULL, leaving the document out of
+// summary-vector search until a subsequent run embeds it.
+func (s *DocumentStore) UpdateSummary(ctx context.Context, id uuid.UUID, titleSummary, bulletSummary string, summaryEmbedding []float32) error {
+	var vecArg interface{}
+	if len(summaryEmbedding) > 0 {
+		vecArg = pgvector.NewVector(summaryEmbedding)
+	}
+	_, err := s.pg.pool.Exec(ctx, `
+		UPDATE documents
+		SET title_summary     = $1,
+		    bullet_summary    = $2,
+		    summary_embedding = $3,
+		    updated_at        = now()
+		WHERE id = $4`,
+		titleSummary,
+		bulletSummary,
+		vecArg,
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("update summary %s: %w", id, err)
+	}
+	return nil
 }
 
 // UpdateEmbedding writes the given embedding vector for a single document
@@ -820,15 +898,19 @@ type scannable interface {
 
 func scanDocument(row scannable) (*model.Document, error) {
 	var (
-		doc      model.Document
-		metaJSON []byte
-		vec      *pgvector.Vector
+		doc          model.Document
+		metaJSON     []byte
+		vec          *pgvector.Vector
+		titleSum     pgtype.Text
+		bulletSum    pgtype.Text
+		summVec      *pgvector.Vector
 	)
 	err := row.Scan(
 		&doc.ID, &doc.SourceType, &doc.SourceID,
 		&doc.Title, &doc.Content, &metaJSON, &vec,
 		&doc.Status, &doc.DeletedAt,
 		&doc.OccurredAt, &doc.CollectedAt, &doc.CreatedAt, &doc.UpdatedAt,
+		&titleSum, &bulletSum, &summVec,
 	)
 	if err != nil {
 		return nil, err
@@ -838,6 +920,17 @@ func scanDocument(row scannable) (*model.Document, error) {
 	}
 	if vec != nil {
 		doc.Embedding = vec.Slice()
+	}
+	// pgtype.Text: NULL columns arrive as Valid=false; avoid assigning zero string
+	// from a non-pointer Scan which pgx v5 rejects for nullable text columns.
+	if titleSum.Valid {
+		doc.TitleSummary = titleSum.String
+	}
+	if bulletSum.Valid {
+		doc.BulletSummary = bulletSum.String
+	}
+	if summVec != nil {
+		doc.SummaryEmbedding = summVec.Slice()
 	}
 	return &doc, nil
 }
@@ -858,15 +951,19 @@ func collectResults(rows pgx.Rows, matchType string) ([]*model.SearchResult, err
 	var results []*model.SearchResult
 	for rows.Next() {
 		var (
-			r        model.SearchResult
-			metaJSON []byte
-			vec      *pgvector.Vector
+			r         model.SearchResult
+			metaJSON  []byte
+			vec       *pgvector.Vector
+			titleSum  pgtype.Text
+			bulletSum pgtype.Text
+			summVec   *pgvector.Vector
 		)
 		err := rows.Scan(
 			&r.ID, &r.SourceType, &r.SourceID,
 			&r.Title, &r.Content, &metaJSON, &vec,
 			&r.Status, &r.DeletedAt,
 			&r.OccurredAt, &r.CollectedAt, &r.CreatedAt, &r.UpdatedAt,
+			&titleSum, &bulletSum, &summVec,
 			&r.Score,
 		)
 		if err != nil {
@@ -877,6 +974,15 @@ func collectResults(rows pgx.Rows, matchType string) ([]*model.SearchResult, err
 		}
 		if vec != nil {
 			r.Embedding = vec.Slice()
+		}
+		if titleSum.Valid {
+			r.TitleSummary = titleSum.String
+		}
+		if bulletSum.Valid {
+			r.BulletSummary = bulletSum.String
+		}
+		if summVec != nil {
+			r.SummaryEmbedding = summVec.Slice()
 		}
 		r.MatchType = matchType
 		results = append(results, &r)

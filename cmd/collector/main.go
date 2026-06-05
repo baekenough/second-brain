@@ -15,6 +15,7 @@ import (
 	"github.com/baekenough/second-brain/internal/collector"
 	"github.com/baekenough/second-brain/internal/collector/extractor"
 	"github.com/baekenough/second-brain/internal/config"
+	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/scheduler"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/setup"
@@ -96,6 +97,30 @@ func run() error {
 	} else {
 		slog.Info("embedding API not configured — full-text search only")
 	}
+
+	// --- LLM client (for summarization) ---
+	llmClient := llm.New(llm.Config{
+		BaseURL:     cfg.LLMAPIURL,
+		Model:       cfg.LLMModel,
+		APIKey:      cfg.LLMAPIKey,
+		AuthFile:    cfg.LLMAuthFile,
+		MaxTokens:   cfg.LLMMaxTokens,
+		Temperature: cfg.LLMTemperature,
+	}, nil)
+
+	// --- Summarizer worker ---
+	// Backfills LLM-generated title_summary / bullet_summary / summary_embedding
+	// for documents that have not yet been summarized. The worker polls
+	// ListUnsummarized at a fixed interval and is safe to run concurrently with
+	// the collector and embedding workers.
+	summarizerWorker := worker.NewSummarizerWorker(worker.SummarizerConfig{
+		Store:     docStore,
+		LLM:       llmClient,
+		Embedder:  embedClient,
+		Interval:  5 * time.Minute,
+		BatchSize: 10,
+	})
+	go summarizerWorker.Run(ctx)
 
 	// --- Collectors ---
 	// Discord is intentionally excluded from the collector daemon; it is handled
