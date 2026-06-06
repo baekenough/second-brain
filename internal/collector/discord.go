@@ -1260,9 +1260,14 @@ func (c *DiscordCollector) processAttachment(
 		// Record failure for retry pipeline and return error to caller.
 		if c.extractionFailures != nil {
 			_ = c.extractionFailures.Record(ctx, store.ExtractionFailure{
-				SourceType:   "discord",
-				SourceID:     sourceID,
-				FilePath:     att.Filename,
+				SourceType: "discord",
+				SourceID:   sourceID,
+				// Store the CDN URL so the extraction-retry worker can
+				// re-download the attachment via URLRefetcher on retry.
+				// Discord CDN URLs are time-limited; if the URL has expired by
+				// the time the retry runs, the worker will increment the attempt
+				// counter and back off normally.
+				FilePath:     att.URL,
 				ErrorMessage: err.Error(),
 			})
 		}

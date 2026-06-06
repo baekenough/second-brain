@@ -5,6 +5,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -44,6 +45,12 @@ type Config struct {
 	DocStore DocStore
 	// Extractor is required: performs the actual text extraction from a file path.
 	Extractor Extractor
+	// Refetcher is optional: when non-nil it is used to re-download remote
+	// binaries (e.g. Discord/Slack attachments) before extraction.
+	// When nil (or when the Refetcher returns ErrRefetchNotSupported), remote
+	// paths are skipped with a debug log — identical to the pre-Refetcher
+	// behaviour.
+	Refetcher Refetcher
 	// Interval controls how often the worker polls for due failures.
 	// Defaults to 1 minute when zero or negative.
 	Interval time.Duration
@@ -62,17 +69,17 @@ type Config struct {
 // [FailureStore.Record]), backing off exponentially until the row is
 // dead-lettered at 10 attempts.
 //
-// Remote-source files (Slack attachments, Discord attachments, etc.) cannot be
-// retried by this worker because the original binary is not retained locally.
-// Those paths are skipped with a debug log.
-//
-// TODO(issue#8-followup): add remote-file retry via re-download from the
-// originating collector (Slack/Discord) once a download cache or URL
-// re-fetch mechanism is available.
+// Remote-source files (Slack attachments, Discord attachments, etc.) are
+// handled as follows:
+//   - When Config.Refetcher is nil or returns [ErrRefetchNotSupported], the
+//     record is skipped with a debug log (same as pre-Refetcher behaviour).
+//   - When Config.Refetcher successfully downloads the binary, extraction runs
+//     on the temp file; success resolves the record, failure increments attempts.
 type ExtractionRetryWorker struct {
 	failureStore FailureStore
 	docStore     DocStore
 	extractor    Extractor
+	refetcher    Refetcher // optional; nil disables remote-file retry
 	interval     time.Duration
 	batchSize    int
 }
@@ -99,6 +106,7 @@ func New(cfg Config) *ExtractionRetryWorker {
 		failureStore: cfg.FailureStore,
 		docStore:     cfg.DocStore,
 		extractor:    cfg.Extractor,
+		refetcher:    cfg.Refetcher, // nil is valid; remote retry is disabled
 		interval:     cfg.Interval,
 		batchSize:    cfg.BatchSize,
 	}
@@ -148,32 +156,70 @@ func (w *ExtractionRetryWorker) processBatch(ctx context.Context) {
 
 // processOne attempts to re-extract a single failure record.
 func (w *ExtractionRetryWorker) processOne(ctx context.Context, f store.ExtractionFailure) {
-	// Remote-source files (Slack/Discord attachments) are stored as URLs or
-	// opaque identifiers — the binary is not available locally. Skip them.
 	if !looksLikeLocalPath(f.FilePath) {
-		slog.Debug("extraction retry: skipping non-local path",
+		// Remote-source path: attempt a re-download when a Refetcher is available.
+		w.processRemote(ctx, f)
+		return
+	}
+
+	w.extractAndResolve(ctx, f, f.FilePath, nil)
+}
+
+// processRemote handles a failure record whose FilePath is a remote URL or
+// opaque identifier (not a local absolute path).
+//
+// When w.refetcher is nil or returns ErrRefetchNotSupported the record is
+// skipped with a debug log — identical to pre-Refetcher behaviour so that
+// callers without a Refetcher see no regression.
+func (w *ExtractionRetryWorker) processRemote(ctx context.Context, f store.ExtractionFailure) {
+	if w.refetcher == nil {
+		slog.Debug("extraction retry: skipping non-local path (no refetcher configured)",
 			"source_type", f.SourceType,
 			"source_id", f.SourceID,
 		)
 		return
 	}
 
-	content, err := w.extractor.ExtractFromPath(ctx, f.FilePath)
+	result, err := w.refetcher.Refetch(ctx, f)
 	if err != nil {
-		// Increment attempt counter; the store applies exponential back-off.
-		recordErr := w.failureStore.Record(ctx, store.ExtractionFailure{
-			SourceType:   f.SourceType,
-			SourceID:     f.SourceID,
-			FilePath:     f.FilePath,
-			ErrorMessage: err.Error(),
-		})
-		if recordErr != nil {
-			slog.Warn("extraction retry: failed to record attempt",
+		if errors.Is(err, ErrRefetchNotSupported) {
+			slog.Debug("extraction retry: skipping non-local path (refetch not supported)",
 				"source_type", f.SourceType,
 				"source_id", f.SourceID,
-				"err", recordErr,
 			)
+			return
 		}
+		// Refetch error (e.g. network failure, expired URL): increment attempts.
+		w.recordFailure(ctx, f, err)
+		slog.Warn("extraction retry: refetch failed",
+			"source_type", f.SourceType,
+			"source_id", f.SourceID,
+			"attempt", f.Attempts+1,
+			"err", err,
+		)
+		return
+	}
+
+	w.extractAndResolve(ctx, f, result.LocalPath, result.Cleanup)
+}
+
+// extractAndResolve runs extraction on localPath, upserts the document on
+// success, and resolves the failure record. On extraction failure it increments
+// the attempt counter. cleanup is called (if non-nil) after extraction
+// regardless of outcome (always defer-called so temp files are removed).
+func (w *ExtractionRetryWorker) extractAndResolve(
+	ctx context.Context,
+	f store.ExtractionFailure,
+	localPath string,
+	cleanup func(),
+) {
+	if cleanup != nil {
+		defer cleanup()
+	}
+
+	content, err := w.extractor.ExtractFromPath(ctx, localPath)
+	if err != nil {
+		w.recordFailure(ctx, f, err)
 		slog.Warn("extraction retry: extraction failed",
 			"source_type", f.SourceType,
 			"source_id", f.SourceID,
@@ -185,7 +231,7 @@ func (w *ExtractionRetryWorker) processOne(ctx context.Context, f store.Extracti
 	doc := &model.Document{
 		SourceType:  model.SourceType(f.SourceType),
 		SourceID:    f.SourceID,
-		Title:       filepath.Base(f.FilePath),
+		Title:       filepath.Base(urlPath(f.FilePath)),
 		Content:     content,
 		CollectedAt: time.Now(),
 	}
@@ -211,6 +257,25 @@ func (w *ExtractionRetryWorker) processOne(ctx context.Context, f store.Extracti
 		"source_type", f.SourceType,
 		"source_id", f.SourceID,
 	)
+}
+
+// recordFailure increments the attempt counter for f using the provided error
+// message. Errors from the store are logged and suppressed so that a store
+// hiccup does not mask the original extraction failure.
+func (w *ExtractionRetryWorker) recordFailure(ctx context.Context, f store.ExtractionFailure, cause error) {
+	recordErr := w.failureStore.Record(ctx, store.ExtractionFailure{
+		SourceType:   f.SourceType,
+		SourceID:     f.SourceID,
+		FilePath:     f.FilePath,
+		ErrorMessage: cause.Error(),
+	})
+	if recordErr != nil {
+		slog.Warn("extraction retry: failed to record attempt",
+			"source_type", f.SourceType,
+			"source_id", f.SourceID,
+			"err", recordErr,
+		)
+	}
 }
 
 // looksLikeLocalPath returns true when p is an absolute POSIX path that does

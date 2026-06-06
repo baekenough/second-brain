@@ -90,13 +90,17 @@ func run() error {
 	const drainTimeout = 10 * time.Second
 
 	// --- Extraction retry worker ---
-	// Periodically re-attempts failed file extractions. Remote-source failures
-	// (Slack attachments) are skipped — see worker package for details.
+	// Periodically re-attempts failed file extractions.
+	// Remote-source failures (Discord/Slack attachments) are retried via
+	// re-download: Discord uses the CDN URL stored in FilePath (no auth needed);
+	// Slack uses the bot token. Sources with no matching backend fall back to
+	// skip-and-debug-log, preserving pre-#72 behaviour.
 	extractorReg := extractor.NewRegistry()
 	retryWorker := worker.New(worker.Config{
 		FailureStore: extractionFailureStore,
 		DocStore:     docStore,
 		Extractor:    worker.NewRegistryExtractor(extractorReg, 0),
+		Refetcher:    worker.NewURLRefetcher(cfg.SlackBotToken),
 		Interval:     time.Minute,
 		BatchSize:    20,
 	})
