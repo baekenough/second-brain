@@ -19,10 +19,11 @@ type DocumentSearcher interface {
 	Search(ctx context.Context, query model.SearchQuery) ([]*model.SearchResult, error)
 }
 
-// ChunkSearcher is the subset of the chunk store used for chunk-based FTS.
+// ChunkSearcher is the subset of the chunk store used for chunk-based search.
 // It is satisfied by *store.ChunkStore.
 type ChunkSearcher interface {
 	SearchFTS(ctx context.Context, query string, limit int) ([]store.ChunkSearchResult, error)
+	SearchVector(ctx context.Context, queryVec []float32, limit int) ([]store.ChunkSearchResult, error)
 }
 
 // Service performs hybrid search: it enriches queries with embeddings when
@@ -46,14 +47,14 @@ func NewService(store DocumentSearcher, embed *EmbedClient) *Service {
 }
 
 // WithChunkStore attaches a ChunkSearcher so that the service can perform
-// chunk-based FTS when the primary embedding-based search is unavailable.
-// The primary search path (full-document FTS + vector) is always attempted first;
-// chunks FTS is the fallback when no results are returned from the primary path.
+// chunk-based FTS and vector search.
 //
-// NOTE: The embedding code path is intentionally preserved.
-// TODO(issue#9-embed): promote chunk FTS to primary once cliproxy confirms
-// /v1/embeddings support (#34). At that point, per-chunk embeddings replace
-// the full-document embedding path in embedDocuments.
+// Chunk signals are incorporated into the RRF fusion as additional retrieval
+// sources alongside the full-document path (issue #71). The full-document path
+// is preserved to avoid regression: chunk vector + chunk FTS are additive.
+//
+// When the primary path (full-document FTS + vector) returns no results,
+// chunk FTS is attempted as a secondary fallback strategy.
 func (s *Service) WithChunkStore(cs ChunkSearcher) *Service {
 	s.chunkStore = cs
 	return s
@@ -93,9 +94,12 @@ func (s *Service) WithReranker(r Reranker) *Service {
 // HyDE adds ~1-3 s of latency due to an additional LLM round-trip; it is
 // opt-in and disabled by default.
 //
+// Chunk signals (vector + FTS) are fused into the RRF result set when a
+// chunkStore is configured (issue #71). Full-document retrieval is always
+// attempted first; chunk signals are additive and never replace it.
+//
 // When the primary path returns no results AND a chunk store is configured,
-// chunk-based FTS is attempted as a secondary strategy and the results are
-// mapped to SearchResult objects.
+// chunk-based FTS is attempted as a final fallback strategy.
 func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.SearchResult, error) {
 	if q.Limit <= 0 {
 		q.Limit = 20
@@ -115,6 +119,7 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 		q.Query = Expand(ctx, s.llmClient, q.Query)
 	}
 
+	var queryVec []float32
 	if s.embed.Enabled() {
 		vec, err := s.embed.Embed(ctx, q.Query)
 		if err != nil {
@@ -123,6 +128,7 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 				"error", err)
 		} else {
 			q.Embedding = vec
+			queryVec = vec
 		}
 	}
 
@@ -131,9 +137,22 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 		return nil, fmt.Errorf("search store: %w", err)
 	}
 
-	// When the primary path (full-document FTS / hybrid) returns no results,
-	// fall back to chunk-based FTS. This catches documents whose relevant
-	// content was beyond the previous 8 KB truncation boundary (issue #3/#9).
+	// Chunk vector search: when per-chunk embeddings are available, run a
+	// chunk-level ANN search and merge its results into the candidate set via
+	// RRF. This is an ADDITIVE signal — the full-document path above always
+	// runs first, and chunk results are merged in rather than replacing it.
+	if s.chunkStore != nil && len(queryVec) > 0 {
+		chunkVecResults, cerr := s.searchChunksVector(ctx, queryVec, q.Limit)
+		if cerr != nil {
+			slog.Warn("search: chunk vector search failed, skipping",
+				"error", cerr, "query", q.Query)
+		} else if len(chunkVecResults) > 0 {
+			results = mergeRRF(results, chunkVecResults, q.Limit)
+		}
+	}
+
+	// When the primary path (full-document FTS / hybrid) + chunk vector
+	// returned no results, fall back to chunk FTS.
 	if len(results) == 0 && s.chunkStore != nil {
 		chunkResults, cerr := s.searchChunksFTS(ctx, q.Query, q.Limit)
 		if cerr != nil {
@@ -194,6 +213,80 @@ func (s *Service) applyRerank(ctx context.Context, query string, results []*mode
 	return out, nil
 }
 
+// searchChunksVector queries the chunks table for the nearest neighbours to
+// queryVec using the HNSW index. Results are aggregated per document (keeping
+// the highest-scoring chunk per document) and converted to SearchResult.
+func (s *Service) searchChunksVector(ctx context.Context, queryVec []float32, limit int) ([]*model.SearchResult, error) {
+	raw, err := s.chunkStore.SearchVector(ctx, queryVec, limit*3) // over-fetch for dedup
+	if err != nil {
+		return nil, fmt.Errorf("chunk vector: %w", err)
+	}
+
+	// Aggregate: keep best-scored chunk per document_id.
+	type entry struct {
+		result *model.SearchResult
+		score  float64
+	}
+	seen := make(map[uuid.UUID]entry, len(raw))
+	for _, r := range raw {
+		docID := r.Chunk.DocumentID
+		sr := chunkVecToSearchResult(r)
+		if prev, ok := seen[docID]; !ok || r.Score > prev.score {
+			seen[docID] = entry{result: sr, score: r.Score}
+		}
+	}
+
+	out := make([]*model.SearchResult, 0, len(seen))
+	for _, e := range seen {
+		out = append(out, e.result)
+	}
+	sortByScore(out)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// mergeRRF fuses two ranked result lists using Reciprocal Rank Fusion.
+// k=60 is the standard RRF constant (same as the document store's fusion).
+// Results are deduplicated by document ID: when a document appears in both
+// lists, the RRF score from both ranks is summed. The merged list is
+// truncated to limit entries, ordered by descending RRF score.
+func mergeRRF(primary, secondary []*model.SearchResult, limit int) []*model.SearchResult {
+	const k = 60.0
+
+	type entry struct {
+		result *model.SearchResult
+		score  float64
+	}
+	merged := make(map[uuid.UUID]*entry, len(primary)+len(secondary))
+
+	addList := func(list []*model.SearchResult) {
+		for rank, r := range list {
+			rrf := 1.0 / (k + float64(rank+1))
+			if e, ok := merged[r.ID]; ok {
+				e.score += rrf
+			} else {
+				cp := *r // shallow copy — do not mutate callers' slice
+				merged[r.ID] = &entry{result: &cp, score: rrf}
+			}
+		}
+	}
+	addList(primary)
+	addList(secondary)
+
+	out := make([]*model.SearchResult, 0, len(merged))
+	for _, e := range merged {
+		e.result.Score = e.score
+		out = append(out, e.result)
+	}
+	sortByScore(out)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
 // searchChunksFTS queries the chunks table for matching text chunks, then
 // aggregates results per document keeping the highest-ranked chunk per document.
 // The returned SearchResult list is ordered by descending chunk rank.
@@ -228,6 +321,22 @@ func (s *Service) searchChunksFTS(ctx context.Context, query string, limit int) 
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+// chunkVecToSearchResult converts a vector-search ChunkSearchResult to a
+// model.SearchResult using the Score field (cosine similarity).
+func chunkVecToSearchResult(r store.ChunkSearchResult) *model.SearchResult {
+	return &model.SearchResult{
+		Document: model.Document{
+			ID:         r.Chunk.DocumentID,
+			SourceType: model.SourceType(r.DocumentSource),
+			Title:      r.DocumentTitle,
+			Content:    r.Chunk.Content,
+			Status:     r.DocumentStatus,
+		},
+		Score:     r.Score,
+		MatchType: "chunk-vector",
+	}
 }
 
 // chunkToSearchResult converts a ChunkSearchResult to a model.SearchResult.

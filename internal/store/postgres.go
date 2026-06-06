@@ -99,10 +99,10 @@ func (pg *Postgres) RunMigrations(ctx context.Context, migrationsDir string, emb
 		}
 
 		base := filepath.Base(f)
-		if base == "011_configurable_embedding_dim.sql" && embeddingDim > 0 {
+		if needsEmbeddingDimGUC(base) && embeddingDim > 0 {
 			// Acquire a single connection so that SET LOCAL and the migration SQL
 			// execute on the same underlying PostgreSQL backend process.
-			if err := pg.runMigration011(ctx, string(sql), embeddingDim); err != nil {
+			if err := pg.runMigrationWithEmbeddingDim(ctx, string(sql), embeddingDim); err != nil {
 				return fmt.Errorf("execute migration %q: %w", f, err)
 			}
 		} else {
@@ -115,11 +115,24 @@ func (pg *Postgres) RunMigrations(ctx context.Context, migrationsDir string, emb
 	return nil
 }
 
-// runMigration011 runs migration 011 on a dedicated connection inside a
-// transaction. SET LOCAL scopes app.embedding_dim to the transaction, which
-// guarantees that current_setting('app.embedding_dim') inside the DO block
-// reads the configured value — not NULL — regardless of pool connection reuse.
-func (pg *Postgres) runMigration011(ctx context.Context, sql string, embeddingDim int) error {
+// needsEmbeddingDimGUC reports whether a migration file requires the
+// app.embedding_dim GUC to be set before execution. Currently this covers
+// migration 011 (documents.embedding reshape) and migration 015
+// (chunks.embedding creation/reshape).
+func needsEmbeddingDimGUC(base string) bool {
+	return base == "011_configurable_embedding_dim.sql" ||
+		base == "015_chunk_embeddings.sql"
+}
+
+// runMigrationWithEmbeddingDim runs a GUC-dependent migration on a dedicated
+// connection inside a transaction. SET LOCAL scopes app.embedding_dim to the
+// transaction, which guarantees that current_setting('app.embedding_dim')
+// inside the DO block reads the configured value — not NULL — regardless of
+// pool connection reuse.
+//
+// This replaces the narrower runMigration011 and is used for any migration
+// that reads app.embedding_dim (currently 011 and 015).
+func (pg *Postgres) runMigrationWithEmbeddingDim(ctx context.Context, sql string, embeddingDim int) error {
 	conn, err := pg.pool.Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire connection: %w", err)
