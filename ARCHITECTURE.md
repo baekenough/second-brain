@@ -205,7 +205,7 @@ flowchart LR
 | `internal/api` | `Server`, `Handler()` — chi 라우터, `requireAPIKey()` — Bearer 미들웨어 | `router.go`, `middleware.go`, `search.go`, `document.go`, `source.go`, `stats.go`, `collect_channel.go` |
 | `internal/scheduler` | `Scheduler`, `run()`, `runCollector()`, `embedDocuments()`, `TriggerAll()`, `ForceCollectSlackChannel()`, `LookupSlackChannel()` | `scheduler.go` |
 | `internal/collector` | `FilesystemCollector`, `SlackCollector`, `GitHubCollector`, `GDriveCollector`, `SlackChannelWatcher`, `DriveExporter` | `filesystem.go`, `slack.go`, `slack_watcher.go`, `github.go`, `gdrive.go`, `gdrive_export.go` |
-| `internal/collector/extractor` | `Registry`, `SanitizeText()`, `TruncateUTF8()`, `HTMLExtractor`, `PDFExtractor`, `DocxExtractor`, `XlsxExtractor`, `PptxExtractor` | `extractor.go`, `html.go`, `pdf.go`, `docx.go`, `xlsx.go`, `pptx.go` |
+| `internal/collector/extractor` | `Registry`, `SanitizeText()`, `TruncateUTF8()`, `HTMLExtractor`, `PDFExtractor`, `DocxExtractor`, `XlsxExtractor`, `PptxExtractor`, `HwpxExtractor` | `extractor.go`, `html.go`, `pdf.go`, `docx.go`, `xlsx.go`, `pptx.go`, `hwpx.go` |
 | `internal/search` | `Service.Search()` — 임베딩 실패 시 fulltext 폴백, `EmbedClient.Embed()`, `EmbedClient.EmbedBatch()`, `cliProxyToken` (5분 TTL) | `search.go`, `embed.go` |
 | `internal/store` | `DocumentStore`, `Upsert()`, `hybridSearch()`, `fulltextSearch()`, `LastCollectedAt()`, `MarkDeleted()`, `CountBySource()` | `document.go`, `postgres.go` |
 | `internal/model` | `Document`, `SearchQuery`, `SearchResult`, `SourceType` 상수 5개 | `document.go` |
@@ -458,7 +458,7 @@ sequenceDiagram
 | 스킵 확장자 | `.bak`, `.gitkeep`, `.plist`, `.lock`, `.DS_Store` |
 | 전체 텍스트 확장자 | `.md`, `.txt`, `.csv`, `.json`, `.js`, `.ts`, `.tsx`, `.py`, `.sh` |
 | 텍스트 파일 상한 | 512 KB (`maxTextFileBytes`) |
-| 추출기 확장자 | `.html`, `.htm`, `.pdf`, `.docx`, `.xlsx`, `.pptx` (Registry) |
+| 추출기 확장자 | `.html`, `.htm`, `.pdf`, `.docx`, `.xlsx`, `.pptx`, `.hwpx` (Registry) |
 | Google Workspace | `.gsheet`, `.gdoc`, `.gscript`, `.gslides`, `.gform` — URL 추출 + Drive API export 시도 |
 | 이미지 처리 | `.png`, `.jpg`, `.jpeg`, `.gif`, `.svg` — 메타데이터 전용 |
 | 아카이브 처리 | `.zip`, `.apk`, `.tar`, `.gz` — 메타데이터 전용 |
@@ -522,7 +522,7 @@ type Extractor interface {
 }
 ```
 
-Registry 등록 순서 (extractor.go:42-49): `HTMLExtractor` → `PDFExtractor` → `DocxExtractor` → `XlsxExtractor` → `PptxExtractor`
+Registry 등록 순서 (extractor.go:42-50): `HTMLExtractor` → `PDFExtractor` → `DocxExtractor` → `XlsxExtractor` → `PptxExtractor` → `HwpxExtractor`
 
 ### SanitizeText (`internal/collector/extractor/extractor.go:92`)
 
@@ -545,6 +545,7 @@ Registry 등록 순서 (extractor.go:42-49): `HTMLExtractor` → `PDFExtractor` 
 | `.docx` | `DocxExtractor` | 표준 `archive/zip` + `encoding/xml` | OOXML 압축 해제 → `word/document.xml` → `<w:t>` 노드 | `</w:p>` 마다 개행 삽입 (docx.go:93) |
 | `.xlsx` | `XlsxExtractor` | `github.com/xuri/excelize/v2` | `RawCellValue:true` → 시트별 TSV 블록 | 200 KiB 상한 (`xlsxMaxBytes`), 빈 행/시트 스킵, 셀 내 `\t`/`\n` → 공백 |
 | `.pptx` | `PptxExtractor` | 표준 `archive/zip` + `encoding/xml` | OOXML 압축 해제 → `ppt/slides/*.xml` → `<a:t>` 노드 | |
+| `.hwpx` | `HwpxExtractor` | 표준 `archive/zip` + `encoding/xml` | OWPML 압축 해제 → `Contents/section*.xml` → `<hp:t>` 노드 | 섹션 번호 numeric sort (section10 > section2), `</hp:p>` 마다 개행 삽입 |
 
 ### XLSX TSV 출력 형식
 
