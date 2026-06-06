@@ -396,7 +396,7 @@ func fetchGitHubTrending(ctx context.Context, hc *http.Client, max int) ([]Candi
 }
 
 // ---------------------------------------------------------------------------
-// Source: GeekNews (hada.io feedburner RSS)
+// Source: GeekNews (hada.io feedburner — serves Atom, with RSS fallback)
 // ---------------------------------------------------------------------------
 
 func fetchGeekNews(ctx context.Context, hc *http.Client, max int) ([]Candidate, error) {
@@ -406,7 +406,54 @@ func fetchGeekNews(ctx context.Context, hc *http.Client, max int) ([]Candidate, 
 		return nil, err
 	}
 
-	var feed struct {
+	// Primary: Atom (<feed><entry>…) — what feedburner actually serves for GeekNews.
+	var atom struct {
+		Entries []struct {
+			Title string `xml:"title"`
+			Links []struct {
+				Rel  string `xml:"rel,attr"`
+				Href string `xml:"href,attr"`
+			} `xml:"link"`
+			Content   string `xml:"content"`
+			Summary   string `xml:"summary"`
+			Published string `xml:"published"`
+			Updated   string `xml:"updated"`
+		} `xml:"entry"`
+	}
+	if err := xml.Unmarshal(body, &atom); err == nil && len(atom.Entries) > 0 {
+		out := make([]Candidate, 0, len(atom.Entries))
+		for i, e := range atom.Entries {
+			if i >= max {
+				break
+			}
+			link := ""
+			for _, l := range e.Links {
+				if l.Rel == "alternate" || link == "" {
+					link = l.Href
+				}
+			}
+			when := e.Published
+			if when == "" {
+				when = e.Updated
+			}
+			pub, _ := time.Parse(time.RFC3339, when)
+			desc := e.Content
+			if desc == "" {
+				desc = e.Summary
+			}
+			out = append(out, Candidate{
+				Source:    sourceGeekNews,
+				Title:     clean(e.Title),
+				URL:       strings.TrimSpace(link),
+				Snippet:   truncate(clean(stripTags(desc)), 800),
+				Published: pub,
+			})
+		}
+		return out, nil
+	}
+
+	// Fallback: RSS 2.0 (<channel><item>…), in case the feed format changes back.
+	var rss struct {
 		Items []struct {
 			Title       string `xml:"title"`
 			Link        string `xml:"link"`
@@ -414,12 +461,12 @@ func fetchGeekNews(ctx context.Context, hc *http.Client, max int) ([]Candidate, 
 			PubDate     string `xml:"pubDate"`
 		} `xml:"channel>item"`
 	}
-	if err := xml.Unmarshal(body, &feed); err != nil {
-		return nil, fmt.Errorf("parse rss: %w", err)
+	if err := xml.Unmarshal(body, &rss); err != nil {
+		return nil, fmt.Errorf("parse feed: %w", err)
 	}
 
-	out := make([]Candidate, 0, len(feed.Items))
-	for i, it := range feed.Items {
+	out := make([]Candidate, 0, len(rss.Items))
+	for i, it := range rss.Items {
 		if i >= max {
 			break
 		}
@@ -428,7 +475,7 @@ func fetchGeekNews(ctx context.Context, hc *http.Client, max int) ([]Candidate, 
 			Source:    sourceGeekNews,
 			Title:     clean(it.Title),
 			URL:       strings.TrimSpace(it.Link),
-			Snippet:   truncate(clean(it.Description), 800),
+			Snippet:   truncate(clean(stripTags(it.Description)), 800),
 			Published: pub,
 		})
 	}
@@ -469,7 +516,39 @@ summary_ko에는 항목 자체의 핵심을 2~3문장 한국어로 요약하라.
 [{"id": <int>, "score": <int>, "axis": "<rag-search|go-backend|agent-tooling|ai-trend>", "reason_ko": "<...>", "summary_ko": "<...>"}]
 모든 후보를 빠짐없이 포함하라.`
 
+// curateBatchSize bounds how many candidates go into a single Claude request.
+// One giant request (90+ items) risks both the HTTP client timeout and
+// max_tokens truncation of the JSON reply; small sequential batches are slower
+// but reliably complete.
+const curateBatchSize = 25
+
 func curate(ctx context.Context, hc *http.Client, cfg config, cands []Candidate) ([]Scored, error) {
+	out := make([]Scored, 0, len(cands))
+	var firstErr error
+	for start := 0; start < len(cands); start += curateBatchSize {
+		end := start + curateBatchSize
+		if end > len(cands) {
+			end = len(cands)
+		}
+		batch, err := curateBatch(ctx, hc, cfg, cands[start:end])
+		if err != nil {
+			// One failed batch should not discard the others' verdicts.
+			slog.Warn("curation batch failed", "from", start, "to", end, "err", err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		out = append(out, batch...)
+		slog.Info("curation batch done", "from", start, "to", end, "scored", len(batch))
+	}
+	if len(out) == 0 && firstErr != nil {
+		return nil, firstErr
+	}
+	return out, nil
+}
+
+func curateBatch(ctx context.Context, hc *http.Client, cfg config, cands []Candidate) ([]Scored, error) {
 	payload, err := json.Marshal(cands)
 	if err != nil {
 		return nil, err
@@ -728,6 +807,26 @@ func stripFences(s string) string {
 
 func clean(s string) string {
 	return strings.Join(strings.Fields(s), " ")
+}
+
+// stripTags removes HTML tags (best-effort) so feed HTML bodies become plain
+// text snippets. Not a sanitizer — output is only fed to the curation prompt.
+func stripTags(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inTag := false
+	for _, r := range s {
+		switch {
+		case r == '<':
+			inTag = true
+		case r == '>':
+			inTag = false
+			b.WriteByte(' ')
+		case !inTag:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func truncate(s string, n int) string {
