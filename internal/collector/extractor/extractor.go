@@ -45,6 +45,7 @@ func NewRegistry() *Registry {
 			&DocxExtractor{},
 			&XlsxExtractor{},
 			&PptxExtractor{},
+			&HwpxExtractor{},
 		},
 	}
 }
