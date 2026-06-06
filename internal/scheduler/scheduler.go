@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
 	"github.com/baekenough/second-brain/internal/chunker"
 	"github.com/baekenough/second-brain/internal/collector"
@@ -344,12 +345,11 @@ func (s *Scheduler) backfillEmbeddings(ctx context.Context) {
 // embedDocuments fills the Embedding field of each document by calling the
 // embedding API in batches to avoid timeout and payload-too-large errors.
 //
-// NOTE: The previous 8 KB hard truncation (issue #3) has been removed.
-// Chunk-based embedding is tracked in TODO(issue#9-embed) below and will be
-// activated once cliproxy /v1/embeddings support is confirmed (issue #34).
-//
-// TODO(issue#9-embed): switch from full-document embedding to per-chunk embedding
-// using the chunks table. Activate after cliproxy /v1/embeddings is confirmed (#34).
+// Full-document embeddings are kept alongside per-chunk embeddings so that the
+// existing document-level vector search path (RRF fusion in search.Service)
+// continues to work without regression. Per-chunk embedding is handled by
+// embedChunks (called from persistChunks when both chunkStore and embed are
+// configured). Both paths are additive.
 func (s *Scheduler) embedDocuments(ctx context.Context, docs []model.Document) {
 	const batchSize = 20
 
@@ -388,12 +388,15 @@ func (s *Scheduler) embedDocuments(ctx context.Context, docs []model.Document) {
 // persistChunks splits doc.Content into overlapping text chunks and stores
 // them in the chunks table via ChunkStore.ReplaceDocument. A failure here is
 // non-fatal: the document itself is already persisted in documents; only the
-// chunk-based FTS index is affected.
+// chunk-based FTS and vector index are affected.
 //
 // Chunking strategy is selected per document by chunker.SelectOptions (issue #60).
 // Long-form structured sources (filesystem, notion, github, gdrive) continue to
 // use the heading-aware defaults (Target 2000 / Max 4000 / Overlap 100), so
 // there is no behavioural regression for those sources.
+//
+// When the embedding client is configured, per-chunk embeddings are generated
+// and persisted immediately after the chunks are stored (issue #71).
 func (s *Scheduler) persistChunks(ctx context.Context, doc *model.Document) {
 	texts := chunker.Split(doc.Content, chunker.SelectOptions(*doc))
 	if len(texts) == 0 {
@@ -417,7 +420,91 @@ func (s *Scheduler) persistChunks(ctx context.Context, doc *model.Document) {
 			"source_id", doc.SourceID,
 			"chunk_count", len(chunks),
 		)
+		return // no point embedding if we could not store chunks
 	}
+
+	// Per-chunk embedding: generate and persist vectors for each chunk.
+	// This is a best-effort operation: failure is non-fatal and only affects
+	// vector search quality. FTS-based chunk search remains available.
+	if s.embed.Enabled() {
+		s.embedChunks(ctx, doc.ID, chunks)
+	}
+}
+
+// embedChunks generates embedding vectors for chunks belonging to a single
+// document and persists them via ChunkStore.UpdateChunkEmbeddings.
+//
+// Because ReplaceDocument uses CopyFrom which does not return inserted IDs,
+// we query the database IDs back by (document_id, chunk_index) after
+// insertion via ListByDocument.
+//
+// Failures are non-fatal: a warning is logged and the document remains
+// searchable via FTS.
+func (s *Scheduler) embedChunks(ctx context.Context, docID uuid.UUID, chunks []store.Chunk) {
+	if len(chunks) == 0 {
+		return
+	}
+
+	texts := make([]string, len(chunks))
+	for i, c := range chunks {
+		texts[i] = c.Content
+	}
+
+	vecs, err := s.embed.EmbedBatch(ctx, texts)
+	if err != nil {
+		slog.Warn("scheduler: chunk embedding failed",
+			"doc_id", docID,
+			"chunk_count", len(chunks),
+			"error", err,
+		)
+		return
+	}
+
+	// Fetch the database IDs for the chunks we just stored.
+	// ReplaceDocument uses CopyFrom which doesn't return IDs, so we must
+	// query them back. We do a single SELECT ordered by chunk_index.
+	storedChunks, err := s.chunkStore.ListByDocument(ctx, docID)
+	if err != nil {
+		slog.Warn("scheduler: list chunks for embedding failed",
+			"doc_id", docID,
+			"error", err,
+		)
+		return
+	}
+
+	// Build a chunk_index → DB id map from the stored chunks.
+	idxToID := make(map[int]int64, len(storedChunks))
+	for _, sc := range storedChunks {
+		idxToID[sc.ChunkIndex] = sc.ID
+	}
+
+	embeddings := make([]store.ChunkEmbedding, 0, len(chunks))
+	for i, c := range chunks {
+		if i >= len(vecs) || len(vecs[i]) == 0 {
+			continue
+		}
+		id, ok := idxToID[c.ChunkIndex]
+		if !ok {
+			continue
+		}
+		embeddings = append(embeddings, store.ChunkEmbedding{
+			ChunkID:   id,
+			Embedding: vecs[i],
+		})
+	}
+
+	if err := s.chunkStore.UpdateChunkEmbeddings(ctx, embeddings); err != nil {
+		slog.Warn("scheduler: persist chunk embeddings failed",
+			"doc_id", docID,
+			"error", err,
+		)
+		return
+	}
+
+	slog.Debug("scheduler: chunk embeddings stored",
+		"doc_id", docID,
+		"count", len(embeddings),
+	)
 }
 
 // Collectors returns the list of registered collectors (for status reporting).
