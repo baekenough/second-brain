@@ -1,0 +1,57 @@
+name: daily knowledge scout
+
+# second-brain knowledge scout — 매일 외부 프런티어(arXiv/HN/GitHub/GeekNews)를
+# 정찰해 "두 번째 뇌에 내재화할 가치가 있는" 연구·트렌드를 GitHub 이슈로 적재한다.
+# 점수 임계값(SCOUT_MIN_SCORE)만으로 게이팅하며 개수 상한은 없다.
+
+on:
+  schedule:
+    # 00:00 UTC = 09:00 KST, 매일
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "이슈를 만들지 않고 로그만 출력"
+        type: boolean
+        default: false
+      min_score:
+        description: "관련도 임계값(0-100). 비우면 기본 70"
+        type: string
+        default: ""
+
+# 기본 GITHUB_TOKEN에 이슈/라벨 생성 권한 부여
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: daily-scout
+  cancel-in-progress: false
+
+jobs:
+  scout:
+    name: scout + curate + file issues
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: go mod download
+        run: go mod download
+      - name: run scout
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SCOUT_MIN_SCORE: ${{ github.event.inputs.min_score }}
+          # 필요 시 비용/모델 튜닝:
+          # ANTHROPIC_MODEL: claude-haiku-4-5-20251001
+          # SCOUT_PER_SOURCE: "30"
+        run: |
+          args=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            args="--dry-run"
+          fi
+          go run ./cmd/scout $args
