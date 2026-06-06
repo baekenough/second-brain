@@ -44,10 +44,11 @@ type: project
 - **해결**: 255 byte 초과 파일명 사전 검사 + skip (walk 양 경로)
 - **증거**: `internal/collector/filesystem.go:46` `maxFilenameBytes = 255`, `:680` `isFilenameTooLong`(`len(name)` byte 기준, 한글 3바이트 주석 명시), `:266` (수집 walk), `:374` (ID 리스팅 walk) 양쪽에서 skip+warn
 
-### TODO(issue#8-followup): 원격파일 재다운로드 재시도 — 부분 처리 (의도된 보류)
+### TODO(issue#8-followup): 원격파일 재다운로드 재시도 — RESOLVED ✅ (#72, v0.11.0)
 
-- **상태**: 로컬 경로만 재시도, 원격(Slack/Discord 첨부)은 의도적으로 skip. 코드/주석에 명시된 의도적 제약이며 버그 아님.
-- **증거**: `internal/worker/extraction_retry.go:69` TODO, `:153` `looksLikeLocalPath` 가드, `:219` 판별 함수. 향후 다운로드 캐시/URL 재페치 도입 시 확장 예정 (이슈로 추적).
+- **해결**: `worker/refetch.go` Refetcher+URLRefetcher 구현, Slack token/Discord CDN 지원, `discord.go FilePath=att.URL` 연결
+- **보안 수정 포함**: SSRF + Slack-token-leak-on-redirect → host allowlist + CheckRedirect(auth-strip, 3-hop cap) + ResponseHeaderTimeout
+- **TODO 제거**: `TODO(issue#8-followup)` 코드 제거 완료
 
 ---
 
@@ -73,8 +74,8 @@ type: project
 
 ## 진행 중 / 추적 (Tracking)
 
-### TODO(issue#9-embed): per-chunk 임베딩 마이그레이션 — 부분(의도된 보류)
+### TODO(issue#9-embed): per-chunk 임베딩 마이그레이션 — RESOLVED ✅ (#71, v0.11.0)
 
-- **상태**: 청크 저장(FTS)은 완료, 임베딩은 여전히 full-document 경로 사용. per-chunk 임베딩은 cliproxy `/v1/embeddings` 확인(#34) 대기로 의도적 보류.
-- **증거**: `internal/scheduler/scheduler.go:351` TODO(#34 확인 후 활성화), `internal/search/search.go:54` TODO(청크 FTS를 primary로 승격 예정). #34에서 OpenAI direct 라우팅으로 결정됨 — 코드는 준비, 전환은 운영 검증 대기.
-- **후속조치**: 기능 미완이나 버그 아님. 별도 이슈로 추적.
+- **해결**: migration 015 (`chunks.embedding vector` + HNSW), ChunkStore.SearchVector/UpdateChunkEmbeddings, scheduler.embedChunks, RRF additive fusion
+- **TODO 제거**: `TODO(issue#9-embed)` 코드 제거 완료
+- **후속 권고(이슈 미생성)**: chunk embedding backfill — 기존 청크 재임베딩. 사용자에게 권고만, goal-loop 재트리거 방지를 위해 이슈 미생성.
