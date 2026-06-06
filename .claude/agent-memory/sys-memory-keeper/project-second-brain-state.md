@@ -1,8 +1,24 @@
 ---
-name: second-brain-project-state-2026-04-15
-description: second-brain 프로젝트 2026-04-15 세션 종료 시점 상태 — 서버 teardown 완료, GitHub만 잔존
+name: second-brain-project-state-2026-06-06
+description: second-brain 프로젝트 2026-06-06 현재 상태 — v0.10.0 릴리즈, 로컬 Mac mini 배포 미실행
 type: project
 ---
+
+## 현재 상태 (2026-06-06 업데이트)
+
+- **최신 릴리즈**: v0.10.0 (2026-06-06)
+- **CI**: govulncheck / Docker-multiarch / k8s-gate 전부 green
+- **배포**: 미실행. 실 배포 대상 = 로컬 Mac mini, `docker-compose.local.yml`
+- **오픈 이슈**: #71 (per-chunk embedding, #34 선행 필요), #72 (remote-file retry), 기타 `gh issue list`로 확인
+- **코드 수정 가능 버그**: 0건 (BUG-001~008 전수 감사 완료, 2026-06-06)
+
+**Why:** 2026-04-15 teardown 이후 v0.7.0~v0.10.0까지 다수 릴리즈됨. 아래 2026-04-15 snapshot은 아카이브.
+
+**How to apply:** 배포 착수 시 docker-compose.local.yml 사용. runbook-deploy.md의 host24/minikube는 stale — 참조 금지.
+
+---
+
+## [ARCHIVED] 2026-04-15 상태
 
 second-brain 프로젝트 2026-04-15 세션 종료 시점 상태.
 
