@@ -19,11 +19,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -78,6 +80,11 @@ type metricsSnapshot struct {
 	NDCG10 float64 `json:"ndcg10"`
 	MRR10  float64 `json:"mrr10"`
 	Pairs  int     `json:"pairs"`
+
+	// Read-path latency (observational only — no regression gate).
+	SearchLatencyP50Ms  float64 `json:"search_latency_p50_ms"`
+	SearchLatencyP95Ms  float64 `json:"search_latency_p95_ms"`
+	SearchLatencyMeanMs float64 `json:"search_latency_mean_ms"`
 }
 
 func run() error {
@@ -159,8 +166,9 @@ func run() error {
 
 	// --- Run search for each pair (bounded parallel) ---
 	type evalResult struct {
-		docIDs   []string
-		relevant map[string]bool
+		docIDs     []string
+		relevant   map[string]bool
+		latencyMs  float64 // wall-clock latency of searchSvc.Search in milliseconds
 	}
 
 	resultsCh := make(chan evalResult, len(pairs))
@@ -176,7 +184,10 @@ func run() error {
 				Limit: 10, // evaluate top-10
 			}
 
+			start := time.Now()
 			searchResults, err := searchSvc.Search(gCtx, q)
+			latencyMs := float64(time.Since(start).Nanoseconds()) / 1e6
+
 			if err != nil {
 				// Non-fatal: log and skip the pair rather than aborting the whole run.
 				slog.Warn("eval: search failed for pair", "query", pair.Query, "error", err)
@@ -193,7 +204,7 @@ func run() error {
 				relevant[id] = true
 			}
 
-			resultsCh <- evalResult{docIDs: docIDs, relevant: relevant}
+			resultsCh <- evalResult{docIDs: docIDs, relevant: relevant, latencyMs: latencyMs}
 			return nil
 		})
 	}
@@ -207,9 +218,11 @@ func run() error {
 	// Collect results from the channel.
 	results := make([][]string, 0, len(pairs))
 	relevantSets := make([]map[string]bool, 0, len(pairs))
+	latencies := make([]float64, 0, len(pairs))
 	for r := range resultsCh {
 		results = append(results, r.docIDs)
 		relevantSets = append(relevantSets, r.relevant)
+		latencies = append(latencies, r.latencyMs)
 	}
 
 	if len(results) == 0 {
@@ -219,29 +232,44 @@ func run() error {
 
 	// --- Compute aggregate metrics ---
 	metrics := search.Aggregate(results, relevantSets)
+
+	// --- Compute read-path latency statistics (observational only) ---
+	p50Ms := percentile(latencies, 50)
+	p95Ms := percentile(latencies, 95)
+	meanMs := meanFloat(latencies)
+
 	slog.Info("eval: metrics computed",
 		"ndcg5", metrics.NDCG5,
 		"ndcg10", metrics.NDCG10,
 		"mrr10", metrics.MRR10,
 		"pairs", metrics.Pairs,
+		"search_latency_p50_ms", p50Ms,
+		"search_latency_p95_ms", p95Ms,
+		"search_latency_mean_ms", meanMs,
 	)
 
 	// --- Persist current run ---
 	if err := metricsStore.Save(ctx, store.EvalMetricsRecord{
-		NDCG5:  metrics.NDCG5,
-		NDCG10: metrics.NDCG10,
-		MRR10:  metrics.MRR10,
-		Pairs:  metrics.Pairs,
+		NDCG5:               metrics.NDCG5,
+		NDCG10:              metrics.NDCG10,
+		MRR10:               metrics.MRR10,
+		Pairs:               metrics.Pairs,
+		SearchLatencyP50Ms:  p50Ms,
+		SearchLatencyP95Ms:  p95Ms,
+		SearchLatencyMeanMs: meanMs,
 	}); err != nil {
 		return fmt.Errorf("save eval metrics: %w", err)
 	}
 
 	// --- Build output ---
 	current := metricsSnapshot{
-		NDCG5:  metrics.NDCG5,
-		NDCG10: metrics.NDCG10,
-		MRR10:  metrics.MRR10,
-		Pairs:  metrics.Pairs,
+		NDCG5:               metrics.NDCG5,
+		NDCG10:              metrics.NDCG10,
+		MRR10:               metrics.MRR10,
+		Pairs:               metrics.Pairs,
+		SearchLatencyP50Ms:  p50Ms,
+		SearchLatencyP95Ms:  p95Ms,
+		SearchLatencyMeanMs: meanMs,
 	}
 
 	out := evalOutput{Current: current}
@@ -400,6 +428,40 @@ func computeDeltas(current, baseline metricsSnapshot) (map[string]float64, bool)
 	}
 
 	return deltas, regression
+}
+
+// percentile returns the p-th percentile (0–100) of vals using the nearest-rank
+// method on a sorted copy of the input.  Returns 0 for an empty slice.
+// The sorted copy is constructed locally so the original slice is not mutated.
+func percentile(vals []float64, p float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	sorted := make([]float64, len(vals))
+	copy(sorted, vals)
+	sort.Float64s(sorted)
+
+	// Nearest-rank: index = ceil(p/100 * n) - 1 (1-based rank → 0-based index).
+	rank := int(math.Ceil(p / 100.0 * float64(len(sorted))))
+	if rank < 1 {
+		rank = 1
+	}
+	if rank > len(sorted) {
+		rank = len(sorted)
+	}
+	return sorted[rank-1]
+}
+
+// meanFloat returns the arithmetic mean of vals, or 0 for an empty slice.
+func meanFloat(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	sum := 0.0
+	for _, v := range vals {
+		sum += v
+	}
+	return sum / float64(len(vals))
 }
 
 // migrationsPath returns the path to the migrations directory.
