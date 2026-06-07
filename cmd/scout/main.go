@@ -681,6 +681,13 @@ func ensureLabels(ctx context.Context, hc *http.Client, cfg config) error {
 		{"scout:hn", "d93f0b", "출처: Hacker News"},
 		{"scout:github", "333333", "출처: GitHub"},
 		{"scout:geeknews", "fbca04", "출처: GeekNews"},
+		// Axis labels let downstream triage (auto-dev pre-triage) tell product
+		// items (go-backend, rag-search) apart from harness knowledge
+		// (agent-tooling, ai-trend) instead of blanket-closing everything.
+		{"axis:rag-search", "0052cc", "평가축: RAG·임베딩·하이브리드 검색 (제품)"},
+		{"axis:go-backend", "006b75", "평가축: Go 백엔드/인프라/Postgres (제품)"},
+		{"axis:agent-tooling", "bfd4f2", "평가축: 에이전트/스킬/LLM 오케스트레이션 (하네스)"},
+		{"axis:ai-trend", "c5def5", "평가축: 넓은 AI 동향 (참고)"},
 	}
 	var firstErr error
 	for _, l := range labels {
@@ -702,12 +709,24 @@ var sourceLabel = map[string]string{
 	sourceGeekNews: "scout:geeknews",
 }
 
+// validAxes guards against the model inventing axis values; only known axes
+// become labels so the label namespace stays bounded.
+var validAxes = map[string]bool{
+	"rag-search":    true,
+	"go-backend":    true,
+	"agent-tooling": true,
+	"ai-trend":      true,
+}
+
 func createIssue(ctx context.Context, hc *http.Client, cfg config, s Scored) error {
 	title := fmt.Sprintf("[%s] %s", s.cand.Source, truncate(s.cand.Title, 140))
 	body := renderIssueBody(s)
 	labels := []string{"scout", "scout:internalize"}
 	if l, ok := sourceLabel[s.cand.Source]; ok {
 		labels = append(labels, l)
+	}
+	if validAxes[s.Axis] {
+		labels = append(labels, "axis:"+s.Axis)
 	}
 	b, _ := json.Marshal(map[string]any{"title": title, "body": body, "labels": labels})
 	_, status, err := httpDo(ctx, hc, http.MethodPost,
