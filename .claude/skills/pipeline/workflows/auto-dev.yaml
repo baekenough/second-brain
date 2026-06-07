@@ -1,6 +1,6 @@
 name: auto-dev
 description: "Automated development pipeline for second-brain — scoped release unit from triage to deploy"
-version: "1.2.0-second-brain"
+version: "1.2.1-second-brain"
 
 # Target: baekenough/second-brain (Go backend + Next.js frontend + Postgres/pgvector + k8s)
 # Release artifacts: git tag + GitHub Release + Docker image (no npm publish)
@@ -19,6 +19,20 @@ steps:
         - phase/0..4 — roadmap features
         - chore + blocker — infra/CI/integrations
         - decision-needed — blocked on human decision (EXCLUDE)
+        - scout — knowledge scout items (see scout handling below)
+
+      Scout issue handling (label `scout`) — NEVER blanket-close as out-of-scope:
+        - These are knowledge-internalization candidates from cmd/scout, NOT release
+          work items. EXCLUDE them from release scope selection, but branch on axis:
+        - axis:go-backend, axis:rag-search → PRODUCT-relevant reference. Keep open.
+          Optionally add P2/P3 and link to a roadmap item (EXPANSION.md) if it maps
+          to planned work.
+        - axis:agent-tooling, axis:ai-trend → harness/reference knowledge. May close,
+          but ONLY after leaving a 1-2 line comment stating what was internalized
+          (or why nothing was) — generic boilerplate closures are forbidden.
+        - Issues with `scout` but no axis label: read 분류 in the issue body header
+          and apply the same branching. When in doubt, leave open and tag
+          decision-needed instead of closing.
 
       For each issue compute:
         - dependencies: parse "see #N", "depends on #N", "#N 참조" from body
