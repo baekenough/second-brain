@@ -14,6 +14,12 @@ import (
 	"github.com/baekenough/second-brain/internal/store"
 )
 
+// EntityFetcher retrieves entities linked to a set of documents.
+// It is satisfied by *store.EntityStore.
+type EntityFetcher interface {
+	EntitiesForDocuments(ctx context.Context, docIDs []uuid.UUID) (map[uuid.UUID][]model.Entity, error)
+}
+
 // DocumentSearcher is the subset of the document store used by the search service.
 type DocumentSearcher interface {
 	Search(ctx context.Context, query model.SearchQuery) ([]*model.SearchResult, error)
@@ -32,12 +38,13 @@ type ChunkSearcher interface {
 // HyDE (Hypothetical Document Embeddings) can be enabled per-request to
 // improve recall for short or ambiguous queries.
 type Service struct {
-	store      DocumentSearcher
-	embed      *EmbedClient
-	chunkStore ChunkSearcher       // nil when chunk FTS is not configured
-	llmClient  llm.Completer       // nil when HyDE is not configured
-	weights    model.SearchWeights // zero value uses defaults (k=60, equal weights)
-	reranker   Reranker            // nil when reranking is not configured
+	store         DocumentSearcher
+	embed         *EmbedClient
+	chunkStore    ChunkSearcher       // nil when chunk FTS is not configured
+	llmClient     llm.Completer       // nil when HyDE is not configured
+	weights       model.SearchWeights // zero value uses defaults (k=60, equal weights)
+	reranker      Reranker            // nil when reranking is not configured
+	entityFetcher EntityFetcher       // nil when entity surfacing is not configured
 }
 
 // NewService returns a search Service.
@@ -82,6 +89,15 @@ func (s *Service) WithWeights(w model.SearchWeights) *Service {
 // silently skipped when the reranker is nil or disabled.
 func (s *Service) WithReranker(r Reranker) *Service {
 	s.reranker = r
+	return s
+}
+
+// WithEntityFetcher attaches an entity store so that named entities extracted
+// from the returned documents are populated in SearchResult.Entities.
+// This is ADDITIVE and omitempty — existing consumers are unaffected when the
+// field is nil. Safe to call with nil — surfacing is silently skipped.
+func (s *Service) WithEntityFetcher(ef EntityFetcher) *Service {
+	s.entityFetcher = ef
 	return s
 }
 
@@ -174,6 +190,25 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 			slog.Warn("search: rerank failed, using original order", "error", rerr)
 		} else {
 			results = reranked
+		}
+	}
+
+	// Entity surfacing (issue #77): populate Entities on each result.
+	// Failure is non-fatal — results are returned without entities on error.
+	if s.entityFetcher != nil && len(results) > 0 {
+		docIDs := make([]uuid.UUID, len(results))
+		for i, r := range results {
+			docIDs[i] = r.ID
+		}
+		entityMap, efErr := s.entityFetcher.EntitiesForDocuments(ctx, docIDs)
+		if efErr != nil {
+			slog.Warn("search: entity fetch failed, omitting entities", "error", efErr)
+		} else {
+			for _, r := range results {
+				if ents, ok := entityMap[r.ID]; ok {
+					r.Entities = ents
+				}
+			}
 		}
 	}
 

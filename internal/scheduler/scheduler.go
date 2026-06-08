@@ -13,9 +13,11 @@ import (
 	"github.com/robfig/cron/v3"
 	"github.com/baekenough/second-brain/internal/chunker"
 	"github.com/baekenough/second-brain/internal/collector"
+	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
+	"github.com/baekenough/second-brain/internal/worker"
 )
 
 // DocumentUpserter is the subset of the document store used by the scheduler.
@@ -35,14 +37,23 @@ type DocumentUpserter interface {
 	ActiveSourceIDSet(ctx context.Context, sourceType model.SourceType) (map[string]struct{}, error)
 }
 
+// EntityExtractor is the subset of the entity store used by the scheduler to
+// trigger best-effort entity extraction immediately after document ingestion.
+// It is satisfied by *store.EntityStore.
+type EntityExtractor interface {
+	UpsertAndLinkEntities(ctx context.Context, documentID uuid.UUID, entities []model.Entity) error
+}
+
 // Scheduler wraps robfig/cron and manages periodic collection runs.
 type Scheduler struct {
 	cron        *cron.Cron
 	collectors  []collector.Collector
 	store       DocumentUpserter
 	embed       *search.EmbedClient
-	chunkStore  *store.ChunkStore // nil when chunk storage is disabled
-	instanceID  string            // per-instance watermark key (e.g., "laptop", "host1", "host2")
+	chunkStore  *store.ChunkStore  // nil when chunk storage is disabled
+	entities    EntityExtractor    // nil when entity extraction is disabled
+	llmClient   llm.Completer      // nil when entity extraction is disabled
+	instanceID  string             // per-instance watermark key (e.g., "laptop", "host1", "host2")
 
 	// running is set to 1 while a collection cycle is in progress.
 	// CompareAndSwap from 0→1 acts as a non-blocking try-lock so that
@@ -80,6 +91,23 @@ func (s *Scheduler) WithInstance(id string) *Scheduler {
 // before (full-document FTS via documents.tsv only).
 func (s *Scheduler) WithChunkStore(cs *store.ChunkStore) *Scheduler {
 	s.chunkStore = cs
+	return s
+}
+
+// WithEntityExtraction attaches the entity store and LLM client so that entity
+// extraction is attempted inline after each document is persisted.
+//
+// This method should only be called when entity extraction is explicitly
+// enabled (ENTITY_EXTRACTION_ENABLED=true in cmd/collector/main.go). When not
+// called, s.entities and s.llmClient remain nil and the extractEntities call
+// in processBatch is skipped entirely — zero LLM calls are made.
+//
+// Extraction is BEST-EFFORT: failures are logged as warnings and never block
+// document ingestion. Safe to call with nil arguments — extraction is silently
+// disabled in that case.
+func (s *Scheduler) WithEntityExtraction(entities EntityExtractor, client llm.Completer) *Scheduler {
+	s.entities = entities
+	s.llmClient = client
 	return s
 }
 
@@ -209,6 +237,15 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 			// stored in the chunks table. The documents.content column is unchanged.
 			if s.chunkStore != nil {
 				s.persistChunks(ctx, &batch[i])
+			}
+
+			// Best-effort entity extraction (issue #77).
+			// Only runs when WithEntityExtraction was called (opt-in via
+			// ENTITY_EXTRACTION_ENABLED=true). When disabled, both fields are
+			// nil and this block is skipped — zero LLM calls are made.
+			// Never blocks or fails document ingestion — errors are logged only.
+			if s.entities != nil && s.llmClient != nil {
+				s.extractEntities(ctx, &batch[i])
 			}
 		}
 		return nil
@@ -505,6 +542,31 @@ func (s *Scheduler) embedChunks(ctx context.Context, docID uuid.UUID, chunks []s
 		"doc_id", docID,
 		"count", len(embeddings),
 	)
+}
+
+// extractEntities calls the LLM to extract named entities from doc and
+// persists them via the entity store. All errors are logged as warnings;
+// this method never returns an error so document ingestion is never blocked.
+//
+// The LLM call uses the request context so it respects scheduler shutdown.
+// It runs synchronously in the collection goroutine to keep the architecture
+// simple for the MVP; a dedicated background EntityWorker (internal/worker) is
+// available for backfill of documents that were ingested before this feature
+// was deployed.
+func (s *Scheduler) extractEntities(ctx context.Context, doc *model.Document) {
+	entities, err := worker.ExtractEntities(ctx, s.llmClient, doc)
+	if err != nil {
+		slog.Warn("scheduler: entity extraction failed (non-fatal)",
+			"doc_id", doc.ID, "source_id", doc.SourceID, "error", err)
+		return
+	}
+	if len(entities) == 0 {
+		return
+	}
+	if linkErr := s.entities.UpsertAndLinkEntities(ctx, doc.ID, entities); linkErr != nil {
+		slog.Warn("scheduler: entity link failed (non-fatal)",
+			"doc_id", doc.ID, "count", len(entities), "error", linkErr)
+	}
 }
 
 // Collectors returns the list of registered collectors (for status reporting).

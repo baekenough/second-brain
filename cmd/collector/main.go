@@ -77,6 +77,7 @@ func run() error {
 	docStore := store.NewDocumentStore(pg)
 	extractionFailureStore := store.NewExtractionFailureStore(pg)
 	chunkStore := store.NewChunkStore(pg)
+	entityStore := store.NewEntityStore(pg)
 
 	// wg tracks long-running background goroutines that need a graceful drain
 	// window on SIGTERM before the process exits (#65).
@@ -160,6 +161,40 @@ func run() error {
 		summarizerWorker.Run(ctx)
 	}()
 
+	// --- Entity extraction worker (issue #77) ---
+	// Entity extraction makes one LLM call per document and is therefore
+	// OPT-IN. Set ENTITY_EXTRACTION_ENABLED=true (or =1) to enable both the
+	// inline scheduler extraction and the backfill worker. Any other value
+	// (including unset) leaves extraction disabled so that a vanilla deployment
+	// incurs zero extra LLM cost.
+	//
+	// The server-side read path (search.WithEntityFetcher) is always active —
+	// it is a cheap DB read and returns omitempty when no entities exist.
+	ev := os.Getenv("ENTITY_EXTRACTION_ENABLED")
+	entityExtractionEnabled := ev == "true" || ev == "1"
+	if entityExtractionEnabled {
+		slog.Info("entity extraction enabled via ENTITY_EXTRACTION_ENABLED=" + ev)
+	} else {
+		slog.Info("entity extraction disabled (set ENTITY_EXTRACTION_ENABLED=true to enable)")
+	}
+	entityWorker := worker.NewEntityWorker(worker.EntityWorkerConfig{
+		Store:     docStore,
+		Entities:  entityStore,
+		LLM:       llmClient,
+		Interval:  10 * time.Minute,
+		BatchSize: 5,
+	})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if !entityExtractionEnabled {
+			// Block until shutdown so the WaitGroup stays balanced.
+			<-ctx.Done()
+			return
+		}
+		entityWorker.Run(ctx)
+	}()
+
 	// --- Collectors ---
 	// Discord is intentionally excluded from the collector daemon; it is handled
 	// by the API server which owns the WebSocket gateway and mention responses.
@@ -191,9 +226,14 @@ func run() error {
 	}
 
 	// --- Scheduler ---
+	// WithEntityExtraction is only called when extraction is explicitly enabled
+	// so that the inline per-document LLM call is never made in a default deployment.
 	sched := scheduler.New(docStore, embedClient, collectors...).
 		WithChunkStore(chunkStore).
 		WithInstance(cfg.CollectorInstance)
+	if entityExtractionEnabled {
+		sched = sched.WithEntityExtraction(entityStore, llmClient)
+	}
 	slog.Info("collector instance", "id", cfg.CollectorInstance)
 	if err := sched.Register(cfg.CollectInterval); err != nil {
 		return err

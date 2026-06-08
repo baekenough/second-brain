@@ -56,8 +56,9 @@ type Document struct {
 // SearchResult wraps a Document with relevance scoring metadata.
 type SearchResult struct {
 	Document
-	Score     float64 `json:"score"`
-	MatchType string  `json:"match_type"` // "fulltext", "vector", or "hybrid"
+	Score     float64  `json:"score"`
+	MatchType string   `json:"match_type"`          // "fulltext", "vector", or "hybrid"
+	Entities  []Entity `json:"entities,omitempty"` // named entities extracted from the document; nil when not populated
 }
 
 // SearchWeights controls RRF fusion behaviour.

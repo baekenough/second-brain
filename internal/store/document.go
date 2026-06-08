@@ -805,6 +805,35 @@ func (s *DocumentStore) ListUnembedded(ctx context.Context, limit int) ([]*model
 	return collectDocuments(rows)
 }
 
+// ListWithoutEntities returns up to limit active documents that have no rows
+// in document_entities, ordered by collected_at ASC (oldest first) so that
+// entity-extraction backfill progresses forward in time.
+//
+// Soft-deleted documents are excluded — there is no value in extracting
+// entities from documents that are not served in search results.
+func (s *DocumentStore) ListWithoutEntities(ctx context.Context, limit int) ([]*model.Document, error) {
+	const q = `
+		SELECT id, source_type, source_id, title, content, metadata, embedding,
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding
+		FROM documents
+		WHERE status = 'active'
+		  AND NOT EXISTS (
+		      SELECT 1 FROM document_entities de
+		      WHERE de.document_id = documents.id
+		  )
+		ORDER BY collected_at ASC
+		LIMIT $1`
+
+	rows, err := s.pg.pool.Query(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list without entities: %w", err)
+	}
+	defer rows.Close()
+
+	return collectDocuments(rows)
+}
+
 // ListUnsummarized returns up to limit active documents whose title_summary
 // column is NULL, ordered by collected_at ASC (oldest first) so backfill
 // progresses forward in time.

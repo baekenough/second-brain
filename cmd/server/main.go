@@ -59,11 +59,12 @@ func run() error {
 	}
 
 	docStore := store.NewDocumentStore(pg)
-	chunkStore := store.NewChunkStore(pg)           // issue #9: chunk-based FTS
-	feedbackStore := store.NewFeedbackStore(pg)     // issue #17: user feedback
-	evalStore := store.NewEvalStore(pg)             // issue #18: eval set export
-	metricsStore := store.NewEvalMetricsStore(pg)   // issue #19: eval metrics history
+	chunkStore := store.NewChunkStore(pg)               // issue #9: chunk-based FTS
+	feedbackStore := store.NewFeedbackStore(pg)         // issue #17: user feedback
+	evalStore := store.NewEvalStore(pg)                 // issue #18: eval set export
+	metricsStore := store.NewEvalMetricsStore(pg)       // issue #19: eval metrics history
 	reindexStateStore := store.NewReindexStateStore(pg) // issue #20: reindex state tracking
+	entityStore := store.NewEntityStore(pg)             // issue #77: knowledge-graph entities
 
 	// --- Embedding client ---
 	embedClient := search.NewEmbedClient(cfg.EmbeddingAPIURL, cfg.EmbeddingAPIKey, cfg.CliProxyAuthFile, cfg.EmbeddingModel)
@@ -81,9 +82,11 @@ func run() error {
 
 	// --- Search service ---
 	// ChunkStore is attached to enable chunk-based FTS fallback (issue #9).
+	// EntityStore is attached to surface entities in search results (issue #77).
 	searchSvc := search.NewService(docStore, embedClient).
 		WithChunkStore(chunkStore).
-		WithReranker(reranker)
+		WithReranker(reranker).
+		WithEntityFetcher(entityStore)
 
 	// --- LLM client (curation) ---
 	llmClient := llm.New(llm.Config{
