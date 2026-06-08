@@ -81,8 +81,11 @@ services:
       - ${LLM_MEMORY_DB_HOST_PATH:-/Users/user/workspace/llm-memory/data/memory.sqlite}:/data/llm-memory.sqlite:ro
       - /Users/user/workspace/private/secretary/gmail:/data/gmail:ro
       - /Users/user/workspace/private/secretary/calendar:/data/calendar:ro
-      - /Users/user/Library/CloudStorage/OneDrive-개인/secretary/sms:/data/sms:ro
-      - /Users/user/Library/CloudStorage/OneDrive-개인/secretary/call:/data/call:ro
+      # OneDrive sms/call are copied to local staging by onedrive-bridge.sh
+      # (launchd: com.user.secondbrain.onedrive-bridge, interval 600s)
+      # to avoid VirtioFS resource-deadlock on on-demand cloud files.
+      - ${HOME}/.second-brain/stage/sms:/data/sms:ro
+      - ${HOME}/.second-brain/stage/call:/data/call:ro
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
