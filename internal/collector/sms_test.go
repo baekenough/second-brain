@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -547,6 +548,113 @@ func TestSMSCollector_Collect_EmptyDir(t *testing.T) {
 	}
 	if len(docs) != 0 {
 		t.Errorf("expected 0 docs from empty dir, got %d", len(docs))
+	}
+}
+
+// --- Tests: readFileWithRetry / FUSE deadlock ---
+
+// TestIsTransientFUSEError verifies the error classifier for EDEADLK and ETIMEDOUT.
+func TestIsTransientFUSEError(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		err       error
+		wantRetry bool
+	}{
+		{name: "EDEADLK", err: syscall.EDEADLK, wantRetry: true},
+		{name: "ETIMEDOUT", err: syscall.ETIMEDOUT, wantRetry: true},
+		{name: "ENOENT", err: syscall.ENOENT, wantRetry: false},
+		{name: "EACCES", err: syscall.EACCES, wantRetry: false},
+		{name: "nil", err: nil, wantRetry: false},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := isTransientFUSEError(tc.err)
+			if got != tc.wantRetry {
+				t.Errorf("isTransientFUSEError(%v) = %v, want %v", tc.err, got, tc.wantRetry)
+			}
+		})
+	}
+}
+
+// TestReadFileWithRetry_Success verifies that readFileWithRetry returns file
+// content when os.ReadFile succeeds on the first attempt.
+func TestReadFileWithRetry_Success(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.xml")
+	want := []byte("<smses><sms /></smses>")
+	writeFile(t, path, string(want))
+
+	got, err := readFileWithRetry(path)
+	if err != nil {
+		t.Fatalf("readFileWithRetry: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("content mismatch: got %q, want %q", got, want)
+	}
+}
+
+// TestReadFileWithRetry_ENOENT verifies that non-retryable errors (ENOENT) are
+// returned immediately without retrying.
+func TestReadFileWithRetry_ENOENT(t *testing.T) {
+	t.Parallel()
+
+	// File does not exist — must return immediately without sleeping.
+	_, err := readFileWithRetry("/nonexistent/path/file.xml")
+	if err == nil {
+		t.Fatal("expected error for missing file, got nil")
+	}
+}
+
+// TestSMSCollector_Collect_ReadAllParsing verifies that the read-all-then-parse
+// approach (bytes.Reader instead of streaming os.File) produces identical results
+// to the XML fixture used in other tests. This is a regression guard: the
+// switch from streaming to read-all must not change parsing output.
+func TestSMSCollector_Collect_ReadAllParsing(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	smsXML := makeSMSXML([]struct {
+		Address     string
+		DateMs      int64
+		Type        int
+		Body        string
+		ContactName string
+	}{
+		{"010-1111-0001", hoursAgoMs(3), 1, "첫 번째 메시지", "홍길동"},
+		{"010-2222-0002", hoursAgoMs(2), 2, "두 번째 메시지", ""},
+		{"010-3333-0003", hoursAgoMs(1), 1, "인증번호: 123456", "은행"},
+	})
+	writeFile(t, filepath.Join(dir, "sms-20260101.xml"), smsXML)
+
+	c := NewSMSCollector(dir)
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(docs) != 3 {
+		t.Fatalf("expected 3 docs, got %d", len(docs))
+	}
+
+	// Verify auth flag: only the third message should be auth-like.
+	isAuth0, _ := docs[0].Metadata["is_auth_like"].(bool)
+	isAuth2, _ := docs[2].Metadata["is_auth_like"].(bool)
+	if isAuth0 {
+		t.Errorf("docs[0] should not be auth-like (body=%q)", docs[0].Content)
+	}
+	if !isAuth2 {
+		t.Errorf("docs[2] should be auth-like (body=%q)", docs[2].Content)
+	}
+
+	// Verify contact name fallback.
+	if docs[1].Title != fmt.Sprintf("SMS sent %s", "010-2222-0002") {
+		t.Errorf("docs[1] title fallback wrong: %q", docs[1].Title)
 	}
 }
 

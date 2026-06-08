@@ -585,6 +585,75 @@ func TestSearchWeights_DisableSummaryVec(t *testing.T) {
 // Tests: NULL summary scan regression
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Tests: SUMMARIZER_BACKFILL_ENABLED=false
+// ---------------------------------------------------------------------------
+
+// TestSummarizerWorker_tick_backfillDisabled verifies that when BackfillEnabled
+// is false, tick() returns immediately without calling ListUnsummarized or
+// UpdateSummary. This prevents LLM timeout floods when running a slow local
+// model with a large pre-existing unsummarized backlog.
+func TestSummarizerWorker_tick_backfillDisabled(t *testing.T) {
+	doc := makeDoc("some content")
+	st := &mockSummaryStore{unsummarized: []*model.Document{doc}}
+	lm := &mockLLM{enabled: true, response: validSummaryJSON("Title", "• Bullet")}
+
+	disabled := false
+	w := NewSummarizerWorker(SummarizerConfig{
+		Store:           st,
+		LLM:             lm,
+		BackfillEnabled: &disabled,
+	})
+	w.tick(context.Background())
+
+	// ListUnsummarized must NOT have been called — we verify indirectly: if it
+	// were called and documents returned, UpdateSummary would be called.
+	if len(st.updateCalls) != 0 {
+		t.Errorf("expected no UpdateSummary calls when backfill disabled, got %d", len(st.updateCalls))
+	}
+}
+
+// TestSummarizerWorker_tick_backfillEnabledExplicit verifies that passing
+// BackfillEnabled=true behaves identically to the default (nil) — documents are
+// processed normally.
+func TestSummarizerWorker_tick_backfillEnabledExplicit(t *testing.T) {
+	doc := makeDoc("content")
+	st := &mockSummaryStore{unsummarized: []*model.Document{doc}}
+	lm := &mockLLM{enabled: true, response: validSummaryJSON("Title", "• Bullet")}
+
+	enabled := true
+	w := NewSummarizerWorker(SummarizerConfig{
+		Store:           st,
+		LLM:             lm,
+		BackfillEnabled: &enabled,
+	})
+	w.tick(context.Background())
+
+	if len(st.updateCalls) != 1 {
+		t.Errorf("expected 1 UpdateSummary call when backfill enabled, got %d", len(st.updateCalls))
+	}
+}
+
+// TestSummarizerWorker_tick_backfillNil_defaultsToEnabled verifies that nil
+// BackfillEnabled (i.e. field not set) preserves the existing enabled behaviour.
+func TestSummarizerWorker_tick_backfillNil_defaultsToEnabled(t *testing.T) {
+	doc := makeDoc("content")
+	st := &mockSummaryStore{unsummarized: []*model.Document{doc}}
+	lm := &mockLLM{enabled: true, response: validSummaryJSON("Title", "• Bullet")}
+
+	// BackfillEnabled: nil (not set)
+	w := NewSummarizerWorker(SummarizerConfig{Store: st, LLM: lm})
+	w.tick(context.Background())
+
+	if len(st.updateCalls) != 1 {
+		t.Errorf("expected 1 UpdateSummary call when BackfillEnabled is nil (default true), got %d", len(st.updateCalls))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tests: NULL summary scan regression
+// ---------------------------------------------------------------------------
+
 // TestNullSummaryScan verifies that a Document with NULL summary fields
 // (as returned by a freshly inserted row before the summarizer runs)
 // can be scanned without error and produces empty string fields.

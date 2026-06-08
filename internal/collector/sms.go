@@ -1,15 +1,17 @@
 package collector
 
 import (
+	"bytes"
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -107,27 +109,81 @@ type callRecord struct {
 
 // --- Parsers ---
 
-// parseSMSFile streams smsFile and returns Documents for all <sms> elements
-// whose OccurredAt is after since.
+// smsReadBackoff is the sequence of waits between readFileWithRetry attempts.
+// Three retries with 0.5 s / 1 s / 2 s gaps give OneDrive FUSE mounts time to
+// release their lock before the final attempt is made.
+var smsReadBackoff = []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second}
+
+// readFileWithRetry reads path into memory, retrying on transient FUSE errors
+// (EDEADLK, ETIMEDOUT) up to len(smsReadBackoff) times.
+//
+// OneDrive FUSE mounts on macOS can return EDEADLK ("resource deadlock
+// avoided") or ETIMEDOUT when two goroutines open the same file simultaneously.
+// Reading the full file into a []byte first and then parsing from a
+// bytes.Reader avoids holding an OS-level file descriptor open during XML
+// streaming, which eliminates the deadlock window. When all retries are
+// exhausted the last error is returned.
+func readFileWithRetry(path string) ([]byte, error) {
+	var lastErr error
+	for attempt := 0; attempt <= len(smsReadBackoff); attempt++ {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			return data, nil
+		}
+		// Classify error as transient (worth retrying) or permanent.
+		if !isTransientFUSEError(err) {
+			return nil, err
+		}
+		lastErr = err
+		if attempt < len(smsReadBackoff) {
+			slog.Warn("sms: transient read error, retrying",
+				"path", path,
+				"attempt", attempt+1,
+				"backoff", smsReadBackoff[attempt],
+				"error", err,
+			)
+			time.Sleep(smsReadBackoff[attempt])
+		}
+	}
+	slog.Warn("sms: all read retries exhausted, skipping file",
+		"path", path, "error", lastErr)
+	return nil, fmt.Errorf("read %q after retries: %w", path, lastErr)
+}
+
+// isTransientFUSEError reports whether err is a temporary FUSE-mount error
+// that is worth retrying. Currently matches EDEADLK and ETIMEDOUT which are
+// the two codes observed on OneDrive FUSE mounts when two goroutines open the
+// same large XML file concurrently.
+func isTransientFUSEError(err error) bool {
+	var errno syscall.Errno
+	if !errors.As(err, &errno) {
+		return false
+	}
+	return errno == syscall.EDEADLK || errno == syscall.ETIMEDOUT
+}
+
+// parseSMSFile reads smsFile entirely into memory (with FUSE-safe retry) and
+// returns Documents for all <sms> elements whose OccurredAt is after since.
+//
+// Reading the full file into []byte before XML parsing avoids holding an open
+// file descriptor during streaming, which eliminates the OneDrive FUSE deadlock
+// (EDEADLK) that occurred when the streaming decoder kept the fd open for
+// extended periods on large XML files.
 func parseSMSFile(ctx context.Context, path string, since time.Time) ([]model.Document, error) {
-	f, err := os.Open(path)
+	data, err := readFileWithRetry(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 
 	var docs []model.Document
-	dec := xml.NewDecoder(f)
+	dec := xml.NewDecoder(bytes.NewReader(data))
 	for {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 		tok, err := dec.Token()
-		if err == io.EOF {
-			break
-		}
 		if err != nil {
-			return nil, fmt.Errorf("xml decode: %w", err)
+			break // io.EOF or parse error; both terminate the loop
 		}
 		se, ok := tok.(xml.StartElement)
 		if !ok || se.Name.Local != "sms" {
@@ -173,27 +229,25 @@ func parseSMSFile(ctx context.Context, path string, since time.Time) ([]model.Do
 	return docs, nil
 }
 
-// parseCallsFile streams callsFile and returns Documents for all <call> elements
-// whose OccurredAt is after since.
+// parseCallsFile reads callsFile entirely into memory (with FUSE-safe retry)
+// and returns Documents for all <call> elements whose OccurredAt is after since.
+//
+// See parseSMSFile for the rationale behind the read-all-first approach.
 func parseCallsFile(ctx context.Context, path string, since time.Time) ([]model.Document, error) {
-	f, err := os.Open(path)
+	data, err := readFileWithRetry(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 
 	var docs []model.Document
-	dec := xml.NewDecoder(f)
+	dec := xml.NewDecoder(bytes.NewReader(data))
 	for {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 		tok, err := dec.Token()
-		if err == io.EOF {
-			break
-		}
 		if err != nil {
-			return nil, fmt.Errorf("xml decode calls: %w", err)
+			break // io.EOF or parse error
 		}
 		se, ok := tok.(xml.StartElement)
 		if !ok || se.Name.Local != "call" {

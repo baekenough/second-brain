@@ -72,10 +72,50 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      ollama:
+        condition: service_started
+      whisper:
+        condition: service_started
     volumes:
       - ${SECRETARY_DB_HOST_PATH:-/Users/user/workspace/private/secretary/assistant/secretary.db}:/data/secretary.db:ro
       - ${LLM_MEMORY_DB_HOST_PATH:-/Users/user/workspace/llm-memory/data/memory.sqlite}:/data/llm-memory.sqlite:ro
+      - /Users/user/workspace/private/secretary/gmail:/data/gmail:ro
+      - /Users/user/workspace/private/secretary/calendar:/data/calendar:ro
+      - /Users/user/Library/CloudStorage/OneDrive-개인/secretary/sms:/data/sms:ro
+      - /Users/user/Library/CloudStorage/OneDrive-개인/secretary/call:/data/call:ro
     restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # ollama — 로컬 LLM 서버 (내부 포트 11434).
+  #   gemma3:12b-it-qat 모델을 사용한다. macOS arm64 CPU 전용 (느림).
+  #   모델 파일은 named volume ollama_models 에 영속된다.
+  #   첫 기동 후: docker exec second-brain-ollama ollama pull gemma3:12b-it-qat
+  # ---------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: second-brain-ollama
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: unless-stopped
+    networks:
+      - default
+
+  # ---------------------------------------------------------------------------
+  # whisper — OpenAI-호환 음성인식 서버 (내부 포트 8000).
+  #   fedirz/faster-whisper-server:latest-cpu 사용.
+  #   엔드포인트: POST /v1/audio/transcriptions (multipart: file/model/language)
+  #   WHISPER__MODEL 로 모델 지정 (HuggingFace repo ID).
+  # ---------------------------------------------------------------------------
+  whisper:
+    image: fedirz/faster-whisper-server:latest-cpu
+    environment:
+      WHISPER__MODEL: Systran/faster-whisper-medium
+      WHISPER__INFERENCE_DEVICE: cpu
+      UVICORN_HOST: "0.0.0.0"
+      UVICORN_PORT: "8000"
+    restart: unless-stopped
+    networks:
+      - default
 
   # ---------------------------------------------------------------------------
   # mcp — MCP streamable HTTP 서버 (포트 8090).
@@ -108,3 +148,5 @@ volumes:
   pgdata:
     # macOS arm64 에서 PostgreSQL 데이터 디렉토리를 호스트 bind-mount 하면
     # 파일시스템 권한 충돌이 발생할 수 있으므로 named volume 을 사용한다.
+  ollama_models:
+    # ollama 모델 파일 영속 볼륨. 컨테이너 재생성 시 재다운로드 방지.

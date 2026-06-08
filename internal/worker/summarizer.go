@@ -60,6 +60,14 @@ type SummarizerConfig struct {
 	// It must be shorter than the drain timeout in cmd/collector/main.go (10 s).
 	// Defaults to defaultMaxTickDuration (8 s) when zero or negative.
 	MaxTickDuration time.Duration
+	// BackfillEnabled controls whether the worker scans for pre-existing
+	// unsummarized documents (WHERE title_summary IS NULL).
+	// When false, ListUnsummarized is not called and only documents summarized
+	// via an explicit call path are processed (future use).
+	// Defaults to true when not set, preserving existing behaviour.
+	// Set to false when running a slow local LLM (e.g. gemma3:4b on CPU) to
+	// avoid a flood of LLM calls for the pre-existing backlog (SUMMARIZER_BACKFILL_ENABLED=false).
+	BackfillEnabled *bool
 }
 
 // SummarizerWorker periodically fetches documents without LLM summaries,
@@ -82,6 +90,7 @@ type SummarizerWorker struct {
 	interval        time.Duration
 	batchSize       int
 	maxTickDuration time.Duration
+	backfillEnabled bool
 }
 
 // NewSummarizerWorker constructs a SummarizerWorker from cfg.
@@ -105,6 +114,12 @@ func NewSummarizerWorker(cfg SummarizerConfig) *SummarizerWorker {
 	if maxTick <= 0 {
 		maxTick = defaultMaxTickDuration
 	}
+	// BackfillEnabled defaults to true when not explicitly set (nil), preserving
+	// existing behaviour. Set to false to skip the ListUnsummarized scan.
+	backfill := true
+	if cfg.BackfillEnabled != nil {
+		backfill = *cfg.BackfillEnabled
+	}
 	return &SummarizerWorker{
 		store:           cfg.Store,
 		llm:             cfg.LLM,
@@ -112,6 +127,7 @@ func NewSummarizerWorker(cfg SummarizerConfig) *SummarizerWorker {
 		interval:        interval,
 		batchSize:       batchSize,
 		maxTickDuration: maxTick,
+		backfillEnabled: backfill,
 	}
 }
 
@@ -168,7 +184,16 @@ func (w *SummarizerWorker) runTick(ctx context.Context) {
 // It uses a plain ListUnsummarized (no row locks / no long-lived transaction).
 // Concurrent instances may process the same document, but UpdateSummary's
 // idempotency guard (WHERE title_summary IS NULL) prevents double-writes (#64).
+//
+// When backfillEnabled is false, the ListUnsummarized scan is skipped entirely.
+// This prevents a flood of LLM calls for the pre-existing backlog when running
+// a slow local LLM (e.g. gemma3:4b on CPU) — set SUMMARIZER_BACKFILL_ENABLED=false.
 func (w *SummarizerWorker) tick(ctx context.Context) {
+	if !w.backfillEnabled {
+		slog.Debug("summarizer: backfill disabled — skipping ListUnsummarized scan")
+		return
+	}
+
 	docs, err := w.store.ListUnsummarized(ctx, w.batchSize)
 	if err != nil {
 		slog.Warn("summarizer: list unsummarized failed", "error", err)

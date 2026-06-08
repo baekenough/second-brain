@@ -56,12 +56,16 @@ type Config struct {
 	// LLMAPIURL: LLM_API_URL env var; defaults to EmbeddingAPIURL with /embeddings → /chat/completions suffix fix.
 	// LLMAPIKey: LLM_API_KEY env var; defaults to EmbeddingAPIKey.
 	// LLMAuthFile: LLM_CLIPROXY_AUTH_FILE env var; defaults to CLIPROXY_AUTH_FILE when unset.
-	LLMAPIURL      string
-	LLMAPIKey      string
-	LLMAuthFile    string // path to CliProxyAPI OAuth JSON for LLM requests
-	LLMModel       string
-	LLMMaxTokens   int
-	LLMTemperature float64
+	// LLMTimeoutSeconds: LLM_TIMEOUT_SECONDS env var; per-request HTTP timeout for LLM calls.
+	//   Default 120 s (generous for local CPU inference). Set higher for slow models
+	//   (e.g. gemma3:4b on Mac mini CPU). Setting 0 falls back to the default.
+	LLMAPIURL          string
+	LLMAPIKey          string
+	LLMAuthFile        string // path to CliProxyAPI OAuth JSON for LLM requests
+	LLMModel           string
+	LLMMaxTokens       int
+	LLMTemperature     float64
+	LLMTimeoutSeconds  int    // LLM_TIMEOUT_SECONDS — HTTP client timeout; default 120
 
 	// Slack (optional)
 	SlackBotToken string
@@ -148,6 +152,13 @@ type Config struct {
 	WhisperModel   string
 	WhisperLanguage string
 
+	// Summarizer
+	// SummarizerBackfillEnabled controls whether the SummarizerWorker scans for
+	// pre-existing unsummarized documents (WHERE title_summary IS NULL).
+	// Default true. Set SUMMARIZER_BACKFILL_ENABLED=false when running a slow
+	// local LLM to avoid a flood of LLM calls for the pre-existing backlog.
+	SummarizerBackfillEnabled bool // SUMMARIZER_BACKFILL_ENABLED
+
 	// Scheduler
 	CollectInterval time.Duration
 
@@ -219,6 +230,23 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// LLM_TIMEOUT_SECONDS: default 120 s (generous for local CPU inference).
+	// Cloud APIs (OpenAI) typically respond well within 60 s; increase when
+	// running large local models that take longer to generate tokens.
+	llmTimeoutSeconds := 120
+	if v := os.Getenv("LLM_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			llmTimeoutSeconds = n
+		}
+	}
+
+	// SUMMARIZER_BACKFILL_ENABLED: default true.
+	// Set =false to skip the ListUnsummarized scan when running a slow local LLM.
+	summarizerBackfill := true
+	if v := os.Getenv("SUMMARIZER_BACKFILL_ENABLED"); v == "false" || v == "0" {
+		summarizerBackfill = false
+	}
+
 	collectorInstance := os.Getenv("COLLECTOR_INSTANCE")
 	if collectorInstance == "" {
 		if hn, err := os.Hostname(); err == nil && hn != "" {
@@ -265,12 +293,13 @@ func Load() (*Config, error) {
 		LocalEmbeddingModel:    getenv("LOCAL_EMBEDDING_MODEL", "bge-m3"),
 		LocalEmbeddingEndpoint: os.Getenv("LOCAL_EMBEDDING_ENDPOINT"),
 
-		LLMAPIURL:      llmAPIURL,
-		LLMAPIKey:      llmAPIKey,
-		LLMAuthFile:    llmAuthFile,
-		LLMModel:       getenv("LLM_MODEL", "gpt-4o-mini"),
-		LLMMaxTokens:   llmMaxTokens,
-		LLMTemperature: llmTemperature,
+		LLMAPIURL:          llmAPIURL,
+		LLMAPIKey:          llmAPIKey,
+		LLMAuthFile:        llmAuthFile,
+		LLMModel:           getenv("LLM_MODEL", "gpt-4o-mini"),
+		LLMMaxTokens:       llmMaxTokens,
+		LLMTemperature:     llmTemperature,
+		LLMTimeoutSeconds:  llmTimeoutSeconds,
 
 		SlackBotToken: os.Getenv("SLACK_BOT_TOKEN"),
 		SlackTeamID:   os.Getenv("SLACK_TEAM_ID"),
@@ -324,6 +353,8 @@ func Load() (*Config, error) {
 		WhisperAudioDir: os.Getenv("WHISPER_AUDIO_DIR"),
 		WhisperModel:    getenv("WHISPER_MODEL", "whisper-1"),
 		WhisperLanguage: getenv("WHISPER_LANGUAGE", "ko"),
+
+		SummarizerBackfillEnabled: summarizerBackfill,
 
 		CollectInterval:   interval,
 		CollectorInstance: collectorInstance,

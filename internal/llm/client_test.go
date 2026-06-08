@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/baekenough/second-brain/internal/llm"
 )
@@ -243,6 +244,75 @@ func TestClient_APIErrorIn200(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "rate_limit_exceeded") {
 		t.Fatalf("error should contain API error message, got: %v", err)
+	}
+}
+
+// TestClient_TimeoutConfig verifies that cfg.Timeout is used as the HTTP client
+// timeout when no pre-built httpClient is provided. A server that sleeps longer
+// than the configured timeout should cause a context deadline / timeout error.
+func TestClient_TimeoutConfig(t *testing.T) {
+	t.Parallel()
+
+	// Server that blocks for 200 ms.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Block briefly — client should time out before response.
+		select {
+		case <-r.Context().Done():
+		case <-time.After(200 * time.Millisecond):
+		}
+		// Write response body even though client already disconnected — ignored.
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	// Client with 50 ms timeout — much shorter than the server sleep.
+	c := llm.New(llm.Config{
+		BaseURL: srv.URL,
+		Model:   "gpt-test",
+		APIKey:  "key",
+		Timeout: 50 * time.Millisecond,
+	}, nil)
+
+	_, err := c.Complete(context.Background(), "sys", "user")
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+	// The error should mention timeout / deadline / connection reset.
+	errStr := err.Error()
+	if !strings.Contains(errStr, "timeout") &&
+		!strings.Contains(errStr, "deadline") &&
+		!strings.Contains(errStr, "EOF") &&
+		!strings.Contains(errStr, "connection reset") {
+		t.Fatalf("expected timeout-related error, got: %v", err)
+	}
+}
+
+// TestClient_DefaultTimeout_UsedWhenZero verifies that a zero Timeout in Config
+// does not panic and the client is constructed successfully.
+func TestClient_DefaultTimeout_UsedWhenZero(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(chatResponseOK("ok")) //nolint:errcheck
+	}))
+	t.Cleanup(srv.Close)
+
+	// Zero Timeout → should use default 60 s.
+	c := llm.New(llm.Config{
+		BaseURL: srv.URL,
+		Model:   "gpt-test",
+		APIKey:  "key",
+		Timeout: 0,
+	}, nil)
+
+	got, err := c.Complete(context.Background(), "sys", "user")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "ok" {
+		t.Fatalf("want %q, got %q", "ok", got)
 	}
 }
 

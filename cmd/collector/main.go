@@ -130,6 +130,7 @@ func run() error {
 		AuthFile:    cfg.LLMAuthFile,
 		MaxTokens:   cfg.LLMMaxTokens,
 		Temperature: cfg.LLMTemperature,
+		Timeout:     time.Duration(cfg.LLMTimeoutSeconds) * time.Second,
 	}, nil)
 
 	// --- Summarizer worker ---
@@ -147,11 +148,12 @@ func run() error {
 		slog.Info("summarizer worker disabled via SUMMARIZER_ENABLED=false")
 	}
 	summarizerWorker := worker.NewSummarizerWorker(worker.SummarizerConfig{
-		Store:     docStore,
-		LLM:       llmClient,
-		Embedder:  embedClient,
-		Interval:  5 * time.Minute,
-		BatchSize: 10,
+		Store:           docStore,
+		LLM:             llmClient,
+		Embedder:        embedClient,
+		Interval:        5 * time.Minute,
+		BatchSize:       10,
+		BackfillEnabled: &cfg.SummarizerBackfillEnabled,
 	})
 	wg.Add(1)
 	go func() {

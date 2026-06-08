@@ -42,13 +42,24 @@ type Config struct {
 	AuthFile    string // path to CliProxyAPI OAuth JSON (e.g. ~/.cli-proxy-api/user.json)
 	MaxTokens   int
 	Temperature float64
+	// Timeout is the per-request HTTP timeout for LLM calls.
+	// When zero or negative, the default of 60 s is used.
+	// Increase for slow local CPU inference (e.g. gemma3:4b) by setting
+	// LLM_TIMEOUT_SECONDS in the environment.
+	Timeout time.Duration
 }
 
 // New returns a Client configured with the given Config.
-// httpClient may be nil — the default http.Client with a 60-second timeout is used.
+// httpClient may be nil — an http.Client with cfg.Timeout (default 60 s) is used.
+// When cfg.Timeout is positive it overrides the default. Pass a pre-built
+// httpClient to take full control of transport settings.
 func New(cfg Config, httpClient *http.Client) *Client {
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 60 * time.Second}
+		timeout := cfg.Timeout
+		if timeout <= 0 {
+			timeout = 60 * time.Second
+		}
+		httpClient = &http.Client{Timeout: timeout}
 	}
 	// Normalise base URL: strip trailing slash.
 	baseURL := strings.TrimRight(cfg.BaseURL, "/")
