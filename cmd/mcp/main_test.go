@@ -420,6 +420,52 @@ func TestHandleAddNote_MetadataPropagated(t *testing.T) {
 	}
 }
 
+func TestHandleAddNote_TitleTooLong(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeDocUpserter{}
+	chunks := &fakeChunkWriter{}
+	embed := &fakeEmbedder{}
+
+	longTitle := make([]byte, maxNoteTitleBytes+1)
+	for i := range longTitle {
+		longTitle[i] = 'x'
+	}
+
+	_, errMsg := handleAddNote(
+		context.Background(),
+		docs, chunks, embed,
+		string(longTitle), "Some content.", "", nil, false,
+	)
+
+	if errMsg == "" {
+		t.Error("expected error for title exceeding maxNoteTitleBytes, got none")
+	}
+}
+
+func TestHandleAddNote_TitleAtLimit_Accepted(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeDocUpserter{}
+	chunks := &fakeChunkWriter{}
+	embed := &fakeEmbedder{}
+
+	limitTitle := make([]byte, maxNoteTitleBytes)
+	for i := range limitTitle {
+		limitTitle[i] = 'x'
+	}
+
+	_, errMsg := handleAddNote(
+		context.Background(),
+		docs, chunks, embed,
+		string(limitTitle), "Some content.", "", nil, false,
+	)
+
+	if errMsg != "" {
+		t.Errorf("expected no error for title at exactly maxNoteTitleBytes, got: %s", errMsg)
+	}
+}
+
 func TestHandleAddNote_SourceTypeLLMMemory(t *testing.T) {
 	t.Parallel()
 

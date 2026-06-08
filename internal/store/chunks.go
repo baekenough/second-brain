@@ -212,9 +212,16 @@ type ChunkEmbedding struct {
 	Embedding []float32
 }
 
-// UpdateChunkEmbeddings persists embedding vectors for a batch of chunks in a
-// single transaction. Each entry in embeddings identifies the chunk by its
-// database ID and carries the embedding vector to store.
+// updateEmbeddingsBatchSize is the maximum number of UPDATE statements per
+// transaction in UpdateChunkEmbeddings. Splitting large batches prevents
+// long-held DB connections and reduces lock contention.
+const updateEmbeddingsBatchSize = 500
+
+// UpdateChunkEmbeddings persists embedding vectors for a batch of chunks.
+// When the batch exceeds updateEmbeddingsBatchSize entries, it is split into
+// multiple transactions of at most updateEmbeddingsBatchSize UPDATEs each.
+// Each sub-transaction commits independently; a failure in one sub-batch
+// returns an error but does not roll back already-committed sub-batches.
 //
 // Chunks with an empty embedding slice are silently skipped so that partial
 // batch failures in the scheduler do not block the rest of the batch.
@@ -225,6 +232,23 @@ func (s *ChunkStore) UpdateChunkEmbeddings(ctx context.Context, embeddings []Chu
 		return nil
 	}
 
+	for start := 0; start < len(embeddings); start += updateEmbeddingsBatchSize {
+		end := start + updateEmbeddingsBatchSize
+		if end > len(embeddings) {
+			end = len(embeddings)
+		}
+		batch := embeddings[start:end]
+
+		if err := s.updateEmbeddingsBatch(ctx, batch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// updateEmbeddingsBatch persists a single sub-batch of embeddings in one
+// transaction. It is called exclusively by UpdateChunkEmbeddings.
+func (s *ChunkStore) updateEmbeddingsBatch(ctx context.Context, embeddings []ChunkEmbedding) error {
 	tx, err := s.pg.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("chunk update embeddings begin tx: %w", err)

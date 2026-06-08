@@ -122,12 +122,29 @@ func run() error {
 	slog.Info("MCP server starting", "addr", addr, "transport", "streamable-http",
 		"add_note_auth", cfg.APIKey != "")
 
+	// Build a custom *http.Server with timeouts to guard against slow clients
+	// and runaway connections. WriteTimeout is generous (5 min) to accommodate
+	// large embed operations that may take a while to stream back.
+	// Handler is wired after httpSrv is constructed (see below).
+	customHTTPSrv := &http.Server{
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 5 * time.Minute,
+		IdleTimeout:  2 * time.Minute,
+	}
+
 	// WithHTTPContextFunc injects the Bearer-token validation result into the
 	// request context so tool handlers can check authorisation without direct
 	// access to HTTP headers.
+	// WithStreamableHTTPServer injects the pre-configured *http.Server so that
+	// our timeout settings are applied; Start(addr) will set Addr on it.
 	httpSrv := server.NewStreamableHTTPServer(s,
 		server.WithHTTPContextFunc(mcpAuthContextFunc(cfg.APIKey)),
+		server.WithStreamableHTTPServer(customHTTPSrv),
 	)
+	// Wire the handler after httpSrv is constructed; the library uses
+	// customHTTPSrv.Handler as-is when httpServer is pre-set via
+	// WithStreamableHTTPServer (it skips the internal mux setup).
+	customHTTPSrv.Handler = httpSrv
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -450,6 +467,15 @@ func registerStatsTool(s *server.MCPServer, docs StatsProvider) {
 // maxNoteContentBytes is the upper bound for add_note content (10 MiB).
 const maxNoteContentBytes = 10 * 1024 * 1024
 
+// maxNoteTitleBytes is the upper bound for add_note title (1 KiB).
+const maxNoteTitleBytes = 1024
+
+// maxEmbedChunks is the upper bound for the number of chunks to embed in a
+// single add_note call. Notes that produce more chunks are stored and
+// indexed via FTS, but embedding is skipped to avoid unbounded API cost and
+// long-running DB transactions.
+const maxEmbedChunks = 2000
+
 // NoteDocumentUpserter is the subset of DocumentStore used by the add_note tool.
 type NoteDocumentUpserter interface {
 	Upsert(ctx context.Context, doc *model.Document) error
@@ -491,6 +517,9 @@ func handleAddNote(
 	// Input validation.
 	if strings.TrimSpace(title) == "" {
 		return nil, "title is required and must be non-empty"
+	}
+	if len(title) > maxNoteTitleBytes {
+		return nil, fmt.Sprintf("title exceeds maximum size of %d bytes", maxNoteTitleBytes)
 	}
 	if strings.TrimSpace(content) == "" {
 		return nil, "content is required and must be non-empty"
@@ -571,6 +600,18 @@ func embedNoteChunks(
 	chunkStore NoteChunkWriter,
 	embedClient NoteEmbedder,
 ) error {
+	// Guard: skip embedding for excessively large notes to avoid unbounded
+	// API cost and long-running DB transactions. The note is already stored
+	// and fully searchable via FTS; only vector search is degraded.
+	if len(chunkSlice) > maxEmbedChunks {
+		slog.Warn("mcp add_note: chunk count exceeds embed limit, skipping embedding",
+			"doc_id", docID,
+			"chunks", len(chunkSlice),
+			"limit", maxEmbedChunks,
+		)
+		return nil
+	}
+
 	texts := make([]string, 0, len(chunkSlice))
 	for _, c := range chunkSlice {
 		texts = append(texts, c.Content)
@@ -599,6 +640,10 @@ func embedNoteChunks(
 		}
 		id, ok := idxToID[chunkSlice[i].ChunkIndex]
 		if !ok {
+			slog.Warn("embedNoteChunks: chunk index not found in stored chunks",
+				"doc_id", docID,
+				"chunk_index", chunkSlice[i].ChunkIndex,
+			)
 			continue
 		}
 		embeddings = append(embeddings, store.ChunkEmbedding{
