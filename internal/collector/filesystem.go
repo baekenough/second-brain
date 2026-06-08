@@ -141,9 +141,8 @@ func (c *FilesystemCollector) WithBatchSize(n int) *FilesystemCollector {
 // encounter. Passing nil disables the store-aware new-file detection and
 // restores the previous mtime-only behaviour (used in tests that do not need a
 // store).
-func (c *FilesystemCollector) WithIndexedIDs(ids map[string]struct{}) *FilesystemCollector {
+func (c *FilesystemCollector) WithIndexedIDs(ids map[string]struct{}) {
 	c.indexedIDs = ids
-	return c
 }
 
 // WithExcludes registers additional directory names and file extensions to

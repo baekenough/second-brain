@@ -9,7 +9,9 @@ import (
 	"io/fs"
 	"log/slog"
 	"mime/multipart"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -73,6 +75,11 @@ type WhisperCollector struct {
 	cfg        *config.Config
 	httpClient *http.Client
 	baseURL    string // overridable in tests; defaults to cfg.WhisperAPIURL
+
+	// indexedIDs is an optional set of source_ids already active in the store.
+	// When non-nil, Collect emits files whose SourceID is absent from the set
+	// even when their mtime predates the since watermark (IndexAwareCollector).
+	indexedIDs map[string]struct{}
 }
 
 // NewWhisperCollector returns a WhisperCollector configured from cfg.
@@ -99,17 +106,76 @@ func (c *WhisperCollector) Enabled() bool {
 	return c.cfg.WhisperAudioDir != "" && c.baseURL != ""
 }
 
+// WithIndexedIDs implements IndexAwareCollector. Supplying a non-nil set
+// enables store-aware new-file detection: audio files whose SourceID is absent
+// from the set are transcribed unconditionally (even when mtime <= since).
+// Passing nil restores mtime-only filtering.
+func (c *WhisperCollector) WithIndexedIDs(ids map[string]struct{}) {
+	c.indexedIDs = ids
+}
+
+// isLocalWhisperEndpoint reports whether the given URL host resolves to a
+// loopback, Docker-internal, or RFC-1918 private address. Call-transcription
+// data MUST stay local (issue #100). Misconfiguration producing a cloud endpoint
+// is logged as a prominent warning but does not hard-fail the collector.
+func isLocalWhisperEndpoint(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false // treat unparseable URL as non-local (warn)
+	}
+	host := u.Hostname()
+
+	// Well-known local/docker aliases.
+	switch host {
+	case "localhost", "127.0.0.1", "::1", "host.docker.internal":
+		return true
+	}
+
+	// Numeric IP: check for private/loopback ranges.
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	// RFC-1918 private ranges.
+	privateRanges := []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
+	for _, cidr := range privateRanges {
+		_, block, _ := net.ParseCIDR(cidr)
+		if block != nil && block.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // Collect walks WhisperAudioDir recursively, transcribes audio files modified
 // after since, and returns a Document per successful transcription.
 //
-// Incremental strategy: only files with mtime > since are submitted. The
-// scheduler watermark ensures that on subsequent runs only new or changed audio
-// files are processed. The first run (since == zero) processes all files.
+// Incremental strategy (primary): only files with mtime > since are submitted.
+// The scheduler watermark ensures that on subsequent runs only new or changed
+// audio files are processed. The first run (since == zero) processes all files.
+//
+// IndexAware strategy (defence-in-depth): when WithIndexedIDs is called with a
+// non-nil set, files whose SourceID is absent from the set are also transcribed
+// regardless of mtime (fixes late-arriving files on OneDrive FUSE mounts).
+//
+// Cloud-endpoint guard: if the configured Whisper endpoint resolves to a
+// non-local host, a prominent warning is logged on every collect call.
+// Issue #100 mandates call transcription stays LOCAL.
 //
 // Partial success: individual transcription failures are logged as warnings and
 // the walk continues. The final error is nil as long as the directory walk
 // itself succeeds.
 func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]model.Document, error) {
+	// LOW: cloud-endpoint guard (issue #100).
+	if !isLocalWhisperEndpoint(c.baseURL) {
+		slog.Warn("whisper: endpoint does not appear to be local — call transcription data may be sent to a cloud API; set WhisperAPIURL to a localhost or private-network address",
+			"endpoint", c.baseURL,
+		)
+	}
+
 	var docs []model.Document
 	now := time.Now().UTC()
 
@@ -140,8 +206,19 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 			return nil
 		}
 
-		// Incremental: skip files not modified after the watermark.
-		if !since.IsZero() && !info.ModTime().After(since) {
+		// Compute SourceID early so the indexed-set check can use it.
+		relPath, relErr := filepath.Rel(c.cfg.WhisperAudioDir, path)
+		if relErr != nil {
+			relPath = path
+		}
+		sourceID := "transcript:" + relPath
+
+		// Incremental + IndexAware filter (HIGH#1 fix):
+		// Emit when mtime > since  OR  SourceID not in indexed set.
+		mtimeNew := since.IsZero() || info.ModTime().After(since)
+		_, alreadyIndexed := c.indexedIDs[sourceID]
+		notIndexed := c.indexedIDs != nil && !alreadyIndexed
+		if !mtimeNew && !notIndexed {
 			return nil
 		}
 
@@ -161,13 +238,6 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 			return nil // partial success — continue
 		}
 
-		// SourceID uses the relative path from WhisperAudioDir so that the
-		// identifier is stable across directory moves.
-		relPath, err := filepath.Rel(c.cfg.WhisperAudioDir, path)
-		if err != nil {
-			relPath = path // fallback: absolute path
-		}
-
 		// Title is the filename without extension.
 		title := strings.TrimSuffix(d.Name(), filepath.Ext(d.Name()))
 
@@ -182,7 +252,7 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 		docs = append(docs, model.Document{
 			ID:          uuid.New(),
 			SourceType:  model.SourceCallTranscript,
-			SourceID:    "transcript:" + relPath,
+			SourceID:    sourceID,
 			Title:       title,
 			Content:     text,
 			Metadata:    meta,

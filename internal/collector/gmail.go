@@ -173,6 +173,14 @@ func (c *GmailCollector) fetchMessage(ctx context.Context, token, id string) (mo
 		return model.Document{}, err
 	}
 
+	// MEDIUM: nil Payload guard — the Gmail API can return messages without
+	// a payload (e.g. draft stubs, deleted messages returned by accident).
+	// Dereferencing a nil pointer would panic; skip with a warning instead.
+	if msg.Payload == nil {
+		slog.Warn("gmail: message has nil payload, skipping", "id", id)
+		return model.Document{}, fmt.Errorf("gmail: message %q has nil payload", id)
+	}
+
 	subject := gmailHeaders(msg.Payload.Headers).get("Subject")
 	from := gmailHeaders(msg.Payload.Headers).get("From")
 	to := gmailHeaders(msg.Payload.Headers).get("To")

@@ -44,3 +44,28 @@ type DeletionDetector interface {
 	// source. The scheduler uses this to detect files removed since last run.
 	ListActiveSourceIDs(ctx context.Context) ([]string, error)
 }
+
+// IndexAwareCollector is an optional interface implemented by collectors that
+// can use the set of already-indexed source IDs to detect records that have
+// never been collected, even when their event time (OccurredAt or mtime)
+// predates the scheduler watermark.
+//
+// This fixes two classes of data-loss bugs:
+//
+//  1. Late-arriving records (HIGH#1): SMS/call events or audio files that
+//     arrive on the device after a collection run completed have an event time
+//     before the watermark. A pure event-time filter drops them forever.
+//  2. Post-truncation records (HIGH#2): After an XML parse error, records after
+//     the truncation point were never indexed. The SourceID mechanism guarantees
+//     they are eventually collected on the next successful run.
+//
+// The scheduler calls WithIndexedIDs once per run (before Collect). Passing nil
+// disables the mechanism and restores mtime/event-time-only filtering.
+type IndexAwareCollector interface {
+	Collector
+	// WithIndexedIDs supplies the collector with the set of source_ids currently
+	// active in the store. When set, the collector emits a record when EITHER
+	// its event time is after since OR its source_id is absent from the set.
+	// Passing nil disables store-aware detection (fallback to event-time only).
+	WithIndexedIDs(ids map[string]struct{})
+}

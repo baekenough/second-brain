@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -204,6 +205,7 @@ func TestSMSCollector_Collect_SourceIDFormat(t *testing.T) {
 	dir := t.TempDir()
 	dateMs := hoursAgoMs(1)
 	addr := "010-1111-2222"
+	body := "hello"
 	writeFile(t, filepath.Join(dir, "sms-20260101.xml"), makeSMSXML([]struct {
 		Address     string
 		DateMs      int64
@@ -211,7 +213,7 @@ func TestSMSCollector_Collect_SourceIDFormat(t *testing.T) {
 		Body        string
 		ContactName string
 	}{
-		{addr, dateMs, 1, "hello", "Bob"},
+		{addr, dateMs, 1, body, "Bob"},
 	}))
 
 	c := NewSMSCollector(dir)
@@ -223,9 +225,17 @@ func TestSMSCollector_Collect_SourceIDFormat(t *testing.T) {
 		t.Fatalf("expected 1 doc, got %d", len(docs))
 	}
 
-	want := fmt.Sprintf("sms:%d:%s", dateMs, addr)
+	// SourceID format: sms:{dateMs}:{sha256(addr)[:16]}:{sha256(body)[:8]}
+	// Raw PII (phone number) must NOT appear in the source_id.
+	wantAddrHash := smsShortHash(addr)
+	wantBodyHash := smsBodyHash(body)
+	want := fmt.Sprintf("sms:%d:%s:%s", dateMs, wantAddrHash, wantBodyHash)
 	if docs[0].SourceID != want {
 		t.Errorf("SourceID=%q, want %q", docs[0].SourceID, want)
+	}
+	// Verify raw address is NOT in the SourceID.
+	if strings.Contains(docs[0].SourceID, addr) {
+		t.Errorf("SourceID must not contain raw phone number %q, got %q", addr, docs[0].SourceID)
 	}
 }
 
@@ -450,6 +460,7 @@ func TestSMSCollector_Collect_CallLog_SourceIDFormat(t *testing.T) {
 	dir := t.TempDir()
 	dateMs := hoursAgoMs(1)
 	number := "010-1234-0000"
+	duration := int64(90)
 	writeFile(t, filepath.Join(dir, "calls-20260101.xml"), makeCallsXML([]struct {
 		Number      string
 		DateMs      int64
@@ -457,7 +468,7 @@ func TestSMSCollector_Collect_CallLog_SourceIDFormat(t *testing.T) {
 		Duration    int64
 		ContactName string
 	}{
-		{number, dateMs, 2, 90, "Eve"},
+		{number, dateMs, 2, duration, "Eve"},
 	}))
 
 	c := NewSMSCollector(dir)
@@ -469,9 +480,17 @@ func TestSMSCollector_Collect_CallLog_SourceIDFormat(t *testing.T) {
 		t.Fatalf("expected 1 doc, got %d", len(docs))
 	}
 
-	want := fmt.Sprintf("call-log:%d:%s", dateMs, number)
+	// SourceID format: call-log:{dateMs}:{sha256(number)[:16]}:{sha256(duration)[:8]}
+	// Raw PII (phone number) must NOT appear in the source_id.
+	wantNumHash := smsShortHash(number)
+	wantDurHash := smsBodyHash(fmt.Sprintf("%d", duration))
+	want := fmt.Sprintf("call-log:%d:%s:%s", dateMs, wantNumHash, wantDurHash)
 	if docs[0].SourceID != want {
 		t.Errorf("SourceID=%q, want %q", docs[0].SourceID, want)
+	}
+	// Verify raw phone number is NOT in the SourceID.
+	if strings.Contains(docs[0].SourceID, number) {
+		t.Errorf("SourceID must not contain raw phone number %q, got %q", number, docs[0].SourceID)
 	}
 }
 

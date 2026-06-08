@@ -182,25 +182,30 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 		"since", since.Format(time.RFC3339),
 	)
 
-	// For the filesystem collector, pre-load the set of already-indexed source_ids
-	// so that the collector can detect files that are new (never indexed) even when
-	// their mtime predates the cursor. This fixes the bug where a file copied with
-	// a preserved old mtime is silently skipped on its first encounter.
+	// For collectors that implement IndexAwareCollector (filesystem, SMS, whisper),
+	// pre-load the set of already-indexed source_ids so the collector can detect
+	// records that are new (never indexed) even when their event time predates the
+	// cursor. This fixes two classes of data-loss bugs:
 	//
-	// We load the set once per run (not per-file) so the per-file cost is an O(1)
-	// map lookup rather than a round-trip to the database.
-	if fsc, ok := col.(*collector.FilesystemCollector); ok && !since.IsZero() {
+	//  HIGH#1: late-arriving records (OneDrive sync lag) have OccurredAt/mtime
+	//          before the watermark → pure event-time filter drops them forever.
+	//  HIGH#2: after XML truncation the SourceID mechanism guarantees eventual
+	//          re-collection of post-truncation records on the next successful run.
+	//
+	// We load the set once per run (not per-record) so the per-record cost is an
+	// O(1) map lookup rather than a round-trip to the database.
+	if iac, ok := col.(collector.IndexAwareCollector); ok && !since.IsZero() {
 		indexedIDs, err := s.store.ActiveSourceIDSet(ctx, col.Source())
 		if err != nil {
-			// Non-fatal: fall back to mtime-only behaviour for this run.
-			// Explicitly clear any stale indexedIDs from a previous successful run
-			// so the collector does not silently carry over a stale set.
-			fsc.WithIndexedIDs(nil)
-			slog.Warn("scheduler: could not load indexed source IDs, falling back to mtime-only",
+			// Non-fatal: fall back to event-time-only behaviour for this run.
+			// Explicitly clear any stale set so the collector does not silently
+			// carry over stale data from a previous successful run.
+			iac.WithIndexedIDs(nil)
+			slog.Warn("scheduler: could not load indexed source IDs, falling back to event-time-only",
 				"collector", col.Name(), "error", err)
 		} else {
-			fsc.WithIndexedIDs(indexedIDs)
-			slog.Debug("scheduler: loaded indexed source IDs for filesystem collector",
+			iac.WithIndexedIDs(indexedIDs)
+			slog.Debug("scheduler: loaded indexed source IDs",
 				"collector", col.Name(), "count", len(indexedIDs))
 		}
 	}

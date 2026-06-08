@@ -3,9 +3,11 @@ package collector
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -26,16 +28,32 @@ import (
 //   - 타인에게 (Korean "don't share with others" — common in auth SMS)
 var authLikeRe = regexp.MustCompile(`(?i)인증번호|본인.{0,2}확인|verification|\b\d{4,8}\b|타인에게|otp`)
 
+// otpDigitsRe matches runs of 4–8 digits to redact from auth-like bodies.
+var otpDigitsRe = regexp.MustCompile(`\b\d{4,8}\b`)
+
+// smsMaxFileBytes is the maximum accepted file size for a single SMS export XML.
+// SMS Backup & Restore files grow unboundedly over time; a generous 256 MB cap
+// protects against OOM while accommodating multi-year SMS histories.
+// (Whisper uses 25 MB; we choose 256 MB here because XML is not binary data.)
+const smsMaxFileBytes = 256 << 20 // 256 MB
+
 // SMSCollector reads SMS messages and call logs from SMS Backup & Restore XML
 // exports. Each prefix (sms-*.xml, calls-*.xml) uses the single file with the
-// latest modification time in cfg.SMSSourceDir, enabling additive backups where
-// the app writes a new file per export without overwriting the previous one.
+// lexicographically-greatest filename (date-stamped sms-YYYYMMDD.xml) in
+// cfg.SMSSourceDir, enabling additive backups where the app writes a new file
+// per export without overwriting the previous one.
 //
-// Incremental strategy: the full XML is parsed on every run (XML streams cannot
-// be seeked), but only records whose OccurredAt > since are emitted. This is
-// correct because each export is cumulative — no records are dropped between runs.
+// Incremental strategy (primary): the full XML is parsed on every run (XML
+// streams cannot be seeked), but only records whose OccurredAt > since are
+// emitted. This is correct because each export is cumulative.
+//
+// IndexAware strategy (defence-in-depth): when WithIndexedIDs is called with a
+// non-nil set, records are ALSO emitted when their SourceID is absent from the
+// indexed set regardless of OccurredAt. This rescues late-arriving records
+// (OneDrive sync lag) and records after an XML truncation point.
 type SMSCollector struct {
-	sourceDir string
+	sourceDir  string
+	indexedIDs map[string]struct{} // nil = mtime-only mode
 }
 
 // NewSMSCollector returns an SMSCollector that reads XML exports from sourceDir.
@@ -49,10 +67,21 @@ func (c *SMSCollector) Name() string             { return "sms" }
 func (c *SMSCollector) Source() model.SourceType { return model.SourceSMS }
 func (c *SMSCollector) Enabled() bool            { return c.sourceDir != "" }
 
+// WithIndexedIDs implements IndexAwareCollector. Supplying a non-nil set
+// enables store-aware new-record detection: records whose SourceID is absent
+// from the set are emitted unconditionally (i.e. even when OccurredAt <= since).
+// Passing nil restores event-time-only filtering.
+func (c *SMSCollector) WithIndexedIDs(ids map[string]struct{}) {
+	c.indexedIDs = ids
+}
+
 // Collect parses the latest sms-*.xml and calls-*.xml files in sourceDir and
-// returns documents for all records whose OccurredAt is after since.
-// Both files are optional: if one is missing (or sourceDir contains no matching
-// file) it is silently skipped.
+// returns documents for all records that satisfy the emission criteria.
+// Both files are optional: if one is missing it is silently skipped.
+//
+// Partial-result contract: if the SMS file parse fails, already-parsed call-log
+// docs (and vice-versa) are still returned. Per-file failures are logged as
+// slog.Warn. This matches the gmail/calendar/whisper partial-result pattern.
 func (c *SMSCollector) Collect(ctx context.Context, since time.Time) ([]model.Document, error) {
 	var docs []model.Document
 
@@ -61,9 +90,10 @@ func (c *SMSCollector) Collect(ctx context.Context, since time.Time) ([]model.Do
 	if err != nil {
 		slog.Warn("sms: could not find sms file", "dir", c.sourceDir, "error", err)
 	} else if smsFile != "" {
-		smsDocs, err := parseSMSFile(ctx, smsFile, since)
+		smsDocs, err := c.parseSMSFile(ctx, smsFile, since)
 		if err != nil {
-			return nil, fmt.Errorf("sms: parse %q: %w", smsFile, err)
+			slog.Warn("sms: parse sms file failed (partial result returned)",
+				"file", smsFile, "error", err)
 		}
 		docs = append(docs, smsDocs...)
 	}
@@ -73,9 +103,10 @@ func (c *SMSCollector) Collect(ctx context.Context, since time.Time) ([]model.Do
 	if err != nil {
 		slog.Warn("sms: could not find calls file", "dir", c.sourceDir, "error", err)
 	} else if callsFile != "" {
-		callDocs, err := parseCallsFile(ctx, callsFile, since)
+		callDocs, err := c.parseCallsFile(ctx, callsFile, since)
 		if err != nil {
-			return nil, fmt.Errorf("sms: parse calls %q: %w", callsFile, err)
+			slog.Warn("sms: parse calls file failed (partial result returned)",
+				"file", callsFile, "error", err)
 		}
 		docs = append(docs, callDocs...)
 	}
@@ -162,14 +193,68 @@ func isTransientFUSEError(err error) bool {
 	return errno == syscall.EDEADLK || errno == syscall.ETIMEDOUT
 }
 
+// smsShortHash returns a 16-character hex string that is the first 8 bytes of
+// SHA-256(s). Used to hash PII (phone numbers/addresses) in SourceIDs so they
+// are not logged downstream. The hash is truncated for readability; collision
+// probability over a typical contact book (~1000 numbers) is negligible.
+func smsShortHash(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return fmt.Sprintf("%x", h[:8]) // 16 hex chars
+}
+
+// smsBodyHash returns an 8-character hex string of SHA-256(body) used to
+// disambiguate SourceIDs when two messages share the same address and
+// millisecond timestamp. SMS bodies are immutable, so body-in-key is stable.
+func smsBodyHash(body string) string {
+	h := sha256.Sum256([]byte(body))
+	return fmt.Sprintf("%x", h[:4]) // 8 hex chars
+}
+
+// shouldEmitSMS returns true when the record should be included in the output.
+// Emission criteria (OR):
+//  1. OccurredAt is after since (normal incremental case).
+//  2. sourceID is NOT in the indexed set AND the set is non-nil (index-aware
+//     case: rescues late-arriving and post-truncation records).
+//
+// When indexedIDs is nil (legacy/test mode), only criterion 1 applies.
+func (c *SMSCollector) shouldEmitSMS(occurredAt time.Time, sourceID string, since time.Time) bool {
+	if since.IsZero() || occurredAt.After(since) {
+		return true
+	}
+	if c.indexedIDs != nil {
+		if _, alreadyIndexed := c.indexedIDs[sourceID]; !alreadyIndexed {
+			return true
+		}
+	}
+	return false
+}
+
 // parseSMSFile reads smsFile entirely into memory (with FUSE-safe retry) and
-// returns Documents for all <sms> elements whose OccurredAt is after since.
+// returns Documents for all <sms> elements that satisfy the emission criteria.
 //
 // Reading the full file into []byte before XML parsing avoids holding an open
 // file descriptor during streaming, which eliminates the OneDrive FUSE deadlock
 // (EDEADLK) that occurred when the streaming decoder kept the fd open for
 // extended periods on large XML files.
-func parseSMSFile(ctx context.Context, path string, since time.Time) ([]model.Document, error) {
+//
+// HIGH#2 defence: io.EOF is treated as clean end-of-stream; any other decode
+// error is logged as slog.Warn (file may be truncated) and the loop breaks.
+// This gives observability without blocking the partial result.
+func (c *SMSCollector) parseSMSFile(ctx context.Context, path string, since time.Time) ([]model.Document, error) {
+	// Unbounded-memory guard (MEDIUM): stat before reading.
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("stat %q: %w", path, err)
+	}
+	if info.Size() > smsMaxFileBytes {
+		slog.Warn("sms: skipping oversized sms file",
+			"path", path,
+			"size_bytes", info.Size(),
+			"limit_bytes", smsMaxFileBytes,
+		)
+		return nil, nil
+	}
+
 	data, err := readFileWithRetry(path)
 	if err != nil {
 		return nil, err
@@ -183,7 +268,13 @@ func parseSMSFile(ctx context.Context, path string, since time.Time) ([]model.Do
 		}
 		tok, err := dec.Token()
 		if err != nil {
-			break // io.EOF or parse error; both terminate the loop
+			// HIGH#2 fix: distinguish clean EOF from real parse errors.
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			slog.Warn("sms: xml token stream error (file may be truncated; records will be re-collected next run)",
+				"file", path, "error", err)
+			break
 		}
 		se, ok := tok.(xml.StartElement)
 		if !ok || se.Name.Local != "sms" {
@@ -197,16 +288,27 @@ func parseSMSFile(ctx context.Context, path string, since time.Time) ([]model.Do
 		}
 
 		occurredAt := msToUTC(rec.Date)
-		if !since.IsZero() && !occurredAt.After(since) {
+
+		// PII fix (MEDIUM): hash address to avoid logging raw phone numbers.
+		addrHash := smsShortHash(rec.Address)
+		bodyHash := smsBodyHash(rec.Body)
+		sourceID := fmt.Sprintf("sms:%d:%s:%s", rec.Date, addrHash, bodyHash)
+
+		if !c.shouldEmitSMS(occurredAt, sourceID, since) {
 			continue
 		}
 
 		direction := smsDirection(rec.Type)
 		contact := firstNonEmptySMS(rec.ContactName, rec.Address)
-		sourceID := fmt.Sprintf("sms:%d:%s", rec.Date, rec.Address)
 		title := fmt.Sprintf("SMS %s %s", direction, contact)
 
 		isAuth := authLikeRe.MatchString(rec.Body)
+
+		// OTP redaction (MEDIUM): replace sensitive digit runs before storing.
+		body := rec.Body
+		if isAuth {
+			body = otpDigitsRe.ReplaceAllString(body, "[REDACTED]")
+		}
 
 		meta := map[string]any{
 			"contact_name": rec.ContactName,
@@ -220,7 +322,7 @@ func parseSMSFile(ctx context.Context, path string, since time.Time) ([]model.Do
 			SourceType:  model.SourceSMS,
 			SourceID:    sourceID,
 			Title:       title,
-			Content:     rec.Body,
+			Content:     body,
 			Metadata:    meta,
 			OccurredAt:  &t,
 			CollectedAt: time.Now().UTC(),
@@ -230,10 +332,25 @@ func parseSMSFile(ctx context.Context, path string, since time.Time) ([]model.Do
 }
 
 // parseCallsFile reads callsFile entirely into memory (with FUSE-safe retry)
-// and returns Documents for all <call> elements whose OccurredAt is after since.
+// and returns Documents for all <call> elements that satisfy the emission
+// criteria.
 //
 // See parseSMSFile for the rationale behind the read-all-first approach.
-func parseCallsFile(ctx context.Context, path string, since time.Time) ([]model.Document, error) {
+func (c *SMSCollector) parseCallsFile(ctx context.Context, path string, since time.Time) ([]model.Document, error) {
+	// Unbounded-memory guard (MEDIUM): stat before reading.
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("stat %q: %w", path, err)
+	}
+	if info.Size() > smsMaxFileBytes {
+		slog.Warn("sms: skipping oversized calls file",
+			"path", path,
+			"size_bytes", info.Size(),
+			"limit_bytes", smsMaxFileBytes,
+		)
+		return nil, nil
+	}
+
 	data, err := readFileWithRetry(path)
 	if err != nil {
 		return nil, err
@@ -247,7 +364,13 @@ func parseCallsFile(ctx context.Context, path string, since time.Time) ([]model.
 		}
 		tok, err := dec.Token()
 		if err != nil {
-			break // io.EOF or parse error
+			// HIGH#2 fix: distinguish clean EOF from real parse errors.
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			slog.Warn("sms: xml token stream error (file may be truncated; records will be re-collected next run)",
+				"file", path, "error", err)
+			break
 		}
 		se, ok := tok.(xml.StartElement)
 		if !ok || se.Name.Local != "call" {
@@ -261,13 +384,20 @@ func parseCallsFile(ctx context.Context, path string, since time.Time) ([]model.
 		}
 
 		occurredAt := msToUTC(rec.Date)
-		if !since.IsZero() && !occurredAt.After(since) {
+
+		// PII fix (MEDIUM): hash number to avoid logging raw phone numbers.
+		numHash := smsShortHash(rec.Number)
+		// For call logs use duration as a stable discriminator (not body).
+		durationStr := fmt.Sprintf("%d", rec.Duration)
+		durationHash := smsBodyHash(durationStr)
+		sourceID := fmt.Sprintf("call-log:%d:%s:%s", rec.Date, numHash, durationHash)
+
+		if !c.shouldEmitSMS(occurredAt, sourceID, since) {
 			continue
 		}
 
 		direction := callDirection(rec.Type)
 		contact := firstNonEmptySMS(rec.ContactName, rec.Number)
-		sourceID := fmt.Sprintf("call-log:%d:%s", rec.Date, rec.Number)
 		title := fmt.Sprintf("%s 통화 %s", direction, contact)
 
 		callTime := occurredAt.Format("2006-01-02 15:04:05 MST")
@@ -298,16 +428,22 @@ func parseCallsFile(ctx context.Context, path string, since time.Time) ([]model.
 // --- Helpers ---
 
 // latestFileByPrefix returns the path of the file in dir whose name starts with
-// prefix and has the most recent modification time. Returns an empty string and
-// nil error when no matching file exists (the caller decides how to handle this).
+// prefix and has the lexicographically-greatest filename (date-stamped
+// sms-YYYYMMDD.xml pattern). mtime is used as a tiebreak when two files share
+// the same name prefix and lexicographic sort order.
+//
+// This prefers date-stamped filenames over mtime because mtime is unreliable
+// on FUSE mounts (OneDrive can report incorrect mtimes for newly synced files).
+// Returns an empty string and nil error when no matching file exists.
 func latestFileByPrefix(dir, prefix string) (string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return "", fmt.Errorf("readdir %q: %w", dir, err)
 	}
 
-	var latest string
+	var latestName string
 	var latestMtime time.Time
+	var latestPath string
 
 	for _, e := range entries {
 		if e.IsDir() {
@@ -316,23 +452,38 @@ func latestFileByPrefix(dir, prefix string) (string, error) {
 		if !strings.HasPrefix(e.Name(), prefix) {
 			continue
 		}
-		info, err := e.Info()
-		if err != nil {
+
+		// Primary sort: lexicographically-greatest filename (date-stamped).
+		if e.Name() > latestName {
+			latestName = e.Name()
+			// Reset mtime for this new best-name candidate.
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			latestMtime = info.ModTime()
+			latestPath = filepath.Join(dir, e.Name())
 			continue
 		}
-		if info.ModTime().After(latestMtime) {
-			latestMtime = info.ModTime()
-			latest = filepath.Join(dir, e.Name())
+
+		// Tiebreak: same lexicographic name → use mtime.
+		if e.Name() == latestName {
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			if info.ModTime().After(latestMtime) {
+				latestMtime = info.ModTime()
+				latestPath = filepath.Join(dir, e.Name())
+			}
 		}
 	}
-	return latest, nil
+	return latestPath, nil
 }
 
 // msToUTC converts a Unix millisecond timestamp to a UTC time.Time.
 func msToUTC(ms int64) time.Time {
-	sec := ms / 1000
-	nsec := (ms % 1000) * int64(time.Millisecond)
-	return time.Unix(sec, nsec).UTC()
+	return time.UnixMilli(ms).UTC()
 }
 
 // smsDirection maps SMS Backup & Restore type codes to human-readable strings.
