@@ -228,7 +228,8 @@ func TestEntityWorker_SuccessPath_MarksProcessed(t *testing.T) {
 }
 
 // TestEntityWorker_MarkFails_DoesNotPanic verifies that a MarkEntitiesProcessed
-// failure (e.g. transient DB error) is handled gracefully without panicking.
+// failure (e.g. transient DB error) is handled gracefully without panicking,
+// and that the document is NOT recorded as marked when the store returns an error.
 func TestEntityWorker_MarkFails_DoesNotPanic(t *testing.T) {
 	t.Parallel()
 
@@ -247,6 +248,79 @@ func TestEntityWorker_MarkFails_DoesNotPanic(t *testing.T) {
 
 	// Should not panic.
 	w.tick(context.Background())
+
+	// Mark failed → the document must NOT appear in the marked list.
+	if st.wasMarked(docID) {
+		t.Errorf("MarkEntitiesProcessed recorded doc %s as marked despite store returning an error", docID)
+	}
+}
+
+// TestEntityWorker_MixedBatch_CountsCorrectly exercises a single tick with a
+// batch of three documents:
+//
+//  1. Extraction error  — should NOT be marked; linker NOT called.
+//  2. Zero entities     — should be marked; linker NOT called.
+//  3. Entities present  — should be marked; linker called once with this doc.
+//
+// It verifies that the succeeded counter is accurate (2 out of 3) and that
+// the linker only receives the success-path document's entities.
+func TestEntityWorker_MixedBatch_CountsCorrectly(t *testing.T) {
+	t.Parallel()
+
+	errDocID := uuid.New()
+	zeroDocID := uuid.New()
+	successDocID := uuid.New()
+
+	docs := []*model.Document{
+		newDoc(errDocID),
+		newDoc(zeroDocID),
+		newDoc(successDocID),
+	}
+	st := &fakeEntityDocumentLister{docs: docs}
+	linker := &fakeEntityLinker{}
+
+	successEntity := model.Entity{Name: "Alice", Type: model.EntityTypePerson}
+
+	w := newTestWorker(st, linker,
+		func(_ context.Context, _ llm.Completer, doc *model.Document) ([]model.Entity, error) {
+			switch doc.ID {
+			case errDocID:
+				return nil, errors.New("LLM timeout")
+			case zeroDocID:
+				return []model.Entity{}, nil
+			default:
+				return []model.Entity{successEntity}, nil
+			}
+		},
+	)
+	w.tick(context.Background())
+
+	// Extraction-error doc must NOT be marked.
+	if st.wasMarked(errDocID) {
+		t.Errorf("errDoc %s must not be marked when extraction fails", errDocID)
+	}
+	// Zero-entity doc must be marked (prevents re-queuing).
+	if !st.wasMarked(zeroDocID) {
+		t.Errorf("zeroDoc %s must be marked even when extraction yields zero entities", zeroDocID)
+	}
+	// Success doc must be marked.
+	if !st.wasMarked(successDocID) {
+		t.Errorf("successDoc %s must be marked after successful linking", successDocID)
+	}
+
+	// Linker must have been called exactly once, for the success-path doc.
+	if linker.callCount() != 1 {
+		t.Errorf("UpsertAndLinkEntities called %d times, want 1", linker.callCount())
+	}
+	linker.mu.Lock()
+	gotCall := linker.calls[0]
+	linker.mu.Unlock()
+	if gotCall.documentID != successDocID {
+		t.Errorf("linker called for doc %s, want %s", gotCall.documentID, successDocID)
+	}
+	if len(gotCall.entities) != 1 || gotCall.entities[0].Name != successEntity.Name {
+		t.Errorf("linker received entities %v, want [{Name:%s}]", gotCall.entities, successEntity.Name)
+	}
 }
 
 // TestEntityWorker_EmptyBatch_NoOp verifies that tick is a no-op when there

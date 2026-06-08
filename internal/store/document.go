@@ -840,7 +840,7 @@ func (s *DocumentStore) ListWithoutEntities(ctx context.Context, limit int) ([]*
 // ListWithoutEntities, preventing the EntityWorker from re-queuing it on
 // every tick when entity extraction consistently returns zero results.
 func (s *DocumentStore) MarkEntitiesProcessed(ctx context.Context, documentID uuid.UUID) error {
-	const q = `UPDATE documents SET entities_processed_at = now() WHERE id = $1`
+	const q = `UPDATE documents SET entities_processed_at = now() WHERE id = $1 AND entities_processed_at IS NULL`
 	if _, err := s.pg.pool.Exec(ctx, q, documentID); err != nil {
 		return fmt.Errorf("mark entities processed %s: %w", documentID, err)
 	}
