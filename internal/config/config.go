@@ -46,7 +46,7 @@ type Config struct {
 	// Local embedding (Ollama-compatible) — used when EMBEDDING_PROVIDER=local.
 	//
 	// LOCAL_EMBEDDING_MODEL:    Ollama model name (default "bge-m3").
-	// LOCAL_EMBEDDING_ENDPOINT: Ollama base URL (default "http://localhost:11434").
+	// LOCAL_EMBEDDING_ENDPOINT: Ollama base URL (no default).
 	//                           When empty the local embedder is disabled even if
 	//                           EMBEDDING_PROVIDER=local (a warning is logged).
 	LocalEmbeddingModel    string
@@ -226,7 +226,7 @@ func Load() (*Config, error) {
 		EmbeddingProvider: getenv("EMBEDDING_PROVIDER", "openai"),
 
 		LocalEmbeddingModel:    getenv("LOCAL_EMBEDDING_MODEL", "bge-m3"),
-		LocalEmbeddingEndpoint: getenv("LOCAL_EMBEDDING_ENDPOINT", "http://localhost:11434"),
+		LocalEmbeddingEndpoint: os.Getenv("LOCAL_EMBEDDING_ENDPOINT"),
 
 		LLMAPIURL:      llmAPIURL,
 		LLMAPIKey:      llmAPIKey,

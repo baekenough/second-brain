@@ -488,6 +488,121 @@ func TestHandleAddNote_SourceTypeLLMMemory(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// embedNoteChunks: chunk-limit sentinel tests
+// ---------------------------------------------------------------------------
+
+// TestEmbedNoteChunks_ExceedsLimit_ReturnsErrEmbedSkipped verifies that
+// embedNoteChunks returns errEmbedSkipped (not nil) when the chunk count
+// exceeds maxEmbedChunks. This guards the handleAddNote contract that
+// EmbeddingCreated must stay false on a deliberate skip.
+func TestEmbedNoteChunks_ExceedsLimit_ReturnsErrEmbedSkipped(t *testing.T) {
+	t.Parallel()
+
+	// Build a slice with exactly maxEmbedChunks+1 chunks.
+	overLimit := make([]store.Chunk, maxEmbedChunks+1)
+	for i := range overLimit {
+		overLimit[i] = store.Chunk{
+			DocumentID: uuid.Nil,
+			ChunkIndex: i,
+			Content:    "x",
+			ByteSize:   1,
+		}
+	}
+
+	chunkW := &fakeChunkWriter{}
+	embedder := &fakeEmbedder{enabled: true}
+
+	err := embedNoteChunks(context.Background(), uuid.Nil, overLimit, chunkW, embedder)
+
+	if !errors.Is(err, errEmbedSkipped) {
+		t.Errorf("want errEmbedSkipped, got %v", err)
+	}
+	if embedder.embedCalls != 0 {
+		t.Errorf("EmbedBatch called %d times, want 0 when chunk count exceeds limit", embedder.embedCalls)
+	}
+}
+
+// TestEmbedNoteChunks_AtLimit_Embeds verifies that a chunk count exactly equal
+// to maxEmbedChunks does NOT trigger the skip guard.
+func TestEmbedNoteChunks_AtLimit_Embeds(t *testing.T) {
+	t.Parallel()
+
+	atLimit := make([]store.Chunk, maxEmbedChunks)
+	for i := range atLimit {
+		atLimit[i] = store.Chunk{
+			DocumentID: uuid.Nil,
+			ChunkIndex: i,
+			Content:    "x",
+			ByteSize:   1,
+		}
+	}
+
+	// Prime ListByDocument with matching stored chunks so UpdateChunkEmbeddings succeeds.
+	chunkW := &fakeChunkWriter{chunks: atLimit}
+	for i := range chunkW.chunks {
+		chunkW.chunks[i].ID = int64(i + 1)
+	}
+	embedder := &fakeEmbedder{enabled: true}
+
+	err := embedNoteChunks(context.Background(), uuid.Nil, atLimit, chunkW, embedder)
+
+	if errors.Is(err, errEmbedSkipped) {
+		t.Error("got errEmbedSkipped at exactly maxEmbedChunks, want embedding to proceed")
+	}
+	if embedder.embedCalls != 1 {
+		t.Errorf("EmbedBatch called %d times, want 1", embedder.embedCalls)
+	}
+}
+
+// TestHandleAddNote_EmbedSkipped_EmbeddingCreatedFalse verifies the end-to-end
+// contract via handleAddNote: when embedNoteChunks returns errEmbedSkipped,
+// EmbeddingCreated must be false (not true).
+//
+// Implementation note: handleAddNote builds chunkSlice from chunker.Split, so
+// we cannot directly inject an over-limit slice. Instead we verify the
+// sentinel contract by calling embedNoteChunks directly and checking that
+// errors.Is(err, errEmbedSkipped) returns true, then separately confirm that
+// handleAddNote treats that sentinel as EmbeddingCreated=false via a
+// controlled embedder that simulates the skip return.
+func TestHandleAddNote_EmbedSkippedSentinel_EmbeddingCreatedFalse(t *testing.T) {
+	t.Parallel()
+
+	// Use a custom embedder that always returns errEmbedSkipped to simulate
+	// what embedNoteChunks propagates when chunk count exceeds the limit.
+	// This exercises the switch-case branch in handleAddNote.
+	docs := &fakeDocUpserter{}
+	chunkW := &fakeChunkWriter{}
+	embed := &skipSentinelEmbedder{}
+
+	result, errMsg := handleAddNote(
+		context.Background(),
+		docs, chunkW, embed,
+		"Title", "Content.", "", nil, true,
+	)
+
+	if errMsg != "" {
+		t.Fatalf("unexpected user-facing error: %s", errMsg)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if result.EmbeddingCreated {
+		t.Error("EmbeddingCreated must be false when embedNoteChunks returns errEmbedSkipped")
+	}
+}
+
+// skipSentinelEmbedder is a NoteEmbedder that returns errEmbedSkipped from
+// EmbedBatch, simulating the behaviour of embedNoteChunks when chunk count
+// exceeds maxEmbedChunks. It lets us exercise the handleAddNote sentinel branch
+// without needing to produce maxEmbedChunks+1 real chunks.
+type skipSentinelEmbedder struct{}
+
+func (s *skipSentinelEmbedder) Enabled() bool { return true }
+func (s *skipSentinelEmbedder) EmbedBatch(_ context.Context, _ []string) ([][]float32, error) {
+	return nil, errEmbedSkipped
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

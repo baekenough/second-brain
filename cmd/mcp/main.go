@@ -474,6 +474,12 @@ const maxNoteTitleBytes = 1024
 // long-running DB transactions.
 const maxEmbedChunks = 2000
 
+// errEmbedSkipped is returned by embedNoteChunks when the chunk count exceeds
+// maxEmbedChunks. It is a sentinel that handleAddNote treats as a deliberate
+// skip (non-fatal, non-success) rather than an actual embedding failure.
+// The caller MUST NOT surface this as a user-facing error.
+var errEmbedSkipped = errors.New("embedding skipped: chunk count exceeds limit")
+
 // NoteDocumentUpserter is the subset of DocumentStore used by the add_note tool.
 type NoteDocumentUpserter interface {
 	Upsert(ctx context.Context, doc *model.Document) error
@@ -578,12 +584,18 @@ func handleAddNote(
 
 	// Optionally embed chunks.
 	if doEmbed && embed.Enabled() && len(chunkSlice) > 0 {
-		if embErr := embedNoteChunks(ctx, doc.ID, chunkSlice, chunks, embed); embErr != nil {
-			// Embedding failure is non-fatal: the note is already stored and
-			// searchable via FTS; only vector search is degraded.
-			slog.Warn("mcp add_note: embedding failed (non-fatal)", "doc_id", doc.ID, "error", embErr)
-		} else {
+		embErr := embedNoteChunks(ctx, doc.ID, chunkSlice, chunks, embed)
+		switch {
+		case embErr == nil:
+			// Embedding completed successfully.
 			result.EmbeddingCreated = true
+		case errors.Is(embErr, errEmbedSkipped):
+			// Deliberate skip due to chunk count limit — EmbeddingCreated stays
+			// false. The warning was already emitted inside embedNoteChunks.
+		default:
+			// Real embedding failure: non-fatal, note is stored and FTS-searchable,
+			// but vector search is degraded.
+			slog.Warn("mcp add_note: embedding failed (non-fatal)", "doc_id", doc.ID, "error", embErr)
 		}
 	}
 
@@ -601,13 +613,15 @@ func embedNoteChunks(
 	// Guard: skip embedding for excessively large notes to avoid unbounded
 	// API cost and long-running DB transactions. The note is already stored
 	// and fully searchable via FTS; only vector search is degraded.
+	// Return errEmbedSkipped so that handleAddNote can distinguish a deliberate
+	// skip from a real embedding failure and leave EmbeddingCreated=false.
 	if len(chunkSlice) > maxEmbedChunks {
 		slog.Warn("mcp add_note: chunk count exceeds embed limit, skipping embedding",
 			"doc_id", docID,
 			"chunks", len(chunkSlice),
 			"limit", maxEmbedChunks,
 		)
-		return nil
+		return errEmbedSkipped
 	}
 
 	texts := make([]string, 0, len(chunkSlice))
