@@ -13,15 +13,20 @@ import (
 type SourceType string
 
 const (
-	SourceSlack      SourceType = "slack"
-	SourceGitHub     SourceType = "github"
-	SourceGDrive     SourceType = "gdrive"
-	SourceNotion     SourceType = "notion"
-	SourceFilesystem SourceType = "filesystem"
-	SourceDiscord    SourceType = "discord"
-	SourceTelegram   SourceType = "telegram"
-	SourceSecretary  SourceType = "secretary"
-	SourceLLMMemory  SourceType = "llm-memory"
+	SourceSlack          SourceType = "slack"
+	SourceGitHub         SourceType = "github"
+	SourceGDrive         SourceType = "gdrive"
+	SourceNotion         SourceType = "notion"
+	SourceFilesystem     SourceType = "filesystem"
+	SourceDiscord        SourceType = "discord"
+	SourceTelegram       SourceType = "telegram"
+	SourceSecretary      SourceType = "secretary"
+	SourceLLMMemory      SourceType = "llm-memory"
+	SourceGmail          SourceType = "gmail"
+	SourceCalendar       SourceType = "calendar"
+	SourceSMS            SourceType = "sms"
+	SourceCallLog        SourceType = "call-log"
+	SourceCallTranscript SourceType = "call-transcript"
 )
 
 // Document represents a piece of content collected from an external source.

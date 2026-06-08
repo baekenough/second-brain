@@ -207,6 +207,10 @@ func run() error {
 		collector.NewGDriveCollector(cfg.GDriveCredentialsJSON),
 		collector.NewNotionCollector(cfg.NotionToken),
 		collector.NewTelegramCollector(cfg.TelegramBotToken, cfg.TelegramChatIDs),
+		collector.NewGmailCollector(cfg),
+		collector.NewCalendarCollector(cfg),
+		collector.NewSMSCollector(cfg.SMSSourceDir),
+		collector.NewWhisperCollector(cfg),
 	}
 	if cfg.FilesystemEnabled && cfg.FilesystemPath != "" {
 		// Attempt to initialise the Drive exporter via ADC. If ADC is not

@@ -111,6 +111,43 @@ type Config struct {
 	// LLM Memory SQLite (optional — disabled when empty)
 	LLMMemoryDBPath string // LLM_MEMORY_DB_PATH — path to llm-memory.sqlite (e.g. /data/llm-memory.sqlite)
 
+	// Gmail (optional — disabled when both credential fields are empty)
+	// GMAIL_CREDENTIALS_JSON: OAuth2 client credentials JSON string (from Google Cloud Console)
+	// GMAIL_TOKEN_JSON: OAuth2 access/refresh token JSON string
+	// GMAIL_QUERY: Gmail search query (default: "-in:spam -in:trash")
+	GmailCredentialsJSON string
+	GmailTokenJSON       string
+	GmailQuery           string
+
+	// Calendar (optional — disabled when both credential fields are empty)
+	// CALENDAR_CREDENTIALS_JSON: OAuth2 client credentials JSON string
+	// CALENDAR_TOKEN_JSON: OAuth2 access/refresh token JSON string
+	// CALENDAR_ID: calendar identifier (default: "primary")
+	// CALENDAR_LOOKAHEAD_DAYS: days into the future to collect (default: 90)
+	// CALENDAR_LOOKBEHIND_DAYS: days into the past to collect (default: 30)
+	CalendarCredentialsJSON string
+	CalendarTokenJSON       string
+	CalendarID              string
+	CalendarLookaheadDays   int
+	CalendarLookbehindDays  int
+
+	// SMS + Call Log (optional — disabled when SMSSourceDir is empty)
+	// SMS_SOURCE_DIR: directory containing SMS Backup & Restore XML exports
+	// (sms-*.xml and calls-*.xml; latest mtime per prefix is used)
+	SMSSourceDir string
+
+	// Whisper transcription (optional — disabled when WhisperAPIKey is empty)
+	// WHISPER_API_KEY: OpenAI (or compatible) API key
+	// WHISPER_API_URL: base URL (default: "https://api.openai.com/v1")
+	// WHISPER_AUDIO_DIR: directory containing audio files to transcribe
+	// WHISPER_MODEL: model identifier (default: "whisper-1")
+	// WHISPER_LANGUAGE: BCP-47 language hint (default: "ko")
+	WhisperAPIKey  string
+	WhisperAPIURL  string
+	WhisperAudioDir string
+	WhisperModel   string
+	WhisperLanguage string
+
 	// Scheduler
 	CollectInterval time.Duration
 
@@ -270,9 +307,45 @@ func Load() (*Config, error) {
 		SecretaryDBPath: os.Getenv("SECRETARY_DB_PATH"),
 		LLMMemoryDBPath: os.Getenv("LLM_MEMORY_DB_PATH"),
 
+		GmailCredentialsJSON: os.Getenv("GMAIL_CREDENTIALS_JSON"),
+		GmailTokenJSON:       os.Getenv("GMAIL_TOKEN_JSON"),
+		GmailQuery:           getenv("GMAIL_QUERY", "-in:spam -in:trash"),
+
+		CalendarCredentialsJSON: os.Getenv("CALENDAR_CREDENTIALS_JSON"),
+		CalendarTokenJSON:       os.Getenv("CALENDAR_TOKEN_JSON"),
+		CalendarID:              getenv("CALENDAR_ID", "primary"),
+		CalendarLookaheadDays:   calendarLookaheadDays(),
+		CalendarLookbehindDays:  calendarLookbehindDays(),
+
+		SMSSourceDir: os.Getenv("SMS_SOURCE_DIR"),
+
+		WhisperAPIKey:   os.Getenv("WHISPER_API_KEY"),
+		WhisperAPIURL:   getenv("WHISPER_API_URL", "https://api.openai.com/v1"),
+		WhisperAudioDir: os.Getenv("WHISPER_AUDIO_DIR"),
+		WhisperModel:    getenv("WHISPER_MODEL", "whisper-1"),
+		WhisperLanguage: getenv("WHISPER_LANGUAGE", "ko"),
+
 		CollectInterval:   interval,
 		CollectorInstance: collectorInstance,
 	}, nil
+}
+
+func calendarLookaheadDays() int {
+	if v := os.Getenv("CALENDAR_LOOKAHEAD_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 90
+}
+
+func calendarLookbehindDays() int {
+	if v := os.Getenv("CALENDAR_LOOKBEHIND_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 30
 }
 
 // LoadCollector reads configuration for the collector daemon.
