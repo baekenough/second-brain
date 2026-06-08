@@ -10,13 +10,18 @@ import (
 	"github.com/baekenough/second-brain/internal/model"
 )
 
-// EntityDocumentLister is the read side of the document store required by
-// EntityWorker. It returns documents that have not yet had entity extraction run.
+// EntityDocumentLister is the read/write side of the document store required
+// by EntityWorker.
 type EntityDocumentLister interface {
-	// ListWithoutEntities returns up to limit active documents that have no
-	// entries in document_entities. Documents are ordered by collected_at ASC
-	// so backfill progresses forward in time.
+	// ListWithoutEntities returns up to limit active documents whose
+	// entities_processed_at column is NULL. Documents are ordered by
+	// collected_at ASC so backfill progresses forward in time.
 	ListWithoutEntities(ctx context.Context, limit int) ([]*model.Document, error)
+
+	// MarkEntitiesProcessed sets entities_processed_at to now() for the
+	// given document so it is not re-queued by ListWithoutEntities on the
+	// next tick (issue #86).
+	MarkEntitiesProcessed(ctx context.Context, documentID uuid.UUID) error
 }
 
 // EntityLinker is the write side of the entity store required by EntityWorker.
@@ -27,8 +32,8 @@ type EntityLinker interface {
 
 // EntityWorkerConfig holds configuration for EntityWorker.
 type EntityWorkerConfig struct {
-	// Store provides both document listing and entity linking.
-	// Typically a *store.DocumentEntityStore (see adapters.go).
+	// Store provides both document listing and marking-processed.
+	// Typically *store.DocumentStore satisfies this interface.
 	Store EntityDocumentLister
 	// Entities is the entity store (write side).
 	Entities EntityLinker
@@ -43,16 +48,21 @@ type EntityWorkerConfig struct {
 // EntityWorker is a background worker that extracts named entities from
 // documents that have not yet been processed and persists them via EntityStore.
 //
-// Extraction is BEST-EFFORT: failures are logged as warnings and the document
-// is not re-queued (it will remain eligible for extraction on the next tick
-// because ListWithoutEntities only excludes documents that already have at
-// least one entity linked).
+// Extraction is BEST-EFFORT: LLM failures are logged as warnings and the
+// document is left eligible for retry on the next tick. For documents where
+// extraction succeeds (even with zero entities) or where entity linking fails,
+// MarkEntitiesProcessed is called so the document is not re-queued indefinitely
+// (issue #86).
 type EntityWorker struct {
 	store     EntityDocumentLister
 	entities  EntityLinker
 	llm       llm.Completer
 	interval  time.Duration
 	batchSize int
+
+	// extractFn is the entity-extraction function. It defaults to
+	// ExtractEntities and can be replaced in tests to avoid live LLM calls.
+	extractFn func(ctx context.Context, c llm.Completer, doc *model.Document) ([]model.Entity, error)
 }
 
 // NewEntityWorker constructs an EntityWorker from cfg.
@@ -81,6 +91,7 @@ func NewEntityWorker(cfg EntityWorkerConfig) *EntityWorker {
 		llm:       cfg.LLM,
 		interval:  interval,
 		batchSize: batchSize,
+		extractFn: ExtractEntities,
 	}
 }
 
@@ -125,30 +136,34 @@ func (w *EntityWorker) tick(ctx context.Context) {
 	slog.Info("entity worker: processing batch", "count", len(docs))
 	succeeded := 0
 	for _, doc := range docs {
-		entities, err := ExtractEntities(ctx, w.llm, doc)
+		entities, err := w.extractFn(ctx, w.llm, doc)
 		if err != nil {
+			// LLM failure is considered transient; leave entities_processed_at
+			// NULL so the document is retried on the next tick.
 			slog.Warn("entity worker: extraction failed",
 				"doc_id", doc.ID, "source_id", doc.SourceID, "error", err)
-			// Insert a sentinel empty-link so that this document is not re-queued
-			// indefinitely when the LLM consistently fails on it.
-			// We skip this and rely on the caller to mark it processed externally.
-			// For the MVP, the document simply remains in the queue and will be
-			// retried on the next tick — this is acceptable for best-effort extraction.
 			continue
 		}
+
 		if len(entities) == 0 {
-			// No entities found — still a valid result; document will not be
-			// re-processed unless the table has a mechanism for it. For the MVP
-			// we accept that documents with zero entities will be re-queued each
-			// tick. Callers can add a processed_at column in a follow-up.
+			// No entities found — valid result (e.g. binary or very short doc).
+			// Mark processed to prevent re-queuing on every tick (issue #86).
+			w.markProcessed(ctx, doc.ID)
 			succeeded++
 			continue
 		}
+
 		if linkErr := w.entities.UpsertAndLinkEntities(ctx, doc.ID, entities); linkErr != nil {
+			// Link failure may be transient, but to avoid infinite re-queuing we
+			// still mark the document processed. The entities can be re-extracted
+			// via a manual trigger if needed.
 			slog.Warn("entity worker: link entities failed",
 				"doc_id", doc.ID, "count", len(entities), "error", linkErr)
+			w.markProcessed(ctx, doc.ID)
 			continue
 		}
+
+		w.markProcessed(ctx, doc.ID)
 		succeeded++
 		slog.Debug("entity worker: entities linked",
 			"doc_id", doc.ID, "count", len(entities))
@@ -156,4 +171,13 @@ func (w *EntityWorker) tick(ctx context.Context) {
 
 	slog.Info("entity worker: batch complete",
 		"processed", len(docs), "succeeded", succeeded)
+}
+
+// markProcessed calls MarkEntitiesProcessed and logs a warning on failure.
+// It is a convenience wrapper to keep tick() readable.
+func (w *EntityWorker) markProcessed(ctx context.Context, documentID uuid.UUID) {
+	if err := w.store.MarkEntitiesProcessed(ctx, documentID); err != nil {
+		slog.Warn("entity worker: mark processed failed",
+			"doc_id", documentID, "error", err)
+	}
 }

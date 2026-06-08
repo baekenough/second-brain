@@ -805,9 +805,13 @@ func (s *DocumentStore) ListUnembedded(ctx context.Context, limit int) ([]*model
 	return collectDocuments(rows)
 }
 
-// ListWithoutEntities returns up to limit active documents that have no rows
-// in document_entities, ordered by collected_at ASC (oldest first) so that
-// entity-extraction backfill progresses forward in time.
+// ListWithoutEntities returns up to limit active documents whose
+// entities_processed_at column is NULL, ordered by collected_at ASC (oldest
+// first) so that entity-extraction backfill progresses forward in time.
+//
+// Once the EntityWorker attempts extraction for a document — whether or not
+// any entities are found — it calls MarkEntitiesProcessed to set the column,
+// preventing the document from being re-queued on subsequent ticks.
 //
 // Soft-deleted documents are excluded — there is no value in extracting
 // entities from documents that are not served in search results.
@@ -818,10 +822,7 @@ func (s *DocumentStore) ListWithoutEntities(ctx context.Context, limit int) ([]*
 		       title_summary, bullet_summary, summary_embedding
 		FROM documents
 		WHERE status = 'active'
-		  AND NOT EXISTS (
-		      SELECT 1 FROM document_entities de
-		      WHERE de.document_id = documents.id
-		  )
+		  AND entities_processed_at IS NULL
 		ORDER BY collected_at ASC
 		LIMIT $1`
 
@@ -832,6 +833,18 @@ func (s *DocumentStore) ListWithoutEntities(ctx context.Context, limit int) ([]*
 	defer rows.Close()
 
 	return collectDocuments(rows)
+}
+
+// MarkEntitiesProcessed sets entities_processed_at to now() for the given
+// document. After this call the document will no longer be returned by
+// ListWithoutEntities, preventing the EntityWorker from re-queuing it on
+// every tick when entity extraction consistently returns zero results.
+func (s *DocumentStore) MarkEntitiesProcessed(ctx context.Context, documentID uuid.UUID) error {
+	const q = `UPDATE documents SET entities_processed_at = now() WHERE id = $1`
+	if _, err := s.pg.pool.Exec(ctx, q, documentID); err != nil {
+		return fmt.Errorf("mark entities processed %s: %w", documentID, err)
+	}
+	return nil
 }
 
 // ListUnsummarized returns up to limit active documents whose title_summary
