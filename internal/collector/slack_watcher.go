@@ -24,7 +24,7 @@ type watcherStore interface {
 type SlackChannelWatcher struct {
 	collector *SlackCollector
 	store     watcherStore
-	embed     *search.EmbedClient
+	embed     search.EmbeddingEngine
 
 	mu       sync.Mutex
 	seen     map[string]struct{}
@@ -35,7 +35,7 @@ type SlackChannelWatcher struct {
 func NewSlackChannelWatcher(
 	col *SlackCollector,
 	store watcherStore,
-	embed *search.EmbedClient,
+	embed search.EmbeddingEngine,
 	interval time.Duration,
 ) *SlackChannelWatcher {
 	return &SlackChannelWatcher{

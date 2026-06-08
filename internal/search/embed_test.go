@@ -39,7 +39,7 @@ func TestEmbedClient_Disabled(t *testing.T) {
 	t.Parallel()
 
 	// No apiKey, no authFilePath → disabled regardless of URL.
-	c := NewEmbedClient("https://api.openai.com/v1", "", "", "text-embedding-3-small")
+	c := NewEmbedClient("https://api.openai.com/v1", "", "", "text-embedding-3-small", 1536)
 
 	if c.Enabled() {
 		t.Fatal("expected Enabled()==false when both apiKey and authFilePath are empty")
@@ -76,7 +76,7 @@ func TestEmbedClient_200_SingleVector(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewEmbedClient(srv.URL, "sk-test", "", "text-embedding-3-small")
+	c := NewEmbedClient(srv.URL, "sk-test", "", "text-embedding-3-small", 1536)
 
 	if !c.Enabled() {
 		t.Fatal("expected Enabled()==true when apiKey is set")
@@ -107,7 +107,7 @@ func TestEmbedClient_404_ReturnsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewEmbedClient(srv.URL, "sk-test", "", "text-embedding-3-small")
+	c := NewEmbedClient(srv.URL, "sk-test", "", "text-embedding-3-small", 1536)
 
 	_, err := c.Embed(context.Background(), "test")
 	if err == nil {
@@ -144,7 +144,7 @@ func TestEmbedBatch_200_OrderPreserved(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewEmbedClient(srv.URL, "sk-test", "", "text-embedding-3-small")
+	c := NewEmbedClient(srv.URL, "sk-test", "", "text-embedding-3-small", 1536)
 
 	got, err := c.EmbedBatch(context.Background(), texts)
 	if err != nil {
@@ -190,7 +190,7 @@ func TestSearchService_EmbedFails_FallbackFTS(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	embedClient := NewEmbedClient(srv.URL, "sk-test", "", "text-embedding-3-small")
+	embedClient := NewEmbedClient(srv.URL, "sk-test", "", "text-embedding-3-small", 1536)
 
 	wantResults := []*model.SearchResult{
 		{

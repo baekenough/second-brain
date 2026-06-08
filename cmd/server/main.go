@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -66,12 +67,15 @@ func run() error {
 	reindexStateStore := store.NewReindexStateStore(pg) // issue #20: reindex state tracking
 	entityStore := store.NewEntityStore(pg)             // issue #77: knowledge-graph entities
 
-	// --- Embedding client ---
-	embedClient := search.NewEmbedClient(cfg.EmbeddingAPIURL, cfg.EmbeddingAPIKey, cfg.CliProxyAuthFile, cfg.EmbeddingModel)
+	// --- Embedding engine ---
+	embedClient, err := search.NewEmbeddingEngine(cfg)
+	if err != nil {
+		return fmt.Errorf("embedding engine: %w", err)
+	}
 	if embedClient.Enabled() {
-		slog.Info("embedding API configured", "url", cfg.EmbeddingAPIURL, "model", cfg.EmbeddingModel)
+		slog.Info("embedding engine configured", "provider", cfg.EmbeddingProvider)
 	} else {
-		slog.Info("embedding API not configured — full-text search only")
+		slog.Info("embedding engine not configured — full-text search only")
 	}
 
 	// --- Reranker (optional) ---

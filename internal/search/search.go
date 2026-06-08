@@ -39,7 +39,7 @@ type ChunkSearcher interface {
 // improve recall for short or ambiguous queries.
 type Service struct {
 	store         DocumentSearcher
-	embed         *EmbedClient
+	embed         EmbeddingEngine
 	chunkStore    ChunkSearcher       // nil when chunk FTS is not configured
 	llmClient     llm.Completer       // nil when HyDE is not configured
 	weights       model.SearchWeights // zero value uses defaults (k=60, equal weights)
@@ -49,7 +49,7 @@ type Service struct {
 
 // NewService returns a search Service.
 // Use WithChunkStore to enable chunk-based FTS search (issue #9).
-func NewService(store DocumentSearcher, embed *EmbedClient) *Service {
+func NewService(store DocumentSearcher, embed EmbeddingEngine) *Service {
 	return &Service{store: store, embed: embed}
 }
 

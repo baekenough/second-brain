@@ -130,13 +130,11 @@ func run() error {
 	evalStore := store.NewEvalStore(pg)
 	metricsStore := store.NewEvalMetricsStore(pg)
 
-	// --- Embedding client ---
-	embedClient := search.NewEmbedClient(
-		cfg.EmbeddingAPIURL,
-		cfg.EmbeddingAPIKey,
-		cfg.CliProxyAuthFile,
-		cfg.EmbeddingModel,
-	)
+	// --- Embedding engine ---
+	embedClient, err := search.NewEmbeddingEngine(cfg)
+	if err != nil {
+		return fmt.Errorf("embedding engine: %w", err)
+	}
 
 	// --- Reranker (optional) ---
 	reranker := search.NewHTTPReranker(cfg.RerankURL, cfg.RerankAPIKey, cfg.RerankModel, 0)

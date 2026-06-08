@@ -41,7 +41,7 @@ func (m *mockChunkStore) UpdateChunkEmbeddings(_ context.Context, embeddings []s
 
 // embedChunksCaller wraps the scheduler so we can call embedChunks directly.
 // embedChunks is a method on *Scheduler, so we build a minimal scheduler.
-func newTestSchedulerWithMockChunk(cs *mockChunkStore, embed *search.EmbedClient) *Scheduler {
+func newTestSchedulerWithMockChunk(cs *mockChunkStore, embed search.EmbeddingEngine) *Scheduler {
 	s := New(&mockStore{}, embed)
 	// We need to set chunkStore on the scheduler. The real chunkStore is
 	// *store.ChunkStore, but our mock satisfies the required methods.
@@ -55,11 +55,11 @@ func newTestSchedulerWithMockChunk(cs *mockChunkStore, embed *search.EmbedClient
 func TestEmbedChunks_DisabledEmbed_NoCalls(t *testing.T) {
 	t.Parallel()
 
-	// With a disabled embed client, persistChunks should not attempt embedding.
-	// We simulate this by verifying the embed client's Enabled() returns false.
-	embed := search.NewEmbedClient("", "", "", "")
+	// With a disabled embed engine, persistChunks should not attempt embedding.
+	// We simulate this by verifying the engine's Enabled() returns false.
+	embed := search.NewEmbedClient("", "", "", "", 0)
 	if embed.Enabled() {
-		t.Fatal("expected embed client to be disabled")
+		t.Fatal("expected embed engine to be disabled")
 	}
 
 	// Confirm the condition in persistChunks: if s.embed.Enabled() { s.embedChunks(...) }
@@ -76,8 +76,8 @@ func TestEmbedChunks_EmptyChunks_NoOp(t *testing.T) {
 	// The guard `if len(chunks) == 0 { return }` must prevent any API call.
 	// Since we cannot intercept the HTTP client here, we rely on the fact that
 	// an empty chunks slice means texts is also empty and EmbedBatch([], []) is a
-	// no-op for the disabled client path.
-	embed := search.NewEmbedClient("", "", "", "")
+	// no-op for the disabled engine path.
+	embed := search.NewEmbedClient("", "", "", "", 0)
 	s := New(&mockStore{}, embed)
 
 	// embedChunks with empty slice must not panic.

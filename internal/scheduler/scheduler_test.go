@@ -124,9 +124,9 @@ func (c *instantCollector) Collect(_ context.Context, _ time.Time) ([]model.Docu
 	return nil, nil
 }
 
-// disabledEmbed returns a no-op EmbedClient (apiURL == "" → Enabled() false).
-func disabledEmbed() *search.EmbedClient {
-	return search.NewEmbedClient("", "", "", "")
+// disabledEmbed returns a no-op EmbeddingEngine (apiURL == "" → Enabled() false).
+func disabledEmbed() search.EmbeddingEngine {
+	return search.NewEmbedClient("", "", "", "", 0)
 }
 
 // --- tests ---

@@ -100,9 +100,12 @@ func truncateForEmbed(text string) string {
 //  1. apiKey non-empty  → static Bearer token
 //  2. authFilePath non-empty → CliProxyAPI OAuth token (auto-refreshed with 5-min TTL)
 //  3. both empty → no Authorization header sent
+//
+// EmbedClient satisfies the EmbeddingEngine interface.
 type EmbedClient struct {
 	apiURL string
 	model  string
+	dim    int    // advisory dimension; 0 means unknown
 	client *http.Client
 	tokens auth.TokenSource // nil when no auth configured
 }
@@ -116,17 +119,25 @@ type EmbedClient struct {
 // client into the disabled state regardless of apiURL. This lets operators
 // disable embeddings by clearing EMBEDDING_API_KEY/CLIPROXY_AUTH_FILE without
 // also having to override the default EMBEDDING_API_URL.
-func NewEmbedClient(apiURL, apiKey, authFilePath, model string) *EmbedClient {
+//
+// dim is the advisory vector dimension (e.g. 1536 for text-embedding-3-small).
+// Pass 0 when unknown.
+func NewEmbedClient(apiURL, apiKey, authFilePath, model string, dim int) *EmbedClient {
 	if apiKey == "" && authFilePath == "" {
 		apiURL = ""
 	}
 	return &EmbedClient{
 		apiURL: apiURL,
 		model:  model,
+		dim:    dim,
 		client: &http.Client{Timeout: 30 * time.Second},
 		tokens: auth.Resolve(apiKey, authFilePath),
 	}
 }
+
+// Dimension returns the advisory vector dimension configured for this client.
+// A value of 0 indicates that the dimension is unknown.
+func (c *EmbedClient) Dimension() int { return c.dim }
 
 // Enabled reports whether an embedding API is configured.
 func (c *EmbedClient) Enabled() bool { return c.apiURL != "" }

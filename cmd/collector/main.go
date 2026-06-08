@@ -111,12 +111,15 @@ func run() error {
 		retryWorker.Run(ctx)
 	}()
 
-	// --- Embedding client ---
-	embedClient := search.NewEmbedClient(cfg.EmbeddingAPIURL, cfg.EmbeddingAPIKey, cfg.CliProxyAuthFile, cfg.EmbeddingModel)
+	// --- Embedding engine ---
+	embedClient, err := search.NewEmbeddingEngine(cfg)
+	if err != nil {
+		return fmt.Errorf("embedding engine: %w", err)
+	}
 	if embedClient.Enabled() {
-		slog.Info("embedding API configured", "url", cfg.EmbeddingAPIURL, "model", cfg.EmbeddingModel)
+		slog.Info("embedding engine configured", "provider", cfg.EmbeddingProvider)
 	} else {
-		slog.Info("embedding API not configured — full-text search only")
+		slog.Info("embedding engine not configured — full-text search only")
 	}
 
 	// --- LLM client (for summarization) ---

@@ -49,7 +49,7 @@ type Scheduler struct {
 	cron        *cron.Cron
 	collectors  []collector.Collector
 	store       DocumentUpserter
-	embed       *search.EmbedClient
+	embed       search.EmbeddingEngine
 	chunkStore  *store.ChunkStore  // nil when chunk storage is disabled
 	entities    EntityExtractor    // nil when entity extraction is disabled
 	llmClient   llm.Completer      // nil when entity extraction is disabled
@@ -64,7 +64,7 @@ type Scheduler struct {
 
 // New returns a Scheduler with the given collectors and storage backend.
 // Use WithChunkStore to enable chunk-based FTS indexing (issue #9).
-func New(store DocumentUpserter, embed *search.EmbedClient, collectors ...collector.Collector) *Scheduler {
+func New(store DocumentUpserter, embed search.EmbeddingEngine, collectors ...collector.Collector) *Scheduler {
 	c := cron.New(cron.WithSeconds())
 	return &Scheduler{
 		cron:       c,

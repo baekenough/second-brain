@@ -39,6 +39,19 @@ type Config struct {
 	EmbeddingDim     int    // EMBEDDING_DIM — vector dimension; must match the model output. Default 1536.
 	CliProxyAuthFile string // CLIPROXY_AUTH_FILE — CliProxyAPI OAuth JSON path (chat proxies only; NOT used for embeddings when EMBEDDING_API_KEY is set)
 
+	// EmbeddingProvider selects the embedding backend (EMBEDDING_PROVIDER env var).
+	// Valid values: "openai" (default), "local" (Ollama-compatible).
+	EmbeddingProvider string
+
+	// Local embedding (Ollama-compatible) — used when EMBEDDING_PROVIDER=local.
+	//
+	// LOCAL_EMBEDDING_MODEL:    Ollama model name (default "bge-m3").
+	// LOCAL_EMBEDDING_ENDPOINT: Ollama base URL (default "http://localhost:11434").
+	//                           When empty the local embedder is disabled even if
+	//                           EMBEDDING_PROVIDER=local (a warning is logged).
+	LocalEmbeddingModel    string
+	LocalEmbeddingEndpoint string
+
 	// LLM (optional — Discord RAG answer generation; falls back to EmbeddingAPIURL when unset)
 	// LLMAPIURL: LLM_API_URL env var; defaults to EmbeddingAPIURL with /embeddings → /chat/completions suffix fix.
 	// LLMAPIKey: LLM_API_KEY env var; defaults to EmbeddingAPIKey.
@@ -209,6 +222,11 @@ func Load() (*Config, error) {
 		EmbeddingModel:   getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
 		EmbeddingDim:     embeddingDim,
 		CliProxyAuthFile: os.Getenv("CLIPROXY_AUTH_FILE"),
+
+		EmbeddingProvider: getenv("EMBEDDING_PROVIDER", "openai"),
+
+		LocalEmbeddingModel:    getenv("LOCAL_EMBEDDING_MODEL", "bge-m3"),
+		LocalEmbeddingEndpoint: getenv("LOCAL_EMBEDDING_ENDPOINT", "http://localhost:11434"),
 
 		LLMAPIURL:      llmAPIURL,
 		LLMAPIKey:      llmAPIKey,
