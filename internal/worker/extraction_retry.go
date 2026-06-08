@@ -268,6 +268,11 @@ func (w *ExtractionRetryWorker) recordFailure(ctx context.Context, f store.Extra
 		SourceID:     f.SourceID,
 		FilePath:     f.FilePath,
 		ErrorMessage: cause.Error(),
+		// Pass the current attempt count so that Record() can compute the
+		// correct exponential back-off delay via durable.ExtractionBackoff.
+		// f.Attempts was read from the DB by DueForRetry; the ON CONFLICT
+		// branch in Record() uses this value to schedule the next retry.
+		Attempts: f.Attempts,
 	})
 	if recordErr != nil {
 		slog.Warn("extraction retry: failed to record attempt",

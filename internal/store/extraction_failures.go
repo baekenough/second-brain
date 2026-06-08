@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/baekenough/second-brain/internal/durable"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -33,20 +34,32 @@ func NewExtractionFailureStore(pg *Postgres) *ExtractionFailureStore {
 
 // Record inserts a new failure row, or increments attempts on an existing one.
 //
-// Back-off schedule: next_retry_at = now() + 2^attempts minutes, capped at 60 minutes.
-// A row is promoted to dead_letter once attempts reaches 10.
+// Back-off and dead-letter logic is delegated to [durable.ExtractionBackoff]
+// so that the policy can be unit-tested without a running Postgres instance.
+// The SQL upsert now receives explicit nextRetryAt and deadLetter values
+// computed in Go, keeping the database as a dumb store.
+//
+// Back-off schedule (matches the previous inline SQL formula):
+//
+//	attempt 0 (first insert): +5 minutes
+//	attempt n (ON CONFLICT):  +LEAST(60, 2^n) minutes
+//
+// Dead-letter threshold: 10 attempts (i.e. currentAttempts+1 >= 10).
 func (s *ExtractionFailureStore) Record(ctx context.Context, f ExtractionFailure) error {
+	now := time.Now()
+	nextRetryAt, deadLetter := durable.ExtractionBackoff.NextRetryAt(f.Attempts, now)
+
 	_, err := s.pg.pool.Exec(ctx, `
 		INSERT INTO extraction_failures
-			(source_type, source_id, file_path, error_message, attempts, next_retry_at)
-		VALUES ($1, $2, $3, $4, 1, now() + INTERVAL '5 minutes')
+			(source_type, source_id, file_path, error_message, attempts, next_retry_at, dead_letter)
+		VALUES ($1, $2, $3, $4, 1, $5, $6)
 		ON CONFLICT (source_type, source_id) DO UPDATE
 		SET attempts      = extraction_failures.attempts + 1,
 		    error_message = EXCLUDED.error_message,
-		    next_retry_at = now() + (INTERVAL '1 minute' * LEAST(60, POWER(2, extraction_failures.attempts)::int)),
-		    dead_letter   = (extraction_failures.attempts + 1 >= 10),
+		    next_retry_at = EXCLUDED.next_retry_at,
+		    dead_letter   = EXCLUDED.dead_letter,
 		    updated_at    = now()
-	`, f.SourceType, f.SourceID, f.FilePath, f.ErrorMessage)
+	`, f.SourceType, f.SourceID, f.FilePath, f.ErrorMessage, nextRetryAt, deadLetter)
 	return err
 }
 
