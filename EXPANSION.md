@@ -254,6 +254,21 @@ A chat interface backed by an LLM with retrieval-augmented generation (RAG). The
 
 Summarize long documents at collection time and store the summary alongside the full content. Surface summaries in search results to reduce time-to-answer.
 
+### Second-Brain lifecycle framework — scout #84
+
+> **Internalized from** scout issue #84 (awesome-second-brain,
+> https://github.com/aristoapp/awesome-second-brain) — a curated comparison
+> guide and decision framework (not a software tool). Verdict: INTEGRATE (P3),
+> keep-external.
+
+Maps the five-stage second-brain lifecycle (Collect → Organize → Evolve →
+Use → Govern) to current codebase status. Introduces the "activation evidence"
+concept as a future eval axis — does retrieved memory actually influence AI
+output? — which pairs with the cost-profiling work in scout #75.
+
+See `guides/second-brain-lifecycle.md` for the full mapping and Govern-stage
+gap analysis.
+
 ### Knowledge graph generation — scout #77
 
 Extract entities (people, projects, products, decisions) and relationships from documents. Expose a graph query API and visualize connections in the web UI. Useful for onboarding and impact analysis.
