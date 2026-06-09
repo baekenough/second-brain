@@ -11,6 +11,8 @@ import com.baekenough.secondbrain.reader.CallLogReader
 import com.baekenough.secondbrain.reader.RecordingScanner
 import com.baekenough.secondbrain.reader.SmsReader
 import com.baekenough.secondbrain.ui.SettingsRepository
+import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
+import okhttp3.MediaType.Companion.toMediaType
 
 /**
  * Background sync worker — the sole wake for all three data sources.
@@ -147,15 +149,12 @@ class SyncWorker(
             }
             .build()
 
+        val json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+        val contentType = "application/json".toMediaType()
         val retrofit = retrofit2.Retrofit.Builder()
             .baseUrl(serverUrl.trimEnd('/') + '/')
             .client(okHttp)
-            .addConverterFactory(
-                com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory(
-                    kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
-                        .let { it }
-                )
-            )
+            .addConverterFactory(json.asConverterFactory(contentType))
             .build()
 
         return Uploader(

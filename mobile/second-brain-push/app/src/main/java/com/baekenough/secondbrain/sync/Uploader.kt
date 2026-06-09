@@ -5,10 +5,9 @@ import com.baekenough.secondbrain.classify.ClassifiedCall
 import com.baekenough.secondbrain.classify.ClassifiedRecording
 import com.baekenough.secondbrain.classify.ClassifiedSms
 import com.baekenough.secondbrain.cursor.CursorStore
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
+import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import retrofit2.Response
@@ -29,12 +28,11 @@ import java.io.File
 class Uploader(
     private val api: ApiService,
     private val cursorStore: CursorStore,
-    private val json: Json = Json { ignoreUnknownKeys = true },
 ) {
 
     companion object {
         private const val TAG = "Uploader"
-        private val MEDIA_JSON = "application/json; charset=utf-8".toMediaType()
+        private val MEDIA_TEXT = "text/plain".toMediaType()
         private val MEDIA_AUDIO = "audio/mp4".toMediaType()
     }
 
@@ -112,20 +110,23 @@ class Uploader(
             return UploadResult.Skipped("file not found")
         }
 
-        val metadata = RecordingMetadata(
-            filename = recording.filename,
-            callDateMs = recording.linkedCall?.dateMs,
-            callNumber = recording.linkedCall?.number,
-            callDurationSec = recording.linkedCall?.durationSec,
-            callDirection = recording.linkedCall?.type?.name,
-        )
+        val linkedCall = recording.linkedCall
+        val numberBody = (linkedCall?.number ?: recording.parsedNumber ?: "").asTextPart()
+        val dateMsBody = (linkedCall?.dateMs ?: recording.recordingTimeMs).toString().asTextPart()
+        val durationSecBody = (linkedCall?.durationSec ?: 0L).toString().asTextPart()
+        val contactNameBody = "".asTextPart()
 
-        val metadataBody = json.encodeToString(metadata).toRequestBody(MEDIA_JSON)
         val fileBody = file.asRequestBody(MEDIA_AUDIO)
         val filePart = MultipartBody.Part.createFormData("file", recording.filename, fileBody)
 
         return try {
-            val response = api.postRecording(filePart, metadataBody)
+            val response = api.postRecording(
+                file = filePart,
+                number = numberBody,
+                dateMs = dateMsBody,
+                durationSec = durationSecBody,
+                contactName = contactNameBody,
+            )
             handleRecordingResponse(response, recording.filename)
         } catch (e: Exception) {
             Log.e(TAG, "uploadRecording network error: ${recording.filename}", e)
@@ -139,10 +140,29 @@ class Uploader(
     ): UploadResult {
         return when {
             response.isSuccessful -> {
-                Log.i(TAG, "uploadRecording success: $filename")
-                // Mark as sent — ONLY on 2xx
-                cursorStore.markRecordingSent(filename)
-                UploadResult.Success(1, 0)
+                val body = response.body()
+                when {
+                    body?.accepted == true -> {
+                        Log.i(TAG, "uploadRecording accepted: $filename (documentId=${body.documentId})")
+                        // Mark as sent — ONLY after server confirms acceptance
+                        cursorStore.markRecordingSent(filename)
+                        UploadResult.Success(1, 0)
+                    }
+                    body?.skipped == true -> {
+                        // Server intentionally skipped (e.g. cutover filter). This is a terminal
+                        // outcome — do NOT retry. Advance the cursor so the same file is not
+                        // re-uploaded on every subsequent wake.
+                        Log.i(TAG, "uploadRecording skipped by server (cutover?): $filename")
+                        cursorStore.markRecordingSent(filename)
+                        UploadResult.Success(0, 1)
+                    }
+                    else -> {
+                        // 2xx body but neither accepted nor skipped — treat as transient so
+                        // WorkManager can retry once the server state is consistent.
+                        Log.w(TAG, "uploadRecording 2xx but accepted=false skipped=false: $filename")
+                        UploadResult.TransientError("unexpected server response: accepted=false, skipped=false")
+                    }
+                }
             }
             response.code() in 400..499 -> {
                 Log.e(TAG, "uploadRecording client error ${response.code()}: $filename")
@@ -154,6 +174,11 @@ class Uploader(
             }
         }
     }
+
+    // ── Private helpers ───────────────────────────────────────────────────
+
+    /** Wraps a string value as a plain-text [RequestBody] for multipart form fields. */
+    private fun String.asTextPart(): RequestBody = toRequestBody(MEDIA_TEXT)
 
     // ── Mapping extensions ─────────────────────────────────────────────────
 

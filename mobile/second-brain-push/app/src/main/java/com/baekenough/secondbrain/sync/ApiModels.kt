@@ -31,15 +31,6 @@ data class MessagesRequest(
     val calls: List<CallPayload>,
 )
 
-@Serializable
-data class RecordingMetadata(
-    val filename: String,
-    @SerialName("call_date_ms") val callDateMs: Long?,
-    @SerialName("call_number") val callNumber: String?,
-    @SerialName("call_duration_sec") val callDurationSec: Long?,
-    @SerialName("call_direction") val callDirection: String?,
-)
-
 // ── Response models — received from the server ────────────────────────────
 
 @Serializable
@@ -51,6 +42,7 @@ data class MessagesResponse(
 
 @Serializable
 data class RecordingResponse(
-    val stored: Boolean,
-    val filename: String,
+    val accepted: Boolean = false,
+    val skipped: Boolean = false,
+    @SerialName("document_id") val documentId: String? = null,
 )
