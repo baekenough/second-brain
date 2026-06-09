@@ -23,10 +23,6 @@ import (
 )
 
 const (
-	// whisperMaxFileBytes is the maximum audio file size accepted by the Whisper API.
-	// Files larger than this limit are skipped to avoid API errors.
-	whisperMaxFileBytes = 25 * 1024 * 1024 // 25 MB
-
 	// whisperHTTPTimeout is the per-request timeout for Whisper transcription.
 	// Audio files can be long; allow up to 10 minutes for transcription.
 	whisperHTTPTimeout = 10 * time.Minute
@@ -76,6 +72,10 @@ type WhisperCollector struct {
 	httpClient *http.Client
 	baseURL    string // overridable in tests; defaults to cfg.WhisperAPIURL
 
+	// maxFileBytes caps the per-file size accepted for transcription (0 = unlimited).
+	// Sourced from cfg.WhisperMaxFileBytes; stored here so tests can override easily.
+	maxFileBytes int64
+
 	// indexedIDs is an optional set of source_ids already active in the store.
 	// When non-nil, Collect emits files whose SourceID is absent from the set
 	// even when their mtime predates the since watermark (IndexAwareCollector).
@@ -91,7 +91,8 @@ func NewWhisperCollector(cfg *config.Config) *WhisperCollector {
 		httpClient: &http.Client{
 			Timeout: whisperHTTPTimeout,
 		},
-		baseURL: cfg.WhisperAPIURL,
+		baseURL:      cfg.WhisperAPIURL,
+		maxFileBytes: cfg.WhisperMaxFileBytes,
 	}
 }
 
@@ -222,12 +223,13 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 			return nil
 		}
 
-		// 25 MB limit imposed by the Whisper API.
-		if info.Size() > whisperMaxFileBytes {
+		// Per-file size cap: skip files that exceed the configured limit.
+		// When maxFileBytes <= 0 the cap is disabled (unlimited).
+		if c.maxFileBytes > 0 && info.Size() > c.maxFileBytes {
 			slog.Warn("whisper: skipping oversized file",
 				"path", path,
 				"size_bytes", info.Size(),
-				"limit_bytes", whisperMaxFileBytes,
+				"limit_bytes", c.maxFileBytes,
 			)
 			return nil
 		}

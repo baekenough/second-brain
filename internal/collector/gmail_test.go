@@ -544,6 +544,117 @@ func TestGmailCollector_Collect_MessageFetchError_Skipped(t *testing.T) {
 	}
 }
 
+// TestGmailCollector_MessageCap_Enforced verifies that when maxMessages is set,
+// the collector stops requesting additional pages once the cap is reached.
+// The cap check occurs before fetching the NEXT page: a page that brings the
+// total over the cap still has all its IDs appended, but no further pages
+// are requested.
+func TestGmailCollector_MessageCap_Enforced(t *testing.T) {
+	t.Parallel()
+
+	// Page 1 returns 3 IDs; cap is 2 so after page 1 len(ids)=3 >= 2 → stop.
+	// Page 2 must NOT be fetched.
+	const cap = 2
+	listCalls := 0
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/gmail/v1/users/me/messages", func(w http.ResponseWriter, r *http.Request) {
+		listCalls++
+		w.Header().Set("Content-Type", "application/json")
+		// Always return page2 token so the loop would continue without the cap.
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"messages": []map[string]any{
+				{"id": "msg-a"},
+				{"id": "msg-b"},
+				{"id": "msg-c"},
+			},
+			"nextPageToken": "page2",
+		})
+	})
+	for _, id := range []string{"msg-a", "msg-b", "msg-c"} {
+		id := id
+		mux.HandleFunc("/gmail/v1/users/me/messages/"+id, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(gmailMessageJSON(
+				id, "t-"+id, "Subj", "a@a.com", "b@b.com",
+				"Mon, 06 Jun 2022 10:00:00 +0000", "body",
+			))
+		})
+	}
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := newGmailCollectorWithFakeSource(validGmailConfig(), srv, nil)
+	c.maxMessages = cap
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	// Page 1 returns 3 IDs which all get appended before the cap check fires.
+	// The cap prevents a second page from being fetched, so at most 3 docs.
+	// The key invariant is that pagination stops (listCalls == 1).
+	if listCalls != 1 {
+		t.Errorf("messages.list called %d times, want 1 (cap stops pagination)", listCalls)
+	}
+	// All IDs from the first (and only) page are returned.
+	if len(docs) != 3 {
+		t.Errorf("Collect returned %d docs, want 3 (single page, no second page fetched)", len(docs))
+	}
+}
+
+// TestGmailCollector_MessageCap_Zero_Unlimited verifies that maxMessages=0
+// disables the cap and the collector follows all pages.
+func TestGmailCollector_MessageCap_Zero_Unlimited(t *testing.T) {
+	t.Parallel()
+
+	pageCount := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/gmail/v1/users/me/messages", func(w http.ResponseWriter, r *http.Request) {
+		pageCount++
+		pt := r.URL.Query().Get("pageToken")
+		w.Header().Set("Content-Type", "application/json")
+		if pt == "" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"messages":      []map[string]any{{"id": "msg-1"}},
+				"nextPageToken": "p2",
+			})
+		} else {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"messages": []map[string]any{{"id": "msg-2"}},
+			})
+		}
+	})
+	for _, id := range []string{"msg-1", "msg-2"} {
+		id := id
+		mux.HandleFunc("/gmail/v1/users/me/messages/"+id, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(gmailMessageJSON(
+				id, "t-"+id, "Subj", "a@a.com", "b@b.com",
+				"Mon, 06 Jun 2022 10:00:00 +0000", "body",
+			))
+		})
+	}
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := newGmailCollectorWithFakeSource(validGmailConfig(), srv, nil)
+	c.maxMessages = 0 // unlimited
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(docs) != 2 {
+		t.Errorf("Collect returned %d docs, want 2 (unlimited)", len(docs))
+	}
+	if pageCount != 2 {
+		t.Errorf("messages.list called %d times, want 2 (pagination followed)", pageCount)
+	}
+}
+
 func TestGmailCollector_Collect_SinceZero_NoAfterFilter(t *testing.T) {
 	t.Parallel()
 

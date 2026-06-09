@@ -26,9 +26,6 @@ import (
 const (
 	gmailScope   = "https://www.googleapis.com/auth/gmail.readonly"
 	gmailBaseURL = "https://gmail.googleapis.com"
-	// maxGmailMessages is a safety cap on the total number of messages fetched
-	// per Collect call. Gmail can return very large result sets for broad queries.
-	maxGmailMessages = 5000
 )
 
 // GmailCollector collects emails from a Gmail account via the Gmail REST API.
@@ -39,6 +36,10 @@ type GmailCollector struct {
 	// httpClient and baseURL are overridable for testing.
 	httpClient *http.Client
 	baseURL    string
+
+	// maxMessages caps the total IDs fetched per Collect call (0 = unlimited).
+	// Sourced from cfg.GmailMaxMessages; stored here so tests can override easily.
+	maxMessages int
 
 	// tokenMu guards tokenSource and cachedToken.
 	tokenMu     sync.Mutex
@@ -51,9 +52,10 @@ type GmailCollector struct {
 // and the scheduler will not call Collect.
 func NewGmailCollector(cfg *config.Config) *GmailCollector {
 	return &GmailCollector{
-		cfg:        cfg,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
-		baseURL:    gmailBaseURL,
+		cfg:         cfg,
+		httpClient:  &http.Client{Timeout: 30 * time.Second},
+		baseURL:     gmailBaseURL,
+		maxMessages: cfg.GmailMaxMessages,
 	}
 }
 
@@ -130,8 +132,8 @@ func (c *GmailCollector) listMessageIDs(ctx context.Context, token string, since
 	pageToken := ""
 
 	for {
-		if len(ids) >= maxGmailMessages {
-			slog.Warn("gmail: reached message cap, truncating results", "cap", maxGmailMessages)
+		if c.maxMessages > 0 && len(ids) >= c.maxMessages {
+			slog.Warn("gmail: reached message cap, truncating results", "cap", c.maxMessages)
 			break
 		}
 

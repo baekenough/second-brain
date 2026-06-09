@@ -342,14 +342,17 @@ func TestWhisperCollector_Collect_OversizedFileSkipped(t *testing.T) {
 	dir := t.TempDir()
 	srv, _ := newWhisperTestServer(t, "이 파일은 전사되지 않아야 함")
 
-	// Create a file whose size is exactly 25 MB + 1 byte.
+	// Use a small explicit cap (1 KiB) so the sparse file is definitely over.
+	const testCap int64 = 1024
+
+	// Create a file whose size is exactly testCap + 1 byte.
 	bigPath := filepath.Join(dir, "big.m4a")
 	// Write a sparse file by seeking past the limit and writing a single byte.
 	f, err := os.Create(bigPath)
 	if err != nil {
 		t.Fatalf("create big file: %v", err)
 	}
-	if _, err := f.Seek(whisperMaxFileBytes, io.SeekStart); err != nil {
+	if _, err := f.Seek(testCap, io.SeekStart); err != nil {
 		f.Close()
 		t.Fatalf("seek: %v", err)
 	}
@@ -365,10 +368,11 @@ func TestWhisperCollector_Collect_OversizedFileSkipped(t *testing.T) {
 	}
 
 	cfg := &config.Config{
-		WhisperAudioDir: dir,
-		WhisperAPIURL:   srv.URL,
-		WhisperModel:    "whisper-1",
-		WhisperLanguage: "ko",
+		WhisperAudioDir:     dir,
+		WhisperAPIURL:       srv.URL,
+		WhisperModel:        "whisper-1",
+		WhisperLanguage:     "ko",
+		WhisperMaxFileBytes: testCap,
 	}
 	c := makeWhisperCollector(cfg, srv)
 
@@ -378,6 +382,104 @@ func TestWhisperCollector_Collect_OversizedFileSkipped(t *testing.T) {
 	}
 	if len(docs) != 0 {
 		t.Errorf("Collect() returned %d docs, want 0 (oversized file must be skipped)", len(docs))
+	}
+}
+
+// TestWhisperCollector_Collect_OversizedFileSkipped_ConfigurableCap verifies
+// that a file below a custom cap is transcribed and a file above is skipped.
+func TestWhisperCollector_Collect_OversizedFileSkipped_ConfigurableCap(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	srv, _ := newWhisperTestServer(t, "작은 파일 전사")
+
+	const testCap int64 = 100 // 100 bytes
+
+	// Small file: under cap → should be transcribed.
+	smallPath := filepath.Join(dir, "small.m4a")
+	if err := os.WriteFile(smallPath, make([]byte, 50), 0o600); err != nil { // 50 bytes
+		t.Fatalf("write small file: %v", err)
+	}
+
+	// Large file: over cap → should be skipped.
+	largePath := filepath.Join(dir, "large.mp3")
+	if err := os.WriteFile(largePath, make([]byte, 200), 0o600); err != nil { // 200 bytes
+		t.Fatalf("write large file: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, p := range []string{smallPath, largePath} {
+		if err := os.Chtimes(p, now, now); err != nil {
+			t.Fatalf("chtimes: %v", err)
+		}
+	}
+
+	cfg := &config.Config{
+		WhisperAudioDir:     dir,
+		WhisperAPIURL:       srv.URL,
+		WhisperModel:        "whisper-1",
+		WhisperLanguage:     "ko",
+		WhisperMaxFileBytes: testCap,
+	}
+	c := makeWhisperCollector(cfg, srv)
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect() error: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Errorf("Collect() returned %d docs, want 1 (large file skipped)", len(docs))
+	}
+	if len(docs) == 1 && docs[0].SourceID != "transcript:small.m4a" {
+		t.Errorf("SourceID = %q, want transcript:small.m4a", docs[0].SourceID)
+	}
+}
+
+// TestWhisperCollector_Collect_ZeroCap_Unlimited verifies that maxFileBytes=0
+// disables the size cap and even large files are transcribed.
+func TestWhisperCollector_Collect_ZeroCap_Unlimited(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	srv, _ := newWhisperTestServer(t, "대용량 파일 전사")
+
+	// Write a 10 MB sparse file — well above the old 25 MB constant and only
+	// limited to keep the test fast.
+	bigPath := filepath.Join(dir, "huge.m4a")
+	f, err := os.Create(bigPath)
+	if err != nil {
+		t.Fatalf("create big file: %v", err)
+	}
+	if _, err := f.Seek(10<<20, io.SeekStart); err != nil { // 10 MiB
+		f.Close()
+		t.Fatalf("seek: %v", err)
+	}
+	if _, err := f.Write([]byte{0}); err != nil {
+		f.Close()
+		t.Fatalf("write: %v", err)
+	}
+	f.Close()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := os.Chtimes(bigPath, now, now); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	cfg := &config.Config{
+		WhisperAudioDir:     dir,
+		WhisperAPIURL:       srv.URL,
+		WhisperModel:        "whisper-1",
+		WhisperLanguage:     "ko",
+		WhisperMaxFileBytes: 0, // unlimited
+	}
+	c := makeWhisperCollector(cfg, srv)
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect() error: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Errorf("Collect() returned %d docs, want 1 (zero cap = unlimited)", len(docs))
 	}
 }
 

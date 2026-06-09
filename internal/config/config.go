@@ -119,16 +119,19 @@ type Config struct {
 	// GMAIL_CREDENTIALS_JSON: OAuth2 client credentials JSON string (from Google Cloud Console)
 	// GMAIL_TOKEN_JSON: OAuth2 access/refresh token JSON string
 	// GMAIL_QUERY: Gmail search query (default: "-in:spam -in:trash")
+	// GMAIL_MAX_MESSAGES: per-Collect cap on total message IDs fetched (default: 50000).
+	// Set 0 to disable the cap entirely (no limit). Invalid values use the default.
 	GmailCredentialsJSON string
 	GmailTokenJSON       string
 	GmailQuery           string
+	GmailMaxMessages     int
 
 	// Calendar (optional — disabled when both credential fields are empty)
 	// CALENDAR_CREDENTIALS_JSON: OAuth2 client credentials JSON string
 	// CALENDAR_TOKEN_JSON: OAuth2 access/refresh token JSON string
 	// CALENDAR_ID: calendar identifier (default: "primary")
 	// CALENDAR_LOOKAHEAD_DAYS: days into the future to collect (default: 90)
-	// CALENDAR_LOOKBEHIND_DAYS: days into the past to collect (default: 30)
+	// CALENDAR_LOOKBEHIND_DAYS: days into the past to collect (default: 365)
 	CalendarCredentialsJSON string
 	CalendarTokenJSON       string
 	CalendarID              string
@@ -149,11 +152,14 @@ type Config struct {
 	// WHISPER_AUDIO_DIR: directory containing audio files to transcribe
 	// WHISPER_MODEL: model identifier (default: "whisper-1")
 	// WHISPER_LANGUAGE: BCP-47 language hint (default: "ko")
-	WhisperAPIKey  string
-	WhisperAPIURL  string
-	WhisperAudioDir string
-	WhisperModel   string
-	WhisperLanguage string
+	// WHISPER_MAX_FILE_BYTES: per-file size cap (bytes, int64, default: 100 MiB).
+	// Set 0 to disable the cap entirely (no limit). Invalid values use the default.
+	WhisperAPIKey       string
+	WhisperAPIURL       string
+	WhisperAudioDir     string
+	WhisperModel        string
+	WhisperLanguage     string
+	WhisperMaxFileBytes int64
 
 	// Summarizer
 	// SummarizerBackfillEnabled controls whether the SummarizerWorker scans for
@@ -342,6 +348,7 @@ func Load() (*Config, error) {
 		GmailCredentialsJSON: os.Getenv("GMAIL_CREDENTIALS_JSON"),
 		GmailTokenJSON:       os.Getenv("GMAIL_TOKEN_JSON"),
 		GmailQuery:           getenv("GMAIL_QUERY", "-in:spam -in:trash"),
+		GmailMaxMessages:     gmailMaxMessages(),
 
 		CalendarCredentialsJSON: os.Getenv("CALENDAR_CREDENTIALS_JSON"),
 		CalendarTokenJSON:       os.Getenv("CALENDAR_TOKEN_JSON"),
@@ -352,11 +359,12 @@ func Load() (*Config, error) {
 		SMSSourceDir:    os.Getenv("SMS_SOURCE_DIR"),
 		SMSMaxFileBytes: smsMaxFileBytes(),
 
-		WhisperAPIKey:   os.Getenv("WHISPER_API_KEY"),
-		WhisperAPIURL:   getenv("WHISPER_API_URL", "https://api.openai.com/v1"),
-		WhisperAudioDir: os.Getenv("WHISPER_AUDIO_DIR"),
-		WhisperModel:    getenv("WHISPER_MODEL", "whisper-1"),
-		WhisperLanguage: getenv("WHISPER_LANGUAGE", "ko"),
+		WhisperAPIKey:       os.Getenv("WHISPER_API_KEY"),
+		WhisperAPIURL:       getenv("WHISPER_API_URL", "https://api.openai.com/v1"),
+		WhisperAudioDir:     os.Getenv("WHISPER_AUDIO_DIR"),
+		WhisperModel:        getenv("WHISPER_MODEL", "whisper-1"),
+		WhisperLanguage:     getenv("WHISPER_LANGUAGE", "ko"),
+		WhisperMaxFileBytes: whisperMaxFileBytes(),
 
 		SummarizerBackfillEnabled: summarizerBackfill,
 
@@ -380,7 +388,7 @@ func calendarLookbehindDays() int {
 			return n
 		}
 	}
-	return 30
+	return 365
 }
 
 // smsMaxFileBytes parses SMS_MAX_FILE_BYTES from the environment.
@@ -396,6 +404,48 @@ func smsMaxFileBytes() int64 {
 	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil || n < 0 {
 		slog.Warn("config: SMS_MAX_FILE_BYTES is invalid; using default 1 GiB",
+			"value", v,
+			"error", err,
+		)
+		return defaultCap
+	}
+	return n // 0 means no limit (caller checks maxFileBytes <= 0)
+}
+
+// gmailMaxMessages parses GMAIL_MAX_MESSAGES from the environment.
+// Default is 50000 (generous enough to match a large secretary export).
+// Set GMAIL_MAX_MESSAGES=0 to disable the cap entirely (no limit).
+// Invalid values are ignored and the default is used.
+func gmailMaxMessages() int {
+	const defaultCap = 50000
+	v := os.Getenv("GMAIL_MAX_MESSAGES")
+	if v == "" {
+		return defaultCap
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		slog.Warn("config: GMAIL_MAX_MESSAGES is invalid; using default 50000",
+			"value", v,
+			"error", err,
+		)
+		return defaultCap
+	}
+	return n // 0 means no limit (caller checks maxMessages <= 0)
+}
+
+// whisperMaxFileBytes parses WHISPER_MAX_FILE_BYTES from the environment.
+// Default is 100 MiB (covers call recordings in the 28–32 MB range).
+// Set WHISPER_MAX_FILE_BYTES=0 to disable the cap entirely (no limit).
+// Invalid values are ignored and the default is used.
+func whisperMaxFileBytes() int64 {
+	const defaultCap = 100 << 20 // 100 MiB
+	v := os.Getenv("WHISPER_MAX_FILE_BYTES")
+	if v == "" {
+		return defaultCap
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		slog.Warn("config: WHISPER_MAX_FILE_BYTES is invalid; using default 100 MiB",
 			"value", v,
 			"error", err,
 		)
