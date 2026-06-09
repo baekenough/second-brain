@@ -215,15 +215,21 @@ func isAuthorized(ctx context.Context) bool {
 // allowedSourceTypes is the set of valid model.SourceType values accepted by
 // the search tool's "source" parameter. Defined once for reuse and validation.
 var allowedSourceTypes = map[model.SourceType]struct{}{
-	model.SourceSlack:      {},
-	model.SourceGitHub:     {},
-	model.SourceGDrive:     {},
-	model.SourceNotion:     {},
-	model.SourceFilesystem: {},
-	model.SourceDiscord:    {},
-	model.SourceTelegram:   {},
-	model.SourceSecretary:  {},
-	model.SourceLLMMemory:  {},
+	model.SourceSlack:          {},
+	model.SourceGitHub:         {},
+	model.SourceGDrive:         {},
+	model.SourceNotion:         {},
+	model.SourceFilesystem:     {},
+	model.SourceDiscord:        {},
+	model.SourceTelegram:       {},
+	model.SourceSecretary:      {},
+	model.SourceLLMMemory:      {},
+	model.SourceGmail:          {},
+	model.SourceCalendar:       {},
+	model.SourceSMS:            {},
+	model.SourceCallLog:        {},
+	model.SourceCallTranscript: {},
+	model.SourceUpload:         {},
 }
 
 // searchResult is the MCP-friendly projection of model.SearchResult.
@@ -254,7 +260,8 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service) {
 		mcp.WithString("source",
 			mcp.Description(
 				"Optional source type filter. One of: slack, github, gdrive, notion, "+
-					"filesystem, discord, telegram, secretary, llm-memory.",
+					"filesystem, discord, telegram, secretary, llm-memory, "+
+					"gmail, calendar, sms, call-log, call-transcript, upload.",
 			),
 		),
 	)
@@ -288,7 +295,7 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service) {
 			st := model.SourceType(strings.TrimSpace(src))
 			if _, ok := allowedSourceTypes[st]; !ok {
 				return mcp.NewToolResultError(fmt.Sprintf(
-					"unknown source type %q; allowed: slack, github, gdrive, notion, filesystem, discord, telegram, secretary, llm-memory",
+					"unknown source type %q; allowed: slack, github, gdrive, notion, filesystem, discord, telegram, secretary, llm-memory, gmail, calendar, sms, call-log, call-transcript, upload",
 					src,
 				)), nil
 			}
