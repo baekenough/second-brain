@@ -151,13 +151,23 @@ class Uploader(
                 }
                 UploadResult.Success(body?.accepted ?: 0, body?.skipped ?: 0)
             }
-            response.code() in 400..499 -> {
+            response.code() == 401 || response.code() == 403 -> {
                 Log.e(
                     TAG,
-                    "uploadMessages auth/client error on batch $batchNum/$totalBatches: " +
+                    "uploadMessages auth error on batch $batchNum/$totalBatches: " +
                         "${response.code()} ${response.message()}",
                 )
                 UploadResult.AuthError(response.code(), response.message())
+            }
+            response.code() in 400..499 -> {
+                // Unexpected client error on a messages batch (e.g. malformed payload).
+                // Treat as transient: WM will retry, giving the server a chance to recover.
+                Log.e(
+                    TAG,
+                    "uploadMessages unexpected client error on batch $batchNum/$totalBatches: " +
+                        "${response.code()} ${response.message()}",
+                )
+                UploadResult.TransientError("HTTP ${response.code()}")
             }
             else -> {
                 Log.e(TAG, "uploadMessages server error on batch $batchNum/$totalBatches: ${response.code()}")
@@ -184,7 +194,7 @@ class Uploader(
         val numberBody = (linkedCall?.number ?: recording.parsedNumber ?: "").asTextPart()
         val dateMsBody = (linkedCall?.dateMs ?: recording.recordingTimeMs).toString().asTextPart()
         val durationSecBody = (linkedCall?.durationSec ?: 0L).toString().asTextPart()
-        val contactNameBody = "".asTextPart()
+        val contactNameBody = (recording.parsedContactName ?: "").asTextPart()
 
         val fileBody = file.asRequestBody(MEDIA_AUDIO)
         val filePart = MultipartBody.Part.createFormData("file", recording.filename, fileBody)
@@ -234,9 +244,21 @@ class Uploader(
                     }
                 }
             }
-            response.code() in 400..499 -> {
-                Log.e(TAG, "uploadRecording client error ${response.code()}: $filename")
+            response.code() == 401 || response.code() == 403 -> {
+                // True auth failure — credentials are wrong; user must intervene.
+                Log.e(TAG, "uploadRecording auth error ${response.code()}: $filename")
                 UploadResult.AuthError(response.code(), response.message())
+            }
+            response.code() in 400..499 -> {
+                // Per-file client error (bad request, 404, 413, etc.) — this recording
+                // is permanently invalid from the server's perspective. Mark it as handled
+                // so it is never retried, but do NOT abort the rest of the sync run.
+                Log.w(
+                    TAG,
+                    "uploadRecording per-file client error ${response.code()} — marking handled, continuing: $filename",
+                )
+                cursorStore.markRecordingSent(filename)
+                UploadResult.PerFileClientError(response.code(), filename)
             }
             else -> {
                 Log.e(TAG, "uploadRecording server error ${response.code()}: $filename")
@@ -281,8 +303,17 @@ sealed interface UploadResult {
     data class Success(val accepted: Int, val skipped: Int) : UploadResult
     data object NothingToSend : UploadResult
     data class Skipped(val reason: String) : UploadResult
-    /** 4xx — misconfigured credentials; do NOT retry without user action. */
+    /**
+     * 401 or 403 — credentials are wrong or expired; the user must reconfigure.
+     * The sync run should stop immediately and return [Result.failure()].
+     */
     data class AuthError(val code: Int, val message: String) : UploadResult
+    /**
+     * 4xx (non-auth) on a single recording file — the payload is permanently invalid
+     * for this file (e.g. missing number, oversized). The file has already been marked
+     * sent so it will not be retried. The overall sync run should CONTINUE to the next file.
+     */
+    data class PerFileClientError(val code: Int, val filename: String) : UploadResult
     /** 5xx / network error — transient; WorkManager should retry with backoff. */
     data class TransientError(val message: String) : UploadResult
 }

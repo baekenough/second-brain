@@ -2,37 +2,82 @@
 <resources>
     <string name="app_name">Second Brain Push</string>
 
-    <!-- Sections -->
-    <string name="section_server">Server</string>
-    <string name="section_sync">Sync Settings</string>
-    <string name="section_permissions">Permissions</string>
+    <!-- Bottom navigation -->
+    <string name="nav_dashboard">대시보드</string>
+    <string name="nav_settings">설정</string>
+
+    <!-- Dashboard -->
+    <string name="dashboard_title">Second Brain Push</string>
+    <string name="card_connection_title">연결 상태</string>
+    <string name="status_connected">연결됨</string>
+    <string name="status_needs_config">설정 필요</string>
+    <string name="card_last_sync_title">동기화</string>
+    <string name="last_sync_never">아직 동기화 안 됨</string>
+    <string name="last_sync_auto_interval">자동 동기화: %1$d분마다</string>
+    <string name="card_stats_title">업로드 현황</string>
+    <string name="stats_sms_label">SMS</string>
+    <string name="stats_calls_label">통화</string>
+    <string name="stats_recordings_label">녹음</string>
+    <string name="btn_sync_now">지금 동기화</string>
+
+    <!-- Background execution status card -->
+    <string name="card_background_title">백그라운드 실행</string>
+    <string name="bg_status_ok">백그라운드 자동 동기화 켜짐 · %1$d분마다</string>
+    <string name="bg_status_restricted">백그라운드가 제한될 수 있어요. 배터리 최적화를 해제하세요.</string>
+    <string name="btn_disable_battery_optimization">배터리 최적화 해제</string>
+    <string name="bg_samsung_hint">삼성 기기: 설정 > 배터리 > 백그라운드 사용 제한 에서 이 앱을 \'제한 안 함\'으로 두세요.</string>
+    <string name="sync_in_progress">동기화 중…</string>
+
+    <!-- Relative time -->
+    <string name="time_just_now">방금 전</string>
+    <string name="time_minutes_ago">%1$d분 전</string>
+    <string name="time_hours_ago">%1$d시간 전</string>
+
+    <!-- Settings sections -->
+    <string name="section_server">서버</string>
+    <string name="section_sync">동기화 설정</string>
+    <string name="section_recordings">녹음</string>
+    <string name="section_permissions">권한</string>
 
     <!-- Hints -->
-    <string name="hint_server_url">Server URL (e.g. https://your-tunnel.example.com)</string>
-    <string name="hint_api_token">API Bearer Token</string>
-    <string name="hint_sync_interval">Sync interval (hours, 1–24)</string>
+    <string name="hint_server_url">서버 URL (예: https://brain.example.com)</string>
+    <string name="hint_api_token">API Bearer 토큰</string>
+    <string name="hint_sync_interval">동기화 주기 (분, 최소 15)</string>
+    <string name="hint_recording_path">녹음 폴더 경로 (비우면 자동 감지)</string>
 
     <!-- Switches -->
-    <string name="label_audio_wifi_only">Upload recordings on Wi-Fi only</string>
-    <string name="label_audio_charging_only">Upload recordings while charging only</string>
+    <string name="label_audio_wifi_only">Wi-Fi에서만 녹음 업로드</string>
+    <string name="label_audio_charging_only">충전 중에만 녹음 업로드</string>
 
     <!-- Buttons -->
-    <string name="btn_save">Save Settings</string>
-    <string name="btn_sync_now">Sync Now</string>
-    <string name="btn_request_permissions">Grant Permissions</string>
+    <string name="btn_save">설정 저장</string>
+    <string name="btn_request_permissions">권한 허용</string>
 
     <!-- Permission labels -->
     <string name="permission_sms">READ_SMS</string>
     <string name="permission_call_log">READ_CALL_LOG</string>
     <string name="permission_audio">READ_MEDIA_AUDIO / READ_EXTERNAL_STORAGE</string>
-    <string name="permission_granted">✓ %1$s: Granted</string>
-    <string name="permission_denied">✗ %1$s: Not granted</string>
+    <string name="permission_granted">✓ %1$s: 허용됨</string>
+    <string name="permission_denied">✗ %1$s: 미허용</string>
+
+    <!-- Folder picker dialog -->
+    <string name="folder_picker_title">폴더 선택</string>
+    <string name="folder_picker_up">상위 폴더</string>
+    <string name="folder_picker_select">이 폴더 선택</string>
+    <string name="folder_picker_cancel">취소</string>
+    <string name="folder_picker_empty">하위 폴더 없음</string>
+    <string name="folder_picker_unreadable">폴더를 읽을 수 없습니다.</string>
+
+    <!-- Recording path picker (Settings screen) -->
+    <string name="recording_path_auto">자동 감지</string>
+    <string name="btn_browse_folder">폴더 선택</string>
+    <string name="btn_reset_path">자동 감지로 초기화</string>
 
     <!-- Toasts / messages -->
-    <string name="settings_saved">Settings saved.</string>
-    <string name="permissions_granted">All permissions granted!</string>
-    <string name="permissions_partial">Some permissions were denied. Sync may be incomplete.</string>
-    <string name="sync_success">Sync completed successfully.</string>
-    <string name="sync_failed">Sync failed. Check server URL and API token.</string>
-    <string name="error_not_configured">Please save a server URL and API token first.</string>
+    <string name="settings_saved">설정이 저장되었습니다.</string>
+    <string name="permissions_granted">모든 권한이 허용되었습니다!</string>
+    <string name="permissions_partial">일부 권한이 거부되었습니다. 동기화가 불완전할 수 있습니다.</string>
+    <string name="sync_success">동기화가 완료되었습니다.</string>
+    <string name="sync_failed">동기화에 실패했습니다. 서버 URL과 API 토큰을 확인하세요.</string>
+    <string name="error_not_configured">서버 URL과 API 토큰을 먼저 저장해 주세요.</string>
 </resources>

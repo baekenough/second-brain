@@ -180,6 +180,8 @@ All endpoints use the `/api/v1` prefix. The single exception is `/health`.
 | `GET` | `/api/v1/documents/{id}` | Single document detail |
 | `GET` | `/api/v1/documents/{id}/raw` | Raw file streaming (filesystem only, 50 MiB limit) |
 | `GET` | `/api/v1/sources` | Registered collector list |
+| `POST` | `/api/v1/ingest/messages` | Receive SMS + call-log JSON batch (Android app → server) |
+| `POST` | `/api/v1/ingest/recording` | Receive call recording `.m4a` multipart (Android app → server) |
 
 ---
 
@@ -372,6 +374,7 @@ Full list based on `internal/config/config.go`.
 | github | `GITHUB_TOKEN` + `GITHUB_ORG` set | Complete | ERROR then skip if unset |
 | gdrive (export) | `GDRIVE_CREDENTIALS_JSON` set | Scaffold only | Requires ADC; disabled by default |
 | notion | — | Removed | Deregistered from main.go |
+| mobile-push (SMS / calls / recordings) | Android app installed + server URL/token configured | Fully operational | Galaxy Z Flip6 live-tested. App: [`mobile/second-brain-push/`](mobile/second-brain-push/README.md) |
 
 ### File Extractors (`internal/collector/extractor/`)
 

@@ -8,20 +8,16 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.lifecycleScope
-import androidx.work.WorkInfo
-import androidx.work.WorkManager
 import com.baekenough.secondbrain.R
 import com.baekenough.secondbrain.databinding.ActivitySettingsBinding
 import com.baekenough.secondbrain.sync.SyncScheduler
-import com.baekenough.secondbrain.sync.SyncWorker
-import kotlinx.coroutines.launch
 
 /**
  * Single-screen settings + permission request UI.
  *
  * Responsibilities:
- *  - Display server URL, API token, sync interval, audio WiFi/charging toggles.
+ *  - Display server URL, API token, sync interval (in minutes), audio WiFi/charging toggles.
+ *  - Display and persist a manual recording path override (empty = auto-detect).
  *  - Request READ_SMS, READ_CALL_LOG, READ_MEDIA_AUDIO (or READ_EXTERNAL_STORAGE)
  *    at runtime before the first sync.
  *  - Show permission status indicators.
@@ -63,7 +59,8 @@ class SettingsActivity : AppCompatActivity() {
     private fun loadSettings() {
         binding.etServerUrl.setText(settings.getServerUrl())
         binding.etApiToken.setText(settings.getApiToken())
-        binding.etSyncInterval.setText(settings.getSyncIntervalHours().toString())
+        binding.etSyncInterval.setText(settings.getSyncIntervalMinutes().toString())
+        binding.etRecordingPath.setText(settings.getRecordingPathOverride())
         binding.switchAudioWifi.isChecked = settings.isAudioWifiOnly()
         binding.switchAudioCharging.isChecked = settings.isAudioChargingOnly()
     }
@@ -77,18 +74,21 @@ class SettingsActivity : AppCompatActivity() {
         binding.btnRequestPermissions.setOnClickListener {
             requestRequiredPermissions()
         }
-
-        binding.btnSyncNow.setOnClickListener {
-            triggerImmediateSync()
-        }
     }
 
     private fun saveSettings() {
         settings.saveServerUrl(binding.etServerUrl.text.toString())
         settings.saveApiToken(binding.etApiToken.text.toString())
-        val intervalHours = binding.etSyncInterval.text.toString().toLongOrNull()
-            ?: SettingsRepository.DEFAULT_SYNC_INTERVAL_HOURS
-        settings.saveSyncIntervalHours(intervalHours.coerceIn(1L, 24L))
+
+        val intervalMinutes = binding.etSyncInterval.text.toString().toLongOrNull()
+            ?: SettingsRepository.DEFAULT_SYNC_INTERVAL_MINUTES
+        // coerceIn also applied inside saveSyncIntervalMinutes, but being explicit here
+        // ensures the UI field reflects the clamped value after save if user enters < 15.
+        settings.saveSyncIntervalMinutes(
+            intervalMinutes.coerceIn(SyncScheduler.MIN_INTERVAL_MINUTES, SyncScheduler.MAX_INTERVAL_MINUTES)
+        )
+
+        settings.saveRecordingPathOverride(binding.etRecordingPath.text.toString())
         settings.saveAudioWifiOnly(binding.switchAudioWifi.isChecked)
         settings.saveAudioChargingOnly(binding.switchAudioCharging.isChecked)
     }
@@ -135,28 +135,4 @@ class SettingsActivity : AppCompatActivity() {
     private fun isGranted(permission: String): Boolean =
         ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
 
-    private fun triggerImmediateSync() {
-        if (!settings.isConfigured()) {
-            Toast.makeText(this, R.string.error_not_configured, Toast.LENGTH_LONG).show()
-            return
-        }
-
-        // Enqueue a one-time immediate work request using the same worker
-        val request = androidx.work.OneTimeWorkRequestBuilder<SyncWorker>().build()
-        WorkManager.getInstance(this).enqueue(request)
-
-        lifecycleScope.launch {
-            WorkManager.getInstance(this@SettingsActivity)
-                .getWorkInfoByIdFlow(request.id)
-                .collect { info ->
-                    when (info?.state) {
-                        WorkInfo.State.SUCCEEDED ->
-                            Toast.makeText(this@SettingsActivity, R.string.sync_success, Toast.LENGTH_SHORT).show()
-                        WorkInfo.State.FAILED ->
-                            Toast.makeText(this@SettingsActivity, R.string.sync_failed, Toast.LENGTH_LONG).show()
-                        else -> Unit
-                    }
-                }
-        }
-    }
 }

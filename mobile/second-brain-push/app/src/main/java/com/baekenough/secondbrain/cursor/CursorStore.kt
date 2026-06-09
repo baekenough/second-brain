@@ -42,8 +42,11 @@ class CursorStore(private val context: Context) {
         private val KEY_LAST_CALL_DATE = longPreferencesKey("last_call_date")
         private val KEY_SENT_RECORDINGS = stringSetPreferencesKey("sent_recordings")
 
-        // Stored recording path detected by PathDetector
+        // Stored recording path detected by PathDetector (legacy single-path key — kept for migration)
         private val KEY_RECORDING_DIR = androidx.datastore.preferences.core.stringPreferencesKey("recording_dir")
+
+        // Multi-dir cache: pipe-separated list of absolute paths detected by PathDetector
+        private val KEY_RECORDING_DIRS = androidx.datastore.preferences.core.stringPreferencesKey("recording_dirs")
     }
 
     private val dataStore get() = context.syncDataStore
@@ -87,18 +90,53 @@ class CursorStore(private val context: Context) {
         }
     }
 
-    // ── Recording dir cache ────────────────────────────────────────────────
+    // ── Recording dir cache (multi-dir) ───────────────────────────────────
 
-    suspend fun getCachedRecordingDir(): String? =
-        dataStore.data.map { it[KEY_RECORDING_DIR] }.first()
-
-    suspend fun setCachedRecordingDir(path: String) {
-        dataStore.edit { it[KEY_RECORDING_DIR] = path }
+    /**
+     * Returns the list of cached recording directories, or empty list if none cached.
+     * Migrates legacy single-path [KEY_RECORDING_DIR] on first read.
+     */
+    suspend fun getCachedRecordingDirs(): List<String> {
+        val prefs = dataStore.data.first()
+        // Check new multi-dir key first
+        val multi = prefs[KEY_RECORDING_DIRS]
+        if (multi != null) {
+            return multi.split("|").filter { it.isNotBlank() }
+        }
+        // Migrate legacy single-path key
+        val legacy = prefs[KEY_RECORDING_DIR]
+        if (legacy != null && legacy.isNotBlank()) {
+            // Write it to the new key and clear the old one
+            dataStore.edit { p ->
+                p[KEY_RECORDING_DIRS] = legacy
+                p.remove(KEY_RECORDING_DIR)
+            }
+            return listOf(legacy)
+        }
+        return emptyList()
     }
 
-    suspend fun clearCachedRecordingDir() {
-        dataStore.edit { it.remove(KEY_RECORDING_DIR) }
+    suspend fun setCachedRecordingDirs(paths: List<String>) {
+        dataStore.edit { it[KEY_RECORDING_DIRS] = paths.joinToString("|") }
     }
+
+    suspend fun clearCachedRecordingDirs() {
+        dataStore.edit { prefs ->
+            prefs.remove(KEY_RECORDING_DIRS)
+            prefs.remove(KEY_RECORDING_DIR) // also clear legacy key if present
+        }
+    }
+
+    // ── Legacy single-dir accessors (kept for callers not yet migrated) ────
+
+    /** @deprecated Use [getCachedRecordingDirs]. Will be removed in a future version. */
+    suspend fun getCachedRecordingDir(): String? = getCachedRecordingDirs().firstOrNull()
+
+    /** @deprecated Use [setCachedRecordingDirs]. */
+    suspend fun setCachedRecordingDir(path: String) = setCachedRecordingDirs(listOf(path))
+
+    /** @deprecated Use [clearCachedRecordingDirs]. */
+    suspend fun clearCachedRecordingDir() = clearCachedRecordingDirs()
 }
 
 /**

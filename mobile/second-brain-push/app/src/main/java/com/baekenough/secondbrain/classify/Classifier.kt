@@ -43,6 +43,8 @@ data class ClassifiedRecording(
     val filePath: String,
     val recordingTimeMs: Long,
     val parsedNumber: String?,
+    /** Contact name parsed from the filename (leading `#` stripped). Null when absent. */
+    val parsedContactName: String? = null,
     /** Linked call metadata when a matching call-log entry was found (±60 s window). */
     val linkedCall: ClassifiedCall?,
 )
@@ -119,19 +121,28 @@ object Classifier {
     /**
      * Parses the recording [filename] and returns epoch ms of the recording moment.
      *
-     * Supported patterns (One UI → Korean timezone KST = UTC+9):
-     *   One UI call app : `+821012345678_20260601143022.m4a`
-     *   Samsung Voice Recorder (Mediweil): `메디웨일_260601_143022.m4a`
+     * Supported patterns (One UI / TPhone → Korean timezone KST = UTC+9):
+     *   TPhone / One UI call app (with contact name):
+     *     `수아리즈박한이01_01026042673_20260531053052.m4a`
+     *     `#오피스부동산_01092194194_20260319161814.m4a`
+     *   TPhone / One UI call app (no contact name):
+     *     `+821012345678_20260601143022.m4a`
+     *     `00631657726916_20260108115303.m4a`
+     *   Samsung Voice Recorder (Mediweil):
+     *     `메디웨일_260601_143022.m4a`
      *
      * Returns null when the filename doesn't match either pattern.
      */
     fun parseRecordingTimestamp(filename: String): Long? {
-        PATTERN_ONEUI.matcher(filename).let { m ->
-            if (m.matches()) {
-                val ts = m.group(2) ?: return null
-                return parseFull14(ts)
+        // TPhone / One UI: last segment is _YYYYMMDDHHMMSS (14 digits)
+        val base = filename.removeSuffix(".m4a")
+        if (base != filename) {
+            val lastSeg = base.substringAfterLast("_", "")
+            if (lastSeg.length == 14 && lastSeg.all { it.isDigit() }) {
+                return parseFull14(lastSeg)
             }
         }
+        // Mediweil 6-digit short date
         PATTERN_MEDIWEIL.matcher(filename).let { m ->
             if (m.matches()) {
                 val date6 = m.group(1) ?: return null
@@ -143,12 +154,22 @@ object Classifier {
     }
 
     /**
-     * Parses the phone number from a One UI recording filename.
+     * Parses the phone number from a TPhone / One UI recording filename.
+     *
+     * The phone number is the segment immediately before the 14-digit timestamp,
+     * regardless of how many name segments precede it.
+     *
      * Returns null for Voice Recorder (메디웨일) pattern or unrecognised patterns.
      */
     fun parseRecordingNumber(filename: String): String? {
-        val m = PATTERN_ONEUI.matcher(filename)
-        return if (m.matches()) m.group(1)?.normalizePhone() else null
+        val base = filename.removeSuffix(".m4a")
+        if (base == filename) return null // not .m4a
+        val segments = base.split("_")
+        if (segments.size < 2) return null
+        val tsRaw = segments.last()
+        if (tsRaw.length != 14 || !tsRaw.all { it.isDigit() }) return null
+        val numberRaw = segments[segments.size - 2]
+        return if (numberRaw.isBlank()) null else numberRaw.normalizePhone()
     }
 
     /**
@@ -163,8 +184,14 @@ object Classifier {
         calls: List<ClassifiedCall>,
         windowMs: Long = 60_000L,
     ): ClassifiedCall? {
-        val recTimeMs = parseRecordingTimestamp(recording.filename) ?: return null
-        val recNumber = parseRecordingNumber(recording.filename)
+        // Prefer pre-parsed fields from RecordingScanner when available,
+        // fall back to re-parsing (e.g. for Mediweil files passed through).
+        val recTimeMs = when {
+            recording.recordingTimeMs > 0L -> recording.recordingTimeMs
+            else -> parseRecordingTimestamp(recording.filename) ?: return null
+        }
+        val recNumber = recording.parsedNumber?.normalizePhone()
+            ?: parseRecordingNumber(recording.filename)
 
         return calls
             .filter { call ->
@@ -179,23 +206,24 @@ object Classifier {
         raw: RawRecording,
         allCalls: List<ClassifiedCall>,
     ): ClassifiedRecording {
-        val tsMs = parseRecordingTimestamp(raw.filename)
-            ?: raw.lastModifiedMs // fallback to file mtime
+        // Use pre-parsed timestamp when available (RecordingScanner guarantees KST epoch).
+        val tsMs = when {
+            raw.recordingTimeMs > 0L -> raw.recordingTimeMs
+            else -> parseRecordingTimestamp(raw.filename) ?: raw.lastModifiedMs
+        }
+        val number = raw.parsedNumber?.normalizePhone() ?: parseRecordingNumber(raw.filename)
         val linked = linkRecordingToCall(raw, allCalls)
         return ClassifiedRecording(
             filename = raw.filename,
             filePath = raw.filePath,
             recordingTimeMs = tsMs,
-            parsedNumber = parseRecordingNumber(raw.filename),
+            parsedNumber = number,
+            parsedContactName = raw.parsedContactName,
             linkedCall = linked,
         )
     }
 
     // ── Private helpers ───────────────────────────────────────────────────
-
-    // One UI: +821012345678_20260601143022.m4a  (number may have + prefix)
-    private val PATTERN_ONEUI: Pattern =
-        Pattern.compile("""^(\+?\d{7,15})_(\d{14})\.m4a$""")
 
     // Voice Recorder (Mediweil): 메디웨일_260601_143022.m4a
     private val PATTERN_MEDIWEIL: Pattern =

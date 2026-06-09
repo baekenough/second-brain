@@ -29,4 +29,23 @@ data class RawRecording(
     /** File last-modified epoch ms — used as fallback timestamp when filename parsing fails. */
     val lastModifiedMs: Long,
     val sizeBytes: Long,
+    /**
+     * Phone number parsed from the filename (e.g. `01026042673` from
+     * `수아리즈박한이01_01026042673_20260531053052.m4a`). Null when the filename
+     * does not match any known pattern. RecordingScanner SKIPS files where this
+     * and [recordingTimeMs] cannot be determined, so callers can treat null as
+     * "unknown" rather than "invalid".
+     */
+    val parsedNumber: String? = null,
+    /**
+     * Epoch milliseconds parsed from the filename timestamp segment (KST).
+     * 0L when not parsed (only for files that passed the scanner's skip-guard,
+     * i.e. Mediweil files whose 6-digit date is ambiguous).
+     */
+    val recordingTimeMs: Long = 0L,
+    /**
+     * Contact name parsed from the filename before the phone-number segment, with
+     * any leading `#` stripped. Null when no name segment is present.
+     */
+    val parsedContactName: String? = null,
 )

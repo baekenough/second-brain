@@ -2,19 +2,24 @@ package com.baekenough.secondbrain.sync
 
 import com.baekenough.secondbrain.classify.CallType
 import com.baekenough.secondbrain.classify.ClassifiedCall
+import com.baekenough.secondbrain.classify.ClassifiedRecording
 import com.baekenough.secondbrain.classify.ClassifiedSms
 import com.baekenough.secondbrain.classify.SmsDirection
 import com.baekenough.secondbrain.cursor.CursorStore
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.mockk
-
+import io.mockk.slot
 import kotlinx.coroutines.runBlocking
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
+import java.io.File
 
 /**
  * Unit tests for [Uploader] batching logic.
@@ -179,6 +184,134 @@ class UploaderBatchTest {
         coVerify(exactly = 0) { api.postMessages(any()) }
     }
 
+    @Test
+    fun `uploadMessages treats 400 as TransientError (not AuthError)`() = runBlocking {
+        val smsList = makeSms(2)
+        val api = mockk<ApiService>()
+        val cursorStore = mockk<CursorStore>(relaxed = true)
+        val uploader = Uploader(api, cursorStore)
+
+        coEvery { api.postMessages(any()) } returns okHttpErrorResponse(400)
+
+        val result = uploader.uploadMessages(smsList, emptyList())
+
+        assertTrue("expected TransientError, got $result", result is UploadResult.TransientError)
+        coVerify(exactly = 0) { cursorStore.advanceSms(any(), any()) }
+    }
+
+    @Test
+    fun `uploadMessages returns AuthError on 401`() = runBlocking {
+        val smsList = makeSms(2)
+        val api = mockk<ApiService>()
+        val cursorStore = mockk<CursorStore>(relaxed = true)
+        val uploader = Uploader(api, cursorStore)
+
+        coEvery { api.postMessages(any()) } returns okHttpErrorResponse(401)
+
+        val result = uploader.uploadMessages(smsList, emptyList())
+
+        assertTrue("expected AuthError, got $result", result is UploadResult.AuthError)
+    }
+
+    @Test
+    fun `uploadMessages returns AuthError on 403`() = runBlocking {
+        val smsList = makeSms(2)
+        val api = mockk<ApiService>()
+        val cursorStore = mockk<CursorStore>(relaxed = true)
+        val uploader = Uploader(api, cursorStore)
+
+        coEvery { api.postMessages(any()) } returns okHttpErrorResponse(403)
+
+        val result = uploader.uploadMessages(smsList, emptyList())
+
+        assertTrue("expected AuthError, got $result", result is UploadResult.AuthError)
+    }
+
+    // ── uploadRecording error handling ────────────────────────────────────
+
+    @get:Rule
+    val tmpFolder = TemporaryFolder()
+
+    @Test
+    fun `uploadRecording returns PerFileClientError on 400 and marks file sent`() = runBlocking {
+        val api = mockk<ApiService>()
+        val cursorStore = mockk<CursorStore>(relaxed = true)
+        val uploader = Uploader(api, cursorStore)
+
+        val file = tmpFolder.newFile("수아리즈박한이01_01026042673_20260531053052.m4a")
+        file.writeBytes(ByteArray(100))
+        val recording = makeRecording(file)
+
+        coEvery { api.postRecording(any(), any(), any(), any(), any()) } returns
+            okHttpRecordingError(400)
+
+        val result = uploader.uploadRecording(recording)
+
+        assertTrue("expected PerFileClientError, got $result", result is UploadResult.PerFileClientError)
+        val err = result as UploadResult.PerFileClientError
+        assertEquals(400, err.code)
+        assertEquals(file.name, err.filename)
+        // Must be marked sent so it is never retried
+        coVerify(exactly = 1) { cursorStore.markRecordingSent(file.name) }
+    }
+
+    @Test
+    fun `uploadRecording returns AuthError on 401 and does NOT mark file sent`() = runBlocking {
+        val api = mockk<ApiService>()
+        val cursorStore = mockk<CursorStore>(relaxed = true)
+        val uploader = Uploader(api, cursorStore)
+
+        val file = tmpFolder.newFile("+821012345678_20260601143022.m4a")
+        file.writeBytes(ByteArray(100))
+        val recording = makeRecording(file)
+
+        coEvery { api.postRecording(any(), any(), any(), any(), any()) } returns
+            okHttpRecordingError(401)
+
+        val result = uploader.uploadRecording(recording)
+
+        assertTrue("expected AuthError, got $result", result is UploadResult.AuthError)
+        coVerify(exactly = 0) { cursorStore.markRecordingSent(any()) }
+    }
+
+    @Test
+    fun `uploadRecording returns AuthError on 403 and does NOT mark file sent`() = runBlocking {
+        val api = mockk<ApiService>()
+        val cursorStore = mockk<CursorStore>(relaxed = true)
+        val uploader = Uploader(api, cursorStore)
+
+        val file = tmpFolder.newFile("+821099887766_20260602090000.m4a")
+        file.writeBytes(ByteArray(100))
+        val recording = makeRecording(file)
+
+        coEvery { api.postRecording(any(), any(), any(), any(), any()) } returns
+            okHttpRecordingError(403)
+
+        val result = uploader.uploadRecording(recording)
+
+        assertTrue("expected AuthError, got $result", result is UploadResult.AuthError)
+        coVerify(exactly = 0) { cursorStore.markRecordingSent(any()) }
+    }
+
+    @Test
+    fun `uploadRecording returns PerFileClientError on 413 (payload too large)`() = runBlocking {
+        val api = mockk<ApiService>()
+        val cursorStore = mockk<CursorStore>(relaxed = true)
+        val uploader = Uploader(api, cursorStore)
+
+        val file = tmpFolder.newFile("+821012345678_20260601143022.m4a")
+        file.writeBytes(ByteArray(100))
+        val recording = makeRecording(file)
+
+        coEvery { api.postRecording(any(), any(), any(), any(), any()) } returns
+            okHttpRecordingError(413)
+
+        val result = uploader.uploadRecording(recording)
+
+        assertTrue("expected PerFileClientError, got $result", result is UploadResult.PerFileClientError)
+        coVerify(exactly = 1) { cursorStore.markRecordingSent(file.name) }
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────────
 
     private fun makeUploader(
@@ -216,5 +349,21 @@ class UploaderBatchTest {
         retrofit2.Response.error(
             code,
             """{"error":"test"}""".toResponseBody("application/json".toMediaType()),
+        )
+
+    private fun okHttpRecordingError(code: Int): retrofit2.Response<RecordingResponse> =
+        retrofit2.Response.error(
+            code,
+            """{"error":"test"}""".toResponseBody("application/json".toMediaType()),
+        )
+
+    private fun makeRecording(file: File): ClassifiedRecording =
+        ClassifiedRecording(
+            filename = file.name,
+            filePath = file.absolutePath,
+            recordingTimeMs = 1780291822000L, // 2026-06-01T14:30:22 KST
+            parsedNumber = "+821012345678",
+            parsedContactName = null,
+            linkedCall = null,
         )
 }

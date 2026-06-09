@@ -181,6 +181,8 @@ second-brain/
 | `GET` | `/api/v1/documents/{id}` | 단일 문서 상세 조회 |
 | `GET` | `/api/v1/documents/{id}/raw` | 원본 파일 스트리밍 (filesystem 전용, 50 MiB 제한) |
 | `GET` | `/api/v1/sources` | 등록된 수집기 목록 |
+| `POST` | `/api/v1/ingest/messages` | SMS·통화 기록 JSON 배치 수신 (Android 앱 → 서버) |
+| `POST` | `/api/v1/ingest/recording` | 통화 녹음 `.m4a` multipart 수신 (Android 앱 → 서버) |
 
 ---
 
@@ -373,6 +375,7 @@ curl http://localhost:8080/api/v1/sources
 | github | `GITHUB_TOKEN` + `GITHUB_ORG` 설정 | 구현 완료 | 미설정 시 ERROR 후 skip |
 | gdrive (export) | `GDRIVE_CREDENTIALS_JSON` 설정 | 스캐폴드 | ADC 필요, 기본 disabled |
 | notion | — | 제거됨 | main.go 등록 해제 |
+| mobile-push (SMS·통화·녹음) | Android 앱 설치 + 서버 URL/토큰 설정 | 완전 동작 | Galaxy Z Flip6 실기 검증. 앱: [`mobile/second-brain-push/`](mobile/second-brain-push/README.md) |
 
 ### 파일 추출기 (`internal/collector/extractor/`)
 

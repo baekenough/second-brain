@@ -54,3 +54,5 @@ node_modules/
 # TypeScript build info
 web/tsconfig.tsbuildinfo
 .omx/
+
+temp/

@@ -11,6 +11,8 @@ import com.baekenough.secondbrain.reader.CallLogReader
 import com.baekenough.secondbrain.reader.RecordingScanner
 import com.baekenough.secondbrain.reader.SmsReader
 import com.baekenough.secondbrain.ui.SettingsRepository
+import com.baekenough.secondbrain.ui.StatsRepository
+import com.baekenough.secondbrain.util.NetworkState
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import okhttp3.MediaType.Companion.toMediaType
 import java.util.concurrent.TimeUnit
@@ -49,16 +51,21 @@ class SyncWorker(
 
     override suspend fun doWork(): Result {
         Log.i(TAG, "Starting sync run (attempt ${runAttemptCount + 1})")
+        val statsRepo = StatsRepository(applicationContext)
         return try {
-            doWorkInternal()
+            val result = doWorkInternal(statsRepo)
+            val ok = result == Result.success()
+            statsRepo.recordSyncCompleted(ok)
+            result
         } catch (t: Throwable) {
             Log.e(TAG, "sync failed with uncaught exception", t)
+            statsRepo.recordSyncCompleted(false)
             Result.retry()
         }
     }
 
     @Suppress("ReturnCount")
-    private suspend fun doWorkInternal(): Result {
+    private suspend fun doWorkInternal(statsRepo: StatsRepository): Result {
         // ── Stage: settings ────────────────────────────────────────────────
         Log.d(TAG, "stage=settings")
         val settings = SettingsRepository(applicationContext)
@@ -105,12 +112,38 @@ class SyncWorker(
             return Result.retry()
         }
 
+        // ── Stage: stats (messages) ────────────────────────────────────────
+        if (msgResult is UploadResult.Success) {
+            // Attribute accepted counts to SMS vs calls proportionally
+            val totalClassified = classifiedSms.size + classifiedCalls.size
+            if (totalClassified > 0 && msgResult.accepted > 0) {
+                val smsAccepted = (msgResult.accepted * classifiedSms.size.toLong() / totalClassified).toInt()
+                val callsAccepted = msgResult.accepted - smsAccepted
+                statsRepo.incrementSmsUploaded(smsAccepted)
+                statsRepo.incrementCallsUploaded(callsAccepted)
+            }
+        }
+
+        // ── Stage: recordings gate ─────────────────────────────────────────
+        // These checks apply ONLY to recording (audio) uploads.
+        // Message uploads (SMS/calls) already completed above and are never gated.
+        Log.d(TAG, "stage=recording_gate")
+        if (settings.isAudioWifiOnly() && !NetworkState.isUnmetered(applicationContext)) {
+            Log.i(TAG, "Wi-Fi only: skipping recording upload on metered network")
+            return Result.success()
+        }
+        if (settings.isAudioChargingOnly() && !NetworkState.isCharging(applicationContext)) {
+            Log.i(TAG, "Charging only: skipping recording upload while on battery")
+            return Result.success()
+        }
+
         // ── Stage: recordings ──────────────────────────────────────────────
         Log.d(TAG, "stage=recordings")
-        val pathDetector = PathDetector(cursorStore)
-        val recordingDir = pathDetector.detect()
+        val recordingPathOverride = settings.getRecordingPathOverride()
+        val pathDetector = PathDetector(cursorStore, recordingPathOverride)
+        val recordingDirs = pathDetector.detectAll()
 
-        if (recordingDir == null) {
+        if (recordingDirs.isEmpty()) {
             Log.d(TAG, "No recording directory detected — skipping audio upload")
             return Result.success()
         }
@@ -118,8 +151,8 @@ class SyncWorker(
         // ── Stage: recording_scan ──────────────────────────────────────────
         Log.d(TAG, "stage=recording_scan")
         val scanner = RecordingScanner()
-        val newRecordings = scanner.scanNew(recordingDir, cursor)
-        Log.d(TAG, "Recordings: ${newRecordings.size} new files found in ${recordingDir.path}")
+        val newRecordings = scanner.scanAllNew(recordingDirs, cursor)
+        Log.d(TAG, "Recordings: ${newRecordings.size} new files found across ${recordingDirs.map { it.path }}")
 
         // Refresh cursor after message upload may have advanced it
         val freshCursor = cursorStore.snapshot()
@@ -136,11 +169,20 @@ class SyncWorker(
                     Log.e(TAG, "Auth error on recording — aborting audio uploads")
                     return Result.failure()
                 }
+                is UploadResult.PerFileClientError -> {
+                    // This specific file is permanently bad (e.g. server 400). It has already
+                    // been marked sent inside Uploader so it will not be retried. Continue
+                    // uploading the remaining recordings — do NOT abort or retry the whole run.
+                    Log.w(TAG, "Per-file client error ${recResult.code} on ${recResult.filename} — skipping, continuing")
+                }
                 is UploadResult.TransientError -> {
                     Log.w(TAG, "Transient recording error — will retry next wake")
                     // Don't fail the whole run; partial progress is fine.
                     // The recording cursor (sentRecordings set) was NOT advanced for this file.
                     break
+                }
+                is UploadResult.Success -> {
+                    if (recResult.accepted > 0) statsRepo.incrementRecordingsUploaded(1)
                 }
                 else -> Unit
             }

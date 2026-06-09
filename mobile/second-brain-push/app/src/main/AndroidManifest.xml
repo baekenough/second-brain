@@ -28,6 +28,11 @@
     <!-- Reschedule WorkManager after device reboot -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
+    <!-- Battery-optimization exemption: keeps WorkManager periodic work alive on Samsung One UI.
+         Required for ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS intent.
+         Google Play policy: permitted for apps with legitimate background-sync needs. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <application
         android:name=".SecondBrainApp"
         android:allowBackup="false"
@@ -37,15 +42,20 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.SecondBrainPush">
 
-        <!-- Main entry point — settings + permission request -->
+        <!-- Launcher: dashboard-first MainActivity -->
         <activity
-            android:name=".ui.SettingsActivity"
+            android:name=".ui.MainActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- SettingsActivity kept for backward compatibility; no longer the launcher -->
+        <activity
+            android:name=".ui.SettingsActivity"
+            android:exported="false" />
 
         <!-- WorkManager initializer (use default initializer; no custom provider needed) -->
 
