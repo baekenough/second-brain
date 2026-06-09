@@ -50,6 +50,8 @@ services:
       - "8081:8080"
     env_file:
       - .env.local
+    volumes:
+      - ${HOME}/.second-brain/stage/call:/data/call
     depends_on:
       postgres:
         condition: service_healthy
