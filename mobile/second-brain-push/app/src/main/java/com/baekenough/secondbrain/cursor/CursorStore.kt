@@ -11,6 +11,11 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import java.time.Instant
 
+// Top-level property delegate — MUST be file-scoped so exactly ONE DataStore instance
+// is created per process for this file. Declaring it inside a class would create a new
+// DataStore on every instantiation and trigger IllegalStateException at runtime.
+private val Context.syncDataStore: DataStore<Preferences> by preferencesDataStore(name = "sync_cursor")
+
 /**
  * Persistent cursor markers stored via Jetpack DataStore (Preferences).
  *
@@ -41,7 +46,6 @@ class CursorStore(private val context: Context) {
         private val KEY_RECORDING_DIR = androidx.datastore.preferences.core.stringPreferencesKey("recording_dir")
     }
 
-    private val Context.syncDataStore: DataStore<Preferences> by preferencesDataStore(name = "sync_cursor")
     private val dataStore get() = context.syncDataStore
 
     // ── Snapshot read (for a single sync run) ──────────────────────────────

@@ -34,14 +34,23 @@ class Uploader(
         private const val TAG = "Uploader"
         private val MEDIA_TEXT = "text/plain".toMediaType()
         private val MEDIA_AUDIO = "audio/mp4".toMediaType()
+
+        /** Maximum number of SMS + call records to send in a single HTTP request. */
+        internal const val BATCH_SIZE = 300
     }
 
     /**
-     * Uploads a batch of SMS + call-log entries.
+     * Uploads SMS + call-log entries in sequential batches of [BATCH_SIZE].
      *
-     * On HTTP 2xx: advances the SMS and call cursors to the last entry in the batch.
-     * On HTTP 4xx: returns [UploadResult.AuthError] — no retry (wrong credentials).
-     * On HTTP 5xx or network error: returns [UploadResult.TransientError] — WorkManager retries.
+     * Batching strategy: the combined list of (SMS ++ calls), ordered by dateMs, is split
+     * into chunks of [BATCH_SIZE]. SMS and calls in the same chunk are sent together so the
+     * server can correlate them. The cursor is advanced per-batch after each 2xx, so a
+     * transient failure mid-way leaves the cursor at the last successfully sent batch —
+     * WorkManager retry resumes from there rather than re-sending everything.
+     *
+     * On HTTP 2xx (per batch): advances SMS/call cursors to the last record in that batch.
+     * On HTTP 4xx (any batch): returns [UploadResult.AuthError] immediately — no retry.
+     * On HTTP 5xx / network error: stops at the failing batch and returns [UploadResult.TransientError].
      */
     suspend fun uploadMessages(
         smsList: List<ClassifiedSms>,
@@ -52,45 +61,106 @@ class Uploader(
             return UploadResult.NothingToSend
         }
 
-        val request = MessagesRequest(
-            sms = smsList.map { it.toPayload() },
-            calls = callList.map { it.toPayload() },
-        )
+        // Build ordered interleaved batches: sort combined by dateMs so each chunk is a
+        // contiguous time slice. SMS and calls are kept in separate lists per-batch to
+        // preserve the MessagesRequest schema and SourceID semantics.
+        val batches = buildBatches(smsList, callList)
+        val totalBatches = batches.size
+        Log.i(TAG, "uploadMessages: ${smsList.size} sms + ${callList.size} calls → $totalBatches batch(es)")
 
-        return try {
-            val response = api.postMessages(request)
-            handleMessagesResponse(response, smsList, callList)
-        } catch (e: Exception) {
-            Log.e(TAG, "uploadMessages network error", e)
-            UploadResult.TransientError(e.message ?: "network error")
+        var totalAccepted = 0
+        var totalSkipped = 0
+
+        for ((batchIndex, batch) in batches.withIndex()) {
+            val batchNum = batchIndex + 1
+            val (batchSms, batchCalls) = batch
+            val request = MessagesRequest(
+                sms = batchSms.map { it.toPayload() },
+                calls = batchCalls.map { it.toPayload() },
+            )
+
+            val result = try {
+                val response = api.postMessages(request)
+                handleMessagesResponse(response, batchSms, batchCalls, batchNum, totalBatches)
+            } catch (e: Exception) {
+                Log.e(TAG, "uploadMessages batch $batchNum/$totalBatches network error", e)
+                UploadResult.TransientError(e.message ?: "network error")
+            }
+
+            when (result) {
+                is UploadResult.Success -> {
+                    totalAccepted += result.accepted
+                    totalSkipped += result.skipped
+                    // Cursor already advanced inside handleMessagesResponse for this batch.
+                }
+                is UploadResult.AuthError -> return result   // permanent — stop immediately
+                is UploadResult.TransientError -> return result  // stop; WM retries from cursor
+                else -> Unit
+            }
+        }
+
+        return UploadResult.Success(totalAccepted, totalSkipped)
+    }
+
+    /**
+     * Splits [smsList] and [callList] into sequential batches of at most [BATCH_SIZE] records
+     * combined. Records are interleaved by dateMs so each batch is a contiguous time window.
+     *
+     * Returns a list of (smsBatch, callsBatch) pairs.
+     */
+    internal fun buildBatches(
+        smsList: List<ClassifiedSms>,
+        callList: List<ClassifiedCall>,
+    ): List<Pair<List<ClassifiedSms>, List<ClassifiedCall>>> {
+        // Tag each record with its source list, sort by dateMs, then chunk.
+        data class Tagged(val dateMs: Long, val sms: ClassifiedSms?, val call: ClassifiedCall?)
+
+        val combined = smsList.map { Tagged(it.dateMs, it, null) } +
+            callList.map { Tagged(it.dateMs, null, it) }
+        val sorted = combined.sortedBy { it.dateMs }
+        val chunks = sorted.chunked(BATCH_SIZE)
+
+        return chunks.map { chunk ->
+            val chunkSms = chunk.mapNotNull { it.sms }
+            val chunkCalls = chunk.mapNotNull { it.call }
+            chunkSms to chunkCalls
         }
     }
 
     private suspend fun handleMessagesResponse(
         response: Response<MessagesResponse>,
-        smsList: List<ClassifiedSms>,
-        callList: List<ClassifiedCall>,
+        smsBatch: List<ClassifiedSms>,
+        callBatch: List<ClassifiedCall>,
+        batchNum: Int,
+        totalBatches: Int,
     ): UploadResult {
         return when {
             response.isSuccessful -> {
                 val body = response.body()
-                Log.i(TAG, "uploadMessages success: accepted=${body?.accepted} skipped=${body?.skipped}")
+                Log.i(
+                    TAG,
+                    "messages batch $batchNum/$totalBatches: accepted=${body?.accepted} skipped=${body?.skipped}",
+                )
 
-                // Advance cursors — ONLY on 2xx confirmation
-                smsList.lastOrNull()?.let { last ->
+                // Advance cursors — ONLY on 2xx, only for this batch's last record
+                smsBatch.lastOrNull()?.let { last ->
                     cursorStore.advanceSms(last.id, last.dateMs)
                 }
-                callList.lastOrNull()?.let { last ->
+                callBatch.lastOrNull()?.let { last ->
                     cursorStore.advanceCall(last.id, last.dateMs)
                 }
                 UploadResult.Success(body?.accepted ?: 0, body?.skipped ?: 0)
             }
             response.code() in 400..499 -> {
-                Log.e(TAG, "uploadMessages auth/client error: ${response.code()} ${response.message()}")
+                Log.e(
+                    TAG,
+                    "uploadMessages auth/client error on batch $batchNum/$totalBatches: " +
+                        "${response.code()} ${response.message()}",
+                )
                 UploadResult.AuthError(response.code(), response.message())
             }
             else -> {
-                Log.e(TAG, "uploadMessages server error: ${response.code()}")
+                Log.e(TAG, "uploadMessages server error on batch $batchNum/$totalBatches: ${response.code()}")
                 UploadResult.TransientError("HTTP ${response.code()}")
             }
         }

@@ -13,6 +13,7 @@ import com.baekenough.secondbrain.reader.SmsReader
 import com.baekenough.secondbrain.ui.SettingsRepository
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import okhttp3.MediaType.Companion.toMediaType
+import java.util.concurrent.TimeUnit
 
 /**
  * Background sync worker — the sole wake for all three data sources.
@@ -48,7 +49,18 @@ class SyncWorker(
 
     override suspend fun doWork(): Result {
         Log.i(TAG, "Starting sync run (attempt ${runAttemptCount + 1})")
+        return try {
+            doWorkInternal()
+        } catch (t: Throwable) {
+            Log.e(TAG, "sync failed with uncaught exception", t)
+            Result.retry()
+        }
+    }
 
+    @Suppress("ReturnCount")
+    private suspend fun doWorkInternal(): Result {
+        // ── Stage: settings ────────────────────────────────────────────────
+        Log.d(TAG, "stage=settings")
         val settings = SettingsRepository(applicationContext)
         val serverUrl = settings.getServerUrl()
         val apiToken = settings.getApiToken()
@@ -59,22 +71,27 @@ class SyncWorker(
             return Result.success()
         }
 
+        // ── Stage: cursor ──────────────────────────────────────────────────
+        Log.d(TAG, "stage=cursor")
         val cursorStore = CursorStore(applicationContext)
         val cursor = cursorStore.snapshot()
 
-        // ── 1. Read SMS ────────────────────────────────────────────────────
+        // ── Stage: sms_read ────────────────────────────────────────────────
+        Log.d(TAG, "stage=sms_read")
         val smsReader = SmsReader(applicationContext.contentResolver)
         val rawSms = smsReader.readSince(cursor)
         val classifiedSms = rawSms.mapNotNull { Classifier.classifySms(it) }
-        Log.d(TAG, "SMS: ${rawSms.size} raw → ${classifiedSms.size} classified")
+        Log.i(TAG, "SMS: ${rawSms.size} raw → ${classifiedSms.size} classified")
 
-        // ── 2. Read call log ───────────────────────────────────────────────
+        // ── Stage: call_read ───────────────────────────────────────────────
+        Log.d(TAG, "stage=call_read")
         val callReader = CallLogReader(applicationContext.contentResolver)
         val rawCalls = callReader.readSince(cursor)
         val classifiedCalls = rawCalls.map { Classifier.classifyCall(it) }
-        Log.d(TAG, "Calls: ${rawCalls.size} raw → ${classifiedCalls.size} classified")
+        Log.i(TAG, "Calls: ${rawCalls.size} raw → ${classifiedCalls.size} classified")
 
-        // ── 3. Upload messages batch (cellular allowed) ────────────────────
+        // ── Stage: upload ──────────────────────────────────────────────────
+        Log.d(TAG, "stage=upload")
         val uploader = buildUploader(serverUrl, apiToken, cursorStore)
         val msgResult = uploader.uploadMessages(classifiedSms, classifiedCalls)
         Log.i(TAG, "Messages upload result: $msgResult")
@@ -88,7 +105,8 @@ class SyncWorker(
             return Result.retry()
         }
 
-        // ── 4. Detect recording directory (MUST 2) ────────────────────────
+        // ── Stage: recordings ──────────────────────────────────────────────
+        Log.d(TAG, "stage=recordings")
         val pathDetector = PathDetector(cursorStore)
         val recordingDir = pathDetector.detect()
 
@@ -97,7 +115,8 @@ class SyncWorker(
             return Result.success()
         }
 
-        // ── 5. Scan and upload recordings (Wi-Fi only via WorkManager constraints) ──
+        // ── Stage: recording_scan ──────────────────────────────────────────
+        Log.d(TAG, "stage=recording_scan")
         val scanner = RecordingScanner()
         val newRecordings = scanner.scanNew(recordingDir, cursor)
         Log.d(TAG, "Recordings: ${newRecordings.size} new files found in ${recordingDir.path}")
@@ -137,6 +156,10 @@ class SyncWorker(
         cursorStore: CursorStore,
     ): Uploader {
         val okHttp = okhttp3.OkHttpClient.Builder()
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(120, TimeUnit.SECONDS)
+            .writeTimeout(120, TimeUnit.SECONDS)
+            .callTimeout(180, TimeUnit.SECONDS)
             .addInterceptor(AuthInterceptor { apiToken })
             .also { builder ->
                 if (BuildConfigCompat.DEBUG) {
