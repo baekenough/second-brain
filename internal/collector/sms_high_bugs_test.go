@@ -52,7 +52,7 @@ func TestSMSCollector_HIGH1_LateArrivalRecovery(t *testing.T) {
 		{addr, lateMs, 1, "sync-lagged message", "LateContact"},
 	}))
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 
 	// Simulate: since = 2 hours ago (this record's OccurredAt is BEFORE since).
 	since := time.Now().UTC().Add(-2 * time.Hour)
@@ -71,7 +71,7 @@ func TestSMSCollector_HIGH1_LateArrivalRecovery(t *testing.T) {
 	// --- Apply fix: tell collector this sourceID has NOT been indexed. ---
 	// Build an indexed set that does NOT include this record's source ID.
 	// The OR condition should emit the record because it's not in the set.
-	c2 := NewSMSCollector(dir)
+	c2 := NewSMSCollector(dir, 1<<30)
 	// Compute the expected SourceID so we can build the NOT-in-set scenario.
 	// (Address is hashed in the fixed implementation; we rely on the collector
 	// to accept an empty indexed set — meaning nothing is indexed, so all
@@ -114,7 +114,7 @@ func TestSMSCollector_HIGH1_AlreadyIndexedNotReEmitted(t *testing.T) {
 		{addr, lateMs, 1, body, "Indexed"},
 	}))
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	since := time.Now().UTC().Add(-2 * time.Hour)
 
 	// First, collect without indexed set to learn the actual SourceID.
@@ -130,7 +130,7 @@ func TestSMSCollector_HIGH1_AlreadyIndexedNotReEmitted(t *testing.T) {
 
 	// Now simulate it being in the indexed set — it should NOT be re-emitted
 	// when OccurredAt <= since.
-	c2 := NewSMSCollector(dir)
+	c2 := NewSMSCollector(dir, 1<<30)
 	indexedSet := map[string]struct{}{actualSourceID: {}}
 	c2.WithIndexedIDs(indexedSet)
 
@@ -163,7 +163,7 @@ func TestCallLog_HIGH1_LateArrivalRecovery(t *testing.T) {
 		{number, lateMs, 1, 60, "LateCall"},
 	}))
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	since := time.Now().UTC().Add(-2 * time.Hour)
 
 	// Without indexed set: record is silently dropped.
@@ -176,7 +176,7 @@ func TestCallLog_HIGH1_LateArrivalRecovery(t *testing.T) {
 	}
 
 	// With empty indexed set: record should be emitted (SourceID not indexed).
-	c2 := NewSMSCollector(dir)
+	c2 := NewSMSCollector(dir, 1<<30)
 	c2.WithIndexedIDs(map[string]struct{}{})
 
 	docsWithFix, err := c2.Collect(context.Background(), since)
@@ -231,7 +231,7 @@ func TestSMSCollector_HIGH2_TruncatedXMLReturnsPartialDocs(t *testing.T) {
 
 	writeFile(t, filepath.Join(dir, "sms-20260101.xml"), truncatedXML)
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 
 	// The call should NOT return an error — partial success.
 	docs, err := c.Collect(context.Background(), time.Time{})
@@ -256,7 +256,7 @@ func TestSMSCollector_HIGH2_CleanEOFIsNotAnError(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "sms-20260101.xml"),
 		`<?xml version='1.0' encoding='UTF-8' ?><smses></smses>`)
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	docs, err := c.Collect(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("HIGH#2: clean EOF should not produce error, got: %v", err)

@@ -82,7 +82,7 @@ func TestSMSCollector_Enabled(t *testing.T) {
 
 	t.Run("disabled when sourceDir is empty", func(t *testing.T) {
 		t.Parallel()
-		c := NewSMSCollector("")
+		c := NewSMSCollector("", 1<<30)
 		if c.Enabled() {
 			t.Fatal("Enabled() should be false when sourceDir is empty")
 		}
@@ -91,7 +91,7 @@ func TestSMSCollector_Enabled(t *testing.T) {
 	t.Run("enabled when sourceDir is set", func(t *testing.T) {
 		t.Parallel()
 		dir := t.TempDir()
-		c := NewSMSCollector(dir)
+		c := NewSMSCollector(dir, 1<<30)
 		if !c.Enabled() {
 			t.Fatal("Enabled() should be true when sourceDir is non-empty")
 		}
@@ -115,7 +115,7 @@ func TestSMSCollector_Collect_SMS(t *testing.T) {
 	})
 	writeFile(t, filepath.Join(dir, "sms-20260101.xml"), smsXML)
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	docs, err := c.Collect(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
@@ -181,7 +181,7 @@ func TestSMSCollector_Collect_SMS_DirectionMapping(t *testing.T) {
 	}
 	writeFile(t, filepath.Join(dir, "sms-20260101.xml"), makeSMSXML(records))
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	docs, err := c.Collect(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
@@ -216,7 +216,7 @@ func TestSMSCollector_Collect_SourceIDFormat(t *testing.T) {
 		{addr, dateMs, 1, body, "Bob"},
 	}))
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	docs, err := c.Collect(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
@@ -257,7 +257,7 @@ func TestSMSCollector_Collect_OccurredAtConversion(t *testing.T) {
 		{"010-0000-0001", dateMs, 1, "test", "Tester"},
 	}))
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	docs, err := c.Collect(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
@@ -319,7 +319,7 @@ func TestSMSCollector_Collect_IsAuthLike(t *testing.T) {
 	}
 	writeFile(t, filepath.Join(dir, "sms-20260101.xml"), makeSMSXML(records))
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	docs, err := c.Collect(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
@@ -355,7 +355,7 @@ func TestSMSCollector_Collect_SinceFilter(t *testing.T) {
 		{"010-0000-0002", time.Now().UTC().Add(-10 * time.Minute).UnixMilli(), 2, "new message", ""},
 	}))
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	docs, err := c.Collect(context.Background(), cutoff)
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
@@ -400,7 +400,7 @@ func TestSMSCollector_Collect_LatestFileSelection(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	writeFile(t, newPath, newer)
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	docs, err := c.Collect(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
@@ -432,7 +432,7 @@ func TestSMSCollector_Collect_CallLog(t *testing.T) {
 	})
 	writeFile(t, filepath.Join(dir, "calls-20260101.xml"), callsXML)
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	docs, err := c.Collect(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
@@ -471,7 +471,7 @@ func TestSMSCollector_Collect_CallLog_SourceIDFormat(t *testing.T) {
 		{number, dateMs, 2, duration, "Eve"},
 	}))
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	docs, err := c.Collect(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
@@ -534,7 +534,7 @@ func TestSMSCollector_Collect_CallLog_DirectionMapping(t *testing.T) {
 	}
 	writeFile(t, filepath.Join(dir, "calls-20260101.xml"), makeCallsXML(records))
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	docs, err := c.Collect(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
@@ -556,7 +556,7 @@ func TestSMSCollector_Collect_EmptyDir(t *testing.T) {
 
 	dir := t.TempDir() // empty directory
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	if !c.Enabled() {
 		t.Fatal("Enabled() should be true when dir is non-empty string")
 	}
@@ -652,7 +652,7 @@ func TestSMSCollector_Collect_ReadAllParsing(t *testing.T) {
 	})
 	writeFile(t, filepath.Join(dir, "sms-20260101.xml"), smsXML)
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	docs, err := c.Collect(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
@@ -693,7 +693,7 @@ func TestSMSCollector_Collect_ContactNameFallback(t *testing.T) {
 		{addr, hoursAgoMs(1), 1, "hello", ""},
 	}))
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	docs, err := c.Collect(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("Collect: %v", err)

@@ -33,7 +33,7 @@ func TestSMSCollector_SourceID_DoesNotContainPII(t *testing.T) {
 		{addr, hoursAgoMs(1), 1, "hello pii test", ""},
 	}))
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	docs, err := c.Collect(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
@@ -67,7 +67,7 @@ func TestCallLog_SourceID_DoesNotContainPII(t *testing.T) {
 		{number, hoursAgoMs(1), 1, 45, ""},
 	}))
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	docs, err := c.Collect(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
@@ -131,7 +131,7 @@ func TestSMSCollector_AuthLike_OTPRedacted(t *testing.T) {
 				{"010-0001-0001", hoursAgoMs(1), 1, tc.body, "Bank"},
 			}))
 
-			c := NewSMSCollector(dir)
+			c := NewSMSCollector(dir, 1<<30)
 			docs, err := c.Collect(context.Background(), time.Time{})
 			if err != nil {
 				t.Fatalf("Collect: %v", err)
@@ -173,7 +173,7 @@ func TestSMSCollector_NonAuth_NotRedacted(t *testing.T) {
 		{"010-0002-0002", hoursAgoMs(1), 1, body, "Friend"},
 	}))
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	docs, err := c.Collect(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
@@ -191,20 +191,22 @@ func TestSMSCollector_NonAuth_NotRedacted(t *testing.T) {
 // --- MEDIUM: Unbounded memory guard ---
 
 // TestSMSCollector_OversizedFileSkipped verifies that SMS files exceeding
-// smsMaxFileBytes are skipped with a warning rather than causing OOM.
+// the configured cap are skipped with a warning rather than causing OOM.
+// The cap is configured per-collector (not a package-level const).
 func TestSMSCollector_OversizedFileSkipped(t *testing.T) {
 	t.Parallel()
 
+	const cap = int64(1024) // small cap for test purposes
+
 	dir := t.TempDir()
 
-	// Create a sparse file that exceeds smsMaxFileBytes.
+	// Create a sparse file that exceeds the cap by 1 byte.
 	bigPath := filepath.Join(dir, "sms-20260101.xml")
 	f, err := os.Create(bigPath)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	// Write 1 byte past the limit.
-	if _, err := f.Seek(smsMaxFileBytes, 0); err != nil {
+	if _, err := f.Seek(cap, 0); err != nil {
 		f.Close()
 		t.Fatalf("seek: %v", err)
 	}
@@ -214,14 +216,78 @@ func TestSMSCollector_OversizedFileSkipped(t *testing.T) {
 	}
 	f.Close()
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, cap)
 	docs, err := c.Collect(context.Background(), time.Time{})
-	// Must not return an error — skip silently.
+	// Must not return an error — skip silently (Warn only).
 	if err != nil {
 		t.Fatalf("Collect should not error on oversized file, got: %v", err)
 	}
 	if len(docs) != 0 {
 		t.Errorf("expected 0 docs when file exceeds size limit, got %d", len(docs))
+	}
+}
+
+// TestSMSCollector_UnderCapFileProcessed verifies that a file just under
+// the configured cap is processed normally (not skipped).
+func TestSMSCollector_UnderCapFileProcessed(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	smsXML := makeSMSXML([]struct {
+		Address     string
+		DateMs      int64
+		Type        int
+		Body        string
+		ContactName string
+	}{
+		{"010-0001-0001", hoursAgoMs(1), 1, "under cap message", "Test"},
+	})
+
+	path := filepath.Join(dir, "sms-20260101.xml")
+	writeFile(t, path, smsXML)
+
+	// Cap is larger than the file — file must be processed.
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	cap := info.Size() + 1 // just above file size
+
+	c := NewSMSCollector(dir, cap)
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Errorf("expected 1 doc for file under cap, got %d", len(docs))
+	}
+}
+
+// TestSMSCollector_ZeroCapMeansUnlimited verifies that cap=0 disables the
+// size guard: even a file that would exceed any reasonable limit is processed.
+func TestSMSCollector_ZeroCapMeansUnlimited(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	smsXML := makeSMSXML([]struct {
+		Address     string
+		DateMs      int64
+		Type        int
+		Body        string
+		ContactName string
+	}{
+		{"010-0002-0001", hoursAgoMs(1), 1, "unlimited cap message", "Test"},
+	})
+	writeFile(t, filepath.Join(dir, "sms-20260101.xml"), smsXML)
+
+	// cap=0 → no limit; file must be processed regardless of size.
+	c := NewSMSCollector(dir, 0)
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Errorf("expected 1 doc with cap=0 (unlimited), got %d", len(docs))
 	}
 }
 
@@ -257,7 +323,7 @@ func TestSMSCollector_PartialResult_BothFilesCollected(t *testing.T) {
 		{"010-5678-0002", hoursAgoMs(1), 2, 30, "B"},
 	}))
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	docs, err := c.Collect(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
@@ -290,7 +356,7 @@ func TestSMSCollector_SameMsCollision_Disambiguated(t *testing.T) {
 		{addr, sameMs, 2, "second message body", ""},
 	}))
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	docs, err := c.Collect(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
@@ -480,7 +546,7 @@ func TestSMSCollector_LatestFile_PrefersNewerDateName(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	writeFile(t, oldNamePath, older) // written last → newer mtime
 
-	c := NewSMSCollector(dir)
+	c := NewSMSCollector(dir, 1<<30)
 	docs, err := c.Collect(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("Collect: %v", err)

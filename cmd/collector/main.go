@@ -211,7 +211,7 @@ func run() error {
 		collector.NewTelegramCollector(cfg.TelegramBotToken, cfg.TelegramChatIDs),
 		collector.NewGmailCollector(cfg),
 		collector.NewCalendarCollector(cfg),
-		collector.NewSMSCollector(cfg.SMSSourceDir),
+		collector.NewSMSCollector(cfg.SMSSourceDir, cfg.SMSMaxFileBytes),
 		collector.NewWhisperCollector(cfg),
 	}
 	if cfg.FilesystemEnabled && cfg.FilesystemPath != "" {

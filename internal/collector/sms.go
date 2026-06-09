@@ -31,12 +31,6 @@ var authLikeRe = regexp.MustCompile(`(?i)인증번호|본인.{0,2}확인|verific
 // otpDigitsRe matches runs of 4–8 digits to redact from auth-like bodies.
 var otpDigitsRe = regexp.MustCompile(`\b\d{4,8}\b`)
 
-// smsMaxFileBytes is the maximum accepted file size for a single SMS export XML.
-// SMS Backup & Restore files grow unboundedly over time; a generous 256 MB cap
-// protects against OOM while accommodating multi-year SMS histories.
-// (Whisper uses 25 MB; we choose 256 MB here because XML is not binary data.)
-const smsMaxFileBytes = 256 << 20 // 256 MB
-
 // SMSCollector reads SMS messages and call logs from SMS Backup & Restore XML
 // exports. Each prefix (sms-*.xml, calls-*.xml) uses the single file with the
 // lexicographically-greatest filename (date-stamped sms-YYYYMMDD.xml) in
@@ -52,15 +46,18 @@ const smsMaxFileBytes = 256 << 20 // 256 MB
 // indexed set regardless of OccurredAt. This rescues late-arriving records
 // (OneDrive sync lag) and records after an XML truncation point.
 type SMSCollector struct {
-	sourceDir  string
-	indexedIDs map[string]struct{} // nil = mtime-only mode
+	sourceDir    string
+	indexedIDs   map[string]struct{} // nil = mtime-only mode
+	maxFileBytes int64               // per-file size cap; 0 or negative means no limit
 }
 
 // NewSMSCollector returns an SMSCollector that reads XML exports from sourceDir.
+// maxFileBytes is the per-file OOM guard (from cfg.SMSMaxFileBytes): files
+// exceeding this size are skipped with a slog.Warn. Pass 0 to disable the cap.
 // When sourceDir is empty, Enabled() returns false and the scheduler will not
 // call Collect.
-func NewSMSCollector(sourceDir string) *SMSCollector {
-	return &SMSCollector{sourceDir: sourceDir}
+func NewSMSCollector(sourceDir string, maxFileBytes int64) *SMSCollector {
+	return &SMSCollector{sourceDir: sourceDir, maxFileBytes: maxFileBytes}
 }
 
 func (c *SMSCollector) Name() string             { return "sms" }
@@ -242,15 +239,16 @@ func (c *SMSCollector) shouldEmitSMS(occurredAt time.Time, sourceID string, sinc
 // This gives observability without blocking the partial result.
 func (c *SMSCollector) parseSMSFile(ctx context.Context, path string, since time.Time) ([]model.Document, error) {
 	// Unbounded-memory guard (MEDIUM): stat before reading.
+	// cap <= 0 means no limit (safe escape hatch when SMS_MAX_FILE_BYTES=0).
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("stat %q: %w", path, err)
 	}
-	if info.Size() > smsMaxFileBytes {
+	if c.maxFileBytes > 0 && info.Size() > c.maxFileBytes {
 		slog.Warn("sms: skipping oversized sms file",
 			"path", path,
 			"size_bytes", info.Size(),
-			"limit_bytes", smsMaxFileBytes,
+			"limit_bytes", c.maxFileBytes,
 		)
 		return nil, nil
 	}
@@ -338,15 +336,16 @@ func (c *SMSCollector) parseSMSFile(ctx context.Context, path string, since time
 // See parseSMSFile for the rationale behind the read-all-first approach.
 func (c *SMSCollector) parseCallsFile(ctx context.Context, path string, since time.Time) ([]model.Document, error) {
 	// Unbounded-memory guard (MEDIUM): stat before reading.
+	// cap <= 0 means no limit (safe escape hatch when SMS_MAX_FILE_BYTES=0).
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("stat %q: %w", path, err)
 	}
-	if info.Size() > smsMaxFileBytes {
+	if c.maxFileBytes > 0 && info.Size() > c.maxFileBytes {
 		slog.Warn("sms: skipping oversized calls file",
 			"path", path,
 			"size_bytes", info.Size(),
-			"limit_bytes", smsMaxFileBytes,
+			"limit_bytes", c.maxFileBytes,
 		)
 		return nil, nil
 	}

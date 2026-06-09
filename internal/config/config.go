@@ -138,7 +138,10 @@ type Config struct {
 	// SMS + Call Log (optional — disabled when SMSSourceDir is empty)
 	// SMS_SOURCE_DIR: directory containing SMS Backup & Restore XML exports
 	// (sms-*.xml and calls-*.xml; latest mtime per prefix is used)
-	SMSSourceDir string
+	// SMS_MAX_FILE_BYTES: per-file size cap for OOM guard (bytes, int64).
+	// Default 1 GiB. Set 0 to disable the cap entirely (no limit).
+	SMSSourceDir     string
+	SMSMaxFileBytes  int64
 
 	// Whisper transcription (optional — disabled when WhisperAPIKey is empty)
 	// WHISPER_API_KEY: OpenAI (or compatible) API key
@@ -346,7 +349,8 @@ func Load() (*Config, error) {
 		CalendarLookaheadDays:   calendarLookaheadDays(),
 		CalendarLookbehindDays:  calendarLookbehindDays(),
 
-		SMSSourceDir: os.Getenv("SMS_SOURCE_DIR"),
+		SMSSourceDir:    os.Getenv("SMS_SOURCE_DIR"),
+		SMSMaxFileBytes: smsMaxFileBytes(),
 
 		WhisperAPIKey:   os.Getenv("WHISPER_API_KEY"),
 		WhisperAPIURL:   getenv("WHISPER_API_URL", "https://api.openai.com/v1"),
@@ -377,6 +381,27 @@ func calendarLookbehindDays() int {
 		}
 	}
 	return 30
+}
+
+// smsMaxFileBytes parses SMS_MAX_FILE_BYTES from the environment.
+// Default is 1 GiB (generous for multi-year XML exports).
+// Set SMS_MAX_FILE_BYTES=0 to disable the cap entirely (no limit).
+// Invalid values are ignored and the default is used.
+func smsMaxFileBytes() int64 {
+	const defaultCap = 1 << 30 // 1 GiB
+	v := os.Getenv("SMS_MAX_FILE_BYTES")
+	if v == "" {
+		return defaultCap
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		slog.Warn("config: SMS_MAX_FILE_BYTES is invalid; using default 1 GiB",
+			"value", v,
+			"error", err,
+		)
+		return defaultCap
+	}
+	return n // 0 means no limit (caller checks maxFileBytes <= 0)
 }
 
 // LoadCollector reads configuration for the collector daemon.
