@@ -80,6 +80,11 @@ func (c *SMSCollector) WithCutover(t time.Time) {
 	c.cutover = t
 }
 
+// smsStreamBatchSize is the maximum number of documents accumulated before
+// emitting a batch in CollectStream. Keeping this small bounds peak Document
+// memory to ~500 structs regardless of XML file size.
+const smsStreamBatchSize = 500
+
 // Collect parses the latest sms-*.xml and calls-*.xml files in sourceDir and
 // returns documents for all records that satisfy the emission criteria.
 // Both files are optional: if one is missing it is silently skipped.
@@ -119,6 +124,269 @@ func (c *SMSCollector) Collect(ctx context.Context, since time.Time) ([]model.Do
 	slog.Info("sms: collected documents", "count", len(docs),
 		"sms_file", smsFile, "calls_file", callsFile)
 	return docs, nil
+}
+
+// CollectStream implements StreamingCollector. It streams the same sms-*.xml and
+// calls-*.xml files as Collect but emits documents in bounded batches of
+// smsStreamBatchSize instead of accumulating the entire result set in memory.
+//
+// Memory strategy: the raw XML bytes are still read into a []byte buffer via
+// readFileWithRetry (required for FUSE-safe retry semantics). The OOM concern on
+// large exports (~300 MB XML / ~1M records) is NOT the raw bytes but the
+// unbounded []model.Document slice that Collect builds. CollectStream caps that
+// at smsStreamBatchSize documents at a time, so peak live Document memory is
+// bounded regardless of file size.
+//
+// Partial-result contract is preserved: if one file's stream fails, the other
+// file's already-emitted batches are kept; a slog.Warn is issued. onBatch errors
+// abort the stream immediately and are propagated.
+func (c *SMSCollector) CollectStream(ctx context.Context, since time.Time, onBatch func([]model.Document) error) error {
+	smsFile, err := latestFileByPrefix(c.sourceDir, "sms-")
+	if err != nil {
+		slog.Warn("sms: could not find sms file", "dir", c.sourceDir, "error", err)
+	} else if smsFile != "" {
+		if err := c.streamSMSFile(ctx, smsFile, since, onBatch); err != nil {
+			// Propagate onBatch errors immediately; log parse errors as partial.
+			if isOnBatchError(err) {
+				return err
+			}
+			slog.Warn("sms: stream sms file failed (partial result emitted)",
+				"file", smsFile, "error", err)
+		}
+	}
+
+	callsFile, err := latestFileByPrefix(c.sourceDir, "calls-")
+	if err != nil {
+		slog.Warn("sms: could not find calls file", "dir", c.sourceDir, "error", err)
+	} else if callsFile != "" {
+		if err := c.streamCallsFile(ctx, callsFile, since, onBatch); err != nil {
+			if isOnBatchError(err) {
+				return err
+			}
+			slog.Warn("sms: stream calls file failed (partial result emitted)",
+				"file", callsFile, "error", err)
+		}
+	}
+
+	return nil
+}
+
+// onBatchErr is a sentinel wrapper so we can distinguish an error returned by
+// the onBatch callback from an internal parse/IO error.
+type onBatchErr struct{ cause error }
+
+func (e *onBatchErr) Error() string { return e.cause.Error() }
+func (e *onBatchErr) Unwrap() error { return e.cause }
+
+// isOnBatchError reports whether err originates from an onBatch callback.
+func isOnBatchError(err error) bool {
+	var e *onBatchErr
+	return errors.As(err, &e)
+}
+
+// streamSMSFile reads smsFile into memory (FUSE-safe), then stream-parses
+// <sms> elements and emits them in batches via onBatch.
+func (c *SMSCollector) streamSMSFile(ctx context.Context, path string, since time.Time, onBatch func([]model.Document) error) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat %q: %w", path, err)
+	}
+	if info.Size() == 0 {
+		slog.Warn("sms: source file is empty — possible OneDrive materialization/bridge failure; skipping",
+			"file", path)
+		return nil
+	}
+	if c.maxFileBytes > 0 && info.Size() > c.maxFileBytes {
+		slog.Warn("sms: skipping oversized sms file",
+			"path", path,
+			"size_bytes", info.Size(),
+			"limit_bytes", c.maxFileBytes,
+		)
+		return nil
+	}
+
+	data, err := readFileWithRetry(path)
+	if err != nil {
+		return err
+	}
+
+	batch := make([]model.Document, 0, smsStreamBatchSize)
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		tok, err := dec.Token()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			slog.Warn("sms: xml token stream error (file may be truncated; records will be re-collected next run)",
+				"file", path, "error", err)
+			break
+		}
+		se, ok := tok.(xml.StartElement)
+		if !ok || se.Name.Local != "sms" {
+			continue
+		}
+
+		var rec smsRecord
+		if err := dec.DecodeElement(&rec, &se); err != nil {
+			slog.Warn("sms: skipping malformed <sms> element", "error", err)
+			continue
+		}
+
+		occurredAt := msToUTC(rec.Date)
+		addrHash := smsShortHash(rec.Address)
+		bodyHash := smsBodyHash(rec.Body)
+		sourceID := fmt.Sprintf("sms:%d:%s:%s", rec.Date, addrHash, bodyHash)
+
+		if !c.shouldEmitSMS(occurredAt, sourceID, since) {
+			continue
+		}
+
+		direction := smsDirection(rec.Type)
+		contact := firstNonEmptySMS(rec.ContactName, rec.Address)
+		title := fmt.Sprintf("SMS %s %s", direction, contact)
+		isAuth := authLikeRe.MatchString(rec.Body)
+		body := rec.Body
+		if isAuth {
+			body = otpDigitsRe.ReplaceAllString(body, "[REDACTED]")
+		}
+		meta := map[string]any{
+			"contact_name": rec.ContactName,
+			"direction":    direction,
+			"is_auth_like": isAuth,
+		}
+		t := occurredAt
+		batch = append(batch, model.Document{
+			ID:          uuid.New(),
+			SourceType:  model.SourceSMS,
+			SourceID:    sourceID,
+			Title:       title,
+			Content:     body,
+			Metadata:    meta,
+			OccurredAt:  &t,
+			CollectedAt: time.Now().UTC(),
+		})
+
+		if len(batch) >= smsStreamBatchSize {
+			if err := onBatch(batch); err != nil {
+				return &onBatchErr{cause: err}
+			}
+			batch = batch[:0]
+		}
+	}
+
+	// Flush remainder.
+	if len(batch) > 0 {
+		if err := onBatch(batch); err != nil {
+			return &onBatchErr{cause: err}
+		}
+	}
+	return nil
+}
+
+// streamCallsFile reads callsFile into memory (FUSE-safe), then stream-parses
+// <call> elements and emits them in batches via onBatch.
+func (c *SMSCollector) streamCallsFile(ctx context.Context, path string, since time.Time, onBatch func([]model.Document) error) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat %q: %w", path, err)
+	}
+	if info.Size() == 0 {
+		slog.Warn("sms: source file is empty — possible OneDrive materialization/bridge failure; skipping",
+			"file", path)
+		return nil
+	}
+	if c.maxFileBytes > 0 && info.Size() > c.maxFileBytes {
+		slog.Warn("sms: skipping oversized calls file",
+			"path", path,
+			"size_bytes", info.Size(),
+			"limit_bytes", c.maxFileBytes,
+		)
+		return nil
+	}
+
+	data, err := readFileWithRetry(path)
+	if err != nil {
+		return err
+	}
+
+	batch := make([]model.Document, 0, smsStreamBatchSize)
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		tok, err := dec.Token()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			slog.Warn("sms: xml token stream error (file may be truncated; records will be re-collected next run)",
+				"file", path, "error", err)
+			break
+		}
+		se, ok := tok.(xml.StartElement)
+		if !ok || se.Name.Local != "call" {
+			continue
+		}
+
+		var rec callRecord
+		if err := dec.DecodeElement(&rec, &se); err != nil {
+			slog.Warn("sms: skipping malformed <call> element", "error", err)
+			continue
+		}
+
+		occurredAt := msToUTC(rec.Date)
+		numHash := smsShortHash(rec.Number)
+		durationStr := fmt.Sprintf("%d", rec.Duration)
+		durationHash := smsBodyHash(durationStr)
+		sourceID := fmt.Sprintf("call-log:%d:%s:%s", rec.Date, numHash, durationHash)
+
+		if !c.shouldEmitSMS(occurredAt, sourceID, since) {
+			continue
+		}
+
+		direction := callDirection(rec.Type)
+		contact := firstNonEmptySMS(rec.ContactName, rec.Number)
+		title := fmt.Sprintf("%s 통화 %s", direction, contact)
+		callTime := occurredAt.Format("2006-01-02 15:04:05 MST")
+		content := fmt.Sprintf("상대방: %s\n통화 방향: %s\n시각: %s\n통화 시간: %ds",
+			contact, direction, callTime, rec.Duration)
+		meta := map[string]any{
+			"contact_name":     rec.ContactName,
+			"direction":        direction,
+			"duration_seconds": rec.Duration,
+		}
+		t := occurredAt
+		batch = append(batch, model.Document{
+			ID:          uuid.New(),
+			SourceType:  model.SourceCallLog,
+			SourceID:    sourceID,
+			Title:       title,
+			Content:     content,
+			Metadata:    meta,
+			OccurredAt:  &t,
+			CollectedAt: time.Now().UTC(),
+		})
+
+		if len(batch) >= smsStreamBatchSize {
+			if err := onBatch(batch); err != nil {
+				return &onBatchErr{cause: err}
+			}
+			batch = batch[:0]
+		}
+	}
+
+	// Flush remainder.
+	if len(batch) > 0 {
+		if err := onBatch(batch); err != nil {
+			return &onBatchErr{cause: err}
+		}
+	}
+	return nil
 }
 
 // --- XML structures ---

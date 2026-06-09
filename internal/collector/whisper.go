@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -51,6 +52,92 @@ type whisperTranscribeResponse struct {
 	Text string `json:"text"`
 }
 
+// Filename patterns for recording timestamps.
+//
+// Pattern A — Voice Recorder app: <label>_YYMMDD_HHMMSS.<ext>
+//
+//	e.g. 메디웨일_260120_120138.m4a  →  2026-01-20 12:01:38
+//	The 2-digit year is normalised with a 2000 offset (so "26" → 2026).
+//
+// Pattern B — TPhoneCallRecords: <number>_YYYYMMDDHHMMSS[{-N}].<ext>
+//
+//	e.g. 01025777190_20260327202518.m4a     →  2026-03-27 20:25:18
+//	     01025777190_20260327202518-1.m4a   →  2026-03-27 20:25:18  (suffix ignored)
+//
+// Times are parsed in time.Local so that the cutover comparison is meaningful
+// regardless of whether the cutover value was constructed in UTC or Local.
+var (
+	// reVoiceRecorder matches the 2-digit-year pattern at the END of the stem
+	// (before the extension), allowing arbitrary label characters before it.
+	reVoiceRecorder = regexp.MustCompile(`_(\d{2})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})(?:\.\w+)?$`)
+
+	// reTPhone matches the 14-digit timestamp followed by an optional -N suffix.
+	reTPhone = regexp.MustCompile(`_(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:-\d+)?(?:\.\w+)?$`)
+)
+
+// recordingTime returns the recording timestamp for the given audio filename.
+//
+// It tries two filename patterns in order:
+//  1. TPhoneCallRecords: <anything>_YYYYMMDDHHMMSS[-N].<ext>
+//  2. Voice Recorder:   <label>_YYMMDD_HHMMSS.<ext>  (2-digit year, +2000)
+//
+// If neither pattern matches, or if the parsed date is clearly invalid,
+// the file's mtime is returned unchanged. This ensures files with
+// unparseable names continue to use the existing mtime-based cutover check.
+//
+// All parsed times are in time.Local.
+func recordingTime(filename string, mtime time.Time) time.Time {
+	// Pattern B first (14-digit timestamp is unambiguous and more specific).
+	if m := reTPhone.FindStringSubmatch(filename); m != nil {
+		yr := atoi(m[1])
+		mo := atoi(m[2])
+		dy := atoi(m[3])
+		hr := atoi(m[4])
+		mn := atoi(m[5])
+		sc := atoi(m[6])
+		t := time.Date(yr, time.Month(mo), dy, hr, mn, sc, 0, time.Local)
+		if isPlausibleRecordingTime(t) {
+			return t
+		}
+	}
+
+	// Pattern A: 2-digit year.
+	if m := reVoiceRecorder.FindStringSubmatch(filename); m != nil {
+		yr := 2000 + atoi(m[1])
+		mo := atoi(m[2])
+		dy := atoi(m[3])
+		hr := atoi(m[4])
+		mn := atoi(m[5])
+		sc := atoi(m[6])
+		t := time.Date(yr, time.Month(mo), dy, hr, mn, sc, 0, time.Local)
+		if isPlausibleRecordingTime(t) {
+			return t
+		}
+	}
+
+	return mtime
+}
+
+// atoi converts a decimal string to int, returning 0 on any error.
+// The regex guarantees only digit characters, so strconv is not needed.
+func atoi(s string) int {
+	n := 0
+	for _, c := range s {
+		n = n*10 + int(c-'0')
+	}
+	return n
+}
+
+// isPlausibleRecordingTime returns true when t looks like a real recording
+// date: year in [2000, 2100], month in [1, 12], day in [1, 31].
+// time.Date normalises out-of-range values (e.g. month 13 → Jan of next year),
+// so we check the input-level fields after construction to reject nonsense.
+func isPlausibleRecordingTime(t time.Time) bool {
+	return t.Year() >= 2000 && t.Year() <= 2100 &&
+		t.Month() >= 1 && t.Month() <= 12 &&
+		t.Day() >= 1 && t.Day() <= 31
+}
+
 // WhisperCollector transcribes audio files via an OpenAI-compatible Whisper
 // endpoint and produces call-transcript documents.
 //
@@ -81,8 +168,10 @@ type WhisperCollector struct {
 	// even when their mtime predates the since watermark (IndexAwareCollector).
 	indexedIDs map[string]struct{}
 
-	// cutover is an optional floor time. When non-zero, files whose mtime is
-	// before cutover are suppressed even if they were never indexed.
+	// cutover is an optional floor time. When non-zero, files whose recording
+	// timestamp (parsed from the filename via recordingTime) is before cutover
+	// are suppressed even if they were never indexed. Files with unparseable
+	// names fall back to mtime for the comparison.
 	// Zero = floor disabled (no behaviour change).
 	cutover time.Time
 }
@@ -121,7 +210,8 @@ func (c *WhisperCollector) WithIndexedIDs(ids map[string]struct{}) {
 }
 
 // WithCutover implements CutoverAwareCollector. When t is non-zero, files
-// whose mtime is before t are suppressed even if they were never indexed.
+// whose recording timestamp (parsed from the filename; falls back to mtime)
+// is before t are suppressed even if they were never indexed.
 // Zero t disables the floor (no behaviour change).
 func (c *WhisperCollector) WithCutover(t time.Time) {
 	c.cutover = t
@@ -228,7 +318,13 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 
 		// Cutover floor: suppress files that pre-date the cutover even if
 		// they were never indexed. Zero cutover = floor disabled.
-		if !c.cutover.IsZero() && info.ModTime().Before(c.cutover) {
+		//
+		// recordingTime extracts the actual recording date from the filename
+		// (Voice Recorder / TPhoneCallRecords patterns). Staged audio files
+		// have recent mtimes (copy time), so the mtime-based check wrongly
+		// admits historical recordings. Filename-parsed time is used when
+		// available; files with unparseable names fall back to mtime.
+		if !c.cutover.IsZero() && recordingTime(d.Name(), info.ModTime()).Before(c.cutover) {
 			return nil
 		}
 

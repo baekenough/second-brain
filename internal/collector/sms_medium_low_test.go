@@ -669,6 +669,9 @@ func TestSMSCollector_EmptySMSFile_ValidCallsStillCollected(t *testing.T) {
 // Compile-time check: SMSCollector implements IndexAwareCollector.
 var _ IndexAwareCollector = (*SMSCollector)(nil)
 
+// Compile-time check: SMSCollector implements StreamingCollector.
+var _ StreamingCollector = (*SMSCollector)(nil)
+
 // Compile-time check: WhisperCollector implements IndexAwareCollector.
 var _ IndexAwareCollector = (*WhisperCollector)(nil)
 
