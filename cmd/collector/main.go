@@ -239,7 +239,8 @@ func run() error {
 	// so that the inline per-document LLM call is never made in a default deployment.
 	sched := scheduler.New(docStore, embedClient, collectors...).
 		WithChunkStore(chunkStore).
-		WithInstance(cfg.CollectorInstance)
+		WithInstance(cfg.CollectorInstance).
+		WithCutover(cfg.CollectorCutover)
 	if entityExtractionEnabled {
 		sched = sched.WithEntityExtraction(entityStore, llmClient)
 	}

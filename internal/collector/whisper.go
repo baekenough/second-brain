@@ -80,6 +80,11 @@ type WhisperCollector struct {
 	// When non-nil, Collect emits files whose SourceID is absent from the set
 	// even when their mtime predates the since watermark (IndexAwareCollector).
 	indexedIDs map[string]struct{}
+
+	// cutover is an optional floor time. When non-zero, files whose mtime is
+	// before cutover are suppressed even if they were never indexed.
+	// Zero = floor disabled (no behaviour change).
+	cutover time.Time
 }
 
 // NewWhisperCollector returns a WhisperCollector configured from cfg.
@@ -113,6 +118,13 @@ func (c *WhisperCollector) Enabled() bool {
 // Passing nil restores mtime-only filtering.
 func (c *WhisperCollector) WithIndexedIDs(ids map[string]struct{}) {
 	c.indexedIDs = ids
+}
+
+// WithCutover implements CutoverAwareCollector. When t is non-zero, files
+// whose mtime is before t are suppressed even if they were never indexed.
+// Zero t disables the floor (no behaviour change).
+func (c *WhisperCollector) WithCutover(t time.Time) {
+	c.cutover = t
 }
 
 // isLocalWhisperEndpoint reports whether the given URL host resolves to a
@@ -213,6 +225,12 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 			relPath = path
 		}
 		sourceID := "transcript:" + relPath
+
+		// Cutover floor: suppress files that pre-date the cutover even if
+		// they were never indexed. Zero cutover = floor disabled.
+		if !c.cutover.IsZero() && info.ModTime().Before(c.cutover) {
+			return nil
+		}
 
 		// Incremental + IndexAware filter (HIGH#1 fix):
 		// Emit when mtime > since  OR  SourceID not in indexed set.

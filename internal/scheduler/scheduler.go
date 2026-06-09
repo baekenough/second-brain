@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -54,24 +55,45 @@ type Scheduler struct {
 	entities    EntityExtractor    // nil when entity extraction is disabled
 	llmClient   llm.Completer      // nil when entity extraction is disabled
 	instanceID  string             // per-instance watermark key (e.g., "laptop", "host1", "host2")
+	cutover     time.Time          // zero = floor disabled; propagated to CutoverAwareCollectors
 
-	// running is set to 1 while a collection cycle is in progress.
-	// CompareAndSwap from 0→1 acts as a non-blocking try-lock so that
-	// overlapping cron ticks and manual triggers are skipped rather than
-	// piling up.
+	// running is a global guard used by runAll / TriggerAll to prevent a
+	// "run all collectors" operation from overlapping with another one.
+	// Individual per-collector ticks use runningPerCollector instead, so that
+	// distinct collectors can proceed concurrently.
 	running atomic.Bool
+
+	// runningPerCollector holds one try-lock per collector, keyed by Name().
+	// Each cron tick for a specific collector performs a CompareAndSwap on its
+	// own flag only, so a slow collector (e.g. a gmail backfill) cannot block
+	// an unrelated collector (calendar, whisper, sms) from running.
+	//
+	// Pre-populated in New() and never mutated after construction — safe for
+	// concurrent reads without additional locking.
+	runningPerCollector map[string]*atomic.Bool
 }
 
 // New returns a Scheduler with the given collectors and storage backend.
 // Use WithChunkStore to enable chunk-based FTS indexing (issue #9).
 func New(store DocumentUpserter, embed search.EmbeddingEngine, collectors ...collector.Collector) *Scheduler {
 	c := cron.New(cron.WithSeconds())
+
+	// Pre-allocate one atomic.Bool per collector, keyed by Name().
+	// The map itself is never mutated after this point, so concurrent access
+	// to the map is safe (only the atomic.Bool values are written to later).
+	rpc := make(map[string]*atomic.Bool, len(collectors))
+	for _, col := range collectors {
+		var b atomic.Bool
+		rpc[col.Name()] = &b
+	}
+
 	return &Scheduler{
-		cron:       c,
-		collectors: collectors,
-		store:      store,
-		embed:      embed,
-		instanceID: "default",
+		cron:                c,
+		collectors:          collectors,
+		store:               store,
+		embed:               embed,
+		instanceID:          "default",
+		runningPerCollector: rpc,
 	}
 }
 
@@ -111,48 +133,55 @@ func (s *Scheduler) WithEntityExtraction(entities EntityExtractor, client llm.Co
 	return s
 }
 
-// Register adds a SINGLE cron job that runs ALL enabled collectors sequentially
-// on every tick of the given interval (e.g. "@every 1h").
+// WithCutover sets the cutover floor time that is propagated to every
+// CutoverAwareCollector (SMS, Whisper) registered with this scheduler.
+// When non-zero, those collectors will not emit records whose event time
+// (OccurredAt for SMS/call-log, mtime for Whisper) is before t — even when
+// the record was never indexed (IndexAware path).
 //
-// A single job avoids the starvation bug present in the old per-collector
-// design: when N collectors each had their own cron job with the same spec they
-// all fired simultaneously. Each job competed for the single running flag, so
-// only the first winner executed; the other N-1 logged "already running" and
-// were skipped until the next tick. Over time, collectors that consistently lost
-// the race (e.g. gmail) never ran.
+// Zero t (the default) disables the floor entirely (no behaviour change).
+func (s *Scheduler) WithCutover(t time.Time) *Scheduler {
+	s.cutover = t
+	return s
+}
+
+// Register adds ONE cron job PER enabled collector (each "@every interval").
 //
-// With a single job, every tick acquires the flag once and then iterates through
-// all enabled collectors sequentially. A slow collector delays the ones that
-// follow within the same tick, but the next tick is simply skipped by the
-// try-lock if the cycle is still running — this is intentional and strictly
-// better than indefinite starvation.
+// Cron runs each job in its own goroutine, so distinct collectors execute
+// concurrently. A given collector still skips its own overlapping tick via a
+// per-collector try-lock (runningPerCollector). This eliminates the
+// head-of-line blocking that occurred when a single global job ran all
+// collectors sequentially: a slow gmail backfill (~60 min) no longer prevents
+// calendar, whisper, or SMS collectors from running on their scheduled ticks.
+//
+// The old single-job / single-lock design that fixed the starvation bug is
+// preserved in runAll, which is still used by TriggerAll.
 func (s *Scheduler) Register(interval time.Duration) error {
 	spec := fmt.Sprintf("@every %s", interval)
 
-	// Log registration status for each collector before adding the single job.
 	for _, col := range s.collectors {
+		col := col // capture loop variable
 		if !col.Enabled() {
 			slog.Info("scheduler: collector disabled, skipping", "name", col.Name())
 			continue
 		}
 		slog.Info("scheduler: registered collector", "name", col.Name(), "interval", interval)
-	}
-
-	if _, err := s.cron.AddFunc(spec, func() {
-		s.runAll(context.Background())
-	}); err != nil {
-		return fmt.Errorf("register all collectors: %w", err)
+		if _, err := s.cron.AddFunc(spec, func() {
+			s.run(context.Background(), col)
+		}); err != nil {
+			return fmt.Errorf("register collector %q: %w", col.Name(), err)
+		}
 	}
 	return nil
 }
 
-// runAll acquires the running lock and executes all enabled collectors
-// sequentially. It is the cron-tick entry point registered by Register.
+// runAll acquires the GLOBAL running lock and executes all enabled collectors
+// sequentially. It is used by TriggerAll (manual API trigger) and kept for
+// test coverage of the "trigger all" semantic.
 //
 // cron already runs each job in its own goroutine, so runAll does NOT spawn
 // an additional goroutine — doing so would release the outer cron goroutine
-// immediately and break the overlap-skip semantics (the running flag would be
-// cleared before the collectors finish).
+// immediately and break the overlap-skip semantics.
 func (s *Scheduler) runAll(ctx context.Context) {
 	if !s.running.CompareAndSwap(false, true) {
 		slog.Warn("scheduler: collection already running, skipping tick")
@@ -174,44 +203,75 @@ func (s *Scheduler) Start() { s.cron.Start() }
 // Stop gracefully halts the scheduler and waits for running jobs to finish.
 func (s *Scheduler) Stop() { s.cron.Stop() }
 
-// TriggerAll runs all enabled collectors immediately in the background.
+// TriggerAll runs all enabled collectors immediately in the background,
+// each in its own goroutine under its own per-collector lock.
 // It is intended for manual /collect/trigger API calls.
-// If a collection is already in progress the call is a no-op and a warning
-// is logged.
+// Collectors already running on their scheduled tick are skipped for the
+// duration of that overlap; others proceed immediately.
 func (s *Scheduler) TriggerAll(ctx context.Context) {
-	if !s.running.CompareAndSwap(false, true) {
-		slog.Warn("scheduler: collection already running, skipping trigger")
-		return
-	}
-	go func() {
-		defer s.running.Store(false)
-		for _, col := range s.collectors {
-			if !col.Enabled() {
-				continue
-			}
-			s.runCollector(ctx, col)
+	var wg sync.WaitGroup
+	for _, col := range s.collectors {
+		col := col // capture loop variable
+		if !col.Enabled() {
+			continue
 		}
-	}()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.run(ctx, col)
+		}()
+	}
+	// Fire-and-forget at the call site; goroutines clean up via per-collector
+	// locks. We do not block the caller.
+	go wg.Wait()
 }
 
-// run is the cron-tick entry point. It acquires the running flag and
-// delegates to runCollector for each enabled collector.
+// run is the cron-tick and manual-trigger entry point for a single collector.
+// It acquires the PER-COLLECTOR running flag (CompareAndSwap 0→1) so that
+// only one concurrent execution of this collector is allowed at a time, while
+// other collectors proceed unimpeded.
 func (s *Scheduler) run(ctx context.Context, col collector.Collector) {
-	if !s.running.CompareAndSwap(false, true) {
-		slog.Warn("scheduler: collection already running, skipping trigger",
+	flag := s.runningPerCollector[col.Name()]
+	if flag == nil {
+		// Safety valve: collector was not in the original set (should not happen).
+		slog.Warn("scheduler: no running flag for collector, skipping",
 			"collector", col.Name())
 		return
 	}
-	defer s.running.Store(false)
+	if !flag.CompareAndSwap(false, true) {
+		slog.Warn("scheduler: collector still running, skipping tick",
+			"collector", col.Name())
+		return
+	}
+	defer flag.Store(false)
 	s.runCollector(ctx, col)
 }
 
+// runningFor reports whether the named collector's per-collector flag is
+// currently held. Intended for tests only.
+func (s *Scheduler) runningFor(name string) bool {
+	if flag, ok := s.runningPerCollector[name]; ok {
+		return flag.Load()
+	}
+	return false
+}
+
 // runCollector executes a single collection cycle for one collector.
-// It must only be called while s.running is held (i.e. set to true).
+// It must only be called while the caller holds the collector's per-collector
+// flag (via runningPerCollector[col.Name()]) or the global running flag
+// (runAll path). It is safe to call from concurrent goroutines as long as
+// each goroutine holds a distinct flag.
 func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 	started := time.Now()
 	defaultSince := time.Time{} // zero time = collect all files on first run
 	since := s.store.LastCollectedAt(ctx, s.instanceID, col.Source(), defaultSince)
+
+	// Cutover floor for date-watermark collectors (gmail, calendar, secretary,
+	// llm-memory): if since is before the cutover, advance it to the cutover so
+	// that these collectors only fetch data from after the cutover date.
+	if !s.cutover.IsZero() && since.Before(s.cutover) {
+		since = s.cutover
+	}
 
 	slog.Info("scheduler: starting collection",
 		"collector", col.Name(),
@@ -245,6 +305,13 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 			slog.Debug("scheduler: loaded indexed source IDs",
 				"collector", col.Name(), "count", len(indexedIDs))
 		}
+	}
+
+	// Propagate the cutover floor to collectors that support it (SMS, Whisper).
+	// This is done after WithIndexedIDs so the collector has both the indexed
+	// set and the cutover floor for its per-record emit decision.
+	if cac, ok := col.(collector.CutoverAwareCollector); ok {
+		cac.WithCutover(s.cutover)
 	}
 
 	var (

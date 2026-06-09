@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 // setenv is a test helper that sets env vars and registers a cleanup to restore them.
@@ -173,6 +174,54 @@ func TestLoad_CalendarLookbehindDays_Override(t *testing.T) {
 	}
 	if cfg.CalendarLookbehindDays != 90 {
 		t.Errorf("CalendarLookbehindDays = %d, want 90", cfg.CalendarLookbehindDays)
+	}
+}
+
+// TestLoad_CollectorCutover verifies COLLECTOR_CUTOVER RFC3339 parsing.
+func TestLoad_CollectorCutover(t *testing.T) {
+	t.Parallel()
+
+	validCutover := "2025-01-01T00:00:00Z"
+	wantTime := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name    string
+		envVal  string
+		unset   bool
+		wantNil bool   // true when we expect zero time
+		want    time.Time
+	}{
+		{name: "unset_returns_zero", unset: true, wantNil: true},
+		{name: "empty_returns_zero", envVal: "", wantNil: true},
+		{name: "valid_rfc3339", envVal: validCutover, want: wantTime},
+		{name: "invalid_string_returns_zero", envVal: "not-a-date", wantNil: true},
+		{name: "non_rfc3339_date_only_returns_zero", envVal: "2025-01-01", wantNil: true},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			// NOTE: t.Parallel() omitted — Load() reads process-global env vars.
+			if tc.unset {
+				unsetenv(t, "COLLECTOR_CUTOVER")
+			} else {
+				setenv(t, "COLLECTOR_CUTOVER", tc.envVal)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if tc.wantNil {
+				if !cfg.CollectorCutover.IsZero() {
+					t.Errorf("CollectorCutover = %v, want zero time", cfg.CollectorCutover)
+				}
+				return
+			}
+			if !cfg.CollectorCutover.Equal(tc.want) {
+				t.Errorf("CollectorCutover = %v, want %v", cfg.CollectorCutover, tc.want)
+			}
+		})
 	}
 }
 

@@ -9,6 +9,23 @@ import (
 	"github.com/baekenough/second-brain/internal/model"
 )
 
+// CutoverAwareCollector is an optional interface implemented by IndexAware
+// collectors that support a cutover floor time. When a non-zero cutover is
+// set, the collector will not emit any record whose event time (OccurredAt for
+// SMS/call-log, mtime for Whisper) is before the cutover — even if the record
+// was never indexed.
+//
+// This prevents re-collecting pre-cutover history that is already covered by
+// the legacy secretary source while still allowing post-cutover late-arrival
+// recovery via the IndexAware path.
+//
+// Zero cutover (time.Time{}) disables the floor (no behaviour change).
+type CutoverAwareCollector interface {
+	Collector
+	// WithCutover sets the cutover floor time. Zero = disabled.
+	WithCutover(t time.Time)
+}
+
 // Collector collects documents from an external source.
 type Collector interface {
 	// Name returns a human-readable identifier (e.g. "slack", "github").

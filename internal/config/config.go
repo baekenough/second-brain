@@ -175,6 +175,19 @@ type Config struct {
 	// collector_state watermark table. Defaults to os.Hostname() (or
 	// "default" when that fails) when COLLECTOR_INSTANCE is unset.
 	CollectorInstance string
+
+	// CollectorCutover is an optional floor time for IndexAware collectors
+	// (SMS, Whisper). When non-zero, the collector will not emit any record
+	// whose event time (OccurredAt for SMS/call-log, mtime for Whisper) is
+	// before this value — even if the record was never indexed.
+	//
+	// This prevents re-collecting pre-cutover history that is already covered
+	// by the legacy secretary source, while still allowing post-cutover
+	// late-arrival recovery via the IndexAware path.
+	//
+	// Source: COLLECTOR_CUTOVER env var (RFC3339 format).
+	// Default: zero time.Time{} = floor DISABLED (no behaviour change).
+	CollectorCutover time.Time
 }
 
 // Load reads configuration from environment variables and returns a Config.
@@ -370,6 +383,7 @@ func Load() (*Config, error) {
 
 		CollectInterval:   interval,
 		CollectorInstance: collectorInstance,
+		CollectorCutover:  collectorCutover(),
 	}, nil
 }
 
@@ -486,6 +500,25 @@ func splitCSV(raw string) []string {
 		}
 	}
 	return out
+}
+
+// collectorCutover parses COLLECTOR_CUTOVER (RFC3339) from the environment.
+// Returns zero time.Time{} when the variable is unset, empty, or invalid,
+// which disables the cutover floor (no behaviour change).
+func collectorCutover() time.Time {
+	v := os.Getenv("COLLECTOR_CUTOVER")
+	if v == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		slog.Warn("config: COLLECTOR_CUTOVER is invalid RFC3339; cutover floor disabled",
+			"value", v,
+			"error", err,
+		)
+		return time.Time{}
+	}
+	return t.UTC()
 }
 
 // normalizeExts ensures every extension starts with a leading dot and is lowercase.

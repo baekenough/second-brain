@@ -561,6 +561,111 @@ func TestSMSCollector_LatestFile_PrefersNewerDateName(t *testing.T) {
 	}
 }
 
+// --- Issue #103: empty source file guard ---
+
+// TestSMSCollector_EmptySMSFile_SkippedGracefully verifies that a 0-byte sms-*.xml
+// file results in 0 documents and no error. The collector must not panic or return
+// an error — the empty-file case is a silent skip with a Warn log.
+func TestSMSCollector_EmptySMSFile_SkippedGracefully(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	// Create a 0-byte sms file (simulates an OneDrive placeholder that failed
+	// to materialise — the onedrive-bridge staged an empty file).
+	emptyPath := filepath.Join(dir, "sms-20260101.xml")
+	if err := os.WriteFile(emptyPath, []byte{}, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	c := NewSMSCollector(dir, 1<<30)
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect on 0-byte sms file must not error, got: %v", err)
+	}
+	if len(docs) != 0 {
+		t.Errorf("expected 0 docs from 0-byte sms file, got %d", len(docs))
+	}
+}
+
+// TestSMSCollector_EmptyCallsFile_SkippedGracefully verifies that a 0-byte
+// calls-*.xml file results in 0 documents and no error.
+func TestSMSCollector_EmptyCallsFile_SkippedGracefully(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	emptyPath := filepath.Join(dir, "calls-20260101.xml")
+	if err := os.WriteFile(emptyPath, []byte{}, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	c := NewSMSCollector(dir, 1<<30)
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect on 0-byte calls file must not error, got: %v", err)
+	}
+	if len(docs) != 0 {
+		t.Errorf("expected 0 docs from 0-byte calls file, got %d", len(docs))
+	}
+}
+
+// TestSMSCollector_EmptyBothFiles_SkippedGracefully verifies that 0-byte sms AND
+// calls files together still result in 0 docs and no error (partial-result contract
+// holds: neither file panics or errors, both are skipped with Warn).
+func TestSMSCollector_EmptyBothFiles_SkippedGracefully(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	for _, name := range []string{"sms-20260101.xml", "calls-20260101.xml"} {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte{}, 0o600); err != nil {
+			t.Fatalf("WriteFile %q: %v", name, err)
+		}
+	}
+
+	c := NewSMSCollector(dir, 1<<30)
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect on 0-byte sms+calls files must not error, got: %v", err)
+	}
+	if len(docs) != 0 {
+		t.Errorf("expected 0 docs from 0-byte source files, got %d", len(docs))
+	}
+}
+
+// TestSMSCollector_EmptySMSFile_ValidCallsStillCollected verifies the partial-result
+// contract: if the sms file is empty (skipped) but the calls file is valid, call-log
+// docs are still returned.
+func TestSMSCollector_EmptySMSFile_ValidCallsStillCollected(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	// 0-byte sms file.
+	if err := os.WriteFile(filepath.Join(dir, "sms-20260101.xml"), []byte{}, 0o600); err != nil {
+		t.Fatalf("WriteFile sms: %v", err)
+	}
+
+	// Valid calls file with one record.
+	writeFile(t, filepath.Join(dir, "calls-20260101.xml"), makeCallsXML([]struct {
+		Number      string
+		DateMs      int64
+		Type        int
+		Duration    int64
+		ContactName string
+	}{
+		{"010-1234-5678", hoursAgoMs(1), 1, 60, "Test"},
+	}))
+
+	c := NewSMSCollector(dir, 1<<30)
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("expected 1 call-log doc (empty sms file skipped, valid calls collected), got %d", len(docs))
+	}
+}
+
 // Compile-time check: SMSCollector implements IndexAwareCollector.
 var _ IndexAwareCollector = (*SMSCollector)(nil)
 

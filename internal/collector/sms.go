@@ -49,6 +49,7 @@ type SMSCollector struct {
 	sourceDir    string
 	indexedIDs   map[string]struct{} // nil = mtime-only mode
 	maxFileBytes int64               // per-file size cap; 0 or negative means no limit
+	cutover      time.Time           // zero = floor disabled (no behaviour change)
 }
 
 // NewSMSCollector returns an SMSCollector that reads XML exports from sourceDir.
@@ -70,6 +71,13 @@ func (c *SMSCollector) Enabled() bool            { return c.sourceDir != "" }
 // Passing nil restores event-time-only filtering.
 func (c *SMSCollector) WithIndexedIDs(ids map[string]struct{}) {
 	c.indexedIDs = ids
+}
+
+// WithCutover implements CutoverAwareCollector. When t is non-zero, records
+// whose OccurredAt is before t are suppressed even if they were never indexed.
+// Zero t disables the floor (no behaviour change).
+func (c *SMSCollector) WithCutover(t time.Time) {
+	c.cutover = t
 }
 
 // Collect parses the latest sms-*.xml and calls-*.xml files in sourceDir and
@@ -208,13 +216,25 @@ func smsBodyHash(body string) string {
 }
 
 // shouldEmitSMS returns true when the record should be included in the output.
-// Emission criteria (OR):
-//  1. OccurredAt is after since (normal incremental case).
-//  2. sourceID is NOT in the indexed set AND the set is non-nil (index-aware
-//     case: rescues late-arriving and post-truncation records).
+// Emission criteria (both must hold):
 //
-// When indexedIDs is nil (legacy/test mode), only criterion 1 applies.
+//  1. Cutover floor: if cutover is non-zero, occurredAt must not be before
+//     cutover. Records that pre-date the cutover are suppressed regardless of
+//     whether they were indexed (prevents re-collecting legacy history).
+//
+//  2. Watermark / index-aware gate (OR of a or b):
+//     a. OccurredAt is after since (normal incremental case).
+//     b. sourceID is NOT in the indexed set AND the set is non-nil (index-aware
+//        case: rescues late-arriving and post-truncation records).
+//
+// When indexedIDs is nil (legacy/test mode), only criterion 2a applies.
 func (c *SMSCollector) shouldEmitSMS(occurredAt time.Time, sourceID string, since time.Time) bool {
+	// Cutover floor: suppress records that pre-date the cutover.
+	if !c.cutover.IsZero() && occurredAt.Before(c.cutover) {
+		return false
+	}
+
+	// Watermark / index-aware gate.
 	if since.IsZero() || occurredAt.After(since) {
 		return true
 	}
@@ -243,6 +263,15 @@ func (c *SMSCollector) parseSMSFile(ctx context.Context, path string, since time
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("stat %q: %w", path, err)
+	}
+	// Issue #103: a 0-byte file means the onedrive-bridge staged an empty
+	// placeholder that never materialised. Parsing an empty file silently
+	// yields 0 records, which is indistinguishable from "no new messages".
+	// Warn so operators can detect the bridge/sync failure, then skip.
+	if info.Size() == 0 {
+		slog.Warn("sms: source file is empty — possible OneDrive materialization/bridge failure; skipping",
+			"file", path)
+		return nil, nil
 	}
 	if c.maxFileBytes > 0 && info.Size() > c.maxFileBytes {
 		slog.Warn("sms: skipping oversized sms file",
@@ -340,6 +369,13 @@ func (c *SMSCollector) parseCallsFile(ctx context.Context, path string, since ti
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("stat %q: %w", path, err)
+	}
+	// Issue #103: same empty-file guard as parseSMSFile — a 0-byte calls file
+	// means the onedrive-bridge staged a placeholder that never materialised.
+	if info.Size() == 0 {
+		slog.Warn("sms: source file is empty — possible OneDrive materialization/bridge failure; skipping",
+			"file", path)
+		return nil, nil
 	}
 	if c.maxFileBytes > 0 && info.Size() > c.maxFileBytes {
 		slog.Warn("sms: skipping oversized calls file",
