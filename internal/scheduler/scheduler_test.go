@@ -12,6 +12,40 @@ import (
 	"github.com/baekenough/second-brain/internal/search"
 )
 
+// countingCollector records every Collect invocation.
+type countingCollector struct {
+	name    string
+	source  model.SourceType
+	enabled bool
+
+	mu    sync.Mutex
+	calls int
+}
+
+func newCountingCollector(name string, enabled bool) *countingCollector {
+	return &countingCollector{
+		name:    name,
+		source:  model.SourceType("test-" + name),
+		enabled: enabled,
+	}
+}
+
+func (c *countingCollector) Name() string             { return c.name }
+func (c *countingCollector) Source() model.SourceType { return c.source }
+func (c *countingCollector) Enabled() bool            { return c.enabled }
+func (c *countingCollector) Collect(_ context.Context, _ time.Time) ([]model.Document, error) {
+	c.mu.Lock()
+	c.calls++
+	c.mu.Unlock()
+	return nil, nil
+}
+
+func (c *countingCollector) callCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
 // --- test doubles ---
 
 // mockStore implements DocumentUpserter for tests.
@@ -222,6 +256,98 @@ func TestScheduler_PanicInRun_ReleasesLock(t *testing.T) {
 
 	if sched.running.Load() {
 		t.Error("running flag should be false after second run completes")
+	}
+}
+
+// TestScheduler_RunAll_AllEnabledCollectorsRun verifies the starvation fix:
+// a single runAll call runs every enabled collector exactly once and skips
+// disabled collectors entirely.
+//
+// Before the fix, Register() added one cron job per collector; on the same
+// tick they all competed for s.running and only one won — the rest were
+// silently skipped. With the fix, Register() adds a single job that calls
+// runAll(), which iterates through all collectors sequentially while holding
+// the run-lock for the whole cycle.
+func TestScheduler_RunAll_AllEnabledCollectorsRun(t *testing.T) {
+	t.Parallel()
+
+	col1 := newCountingCollector("alpha", true)
+	col2 := newCountingCollector("bravo", true)
+	col3 := newCountingCollector("charlie", true)
+	disabledCol := newCountingCollector("delta", false)
+
+	store := &mockStore{}
+	sched := New(store, disabledEmbed(), col1, col2, col3, disabledCol)
+
+	sched.runAll(context.Background())
+
+	for _, col := range []*countingCollector{col1, col2, col3} {
+		if got := col.callCount(); got != 1 {
+			t.Errorf("collector %q: expected 1 Collect call, got %d", col.Name(), got)
+		}
+	}
+	if got := disabledCol.callCount(); got != 0 {
+		t.Errorf("disabled collector %q: expected 0 Collect calls, got %d", disabledCol.Name(), got)
+	}
+
+	// Running flag must be released after the cycle.
+	if sched.running.Load() {
+		t.Error("running flag should be false after runAll completes")
+	}
+}
+
+// TestScheduler_RunAll_SkipsWhenRunning verifies that a concurrent runAll call
+// is dropped (returns immediately) when a cycle is already in progress.
+func TestScheduler_RunAll_SkipsWhenRunning(t *testing.T) {
+	t.Parallel()
+
+	// Use a slow collector so the first runAll holds the lock long enough for
+	// the second call to arrive while it is still running.
+	slow := newSlowCollector(200 * time.Millisecond)
+	store := &mockStore{}
+	sched := New(store, disabledEmbed(), slow)
+
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		sched.runAll(ctx)
+	}()
+
+	// Let the first runAll acquire the lock.
+	time.Sleep(20 * time.Millisecond)
+
+	// Second runAll must be skipped immediately.
+	sched.runAll(ctx)
+
+	wg.Wait()
+
+	if got := slow.callCount(); got != 1 {
+		t.Errorf("expected 1 Collect call, got %d (second tick should have been skipped)", got)
+	}
+}
+
+// TestScheduler_RunAll_SecondTickRunsAfterFirst verifies that after the first
+// runAll cycle completes the running flag is cleared and a subsequent call
+// executes all collectors again (normal sequential-tick behaviour).
+func TestScheduler_RunAll_SecondTickRunsAfterFirst(t *testing.T) {
+	t.Parallel()
+
+	col := newCountingCollector("echo", true)
+	store := &mockStore{}
+	sched := New(store, disabledEmbed(), col)
+
+	ctx := context.Background()
+	sched.runAll(ctx)
+	sched.runAll(ctx)
+
+	if got := col.callCount(); got != 2 {
+		t.Errorf("expected 2 Collect calls across two ticks, got %d", got)
+	}
+	if sched.running.Load() {
+		t.Error("running flag should be false after both runAll calls complete")
 	}
 }
 

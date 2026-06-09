@@ -111,24 +111,61 @@ func (s *Scheduler) WithEntityExtraction(entities EntityExtractor, client llm.Co
 	return s
 }
 
-// Register adds a cron job for each enabled collector using the given interval
-// (e.g. "@every 1h").
+// Register adds a SINGLE cron job that runs ALL enabled collectors sequentially
+// on every tick of the given interval (e.g. "@every 1h").
+//
+// A single job avoids the starvation bug present in the old per-collector
+// design: when N collectors each had their own cron job with the same spec they
+// all fired simultaneously. Each job competed for the single running flag, so
+// only the first winner executed; the other N-1 logged "already running" and
+// were skipped until the next tick. Over time, collectors that consistently lost
+// the race (e.g. gmail) never ran.
+//
+// With a single job, every tick acquires the flag once and then iterates through
+// all enabled collectors sequentially. A slow collector delays the ones that
+// follow within the same tick, but the next tick is simply skipped by the
+// try-lock if the cycle is still running — this is intentional and strictly
+// better than indefinite starvation.
 func (s *Scheduler) Register(interval time.Duration) error {
 	spec := fmt.Sprintf("@every %s", interval)
+
+	// Log registration status for each collector before adding the single job.
 	for _, col := range s.collectors {
 		if !col.Enabled() {
 			slog.Info("scheduler: collector disabled, skipping", "name", col.Name())
 			continue
 		}
-		c := col // capture loop variable
-		if _, err := s.cron.AddFunc(spec, func() {
-			s.run(context.Background(), c)
-		}); err != nil {
-			return fmt.Errorf("register collector %s: %w", c.Name(), err)
-		}
-		slog.Info("scheduler: registered collector", "name", c.Name(), "interval", interval)
+		slog.Info("scheduler: registered collector", "name", col.Name(), "interval", interval)
+	}
+
+	if _, err := s.cron.AddFunc(spec, func() {
+		s.runAll(context.Background())
+	}); err != nil {
+		return fmt.Errorf("register all collectors: %w", err)
 	}
 	return nil
+}
+
+// runAll acquires the running lock and executes all enabled collectors
+// sequentially. It is the cron-tick entry point registered by Register.
+//
+// cron already runs each job in its own goroutine, so runAll does NOT spawn
+// an additional goroutine — doing so would release the outer cron goroutine
+// immediately and break the overlap-skip semantics (the running flag would be
+// cleared before the collectors finish).
+func (s *Scheduler) runAll(ctx context.Context) {
+	if !s.running.CompareAndSwap(false, true) {
+		slog.Warn("scheduler: collection already running, skipping tick")
+		return
+	}
+	defer s.running.Store(false)
+
+	for _, col := range s.collectors {
+		if !col.Enabled() {
+			continue
+		}
+		s.runCollector(ctx, col)
+	}
 }
 
 // Start begins the cron scheduler. It is non-blocking.
