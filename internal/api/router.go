@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"runtime/debug"
 	"sync"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -56,6 +57,25 @@ type Server struct {
 	ingestChunks       IngestFileChunkWriter
 	ingestEmbedder     IngestFileEmbedder
 	ingestMaxFileBytes int64
+
+	// messagesUpserter, messagesChunks, messagesEmbedder, messagesMaxBatch, and
+	// messagesCutover are optional. When messagesUpserter is non-nil the
+	// POST /api/v1/ingest/messages route is registered.
+	// Set via WithIngestMessages before calling Handler().
+	messagesUpserter IngestMessagesUpserter
+	messagesChunks   IngestFileChunkWriter
+	messagesEmbedder IngestFileEmbedder
+	messagesMaxBatch int
+	messagesCutover  time.Time
+
+	// recordingUpserter, recordingDir, recordingMaxFileBytes, and
+	// recordingCutover are optional. When recordingUpserter is non-nil and
+	// recordingDir is non-empty the POST /api/v1/ingest/recording route is
+	// registered. Set via WithIngestRecording before calling Handler().
+	recordingUpserter     IngestRecordingUpserter
+	recordingDir          string
+	recordingMaxFileBytes int64
+	recordingCutover      time.Time
 
 	// handlerOnce ensures buildHandler is called exactly once per Server so
 	// that the graphql-go schema (and its package-level type objects) are
@@ -143,6 +163,12 @@ func (s *Server) buildHandler() http.Handler {
 		}
 		if s.ingestUpserter != nil {
 			r.Post("/api/v1/ingest/file", s.ingestFileHandler)
+		}
+		if s.messagesUpserter != nil {
+			r.Post("/api/v1/ingest/messages", s.ingestMessagesHandler)
+		}
+		if s.recordingUpserter != nil && s.recordingDir != "" {
+			r.Post("/api/v1/ingest/recording", s.ingestRecordingHandler)
 		}
 	})
 

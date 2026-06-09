@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Second Brain Push</string>
+
+    <!-- Sections -->
+    <string name="section_server">Server</string>
+    <string name="section_sync">Sync Settings</string>
+    <string name="section_permissions">Permissions</string>
+
+    <!-- Hints -->
+    <string name="hint_server_url">Server URL (e.g. https://your-tunnel.example.com)</string>
+    <string name="hint_api_token">API Bearer Token</string>
+    <string name="hint_sync_interval">Sync interval (hours, 1–24)</string>
+
+    <!-- Switches -->
+    <string name="label_audio_wifi_only">Upload recordings on Wi-Fi only</string>
+    <string name="label_audio_charging_only">Upload recordings while charging only</string>
+
+    <!-- Buttons -->
+    <string name="btn_save">Save Settings</string>
+    <string name="btn_sync_now">Sync Now</string>
+    <string name="btn_request_permissions">Grant Permissions</string>
+
+    <!-- Permission labels -->
+    <string name="permission_sms">READ_SMS</string>
+    <string name="permission_call_log">READ_CALL_LOG</string>
+    <string name="permission_audio">READ_MEDIA_AUDIO / READ_EXTERNAL_STORAGE</string>
+    <string name="permission_granted">✓ %1$s: Granted</string>
+    <string name="permission_denied">✗ %1$s: Not granted</string>
+
+    <!-- Toasts / messages -->
+    <string name="settings_saved">Settings saved.</string>
+    <string name="permissions_granted">All permissions granted!</string>
+    <string name="permissions_partial">Some permissions were denied. Sync may be incomplete.</string>
+    <string name="sync_success">Sync completed successfully.</string>
+    <string name="sync_failed">Sync failed. Check server URL and API token.</string>
+    <string name="error_not_configured">Please save a server URL and API token first.</string>
+</resources>

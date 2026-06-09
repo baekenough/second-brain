@@ -3,6 +3,7 @@ package config
 import (
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -161,10 +162,28 @@ type Config struct {
 	WhisperLanguage     string
 	WhisperMaxFileBytes int64
 
-	// IngestMaxFileBytes is the per-upload file size cap for POST /api/v1/ingest/file.
+	// IngestMaxFileBytes is the per-upload file size cap for POST /api/v1/ingest/file
+	// and POST /api/v1/ingest/recording.
 	// Default 100 MiB. Set INGEST_MAX_FILE_BYTES=0 to disable the cap entirely.
 	// Invalid values use the default.
 	IngestMaxFileBytes int64
+
+	// IngestRecordingDir is the directory where POST /api/v1/ingest/recording
+	// saves uploaded audio files for later transcription by WhisperCollector.
+	//
+	// Resolution order:
+	//   1. INGEST_RECORDING_DIR non-empty → use directly.
+	//   2. WHISPER_AUDIO_DIR non-empty    → use WHISPER_AUDIO_DIR/ingest.
+	//   3. Both empty                     → recording ingest is disabled.
+	//
+	// WhisperCollector picks up the saved files on its next scheduled run.
+	IngestRecordingDir string
+
+	// IngestMaxBatchMessages is the maximum number of combined SMS + call records
+	// accepted in a single POST /api/v1/ingest/messages request.
+	// Default 5000. Set INGEST_MAX_BATCH_MESSAGES=0 to use the default.
+	// Invalid values use the default.
+	IngestMaxBatchMessages int
 
 	// Summarizer
 	// SummarizerBackfillEnabled controls whether the SummarizerWorker scans for
@@ -386,6 +405,9 @@ func Load() (*Config, error) {
 
 		IngestMaxFileBytes: ingestMaxFileBytes(),
 
+		IngestRecordingDir:     resolveIngestRecordingDir(),
+		IngestMaxBatchMessages: ingestMaxBatchMessages(),
+
 		SummarizerBackfillEnabled: summarizerBackfill,
 
 		CollectInterval:   interval,
@@ -494,6 +516,38 @@ func ingestMaxFileBytes() int64 {
 		return defaultCap
 	}
 	return n // 0 means no limit (caller checks maxFileBytes <= 0)
+}
+
+// resolveIngestRecordingDir resolves the directory for POST /api/v1/ingest/recording
+// uploads using the three-step resolution order documented on IngestRecordingDir.
+func resolveIngestRecordingDir() string {
+	if v := os.Getenv("INGEST_RECORDING_DIR"); v != "" {
+		return v
+	}
+	if w := os.Getenv("WHISPER_AUDIO_DIR"); w != "" {
+		return filepath.Join(w, "ingest")
+	}
+	return ""
+}
+
+// ingestMaxBatchMessages parses INGEST_MAX_BATCH_MESSAGES from the environment.
+// Default is 5000. Set 0 to use the default (not to disable the cap).
+// Invalid values use the default.
+func ingestMaxBatchMessages() int {
+	const defaultCap = 5000
+	v := os.Getenv("INGEST_MAX_BATCH_MESSAGES")
+	if v == "" {
+		return defaultCap
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		slog.Warn("config: INGEST_MAX_BATCH_MESSAGES is invalid; using default 5000",
+			"value", v,
+			"error", err,
+		)
+		return defaultCap
+	}
+	return n
 }
 
 // LoadCollector reads configuration for the collector daemon.

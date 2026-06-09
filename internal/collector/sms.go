@@ -3,7 +3,6 @@ package collector
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -11,25 +10,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/baekenough/second-brain/internal/collector/smsmap"
 	"github.com/baekenough/second-brain/internal/model"
 )
-
-// authLikeRe matches SMS bodies that look like authentication / OTP messages.
-// Patterns (case-insensitive):
-//   - 인증번호, 본인 확인 (Korean auth phrases)
-//   - verification, otp (English auth phrases)
-//   - 4–8 consecutive digits (typical OTP codes)
-//   - 타인에게 (Korean "don't share with others" — common in auth SMS)
-var authLikeRe = regexp.MustCompile(`(?i)인증번호|본인.{0,2}확인|verification|\b\d{4,8}\b|타인에게|otp`)
-
-// otpDigitsRe matches runs of 4–8 digits to redact from auth-like bodies.
-var otpDigitsRe = regexp.MustCompile(`\b\d{4,8}\b`)
 
 // SMSCollector reads SMS messages and call logs from SMS Backup & Restore XML
 // exports. Each prefix (sms-*.xml, calls-*.xml) uses the single file with the
@@ -237,38 +224,16 @@ func (c *SMSCollector) streamSMSFile(ctx context.Context, path string, since tim
 		}
 
 		occurredAt := msToUTC(rec.Date)
-		addrHash := smsShortHash(rec.Address)
-		bodyHash := smsBodyHash(rec.Body)
+		addrHash := smsmap.ShortHash(rec.Address)
+		bodyHash := smsmap.BodyShortHash(rec.Body)
 		sourceID := fmt.Sprintf("sms:%d:%s:%s", rec.Date, addrHash, bodyHash)
 
 		if !c.shouldEmitSMS(occurredAt, sourceID, since) {
 			continue
 		}
 
-		direction := smsDirection(rec.Type)
-		contact := firstNonEmptySMS(rec.ContactName, rec.Address)
-		title := fmt.Sprintf("SMS %s %s", direction, contact)
-		isAuth := authLikeRe.MatchString(rec.Body)
-		body := rec.Body
-		if isAuth {
-			body = otpDigitsRe.ReplaceAllString(body, "[REDACTED]")
-		}
-		meta := map[string]any{
-			"contact_name": rec.ContactName,
-			"direction":    direction,
-			"is_auth_like": isAuth,
-		}
-		t := occurredAt
-		batch = append(batch, model.Document{
-			ID:          uuid.New(),
-			SourceType:  model.SourceSMS,
-			SourceID:    sourceID,
-			Title:       title,
-			Content:     body,
-			Metadata:    meta,
-			OccurredAt:  &t,
-			CollectedAt: time.Now().UTC(),
-		})
+		doc := smsmap.MapSMS(rec.Address, rec.Body, rec.Date, rec.Type, rec.ContactName)
+		batch = append(batch, doc)
 
 		if len(batch) >= smsStreamBatchSize {
 			if err := onBatch(batch); err != nil {
@@ -340,37 +305,17 @@ func (c *SMSCollector) streamCallsFile(ctx context.Context, path string, since t
 		}
 
 		occurredAt := msToUTC(rec.Date)
-		numHash := smsShortHash(rec.Number)
+		numHash := smsmap.ShortHash(rec.Number)
 		durationStr := fmt.Sprintf("%d", rec.Duration)
-		durationHash := smsBodyHash(durationStr)
+		durationHash := smsmap.BodyShortHash(durationStr)
 		sourceID := fmt.Sprintf("call-log:%d:%s:%s", rec.Date, numHash, durationHash)
 
 		if !c.shouldEmitSMS(occurredAt, sourceID, since) {
 			continue
 		}
 
-		direction := callDirection(rec.Type)
-		contact := firstNonEmptySMS(rec.ContactName, rec.Number)
-		title := fmt.Sprintf("%s 통화 %s", direction, contact)
-		callTime := occurredAt.Format("2006-01-02 15:04:05 MST")
-		content := fmt.Sprintf("상대방: %s\n통화 방향: %s\n시각: %s\n통화 시간: %ds",
-			contact, direction, callTime, rec.Duration)
-		meta := map[string]any{
-			"contact_name":     rec.ContactName,
-			"direction":        direction,
-			"duration_seconds": rec.Duration,
-		}
-		t := occurredAt
-		batch = append(batch, model.Document{
-			ID:          uuid.New(),
-			SourceType:  model.SourceCallLog,
-			SourceID:    sourceID,
-			Title:       title,
-			Content:     content,
-			Metadata:    meta,
-			OccurredAt:  &t,
-			CollectedAt: time.Now().UTC(),
-		})
+		doc := smsmap.MapCall(rec.Number, rec.Date, int(rec.Duration), rec.Type, rec.ContactName)
+		batch = append(batch, doc)
 
 		if len(batch) >= smsStreamBatchSize {
 			if err := onBatch(batch); err != nil {
@@ -464,23 +409,6 @@ func isTransientFUSEError(err error) bool {
 		return false
 	}
 	return errno == syscall.EDEADLK || errno == syscall.ETIMEDOUT
-}
-
-// smsShortHash returns a 16-character hex string that is the first 8 bytes of
-// SHA-256(s). Used to hash PII (phone numbers/addresses) in SourceIDs so they
-// are not logged downstream. The hash is truncated for readability; collision
-// probability over a typical contact book (~1000 numbers) is negligible.
-func smsShortHash(s string) string {
-	h := sha256.Sum256([]byte(s))
-	return fmt.Sprintf("%x", h[:8]) // 16 hex chars
-}
-
-// smsBodyHash returns an 8-character hex string of SHA-256(body) used to
-// disambiguate SourceIDs when two messages share the same address and
-// millisecond timestamp. SMS bodies are immutable, so body-in-key is stable.
-func smsBodyHash(body string) string {
-	h := sha256.Sum256([]byte(body))
-	return fmt.Sprintf("%x", h[:4]) // 8 hex chars
 }
 
 // shouldEmitSMS returns true when the record should be included in the output.
@@ -585,43 +513,16 @@ func (c *SMSCollector) parseSMSFile(ctx context.Context, path string, since time
 		occurredAt := msToUTC(rec.Date)
 
 		// PII fix (MEDIUM): hash address to avoid logging raw phone numbers.
-		addrHash := smsShortHash(rec.Address)
-		bodyHash := smsBodyHash(rec.Body)
+		addrHash := smsmap.ShortHash(rec.Address)
+		bodyHash := smsmap.BodyShortHash(rec.Body)
 		sourceID := fmt.Sprintf("sms:%d:%s:%s", rec.Date, addrHash, bodyHash)
 
 		if !c.shouldEmitSMS(occurredAt, sourceID, since) {
 			continue
 		}
 
-		direction := smsDirection(rec.Type)
-		contact := firstNonEmptySMS(rec.ContactName, rec.Address)
-		title := fmt.Sprintf("SMS %s %s", direction, contact)
-
-		isAuth := authLikeRe.MatchString(rec.Body)
-
-		// OTP redaction (MEDIUM): replace sensitive digit runs before storing.
-		body := rec.Body
-		if isAuth {
-			body = otpDigitsRe.ReplaceAllString(body, "[REDACTED]")
-		}
-
-		meta := map[string]any{
-			"contact_name": rec.ContactName,
-			"direction":    direction,
-			"is_auth_like": isAuth,
-		}
-
-		t := occurredAt
-		docs = append(docs, model.Document{
-			ID:          uuid.New(),
-			SourceType:  model.SourceSMS,
-			SourceID:    sourceID,
-			Title:       title,
-			Content:     body,
-			Metadata:    meta,
-			OccurredAt:  &t,
-			CollectedAt: time.Now().UTC(),
-		})
+		doc := smsmap.MapSMS(rec.Address, rec.Body, rec.Date, rec.Type, rec.ContactName)
+		docs = append(docs, doc)
 	}
 	return docs, nil
 }
@@ -689,41 +590,18 @@ func (c *SMSCollector) parseCallsFile(ctx context.Context, path string, since ti
 		occurredAt := msToUTC(rec.Date)
 
 		// PII fix (MEDIUM): hash number to avoid logging raw phone numbers.
-		numHash := smsShortHash(rec.Number)
+		numHash := smsmap.ShortHash(rec.Number)
 		// For call logs use duration as a stable discriminator (not body).
 		durationStr := fmt.Sprintf("%d", rec.Duration)
-		durationHash := smsBodyHash(durationStr)
+		durationHash := smsmap.BodyShortHash(durationStr)
 		sourceID := fmt.Sprintf("call-log:%d:%s:%s", rec.Date, numHash, durationHash)
 
 		if !c.shouldEmitSMS(occurredAt, sourceID, since) {
 			continue
 		}
 
-		direction := callDirection(rec.Type)
-		contact := firstNonEmptySMS(rec.ContactName, rec.Number)
-		title := fmt.Sprintf("%s 통화 %s", direction, contact)
-
-		callTime := occurredAt.Format("2006-01-02 15:04:05 MST")
-		content := fmt.Sprintf("상대방: %s\n통화 방향: %s\n시각: %s\n통화 시간: %ds",
-			contact, direction, callTime, rec.Duration)
-
-		meta := map[string]any{
-			"contact_name":     rec.ContactName,
-			"direction":        direction,
-			"duration_seconds": rec.Duration,
-		}
-
-		t := occurredAt
-		docs = append(docs, model.Document{
-			ID:          uuid.New(),
-			SourceType:  model.SourceCallLog,
-			SourceID:    sourceID,
-			Title:       title,
-			Content:     content,
-			Metadata:    meta,
-			OccurredAt:  &t,
-			CollectedAt: time.Now().UTC(),
-		})
+		doc := smsmap.MapCall(rec.Number, rec.Date, int(rec.Duration), rec.Type, rec.ContactName)
+		docs = append(docs, doc)
 	}
 	return docs, nil
 }
@@ -789,66 +667,11 @@ func msToUTC(ms int64) time.Time {
 	return time.UnixMilli(ms).UTC()
 }
 
-// smsDirection maps SMS Backup & Restore type codes to human-readable strings.
-//
-//	1 = received
-//	2 = sent
-//	3 = draft
-//	4 = outbox
-//	5 = failed
-//	6 = queued
-func smsDirection(t int) string {
-	switch t {
-	case 1:
-		return "received"
-	case 2:
-		return "sent"
-	case 3:
-		return "draft"
-	case 4:
-		return "outbox"
-	case 5:
-		return "failed"
-	case 6:
-		return "queued"
-	default:
-		return "unknown"
-	}
-}
+// smsShortHash is a package-level alias for smsmap.ShortHash retained for
+// backward compatibility with existing same-package tests that call this helper.
+func smsShortHash(s string) string { return smsmap.ShortHash(s) }
 
-// callDirection maps SMS Backup & Restore call type codes to human-readable strings.
-//
-//	1 = incoming
-//	2 = outgoing
-//	3 = missed
-//	4 = voicemail
-//	5 = rejected
-//	6 = blocked
-func callDirection(t int) string {
-	switch t {
-	case 1:
-		return "incoming"
-	case 2:
-		return "outgoing"
-	case 3:
-		return "missed"
-	case 4:
-		return "voicemail"
-	case 5:
-		return "rejected"
-	case 6:
-		return "blocked"
-	default:
-		return "unknown"
-	}
-}
+// smsBodyHash is a package-level alias for smsmap.BodyShortHash retained for
+// backward compatibility with existing same-package tests that call this helper.
+func smsBodyHash(s string) string { return smsmap.BodyShortHash(s) }
 
-// firstNonEmptySMS returns the first non-blank string, falling back to the second.
-// This is a local variant of firstNonEmptyStr that avoids cross-file coupling on
-// unexported helpers — both files may be compiled independently.
-func firstNonEmptySMS(a, b string) string {
-	if strings.TrimSpace(a) != "" {
-		return a
-	}
-	return b
-}
