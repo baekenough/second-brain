@@ -27,6 +27,7 @@ const (
 	SourceSMS            SourceType = "sms"
 	SourceCallLog        SourceType = "call-log"
 	SourceCallTranscript SourceType = "call-transcript"
+	SourceUpload         SourceType = "upload"
 )
 
 // Document represents a piece of content collected from an external source.

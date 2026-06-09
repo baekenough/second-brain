@@ -5,11 +5,11 @@
 // Transport: streamable HTTP (POST /mcp + GET /mcp/sse).
 // Port:      MCP_PORT env var (default 8090).
 //
-// Tools:
+// Tools (all require Bearer token auth when API_KEY is set):
 //   - search       — hybrid FTS + vector search over collected documents
 //   - get_document — fetch a single document by UUID
 //   - stats        — per-source document / chunk count statistics
-//   - add_note     — persist a note or memory into the knowledge base (requires auth)
+//   - add_note     — persist a note or memory into the knowledge base
 package main
 
 import (
@@ -260,6 +260,12 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service) {
 	)
 
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// Auth check — only enforced when API_KEY is set (isAuthorized returns
+		// true unconditionally when no key is configured).
+		if !isAuthorized(ctx) {
+			return mcp.NewToolResultError("unauthorized: Bearer token required"), nil
+		}
+
 		query, err := req.RequireString("query")
 		if err != nil || strings.TrimSpace(query) == "" {
 			return mcp.NewToolResultError("query parameter is required and must be non-empty"), nil
@@ -358,6 +364,12 @@ func registerGetDocumentTool(s *server.MCPServer, docs DocumentGetter) {
 	)
 
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// Auth check — only enforced when API_KEY is set (isAuthorized returns
+		// true unconditionally when no key is configured).
+		if !isAuthorized(ctx) {
+			return mcp.NewToolResultError("unauthorized: Bearer token required"), nil
+		}
+
 		idStr, err := req.RequireString("id")
 		if err != nil || strings.TrimSpace(idStr) == "" {
 			return mcp.NewToolResultError("id parameter is required"), nil
@@ -419,6 +431,12 @@ func registerStatsTool(s *server.MCPServer, docs StatsProvider) {
 	)
 
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// Auth check — only enforced when API_KEY is set (isAuthorized returns
+		// true unconditionally when no key is configured).
+		if !isAuthorized(ctx) {
+			return mcp.NewToolResultError("unauthorized: Bearer token required"), nil
+		}
+
 		baseline, err := docs.QueryBaselineStats(ctx)
 		if err != nil {
 			slog.Error("mcp stats: baseline query failed", "error", err)

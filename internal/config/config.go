@@ -161,6 +161,11 @@ type Config struct {
 	WhisperLanguage     string
 	WhisperMaxFileBytes int64
 
+	// IngestMaxFileBytes is the per-upload file size cap for POST /api/v1/ingest/file.
+	// Default 100 MiB. Set INGEST_MAX_FILE_BYTES=0 to disable the cap entirely.
+	// Invalid values use the default.
+	IngestMaxFileBytes int64
+
 	// Summarizer
 	// SummarizerBackfillEnabled controls whether the SummarizerWorker scans for
 	// pre-existing unsummarized documents (WHERE title_summary IS NULL).
@@ -379,6 +384,8 @@ func Load() (*Config, error) {
 		WhisperLanguage:     getenv("WHISPER_LANGUAGE", "ko"),
 		WhisperMaxFileBytes: whisperMaxFileBytes(),
 
+		IngestMaxFileBytes: ingestMaxFileBytes(),
+
 		SummarizerBackfillEnabled: summarizerBackfill,
 
 		CollectInterval:   interval,
@@ -460,6 +467,27 @@ func whisperMaxFileBytes() int64 {
 	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil || n < 0 {
 		slog.Warn("config: WHISPER_MAX_FILE_BYTES is invalid; using default 100 MiB",
+			"value", v,
+			"error", err,
+		)
+		return defaultCap
+	}
+	return n // 0 means no limit (caller checks maxFileBytes <= 0)
+}
+
+// ingestMaxFileBytes parses INGEST_MAX_FILE_BYTES from the environment.
+// Default is 100 MiB (generous for typical document uploads).
+// Set INGEST_MAX_FILE_BYTES=0 to disable the cap entirely (no limit).
+// Invalid values are ignored and the default is used.
+func ingestMaxFileBytes() int64 {
+	const defaultCap = 100 << 20 // 100 MiB
+	v := os.Getenv("INGEST_MAX_FILE_BYTES")
+	if v == "" {
+		return defaultCap
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		slog.Warn("config: INGEST_MAX_FILE_BYTES is invalid; using default 100 MiB",
 			"value", v,
 			"error", err,
 		)

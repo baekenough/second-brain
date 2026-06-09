@@ -4,9 +4,14 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/mark3labs/mcp-go/mcp"
+	mcpserver "github.com/mark3labs/mcp-go/server"
+
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/store"
 )
@@ -600,6 +605,251 @@ type skipSentinelEmbedder struct{}
 func (s *skipSentinelEmbedder) Enabled() bool { return true }
 func (s *skipSentinelEmbedder) EmbedBatch(_ context.Context, _ []string) ([][]float32, error) {
 	return nil, errEmbedSkipped
+}
+
+// ---------------------------------------------------------------------------
+// Test doubles for read tools
+// ---------------------------------------------------------------------------
+
+// fakeDocGetter implements DocumentGetter.
+type fakeDocGetter struct {
+	doc    *model.Document
+	getErr error
+}
+
+func (f *fakeDocGetter) GetByID(_ context.Context, _ uuid.UUID) (*model.Document, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	if f.doc == nil {
+		return &model.Document{
+			ID:          uuid.New(),
+			SourceType:  model.SourceLLMMemory,
+			SourceID:    "test-source-id",
+			Title:       "Test Doc",
+			Content:     "Test content",
+			Status:      "active",
+			CollectedAt: time.Now().UTC(),
+		}, nil
+	}
+	return f.doc, nil
+}
+
+// fakeStatsProvider implements StatsProvider.
+type fakeStatsProvider struct {
+	baselineErr error
+	countErr    error
+}
+
+func (f *fakeStatsProvider) CountBySource(_ context.Context) (map[string]int, error) {
+	if f.countErr != nil {
+		return nil, f.countErr
+	}
+	return map[string]int{"llm-memory": 1}, nil
+}
+
+func (f *fakeStatsProvider) QueryBaselineStats(_ context.Context) (*store.BaselineStats, error) {
+	if f.baselineErr != nil {
+		return nil, f.baselineErr
+	}
+	return &store.BaselineStats{}, nil
+}
+
+// fakeSearchService is a minimal search.Service stand-in that satisfies the
+// registerSearchTool signature. Because search.Service is a concrete struct,
+// we use it only in the auth-gate tests where Search() is never actually
+// called (the handler returns before reaching it). We pass nil and rely on the
+// auth check short-circuiting before any nil dereference.
+
+// newTestMCPServer constructs an MCPServer with the three read tools and the
+// add_note tool registered, using the provided fakes. searchSvc may be nil
+// when the test never reaches the search execution path (i.e. auth-gate tests).
+func newTestMCPServer(
+	searchSvc interface{ Search(context.Context, model.SearchQuery) ([]model.SearchResult, error) },
+	docGetter DocumentGetter,
+	statsProvider StatsProvider,
+) *mcpserver.MCPServer {
+	s := mcpserver.NewMCPServer("test", "0.0.0", mcpserver.WithToolCapabilities(false))
+
+	// Register get_document and stats with real fakes.
+	registerGetDocumentTool(s, docGetter)
+	registerStatsTool(s, statsProvider)
+
+	// For search we need a *search.Service. Since the auth guard fires before
+	// the service call, we register the tool with a nil service when searchSvc
+	// is nil. The handler casts ctx early and returns before calling the service.
+	// We register a minimal stub tool handler directly to avoid a nil *search.Service.
+	searchTool := mcp.NewTool(
+		"search",
+		mcp.WithString("query", mcp.Required(), mcp.Description("query")),
+	)
+	s.AddTool(searchTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if !isAuthorized(ctx) {
+			return mcp.NewToolResultError("unauthorized: Bearer token required"), nil
+		}
+		if searchSvc == nil {
+			return mcp.NewToolResultError("no search service"), nil
+		}
+		q, _ := req.RequireString("query")
+		_, err := searchSvc.Search(ctx, model.SearchQuery{Query: q, Limit: 10})
+		if err != nil {
+			return mcp.NewToolResultError("search error"), nil
+		}
+		return mcp.NewToolResultText(`{"results":[],"count":0,"query":"` + q + `"}`), nil
+	})
+
+	return s
+}
+
+// callTool is a test helper that directly invokes a registered tool handler
+// with the given context and arguments map.
+func callTool(
+	t *testing.T,
+	s *mcpserver.MCPServer,
+	toolName string,
+	ctx context.Context,
+	args map[string]any,
+) *mcp.CallToolResult {
+	t.Helper()
+	st := s.GetTool(toolName)
+	if st == nil {
+		t.Fatalf("tool %q not registered", toolName)
+	}
+	req := mcp.CallToolRequest{}
+	req.Params.Name = toolName
+	req.Params.Arguments = args
+	result, err := st.Handler(ctx, req)
+	if err != nil {
+		t.Fatalf("tool %q returned unexpected error: %v", toolName, err)
+	}
+	return result
+}
+
+// authorizedCtx returns a context carrying an approved Bearer-token claim.
+func authorizedCtx() context.Context {
+	return context.WithValue(context.Background(), mcpAuthKey{}, true)
+}
+
+// unauthorizedCtx returns a context carrying a rejected Bearer-token claim
+// (simulating what mcpAuthContextFunc produces when an invalid token is sent).
+func unauthorizedCtx() context.Context {
+	return context.WithValue(context.Background(), mcpAuthKey{}, false)
+}
+
+// isErrorResult reports whether a CallToolResult signals a tool-level error.
+func isErrorResult(r *mcp.CallToolResult) bool {
+	return r != nil && r.IsError
+}
+
+// resultText extracts the text from the first content item of a CallToolResult.
+func resultText(r *mcp.CallToolResult) string {
+	if r == nil || len(r.Content) == 0 {
+		return ""
+	}
+	if tc, ok := r.Content[0].(mcp.TextContent); ok {
+		return tc.Text
+	}
+	return ""
+}
+
+// ---------------------------------------------------------------------------
+// Auth enforcement tests: search
+// ---------------------------------------------------------------------------
+
+func TestSearchTool_Unauthorized_ReturnsAuthError(t *testing.T) {
+	t.Parallel()
+
+	s := newTestMCPServer(nil, &fakeDocGetter{}, &fakeStatsProvider{})
+	result := callTool(t, s, "search", unauthorizedCtx(), map[string]any{"query": "test"})
+
+	if !isErrorResult(result) {
+		t.Error("expected IsError=true for unauthorized search call")
+	}
+	if !strings.Contains(resultText(result), "unauthorized") {
+		t.Errorf("expected unauthorized message, got: %s", resultText(result))
+	}
+}
+
+func TestSearchTool_Authorized_ProceedsToHandler(t *testing.T) {
+	t.Parallel()
+
+	// Use a minimal fake search service that records the call.
+	svc := &fakeSearchSvc{}
+	s := newTestMCPServer(svc, &fakeDocGetter{}, &fakeStatsProvider{})
+	result := callTool(t, s, "search", authorizedCtx(), map[string]any{"query": "hello"})
+
+	if isErrorResult(result) {
+		t.Errorf("expected no error for authorized search call, got: %s", resultText(result))
+	}
+}
+
+// fakeSearchSvc satisfies the search interface used by newTestMCPServer.
+type fakeSearchSvc struct{}
+
+func (f *fakeSearchSvc) Search(_ context.Context, _ model.SearchQuery) ([]model.SearchResult, error) {
+	return nil, nil
+}
+
+// ---------------------------------------------------------------------------
+// Auth enforcement tests: get_document
+// ---------------------------------------------------------------------------
+
+func TestGetDocumentTool_Unauthorized_ReturnsAuthError(t *testing.T) {
+	t.Parallel()
+
+	s := newTestMCPServer(nil, &fakeDocGetter{}, &fakeStatsProvider{})
+	result := callTool(t, s, "get_document", unauthorizedCtx(), map[string]any{
+		"id": uuid.New().String(),
+	})
+
+	if !isErrorResult(result) {
+		t.Error("expected IsError=true for unauthorized get_document call")
+	}
+	if !strings.Contains(resultText(result), "unauthorized") {
+		t.Errorf("expected unauthorized message, got: %s", resultText(result))
+	}
+}
+
+func TestGetDocumentTool_Authorized_ProceedsToHandler(t *testing.T) {
+	t.Parallel()
+
+	s := newTestMCPServer(nil, &fakeDocGetter{}, &fakeStatsProvider{})
+	result := callTool(t, s, "get_document", authorizedCtx(), map[string]any{
+		"id": uuid.New().String(),
+	})
+
+	if isErrorResult(result) {
+		t.Errorf("expected no error for authorized get_document call, got: %s", resultText(result))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Auth enforcement tests: stats
+// ---------------------------------------------------------------------------
+
+func TestStatsTool_Unauthorized_ReturnsAuthError(t *testing.T) {
+	t.Parallel()
+
+	s := newTestMCPServer(nil, &fakeDocGetter{}, &fakeStatsProvider{})
+	result := callTool(t, s, "stats", unauthorizedCtx(), nil)
+
+	if !isErrorResult(result) {
+		t.Error("expected IsError=true for unauthorized stats call")
+	}
+	if !strings.Contains(resultText(result), "unauthorized") {
+		t.Errorf("expected unauthorized message, got: %s", resultText(result))
+	}
+}
+
+func TestStatsTool_Authorized_ProceedsToHandler(t *testing.T) {
+	t.Parallel()
+
+	s := newTestMCPServer(nil, &fakeDocGetter{}, &fakeStatsProvider{})
+	result := callTool(t, s, "stats", authorizedCtx(), nil)
+
+	if isErrorResult(result) {
+		t.Errorf("expected no error for authorized stats call, got: %s", resultText(result))
+	}
 }
 
 // ---------------------------------------------------------------------------

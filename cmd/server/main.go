@@ -116,7 +116,8 @@ func run() error {
 			metricsStore,
 			docStore,
 			reindexStateStore,
-		))
+		)).
+		WithIngestFile(docStore, chunkStore, embedClient, cfg.IngestMaxFileBytes)
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      srv.Handler(),

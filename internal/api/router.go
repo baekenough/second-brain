@@ -49,6 +49,14 @@ type Server struct {
 	// is registered. Set via WithReindexCheck before calling Handler().
 	reindexCheck ReindexRecommender
 
+	// ingestUpserter, ingestChunks, ingestEmbedder, and ingestMaxFileBytes are
+	// optional. When ingestUpserter is non-nil the POST /api/v1/ingest/file
+	// route is registered. Set via WithIngestFile before calling Handler().
+	ingestUpserter     IngestFileUpserter
+	ingestChunks       IngestFileChunkWriter
+	ingestEmbedder     IngestFileEmbedder
+	ingestMaxFileBytes int64
+
 	// handlerOnce ensures buildHandler is called exactly once per Server so
 	// that the graphql-go schema (and its package-level type objects) are
 	// constructed a single time regardless of how many goroutines call Handler.
@@ -132,6 +140,9 @@ func (s *Server) buildHandler() http.Handler {
 		}
 		if s.reindexState != nil {
 			r.Post("/api/v1/reindex", s.reindexHandler)
+		}
+		if s.ingestUpserter != nil {
+			r.Post("/api/v1/ingest/file", s.ingestFileHandler)
 		}
 	})
 
