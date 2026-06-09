@@ -117,7 +117,9 @@ func run() error {
 			docStore,
 			reindexStateStore,
 		)).
-		WithIngestFile(docStore, chunkStore, embedClient, cfg.IngestMaxFileBytes)
+		WithIngestFile(docStore, chunkStore, embedClient, cfg.IngestMaxFileBytes).
+		WithIngestMessages(docStore, chunkStore, embedClient, cfg.IngestMaxBatchMessages, cfg.CollectorCutover).
+		WithIngestRecording(docStore, cfg.IngestRecordingDir, cfg.IngestMaxFileBytes, cfg.CollectorCutover)
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      srv.Handler(),
