@@ -514,14 +514,26 @@ func (s *DocumentStore) MarkDeleted(ctx context.Context, sourceType model.Source
 	return int(tag.RowsAffected()), nil
 }
 
-// CountBySource returns the number of active documents grouped by source_type.
-// Deleted documents are excluded. The returned map is keyed by source_type string.
+// CountBySource returns the number of active documents grouped by logical source.
+// Deleted documents are excluded. The returned map is keyed by logical source string.
+//
+// Legacy documents stored under source_type='secretary' are re-bucketed by their
+// metadata 'kind' field (e.g. "sms", "gmail", "call-log", "call-transcript",
+// "calendar"). This means historical SMS documents count toward the "sms" bucket
+// alongside post-cutover documents — there is no double-counting because the two
+// sets are date-disjoint. All other source_type values are reported as-is.
 func (s *DocumentStore) CountBySource(ctx context.Context) (map[string]int, error) {
 	const q = `
-		SELECT source_type, COUNT(*)::bigint
+		SELECT
+		  CASE
+		    WHEN source_type = 'secretary'
+		      THEN COALESCE(NULLIF(metadata->>'kind', ''), 'secretary')
+		    ELSE source_type
+		  END AS logical_source,
+		  COUNT(*)::bigint
 		FROM documents
 		WHERE status = 'active'
-		GROUP BY source_type`
+		GROUP BY logical_source`
 
 	rows, err := s.pg.pool.Query(ctx, q)
 	if err != nil {
