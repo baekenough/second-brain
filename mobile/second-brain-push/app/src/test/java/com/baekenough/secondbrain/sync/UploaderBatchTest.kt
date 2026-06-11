@@ -242,7 +242,7 @@ class UploaderBatchTest {
         file.writeBytes(ByteArray(100))
         val recording = makeRecording(file)
 
-        coEvery { api.postRecording(any(), any(), any(), any(), any()) } returns
+        coEvery { api.postRecording(any(), any(), any(), any(), any(), any()) } returns
             okHttpRecordingError(400)
 
         val result = uploader.uploadRecording(recording)
@@ -265,7 +265,7 @@ class UploaderBatchTest {
         file.writeBytes(ByteArray(100))
         val recording = makeRecording(file)
 
-        coEvery { api.postRecording(any(), any(), any(), any(), any()) } returns
+        coEvery { api.postRecording(any(), any(), any(), any(), any(), any()) } returns
             okHttpRecordingError(401)
 
         val result = uploader.uploadRecording(recording)
@@ -284,7 +284,7 @@ class UploaderBatchTest {
         file.writeBytes(ByteArray(100))
         val recording = makeRecording(file)
 
-        coEvery { api.postRecording(any(), any(), any(), any(), any()) } returns
+        coEvery { api.postRecording(any(), any(), any(), any(), any(), any()) } returns
             okHttpRecordingError(403)
 
         val result = uploader.uploadRecording(recording)
@@ -303,7 +303,7 @@ class UploaderBatchTest {
         file.writeBytes(ByteArray(100))
         val recording = makeRecording(file)
 
-        coEvery { api.postRecording(any(), any(), any(), any(), any()) } returns
+        coEvery { api.postRecording(any(), any(), any(), any(), any(), any()) } returns
             okHttpRecordingError(413)
 
         val result = uploader.uploadRecording(recording)

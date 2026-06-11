@@ -3,8 +3,11 @@ package com.baekenough.secondbrain.reader
 import android.util.Log
 import com.baekenough.secondbrain.cursor.CursorSnapshot
 import com.baekenough.secondbrain.cursor.CursorStore
+import com.baekenough.secondbrain.detect.PathDetector
 import java.io.File
+import java.time.LocalDate
 import java.time.LocalDateTime
+import java.time.LocalTime
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.time.format.DateTimeParseException
@@ -20,10 +23,12 @@ import java.time.format.DateTimeParseException
  * [CursorStore.CUTOVER_EPOCH_MS] (2026-05-30) are skipped client-side to avoid
  * re-uploading years of historical call recordings on first install. The server also
  * enforces this, but skipping client-side saves bandwidth and battery.
+ * For VOICE_MEMO files where no date can be parsed the filter is fail-open (pass-through).
  *
- * SKIP GUARD: files from which a phone number AND a valid timestamp cannot be parsed
- * are skipped entirely — uploading them would always result in a server 400, since the
- * server requires both `number` (non-empty) and `date_ms` (valid non-zero Unix ms).
+ * SKIP GUARD: applies to CALL folders only — files from which a phone number AND a
+ * valid timestamp cannot be parsed are skipped (would 400 on server). For VOICE_MEMO
+ * folders, files with unparseable filenames are still accepted: number is null,
+ * timestamp falls back to file.lastModified(), title is the bare filename stem.
  *
  * Uses direct [File] access (classic I/O) rather than MediaStore because the
  * recording directories on One UI are not always indexed promptly.
@@ -36,6 +41,45 @@ class RecordingScanner {
         /** KST = UTC+9. Samsung TPhone filenames encode local time. */
         private val KST: ZoneOffset = ZoneOffset.ofHours(9)
         private val DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyyMMddHHmmss")
+
+        /**
+         * Pattern to extract YYMMDD date and optional HHMMSS time from voice-memo filenames.
+         *
+         * Matches the FIRST occurrence of:
+         *   - `YYMMDD_HHMMSS`  (e.g. `음성 260610_163304.m4a`)
+         *   - `YYMMDD`         (e.g. `260602_농심NDS.m4a`)
+         *
+         * Group 1: YY, Group 2: MM, Group 3: DD,
+         * Group 4: HH (optional), Group 5: MM (optional), Group 6: SS (optional).
+         */
+        private val VOICE_DATE_PATTERN =
+            Regex("""(\d{2})(\d{2})(\d{2})(?:_(\d{2})(\d{2})(\d{2}))?""")
+
+        /**
+         * Attempts to parse a YYMMDD date — and an optional HHMMSS time — from a free-form
+         * voice-memo filename.  Returns epoch ms (KST) if successful, null otherwise.
+         *
+         * Examples:
+         *   `음성 260610_163304.m4a` → 2026-06-10 16:33:04 KST
+         *   `260602_농심NDS.m4a`     → 2026-06-02 00:00:00 KST
+         *   `정코치_1차모의면접.m4a`  → null
+         */
+        internal fun parseVoiceMemoDate(filename: String): Long? {
+            val base = filename.removeSuffix(".m4a")
+            val match = VOICE_DATE_PATTERN.find(base) ?: return null
+            val (yy, mo, dd, hh, mi, ss) = match.destructured
+            return try {
+                val date = LocalDate.of("20$yy".toInt(), mo.toInt(), dd.toInt())
+                val time = if (hh.isNotEmpty() && mi.isNotEmpty() && ss.isNotEmpty()) {
+                    LocalTime.of(hh.toInt(), mi.toInt(), ss.toInt())
+                } else {
+                    LocalTime.MIDNIGHT
+                }
+                LocalDateTime.of(date, time).toInstant(KST).toEpochMilli()
+            } catch (_: Exception) {
+                null
+            }
+        }
 
         /**
          * Parses a TPhone / One UI call-recording filename and returns the structured
@@ -138,20 +182,27 @@ class RecordingScanner {
 
         /**
          * Builds a [RawRecording] from a file, parsing filename metadata.
-         * Returns null if the filename yields no usable number or timestamp — such files
-         * would always 400 on the server and must not be submitted.
+         *
+         * Behaviour depends on [sourceType]:
+         *  - [RecordingSourceType.CALL]: returns null when parsing fails (would 400 on server).
+         *  - [RecordingSourceType.VOICE_MEMO]: always succeeds — unparseable filenames produce
+         *    a RawRecording with null number, a best-effort timestamp, and a title derived from
+         *    the bare filename stem.
          */
-        private fun buildRawRecording(file: File): RawRecording? {
+        internal fun buildRawRecording(
+            file: File,
+            sourceType: RecordingSourceType = RecordingSourceType.CALL,
+        ): RawRecording? {
             val parsed = parseFilename(file.name)
 
-            return if (parsed != null) {
+            if (parsed != null) {
                 val tsMs = parseFull14Kst(parsed.timestampRaw)
                 if (tsMs == null) {
-                    // 14 digits but not a valid datetime — skip
+                    // 14 digits but not a valid datetime — skip regardless of sourceType
                     Log.d(TAG, "skip (invalid timestamp): ${file.name}")
                     return null
                 }
-                RawRecording(
+                return RawRecording(
                     filename = file.name,
                     filePath = file.absolutePath,
                     lastModifiedMs = file.lastModified(),
@@ -159,12 +210,45 @@ class RecordingScanner {
                     parsedNumber = parsed.number,
                     recordingTimeMs = tsMs,
                     parsedContactName = parsed.contactName,
+                    sourceType = sourceType,
                 )
-            } else {
-                // Filename doesn't match any TPhone/One UI pattern.
-                // Skip: no number and no reliable timestamp → would 400.
-                Log.d(TAG, "skip (unparseable filename): ${file.name}")
-                null
+            }
+
+            // Filename doesn't match any TPhone/One UI pattern.
+            return when (sourceType) {
+                RecordingSourceType.CALL -> {
+                    // Call recording with no parseable number/timestamp — skip (would 400).
+                    Log.d(TAG, "skip (unparseable filename): ${file.name}")
+                    null
+                }
+                RecordingSourceType.VOICE_MEMO -> {
+                    // Voice memo: free-form filename is normal. Build a recording with best-effort timestamp.
+                    val filenameTs = parseVoiceMemoDate(file.name)
+                    val lastModified = file.lastModified()
+                    val tsMs: Long? = when {
+                        filenameTs != null -> filenameTs
+                        lastModified > 0L -> lastModified
+                        else -> null
+                    }
+                    if (tsMs == null) {
+                        // scoped-storage returned lastModified=0 and filename has no parseable date.
+                        // Uploading with date_ms=0 would cause a server 400 — skip instead.
+                        Log.w(TAG, "voice memo skipped (date_ms=0, cannot determine timestamp): ${file.name}")
+                        return null
+                    }
+                    val title = file.name.removeSuffix(".m4a").ifEmpty { null }
+                    Log.d(TAG, "voice memo accepted (free-form): ${file.name}")
+                    RawRecording(
+                        filename = file.name,
+                        filePath = file.absolutePath,
+                        lastModifiedMs = lastModified,
+                        sizeBytes = file.length(),
+                        parsedNumber = null,
+                        recordingTimeMs = tsMs,
+                        parsedContactName = title,
+                        sourceType = RecordingSourceType.VOICE_MEMO,
+                    )
+                }
             }
         }
     }
@@ -173,13 +257,19 @@ class RecordingScanner {
      * Returns new recordings found in [dir] that haven't been sent yet and are
      * not older than the cutover date.
      *
-     * Files whose filenames cannot be parsed into a phone number + timestamp are
-     * silently skipped (they would produce a server 400).
+     * For CALL directories: files whose filenames cannot be parsed into a phone number +
+     * timestamp are silently skipped (they would produce a server 400).
+     * For VOICE_MEMO directories: all .m4a files are accepted regardless of filename format.
      *
-     * @param dir    The detected call-recording directory (from PathDetector).
-     * @param cursor Current cursor snapshot — [CursorSnapshot.sentRecordings] deduplicates.
+     * @param dir        The detected recording directory (from PathDetector).
+     * @param cursor     Current cursor snapshot — [CursorSnapshot.sentRecordings] deduplicates.
+     * @param sourceType Origin kind of recordings in this directory (default: CALL).
      */
-    fun scanNew(dir: File, cursor: CursorSnapshot): List<RawRecording> {
+    fun scanNew(
+        dir: File,
+        cursor: CursorSnapshot,
+        sourceType: RecordingSourceType = RecordingSourceType.CALL,
+    ): List<RawRecording> {
         if (!dir.exists() || !dir.isDirectory) return emptyList()
 
         return dir
@@ -187,13 +277,16 @@ class RecordingScanner {
             .orEmpty()
             .filter { it.name !in cursor.sentRecordings }
             .filter { !isBeforeCutover(it.name) }
-            .mapNotNull { buildRawRecording(it) }
+            .mapNotNull { buildRawRecording(it, sourceType) }
             .sortedBy { it.lastModifiedMs }
     }
 
     /**
      * Scans multiple directories and returns deduplicated new recordings across all of them.
      * Results are sorted by lastModifiedMs ascending.
+     *
+     * The [RecordingSourceType] for each directory is resolved via [PathDetector.sourceTypeOf]:
+     * call-recording dirs produce CALL entries; voice-memo dirs produce VOICE_MEMO entries.
      *
      * @param dirs   All detected recording directories (e.g. TPhoneCallRecords + Voice Recorder).
      * @param cursor Current cursor snapshot for deduplication.
@@ -204,6 +297,7 @@ class RecordingScanner {
 
         for (dir in dirs) {
             if (!dir.exists() || !dir.isDirectory) continue
+            val sourceType = PathDetector.sourceTypeOf(dir.absolutePath)
             val files = dir
                 .listFiles { f -> f.isFile && f.name.endsWith(".m4a", ignoreCase = true) }
                 .orEmpty()
@@ -212,7 +306,7 @@ class RecordingScanner {
 
             for (file in files) {
                 seenFilenames += file.name // dedup across dirs (same filename in two dirs)
-                val raw = buildRawRecording(file) ?: continue
+                val raw = buildRawRecording(file, sourceType) ?: continue
                 results += raw
             }
         }

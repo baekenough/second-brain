@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/baekenough/second-brain/internal/collector/smsmap"
 	"github.com/baekenough/second-brain/internal/model"
@@ -70,7 +72,8 @@ type IngestRecordingResponse struct {
 //
 // Accepts multipart/form-data with:
 //   - file         (required) — audio file (.m4a recommended; any audio ext accepted)
-//   - number       (required) — caller/callee phone number
+//   - kind         (optional) — "call" (default) or "voice-memo"
+//   - number       (required for kind=call) — caller/callee phone number
 //   - date_ms      (required) — Unix millisecond timestamp of the recording
 //   - duration_sec (optional) — call duration in seconds (default 0)
 //   - contact_name (optional) — display name of the contact
@@ -80,14 +83,20 @@ type IngestRecordingResponse struct {
 //  2. Apply cutover floor: recordings with a timestamp before recordingCutover
 //     are skipped (accepted=false, skipped=true, HTTP 200).
 //  3. Write the audio file to recordingDir with a filename encoding the
-//     recording timestamp in TPhoneCallRecords format so WhisperCollector's
-//     recordingTime() / cutover logic works:
-//     "{sanitized-number}_{YYYYMMDDHHMMSS}.{ext}"
+//     recording timestamp so WhisperCollector's recordingTime() / cutover logic
+//     works:
+//     - call:       "{sanitized-number}_{YYYYMMDDHHMMSS}.{ext}"
+//     - voice-memo: "voice-memo_{YYYYMMDDHHMMSS}.{ext}"
 //  4. Create a PENDING call-log model.Document (SourceType=SourceCallLog) with
 //     "[TRANSCRIPTION PENDING]" in the content and idempotently upsert it.
 //     WhisperCollector transcribes the audio on its next scheduled run.
-//  5. The upsert is idempotent: same number + date_ms + duration_sec → same SourceID
-//     (mirrors smsmap.MapCall SourceID format).
+//  5. The upsert is idempotent: same inputs → same SourceID.
+//     - call:       call-log:{date_ms}:{numHash}:{durHash}  (mirrors smsmap.MapCall)
+//     - voice-memo: call-log:voice-memo:{hash(originalFilename)}
+//       Hash is over the original upload filename only — dateMs is excluded so
+//       that the same file re-uploaded with a different timestamp produces the
+//       same SourceID (fully idempotent). Different filenames still produce
+//       distinct IDs.
 //
 // Returns 201 Created on success, 200 when skipped by cutover floor, appropriate
 // error codes otherwise.
@@ -111,9 +120,19 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// --- Validate kind field (default: "call" for backward compatibility) ---
+	kind := r.FormValue("kind")
+	if kind == "" {
+		kind = "call"
+	}
+	if kind != "call" && kind != "voice-memo" {
+		writeError(w, http.StatusBadRequest, "field 'kind' must be 'call' or 'voice-memo'")
+		return
+	}
+
 	// --- Validate required form fields ---
 	number := r.FormValue("number")
-	if number == "" {
+	if kind == "call" && number == "" {
 		writeError(w, http.StatusBadRequest, "field 'number' is required")
 		return
 	}
@@ -160,21 +179,63 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// --- Build output filename (TPhoneCallRecords pattern) ---
-	// Format: {sanitized-number}_{YYYYMMDDHHMMSS}{ext}
-	// WhisperCollector.recordingTime() parses this pattern to extract the
-	// recording timestamp, so existing cutover / watermark logic works.
+	// --- Build output filename ---
+	// WhisperCollector.recordingTime() parses the timestamp suffix to extract the
+	// recording timestamp, so existing cutover / watermark logic works for both kinds.
 	localTime := recordedAt.In(time.Local)
-	audioFilename := fmt.Sprintf("%s_%s%s",
-		sanitizePhoneNumber(number),
-		localTime.Format("20060102150405"),
-		ext,
-	)
+	timestampStr := localTime.Format("20060102150405")
 
-	// --- Build stable SourceID (mirrors smsmap.MapCall) ---
-	numHash := smsmap.ShortHash(number)
-	durHash := smsmap.BodyShortHash(fmt.Sprintf("%d", durationSec))
-	sourceID := fmt.Sprintf("call-log:%d:%s:%s", dateMs, numHash, durHash)
+	var audioFilename string
+	var sourceID string
+
+	switch kind {
+	case "voice-memo":
+		// SourceID is derived from the original upload filename so that two different
+		// recordings with the same dateMs (e.g. midnight of the same day) produce
+		// distinct source IDs while re-uploading the same file remains idempotent.
+		//
+		// Fallback when the client sends no filename: use dateMs + file size so the
+		// ID is still stable for a given upload and reasonably unique across uploads.
+		originalFilename := ""
+		if fh != nil {
+			originalFilename = fh.Filename
+		}
+		var idBase string
+		if originalFilename != "" {
+			idBase = originalFilename
+		} else {
+			idBase = fmt.Sprintf("%d", dateMs)
+		}
+		filenameHash := smsmap.BodyShortHash(idBase)
+		sourceID = fmt.Sprintf("call-log:voice-memo:%s", filenameHash)
+
+		// Audio filename on disk: sanitize the original filename to stay ASCII-safe
+		// while keeping the timestamp prefix for WhisperCollector.recordingTime().
+		// Format: voice-memo_{YYYYMMDDHHMMSS}_{sanitizedOriginal}{ext}
+		// Same original filename → same disk path (idempotent overwrite OK).
+		if originalFilename != "" {
+			baseName := strings.TrimSuffix(originalFilename, filepath.Ext(originalFilename))
+			sanitized := sanitizeFilename(baseName)
+			if sanitized == "" {
+				sanitized = filenameHash
+			}
+			audioFilename = fmt.Sprintf("voice-memo_%s_%s%s", timestampStr, sanitized, ext)
+		} else {
+			// No original filename: fall back to timestamp-only form (legacy behaviour).
+			audioFilename = fmt.Sprintf("voice-memo_%s%s", timestampStr, ext)
+		}
+	default: // "call"
+		// Format: {sanitized-number}_{YYYYMMDDHHMMSS}{ext}
+		audioFilename = fmt.Sprintf("%s_%s%s",
+			sanitizePhoneNumber(number),
+			timestampStr,
+			ext,
+		)
+		// Mirrors smsmap.MapCall SourceID format.
+		numHash := smsmap.ShortHash(number)
+		durHash := smsmap.BodyShortHash(fmt.Sprintf("%d", durationSec))
+		sourceID = fmt.Sprintf("call-log:%d:%s:%s", dateMs, numHash, durHash)
+	}
 
 	// --- Ensure the recording directory exists ---
 	if err := os.MkdirAll(s.recordingDir, 0o755); err != nil {
@@ -209,24 +270,49 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 		slog.Warn("ingest_recording: close audio file (non-fatal)", "path", destPath, "error", err)
 	}
 
-	// --- Create PENDING call-log document ---
-	// WhisperCollector transcribes the audio later. The document acts as a
-	// placeholder so the call is immediately discoverable via search / metadata.
-	contact := contactName
-	if contact == "" {
-		contact = number
-	}
-	title := fmt.Sprintf("incoming 통화 %s", contact)
-	content := fmt.Sprintf("상대방: %s\n통화 방향: incoming\n통화 시간: %ds\n[TRANSCRIPTION PENDING]",
-		contact, durationSec)
+	// --- Build document title, content, and metadata by kind ---
+	var title, content string
+	var meta map[string]any
 
-	meta := map[string]any{
-		"contact_name":     contactName,
-		"direction":        "incoming",
-		"duration_seconds": durationSec,
-		"audio_file":       audioFilename,
-		"transcription":    "pending",
+	switch kind {
+	case "voice-memo":
+		// Derive a human-readable label: contact name if available, otherwise
+		// the original filename without extension.
+		label := contactName
+		if label == "" && fh != nil && fh.Filename != "" {
+			label = strings.TrimSuffix(fh.Filename, filepath.Ext(fh.Filename))
+		}
+		if label == "" {
+			label = timestampStr
+		}
+		title = fmt.Sprintf("음성메모 %s", label)
+		content = fmt.Sprintf("레이블: %s\n녹음 시간: %ds\n[TRANSCRIPTION PENDING]",
+			label, durationSec)
+		meta = map[string]any{
+			"contact_name":     contactName,
+			"recording_type":   "voice-memo",
+			"duration_seconds": durationSec,
+			"audio_file":       audioFilename,
+			"transcription":    "pending",
+		}
+	default: // "call"
+		contact := contactName
+		if contact == "" {
+			contact = number
+		}
+		title = fmt.Sprintf("incoming 통화 %s", contact)
+		content = fmt.Sprintf("상대방: %s\n통화 방향: incoming\n통화 시간: %ds\n[TRANSCRIPTION PENDING]",
+			contact, durationSec)
+		meta = map[string]any{
+			"contact_name":     contactName,
+			"direction":        "incoming",
+			"recording_type":   "call",
+			"duration_seconds": durationSec,
+			"audio_file":       audioFilename,
+			"transcription":    "pending",
+		}
 	}
+
 	t := recordedAt
 	doc := &model.Document{
 		SourceType:  model.SourceCallLog,
@@ -252,6 +338,47 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 		Skipped:    false,
 		DocumentID: doc.ID.String(),
 	})
+}
+
+// sanitizeFilename converts an arbitrary string (e.g. a user-supplied audio
+// filename stem) into a filesystem-safe ASCII slug. It replaces whitespace and
+// Unicode letters/digits that round-trip through ASCII with underscores so the
+// result is portable across file systems and safe to embed in SourceID strings.
+//
+// Rules:
+//   - ASCII letters and digits are kept as-is.
+//   - Spaces are replaced with underscores.
+//   - Any other character (non-ASCII, punctuation other than '-' and '_') is
+//     replaced with an underscore.
+//   - Runs of underscores are collapsed to a single underscore.
+//   - Leading/trailing underscores are trimmed.
+//
+// Returns "" when the result is empty (caller must supply a fallback).
+func sanitizeFilename(s string) string {
+	out := make([]byte, 0, len(s))
+	prev := byte(0)
+	for _, r := range s {
+		var b byte
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			b = byte(r)
+		case r == '-':
+			b = '-'
+		case unicode.IsSpace(r) || r == '_' || r > 127:
+			b = '_'
+		default:
+			b = '_'
+		}
+		// Collapse consecutive underscores.
+		if b == '_' && prev == '_' {
+			continue
+		}
+		out = append(out, b)
+		prev = b
+	}
+	// Trim leading/trailing underscores.
+	result := strings.Trim(string(out), "_")
+	return result
 }
 
 // sanitizePhoneNumber strips characters that are unsafe in filenames from a

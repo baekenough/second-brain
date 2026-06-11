@@ -4,9 +4,11 @@ import okhttp3.MultipartBody
 import okhttp3.RequestBody
 import retrofit2.Response
 import retrofit2.http.Body
+import retrofit2.http.GET
 import retrofit2.http.Multipart
 import retrofit2.http.POST
 import retrofit2.http.Part
+import retrofit2.http.Query
 
 /**
  * Retrofit interface defining the second-brain ingest endpoints.
@@ -30,11 +32,27 @@ interface ApiService {
      * so no `filename` field is sent.
      *
      * Form fields:
-     *   - `number`       — caller/callee phone number (empty string if unknown)
+     *   - `number`       — caller/callee phone number (empty string if unknown or voice memo)
      *   - `date_ms`      — recording start epoch milliseconds as a decimal string
      *   - `duration_sec` — call duration in seconds as a decimal string
-     *   - `contact_name` — display name (empty string if unknown)
+     *   - `contact_name` — display name (empty string if unknown); for voice memos this is the
+     *                      bare filename stem used as a title
+     *   - `kind`         — `"call"` (default) or `"voice-memo"`. Server stores as
+     *                      `metadata.recording_type` to distinguish the two sources.
      */
+    /**
+     * GET /api/v1/documents/recent
+     * Returns the most recently collected documents of a given kind.
+     *
+     * @param kind  "sms" | "call-recording" | "voice-memo"
+     * @param limit Maximum number of items to return (default 50).
+     */
+    @GET("api/v1/documents/recent")
+    suspend fun getRecentDocuments(
+        @Query("kind") kind: String,
+        @Query("limit") limit: Int = 50,
+    ): Response<RecentDocumentsResponse>
+
     @Multipart
     @POST("api/v1/ingest/recording")
     suspend fun postRecording(
@@ -43,5 +61,6 @@ interface ApiService {
         @Part("date_ms") dateMs: RequestBody,
         @Part("duration_sec") durationSec: RequestBody,
         @Part("contact_name") contactName: RequestBody,
+        @Part("kind") kind: RequestBody,
     ): Response<RecordingResponse>
 }

@@ -5,6 +5,7 @@ import android.provider.Telephony
 import com.baekenough.secondbrain.reader.RawCallEntry
 import com.baekenough.secondbrain.reader.RawRecording
 import com.baekenough.secondbrain.reader.RawSmsEntry
+import com.baekenough.secondbrain.reader.RecordingSourceType
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneOffset
@@ -47,6 +48,11 @@ data class ClassifiedRecording(
     val parsedContactName: String? = null,
     /** Linked call metadata when a matching call-log entry was found (±60 s window). */
     val linkedCall: ClassifiedCall?,
+    /**
+     * Origin kind of this recording — passed through from [RawRecording.sourceType].
+     * Used by [Uploader] to set the `kind` multipart field (call vs voice-memo).
+     */
+    val sourceType: RecordingSourceType = RecordingSourceType.CALL,
 )
 
 // ── Classifier ────────────────────────────────────────────────────────────
@@ -212,7 +218,12 @@ object Classifier {
             else -> parseRecordingTimestamp(raw.filename) ?: raw.lastModifiedMs
         }
         val number = raw.parsedNumber?.normalizePhone() ?: parseRecordingNumber(raw.filename)
-        val linked = linkRecordingToCall(raw, allCalls)
+        // Only attempt call-log linkage for CALL recordings; voice memos have no phone number.
+        val linked = if (raw.sourceType == RecordingSourceType.CALL) {
+            linkRecordingToCall(raw, allCalls)
+        } else {
+            null
+        }
         return ClassifiedRecording(
             filename = raw.filename,
             filePath = raw.filePath,
@@ -220,6 +231,7 @@ object Classifier {
             parsedNumber = number,
             parsedContactName = raw.parsedContactName,
             linkedCall = linked,
+            sourceType = raw.sourceType,
         )
     }
 

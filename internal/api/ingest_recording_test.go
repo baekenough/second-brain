@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -416,6 +417,358 @@ func TestIngestRecording_NotConfigured(t *testing.T) {
 }
 
 // --- unit tests for helpers ---
+
+// TestIngestRecording_VoiceMemoSuccess verifies that a valid voice-memo upload
+// (no phone number) is accepted with 201 and stores the correct metadata.
+func TestIngestRecording_VoiceMemoSuccess(t *testing.T) {
+	t.Parallel()
+
+	upserter := &stubIngestUpserter{}
+	srv, recordingDir := newRecordingTestServer(t, upserter, "", 0, time.Time{})
+
+	dateMs := time.Now().Add(-time.Hour).UnixMilli()
+	audioData := []byte("fake voice memo audio bytes")
+
+	body, ct := buildRecordingForm(t, "memo.m4a", audioData, "" /* no number */, dateMs,
+		"kind", "voice-memo",
+		"duration_sec", "45",
+		"contact_name", "회의 메모",
+	)
+	rr := doRecordingPost(t, srv, body, ct, "Bearer test-key")
+
+	if rr.Code != http.StatusCreated {
+		t.Errorf("status = %d, want %d; body: %s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+
+	if len(upserter.upserted) != 1 {
+		t.Fatalf("expected 1 upserted doc, got %d", len(upserter.upserted))
+	}
+	doc := upserter.upserted[0]
+
+	// SourceType must remain call-log for schema compatibility.
+	if doc.SourceType != "call-log" {
+		t.Errorf("SourceType=%q, want call-log", doc.SourceType)
+	}
+
+	// recording_type must be "voice-memo".
+	recType, _ := doc.Metadata["recording_type"].(string)
+	if recType != "voice-memo" {
+		t.Errorf("metadata[recording_type]=%q, want voice-memo", recType)
+	}
+
+	// direction must NOT be present for voice-memo.
+	if _, ok := doc.Metadata["direction"]; ok {
+		t.Error("metadata[direction] should not be set for voice-memo")
+	}
+
+	// transcription must be pending.
+	transcription, _ := doc.Metadata["transcription"].(string)
+	if transcription != "pending" {
+		t.Errorf("metadata[transcription]=%q, want pending", transcription)
+	}
+
+	// Audio file must exist in recordingDir with voice-memo prefix.
+	entries, err := os.ReadDir(recordingDir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 audio file, got %d", len(entries))
+	}
+	audioFile := entries[0].Name()
+	// New format: voice-memo_{YYYYMMDDHHMMSS}_{sanitizedOriginalName}.ext
+	const voiceMemoPrefix = "voice-memo_"
+	if !strings.HasPrefix(audioFile, voiceMemoPrefix) {
+		t.Errorf("audio filename %q does not start with %q", audioFile, voiceMemoPrefix)
+	}
+
+	// Audio bytes must match.
+	got, err := os.ReadFile(filepath.Join(recordingDir, audioFile))
+	if err != nil {
+		t.Fatalf("read audio file: %v", err)
+	}
+	if !bytes.Equal(got, audioData) {
+		t.Errorf("audio file content mismatch")
+	}
+}
+
+// TestIngestRecording_VoiceMemoNoNumberAllowed verifies that kind=voice-memo
+// with an empty number field returns 201 (not 400).
+func TestIngestRecording_VoiceMemoNoNumberAllowed(t *testing.T) {
+	t.Parallel()
+
+	upserter := &stubIngestUpserter{}
+	srv, _ := newRecordingTestServer(t, upserter, "", 0, time.Time{})
+
+	dateMs := time.Now().Add(-time.Hour).UnixMilli()
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, _ := mw.CreateFormFile("file", "audio.m4a")
+	_, _ = fw.Write([]byte("audio bytes"))
+	// number intentionally omitted
+	_ = mw.WriteField("kind", "voice-memo")
+	_ = mw.WriteField("date_ms", fmt.Sprintf("%d", dateMs))
+	_ = mw.Close()
+
+	rr := doRecordingPost(t, srv, &buf, mw.FormDataContentType(), "Bearer test-key")
+
+	if rr.Code != http.StatusCreated {
+		t.Errorf("status = %d, want %d; body: %s", rr.Code, http.StatusCreated, rr.Body.String())
+	}
+}
+
+// TestIngestRecording_CallKindRequiresNumber verifies that kind=call with an
+// empty number field still returns 400.
+func TestIngestRecording_CallKindRequiresNumber(t *testing.T) {
+	t.Parallel()
+
+	upserter := &stubIngestUpserter{}
+	srv, _ := newRecordingTestServer(t, upserter, "", 0, time.Time{})
+
+	dateMs := time.Now().Add(-time.Hour).UnixMilli()
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, _ := mw.CreateFormFile("file", "audio.m4a")
+	_, _ = fw.Write([]byte("fake audio"))
+	_ = mw.WriteField("kind", "call")
+	// number intentionally omitted
+	_ = mw.WriteField("date_ms", fmt.Sprintf("%d", dateMs))
+	_ = mw.Close()
+
+	rr := doRecordingPost(t, srv, &buf, mw.FormDataContentType(), "Bearer test-key")
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d; body: %s", rr.Code, http.StatusBadRequest, rr.Body.String())
+	}
+}
+
+// TestIngestRecording_InvalidKind verifies that an unknown kind value returns 400.
+func TestIngestRecording_InvalidKind(t *testing.T) {
+	t.Parallel()
+
+	upserter := &stubIngestUpserter{}
+	srv, _ := newRecordingTestServer(t, upserter, "", 0, time.Time{})
+
+	dateMs := time.Now().Add(-time.Hour).UnixMilli()
+	body, ct := buildRecordingForm(t, "audio.m4a", []byte("audio"), "010-1234-5678", dateMs,
+		"kind", "unknown-kind",
+	)
+	rr := doRecordingPost(t, srv, body, ct, "Bearer test-key")
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d; body: %s", rr.Code, http.StatusBadRequest, rr.Body.String())
+	}
+}
+
+// TestIngestRecording_CallRecordingType verifies that kind=call stores
+// recording_type="call" in metadata.
+func TestIngestRecording_CallRecordingType(t *testing.T) {
+	t.Parallel()
+
+	upserter := &stubIngestUpserter{}
+	srv, _ := newRecordingTestServer(t, upserter, "", 0, time.Time{})
+
+	dateMs := time.Now().Add(-time.Hour).UnixMilli()
+	body, ct := buildRecordingForm(t, "call.m4a", []byte("audio"), "010-1234-5678", dateMs,
+		"kind", "call",
+	)
+	rr := doRecordingPost(t, srv, body, ct, "Bearer test-key")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", rr.Code, rr.Body.String())
+	}
+
+	if len(upserter.upserted) != 1 {
+		t.Fatalf("expected 1 doc, got %d", len(upserter.upserted))
+	}
+	doc := upserter.upserted[0]
+
+	recType, _ := doc.Metadata["recording_type"].(string)
+	if recType != "call" {
+		t.Errorf("metadata[recording_type]=%q, want call", recType)
+	}
+
+	direction, _ := doc.Metadata["direction"].(string)
+	if direction != "incoming" {
+		t.Errorf("metadata[direction]=%q, want incoming", direction)
+	}
+}
+
+// TestIngestRecording_VoiceMemoIdempotent verifies that uploading the same
+// voice-memo twice produces the same SourceID.
+func TestIngestRecording_VoiceMemoIdempotent(t *testing.T) {
+	t.Parallel()
+
+	upserter := &stubIngestUpserter{}
+	srv, _ := newRecordingTestServer(t, upserter, "", 0, time.Time{})
+
+	dateMs := time.Now().Add(-time.Hour).UnixMilli()
+
+	// First upload.
+	b1, ct1 := buildRecordingForm(t, "memo.m4a", []byte("audio"), "", dateMs, "kind", "voice-memo")
+	rr1 := doRecordingPost(t, srv, b1, ct1, "Bearer test-key")
+	if rr1.Code != http.StatusCreated {
+		t.Fatalf("first: status = %d, want 201", rr1.Code)
+	}
+
+	// Second upload (identical metadata).
+	b2, ct2 := buildRecordingForm(t, "memo.m4a", []byte("audio"), "", dateMs, "kind", "voice-memo")
+	rr2 := doRecordingPost(t, srv, b2, ct2, "Bearer test-key")
+	if rr2.Code != http.StatusCreated {
+		t.Fatalf("second: status = %d, want 201", rr2.Code)
+	}
+
+	if len(upserter.upserted) != 2 {
+		t.Fatalf("expected 2 upsert calls, got %d", len(upserter.upserted))
+	}
+	id1 := upserter.upserted[0].SourceID
+	id2 := upserter.upserted[1].SourceID
+	if id1 != id2 {
+		t.Errorf("SourceID mismatch (not idempotent): first=%q second=%q", id1, id2)
+	}
+	if len(id1) < 9 || id1[:9] != "call-log:" {
+		t.Errorf("SourceID %q does not have expected 'call-log:' prefix", id1)
+	}
+}
+
+// TestIngestRecording_VoiceMemoSameFileDifferentDateMs is the key regression test
+// for the idempotency fix: uploading the same original filename with a different
+// date_ms (e.g. midnight vs. actual recording time) must yield the same SourceID.
+// Previously this produced two DB records; after the fix the source_id no longer
+// embeds dateMs so both uploads collapse to the same identifier.
+func TestIngestRecording_VoiceMemoSameFileDifferentDateMs(t *testing.T) {
+	t.Parallel()
+
+	upserter := &stubIngestUpserter{}
+	srv, _ := newRecordingTestServer(t, upserter, "", 0, time.Time{})
+
+	filename := "음성 260608_애니.m4a"
+	// First upload: client sends midnight timestamp (legacy behaviour).
+	midnightMs := int64(1749340800000) // 2025-06-08 00:00:00 UTC
+	// Second upload: client sends actual recording time on the same day.
+	actualMs := int64(1749361234000) // 2025-06-08 05:40:34 UTC
+
+	b1, ct1 := buildRecordingForm(t, filename, []byte("audio"), "", midnightMs, "kind", "voice-memo")
+	rr1 := doRecordingPost(t, srv, b1, ct1, "Bearer test-key")
+	if rr1.Code != http.StatusCreated {
+		t.Fatalf("first upload: status = %d, want 201; body: %s", rr1.Code, rr1.Body.String())
+	}
+
+	b2, ct2 := buildRecordingForm(t, filename, []byte("audio"), "", actualMs, "kind", "voice-memo")
+	rr2 := doRecordingPost(t, srv, b2, ct2, "Bearer test-key")
+	if rr2.Code != http.StatusCreated {
+		t.Fatalf("second upload: status = %d, want 201; body: %s", rr2.Code, rr2.Body.String())
+	}
+
+	if len(upserter.upserted) != 2 {
+		t.Fatalf("expected 2 upsert calls, got %d", len(upserter.upserted))
+	}
+	id1 := upserter.upserted[0].SourceID
+	id2 := upserter.upserted[1].SourceID
+
+	// Core assertion: same filename, different dateMs → identical SourceID.
+	if id1 != id2 {
+		t.Errorf("idempotency broken by dateMs change: midnight=%q actual=%q", id1, id2)
+	}
+
+	// Sanity: OccurredAt must still differ — the timestamp is stored on the document.
+	oat1 := upserter.upserted[0].OccurredAt
+	oat2 := upserter.upserted[1].OccurredAt
+	if oat1 == nil || oat2 == nil {
+		t.Fatal("OccurredAt must not be nil")
+	}
+	if oat1.Equal(*oat2) {
+		t.Error("OccurredAt should differ between the two uploads (midnight vs actual time)")
+	}
+}
+
+// TestIngestRecording_VoiceMemoSameDateMsDifferentFilename verifies that two
+// voice-memo uploads sharing the same dateMs but carrying different original
+// filenames produce distinct SourceIDs and are stored as separate DB records.
+func TestIngestRecording_VoiceMemoSameDateMsDifferentFilename(t *testing.T) {
+	t.Parallel()
+
+	upserter := &stubIngestUpserter{}
+	srv, recordingDir := newRecordingTestServer(t, upserter, "", 0, time.Time{})
+
+	// Both recordings are "from" the same day — clients often pass midnight ms.
+	dateMs := int64(1749340800000) // 2025-06-08 00:00:00 UTC (midnight, same for all same-day memos)
+
+	// Upload first voice-memo.
+	b1, ct1 := buildRecordingForm(t, "음성 260608_애니.m4a", []byte("audio-one"), "", dateMs, "kind", "voice-memo")
+	rr1 := doRecordingPost(t, srv, b1, ct1, "Bearer test-key")
+	if rr1.Code != http.StatusCreated {
+		t.Fatalf("first upload: status = %d, want 201; body: %s", rr1.Code, rr1.Body.String())
+	}
+
+	// Upload second voice-memo with different filename but same dateMs.
+	b2, ct2 := buildRecordingForm(t, "260608_JTF회의_2.m4a", []byte("audio-two"), "", dateMs, "kind", "voice-memo")
+	rr2 := doRecordingPost(t, srv, b2, ct2, "Bearer test-key")
+	if rr2.Code != http.StatusCreated {
+		t.Fatalf("second upload: status = %d, want 201; body: %s", rr2.Code, rr2.Body.String())
+	}
+
+	if len(upserter.upserted) != 2 {
+		t.Fatalf("expected 2 upserted docs, got %d", len(upserter.upserted))
+	}
+
+	id1 := upserter.upserted[0].SourceID
+	id2 := upserter.upserted[1].SourceID
+
+	// Different filenames must produce different SourceIDs.
+	if id1 == id2 {
+		t.Errorf("SourceID collision: both uploads produced %q", id1)
+	}
+
+	// Both must use the call-log prefix.
+	for _, id := range []string{id1, id2} {
+		if !strings.HasPrefix(id, "call-log:") {
+			t.Errorf("SourceID %q missing call-log: prefix", id)
+		}
+	}
+
+	// Both audio files must be written to disk (different paths).
+	entries, err := os.ReadDir(recordingDir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 audio files on disk, got %d", len(entries))
+	}
+}
+
+// TestIngestRecording_VoiceMemoSameFilenameIdempotent verifies that uploading
+// the same voice-memo file twice produces the same SourceID (idempotent upsert)
+// even when dateMs is identical between uploads.
+func TestIngestRecording_VoiceMemoSameFilenameIdempotent(t *testing.T) {
+	t.Parallel()
+
+	upserter := &stubIngestUpserter{}
+	srv, _ := newRecordingTestServer(t, upserter, "", 0, time.Time{})
+
+	dateMs := int64(1749340800000) // 2025-06-08 00:00:00 UTC
+
+	upload := func() string {
+		b, ct := buildRecordingForm(t, "음성 260608_애니.m4a", []byte("audio"), "", dateMs, "kind", "voice-memo")
+		rr := doRecordingPost(t, srv, b, ct, "Bearer test-key")
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("upload: status = %d, want 201; body: %s", rr.Code, rr.Body.String())
+		}
+		var resp IngestRecordingResponse
+		if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return upserter.upserted[len(upserter.upserted)-1].SourceID
+	}
+
+	id1 := upload()
+	id2 := upload()
+
+	if id1 != id2 {
+		t.Errorf("idempotency broken: first=%q second=%q", id1, id2)
+	}
+}
 
 // TestSanitizePhoneNumber verifies that sanitizePhoneNumber retains digits, '+',
 // and '-', and returns "unknown" for empty results.

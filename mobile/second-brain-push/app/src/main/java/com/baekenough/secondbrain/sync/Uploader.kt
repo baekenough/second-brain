@@ -5,6 +5,7 @@ import com.baekenough.secondbrain.classify.ClassifiedCall
 import com.baekenough.secondbrain.classify.ClassifiedRecording
 import com.baekenough.secondbrain.classify.ClassifiedSms
 import com.baekenough.secondbrain.cursor.CursorStore
+import com.baekenough.secondbrain.reader.RecordingSourceType
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.RequestBody
@@ -195,6 +196,10 @@ class Uploader(
         val dateMsBody = (linkedCall?.dateMs ?: recording.recordingTimeMs).toString().asTextPart()
         val durationSecBody = (linkedCall?.durationSec ?: 0L).toString().asTextPart()
         val contactNameBody = (recording.parsedContactName ?: "").asTextPart()
+        val kindBody = when (recording.sourceType) {
+            RecordingSourceType.VOICE_MEMO -> "voice-memo"
+            RecordingSourceType.CALL -> "call"
+        }.asTextPart()
 
         val fileBody = file.asRequestBody(MEDIA_AUDIO)
         val filePart = MultipartBody.Part.createFormData("file", recording.filename, fileBody)
@@ -206,6 +211,7 @@ class Uploader(
                 dateMs = dateMsBody,
                 durationSec = durationSecBody,
                 contactName = contactNameBody,
+                kind = kindBody,
             )
             handleRecordingResponse(response, recording.filename)
         } catch (e: Exception) {

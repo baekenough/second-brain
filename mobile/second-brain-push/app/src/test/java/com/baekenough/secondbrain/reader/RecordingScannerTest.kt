@@ -11,6 +11,9 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.ZoneOffset
 
 /**
  * Unit tests for [RecordingScanner] using a [TemporaryFolder] to create real
@@ -381,5 +384,193 @@ class RecordingScannerTest {
         assertEquals(2, result.size)
         assertEquals(older.name, result[0].filename)
         assertEquals(newer.name, result[1].filename)
+    }
+
+    // ── VOICE_MEMO folder: free-form filenames accepted ───────────────────
+
+    @Test fun `scanNew VOICE_MEMO folder accepts free-form filename and preserves title`() {
+        val dir = tmpFolder.newFolder("VoiceRecorder")
+        File(dir, "정코치_1차모의면접.m4a").createNewFile()
+
+        val result = scanner.scanNew(dir, cursor(), RecordingSourceType.VOICE_MEMO)
+        assertEquals(1, result.size)
+        val raw = result[0]
+        assertEquals("정코치_1차모의면접.m4a", raw.filename)
+        assertNull("Voice memo should have null parsedNumber", raw.parsedNumber)
+        assertEquals("정코치_1차모의면접", raw.parsedContactName)
+        assertEquals(RecordingSourceType.VOICE_MEMO, raw.sourceType)
+        assertTrue("recordingTimeMs must be positive", raw.recordingTimeMs > 0L)
+    }
+
+    @Test fun `scanNew VOICE_MEMO folder accepts multiple free-form filenames`() {
+        val dir = tmpFolder.newFolder("VoiceRecorder2")
+        File(dir, "음성 260528_095839.m4a").createNewFile()
+        File(dir, "260602_농심NDS.m4a").createNewFile()
+        File(dir, "정코치_1차모의면접.m4a").createNewFile()
+
+        val result = scanner.scanNew(dir, cursor(), RecordingSourceType.VOICE_MEMO)
+        assertEquals(3, result.size)
+        assertTrue(result.all { it.sourceType == RecordingSourceType.VOICE_MEMO })
+        assertTrue(result.all { it.parsedNumber == null })
+    }
+
+    @Test fun `scanNew VOICE_MEMO folder extracts date+time from filename when available`() {
+        val dir = tmpFolder.newFolder("VoiceRecorder3")
+        // 260528_095839 → 2026-05-28 09:58:39 KST
+        File(dir, "음성 260528_095839.m4a").createNewFile()
+
+        val result = scanner.scanNew(dir, cursor(), RecordingSourceType.VOICE_MEMO)
+        assertEquals(1, result.size)
+        val raw = result[0]
+        // Date AND time should be parsed: 260528_095839 = 2026-05-28 09:58:39 KST
+        val expected = LocalDateTime.of(2026, 5, 28, 9, 58, 39)
+            .toInstant(ZoneOffset.ofHours(9))
+            .toEpochMilli()
+        assertEquals(expected, raw.recordingTimeMs)
+    }
+
+    @Test fun `scanNew VOICE_MEMO folder falls back to lastModified when no date in filename`() {
+        val dir = tmpFolder.newFolder("VoiceRecorder4")
+        val file = File(dir, "인터뷰내용.m4a").also { it.createNewFile() }
+        val expectedMtime = 1_780_000_000_000L
+        file.setLastModified(expectedMtime)
+
+        val result = scanner.scanNew(dir, cursor(), RecordingSourceType.VOICE_MEMO)
+        assertEquals(1, result.size)
+        assertEquals(expectedMtime, result[0].recordingTimeMs)
+    }
+
+    @Test fun `scanNew CALL folder still skips unparseable filenames`() {
+        val dir = tmpFolder.newFolder("CallRecordings")
+        File(dir, "정코치_1차모의면접.m4a").createNewFile()
+        File(dir, "+821012345678_20260601143022.m4a").createNewFile()
+
+        // Default sourceType = CALL
+        val result = scanner.scanNew(dir, cursor(), RecordingSourceType.CALL)
+        assertEquals("CALL folder must skip free-form filenames", 1, result.size)
+        assertEquals("+821012345678_20260601143022.m4a", result[0].filename)
+        assertEquals(RecordingSourceType.CALL, result[0].sourceType)
+    }
+
+    @Test fun `buildRawRecording VOICE_MEMO produces entry with correct sourceType`() {
+        val dir = tmpFolder.newFolder("voicetest")
+        val file = File(dir, "정코치_1차모의면접.m4a").also { it.createNewFile() }
+
+        val raw = RecordingScanner.buildRawRecording(file, RecordingSourceType.VOICE_MEMO)
+        assertNotNull(raw)
+        assertEquals(RecordingSourceType.VOICE_MEMO, raw!!.sourceType)
+        assertNull(raw.parsedNumber)
+        assertEquals("정코치_1차모의면접", raw.parsedContactName)
+    }
+
+    @Test fun `buildRawRecording CALL returns null for unparseable filename`() {
+        val dir = tmpFolder.newFolder("calltest")
+        val file = File(dir, "정코치_1차모의면접.m4a").also { it.createNewFile() }
+
+        val raw = RecordingScanner.buildRawRecording(file, RecordingSourceType.CALL)
+        assertNull("CALL folder must reject free-form filenames", raw)
+    }
+
+    @Test fun `buildRawRecording VOICE_MEMO — TPhone filename also parsed with sourceType VOICE_MEMO`() {
+        // If a TPhone-pattern file somehow appears in a voice-memo folder, it should still be parsed
+        val dir = tmpFolder.newFolder("voicetest2")
+        val file = File(dir, "+821012345678_20260601143022.m4a").also { it.createNewFile() }
+
+        val raw = RecordingScanner.buildRawRecording(file, RecordingSourceType.VOICE_MEMO)
+        assertNotNull(raw)
+        assertEquals(RecordingSourceType.VOICE_MEMO, raw!!.sourceType)
+        assertEquals("+821012345678", raw.parsedNumber)
+    }
+
+    // ── parseVoiceMemoDate ────────────────────────────────────────────────
+
+    @Test fun `parseVoiceMemoDate extracts date AND time from 음성 260528_095839 pattern`() {
+        val ms = RecordingScanner.parseVoiceMemoDate("음성 260528_095839.m4a")
+        assertNotNull(ms)
+        // 260528_095839 → 2026-05-28 09:58:39 KST (time segment is now parsed)
+        val expected = LocalDateTime.of(2026, 5, 28, 9, 58, 39)
+            .toInstant(ZoneOffset.ofHours(9))
+            .toEpochMilli()
+        assertEquals(expected, ms)
+    }
+
+    @Test fun `parseVoiceMemoDate extracts date only from 260602_농심NDS pattern (no time segment)`() {
+        val ms = RecordingScanner.parseVoiceMemoDate("260602_농심NDS.m4a")
+        assertNotNull(ms)
+        // 농심NDS after the _ is not 6 digits, so time falls back to midnight
+        val expected = LocalDate.of(2026, 6, 2)
+            .atStartOfDay()
+            .toInstant(ZoneOffset.ofHours(9))
+            .toEpochMilli()
+        assertEquals(expected, ms)
+    }
+
+    @Test fun `parseVoiceMemoDate extracts date AND time from 음성 260610_163304 pattern`() {
+        val ms = RecordingScanner.parseVoiceMemoDate("음성 260610_163304.m4a")
+        assertNotNull(ms)
+        // 260610_163304 → 2026-06-10 16:33:04 KST
+        val expected = LocalDateTime.of(2026, 6, 10, 16, 33, 4)
+            .toInstant(ZoneOffset.ofHours(9))
+            .toEpochMilli()
+        assertEquals(expected, ms)
+    }
+
+    @Test fun `parseVoiceMemoDate same-day recordings produce different timestamps`() {
+        val ms1 = RecordingScanner.parseVoiceMemoDate("음성 260610_163304.m4a")
+        val ms2 = RecordingScanner.parseVoiceMemoDate("음성 260610_1_리암.m4a")
+        // ms2 has `1` after `_` which is not 6-digit time → falls back to midnight
+        assertNotNull(ms1)
+        assertNotNull(ms2)
+        // 16:33:04 KST epoch vs midnight KST epoch — must differ
+        assertTrue("Same-day recordings must have different timestamps", ms1!! != ms2!!)
+    }
+
+    @Test fun `parseVoiceMemoDate returns null for filename with no date digits`() {
+        // "1" in 1차 is not 6 consecutive digits — no match → null
+        val ms = RecordingScanner.parseVoiceMemoDate("정코치_1차모의면접.m4a")
+        assertNull(ms)
+    }
+
+    @Test fun `parseVoiceMemoDate returns null for no-digit filename`() {
+        val ms = RecordingScanner.parseVoiceMemoDate("인터뷰내용.m4a")
+        assertNull(ms)
+    }
+
+    // ── date_ms=0 guard ───────────────────────────────────────────────────
+
+    @Test fun `buildRawRecording VOICE_MEMO skips file when lastModified=0 and no parseable date`() {
+        val dir = tmpFolder.newFolder("voiceZeroMtime")
+        // Create file with name that has no parseable date
+        val file = File(dir, "인터뷰내용.m4a").also { it.createNewFile() }
+        // Simulate scoped-storage returning 0 for lastModified
+        file.setLastModified(0L)
+
+        val raw = RecordingScanner.buildRawRecording(file, RecordingSourceType.VOICE_MEMO)
+        assertNull("Must skip voice memo when date_ms would be 0", raw)
+    }
+
+    @Test fun `buildRawRecording VOICE_MEMO uses filename timestamp even when lastModified=0`() {
+        val dir = tmpFolder.newFolder("voiceZeroMtime2")
+        val file = File(dir, "음성 260610_163304.m4a").also { it.createNewFile() }
+        file.setLastModified(0L)
+
+        val raw = RecordingScanner.buildRawRecording(file, RecordingSourceType.VOICE_MEMO)
+        // Filename has a parseable timestamp → must NOT be skipped, even with lastModified=0
+        assertNotNull("Must use filename timestamp when lastModified=0", raw)
+        val expected = LocalDateTime.of(2026, 6, 10, 16, 33, 4)
+            .toInstant(ZoneOffset.ofHours(9))
+            .toEpochMilli()
+        assertEquals(expected, raw!!.recordingTimeMs)
+    }
+
+    @Test fun `buildRawRecording VOICE_MEMO uses positive lastModified when filename has no date`() {
+        val dir = tmpFolder.newFolder("voicePositiveMtime")
+        val file = File(dir, "인터뷰내용.m4a").also { it.createNewFile() }
+        val mtime = 1_780_000_000_000L
+        file.setLastModified(mtime)
+
+        val raw = RecordingScanner.buildRawRecording(file, RecordingSourceType.VOICE_MEMO)
+        assertNotNull(raw)
+        assertEquals(mtime, raw!!.recordingTimeMs)
     }
 }
