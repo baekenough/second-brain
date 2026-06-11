@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -36,17 +37,87 @@ class CursorStore(private val context: Context) {
          */
         val CUTOVER_EPOCH_MS: Long = Instant.parse("2026-05-30T00:00:00Z").toEpochMilli()
 
+        /**
+         * Slack added to System.currentTimeMillis() when validating cursor dateMs.
+         * Allows up to 60 s of clock skew before treating a timestamp as future-dated.
+         */
+        internal const val FUTURE_SLACK_MS = 60_000L
+
+        /**
+         * Schema version for the SMS cursor. Bump this constant to trigger a one-time
+         * automatic reset of [KEY_LAST_SMS_ID] / [KEY_LAST_SMS_DATE] back to
+         * [CUTOVER_EPOCH_MS] on the next sync run. Use when the cursor is known to have
+         * been written incorrectly (e.g. future-dated SMS jumped it to the future).
+         *
+         * Current: 2 — forces full re-collection since 2026-05-30 cutover.
+         */
+        internal const val SMS_CURSOR_VERSION = 2
+
+        /**
+         * Schema version for the call-log cursor. Same semantics as [SMS_CURSOR_VERSION].
+         *
+         * Current: 2 — forces full re-collection since 2026-05-30 cutover.
+         */
+        internal const val CALL_CURSOR_VERSION = 2
+
+        /**
+         * Schema version for the voice-memo sent-recordings cursor.
+         *
+         * Bump this constant to trigger a one-time removal of voice-memo entries from
+         * [KEY_SENT_RECORDINGS] on the next sync run. Call-recording entries (filenames
+         * matching the 14-digit timestamp pattern `_\d{14}\.m4a`) are preserved because
+         * call-recording uploads are working correctly and should not be re-sent.
+         *
+         * Current: 2 — clears voice-memo sent flags to force re-upload.
+         */
+        internal const val RECORDING_SENT_VERSION = 2
+
         private val KEY_LAST_SMS_ID = longPreferencesKey("last_sms_id")
         private val KEY_LAST_SMS_DATE = longPreferencesKey("last_sms_date")
         private val KEY_LAST_CALL_ID = longPreferencesKey("last_call_id")
         private val KEY_LAST_CALL_DATE = longPreferencesKey("last_call_date")
         private val KEY_SENT_RECORDINGS = stringSetPreferencesKey("sent_recordings")
 
+        /** Persisted schema version for the SMS cursor — see [SMS_CURSOR_VERSION]. */
+        private val KEY_SMS_CURSOR_SCHEMA_VERSION = intPreferencesKey("sms_cursor_schema_version")
+
+        /** Persisted schema version for voice-memo sent-recordings — see [RECORDING_SENT_VERSION]. */
+        private val KEY_RECORDING_SENT_SCHEMA_VERSION = intPreferencesKey("recording_sent_schema_version")
+
+        /** Persisted schema version for the call cursor — see [CALL_CURSOR_VERSION]. */
+        private val KEY_CALL_CURSOR_SCHEMA_VERSION = intPreferencesKey("call_cursor_schema_version")
+
+        /**
+         * Returns `true` if [dateMs] should be rejected as a future-dated cursor value.
+         *
+         * A value is considered future-dated when it exceeds `nowMs + FUTURE_SLACK_MS`.
+         * Extracted as a pure function so it can be unit-tested without a DataStore.
+         */
+        internal fun isFutureDated(dateMs: Long, nowMs: Long): Boolean =
+            dateMs > nowMs + FUTURE_SLACK_MS
+
+        /**
+         * Returns `true` if advancing to [newDateMs] from [storedDateMs] is monotonically valid.
+         *
+         * The cursor must never go backwards — [newDateMs] must be >= [storedDateMs].
+         * Extracted as a pure function so it can be unit-tested without a DataStore.
+         */
+        internal fun isMonotonicAdvance(newDateMs: Long, storedDateMs: Long): Boolean =
+            newDateMs >= storedDateMs
+
         // Stored recording path detected by PathDetector (legacy single-path key — kept for migration)
         private val KEY_RECORDING_DIR = androidx.datastore.preferences.core.stringPreferencesKey("recording_dir")
 
         // Multi-dir cache: pipe-separated list of absolute paths detected by PathDetector
         private val KEY_RECORDING_DIRS = androidx.datastore.preferences.core.stringPreferencesKey("recording_dirs")
+
+        /**
+         * Schema version written by [PathDetector] after a successful auto-detection run.
+         * When this value differs from [PathDetector.DETECTOR_VERSION] the cache is
+         * invalidated and re-detection runs once, then the new version is stored here.
+         * Absent key is treated as version 0 (triggers re-detection on first run after upgrade).
+         */
+        private val KEY_RECORDING_DIRS_SCHEMA_VERSION = intPreferencesKey("recording_dirs_schema_version")
     }
 
     private val dataStore get() = context.syncDataStore
@@ -66,19 +137,54 @@ class CursorStore(private val context: Context) {
 
     // ── Cursor advance — called ONLY after server confirms HTTP 2xx ────────
 
-    /** Advance SMS cursor. Must only be called after confirmed server acceptance. */
+    /**
+     * Advance SMS cursor. Must only be called after confirmed server acceptance.
+     *
+     * SAFETY GUARDS (both must pass or the write is silently skipped):
+     * 1. Monotonic: new [dateMs] must be >= stored [KEY_LAST_SMS_DATE] (never go backwards).
+     * 2. Future cap: [dateMs] must be <= `System.currentTimeMillis() + FUTURE_SLACK_MS`.
+     *    Future-dated SMS (caused by device clock anomalies) must not push the cursor
+     *    into the future, which would permanently suppress all subsequent sync reads.
+     */
     suspend fun advanceSms(id: Long, dateMs: Long) {
+        val now = System.currentTimeMillis()
+        if (isFutureDated(dateMs, now)) {
+            android.util.Log.w(
+                "CursorStore",
+                "advanceSms: rejected future-dated cursor dateMs=$dateMs (now=$now, slack=$FUTURE_SLACK_MS) — cursor unchanged",
+            )
+            return
+        }
         dataStore.edit { prefs ->
-            prefs[KEY_LAST_SMS_ID] = id
-            prefs[KEY_LAST_SMS_DATE] = dateMs
+            val storedDate = prefs[KEY_LAST_SMS_DATE] ?: CUTOVER_EPOCH_MS
+            if (isMonotonicAdvance(dateMs, storedDate)) {
+                prefs[KEY_LAST_SMS_ID] = id
+                prefs[KEY_LAST_SMS_DATE] = dateMs
+            }
         }
     }
 
-    /** Advance call-log cursor. Must only be called after confirmed server acceptance. */
+    /**
+     * Advance call-log cursor. Must only be called after confirmed server acceptance.
+     *
+     * SAFETY GUARDS — same semantics as [advanceSms]: future-dated entries are rejected,
+     * and the cursor never moves backwards.
+     */
     suspend fun advanceCall(id: Long, dateMs: Long) {
+        val now = System.currentTimeMillis()
+        if (isFutureDated(dateMs, now)) {
+            android.util.Log.w(
+                "CursorStore",
+                "advanceCall: rejected future-dated cursor dateMs=$dateMs (now=$now, slack=$FUTURE_SLACK_MS) — cursor unchanged",
+            )
+            return
+        }
         dataStore.edit { prefs ->
-            prefs[KEY_LAST_CALL_ID] = id
-            prefs[KEY_LAST_CALL_DATE] = dateMs
+            val storedDate = prefs[KEY_LAST_CALL_DATE] ?: CUTOVER_EPOCH_MS
+            if (isMonotonicAdvance(dateMs, storedDate)) {
+                prefs[KEY_LAST_CALL_ID] = id
+                prefs[KEY_LAST_CALL_DATE] = dateMs
+            }
         }
     }
 
@@ -87,6 +193,100 @@ class CursorStore(private val context: Context) {
         dataStore.edit { prefs ->
             val current = prefs[KEY_SENT_RECORDINGS] ?: emptySet()
             prefs[KEY_SENT_RECORDINGS] = current + filename
+        }
+    }
+
+    // ── SMS / call cursor schema-version migration ────────────────────────
+
+    /**
+     * One-time SMS cursor reset guarded by [SMS_CURSOR_VERSION].
+     *
+     * If the persisted schema version differs from [SMS_CURSOR_VERSION], the stored
+     * [KEY_LAST_SMS_ID] and [KEY_LAST_SMS_DATE] are cleared (they will fall back to
+     * [CUTOVER_EPOCH_MS] on the next [snapshot] call), and the new version is written.
+     *
+     * This is idempotent: once the new version is stored the block is a no-op forever.
+     * Safe to call at every sync start — the DataStore read is cheap and the write
+     * only happens once per version bump.
+     *
+     * Call this from [SyncWorker] before reading the cursor snapshot.
+     */
+    suspend fun migrateSmsCursorIfNeeded() {
+        val prefs = dataStore.data.first()
+        val storedVersion = prefs[KEY_SMS_CURSOR_SCHEMA_VERSION] ?: 0
+        if (storedVersion != SMS_CURSOR_VERSION) {
+            android.util.Log.w(
+                "CursorStore",
+                "SMS cursor RESET to cutover (was version=$storedVersion, now=$SMS_CURSOR_VERSION)" +
+                    " — next sync will re-collect SMS since CUTOVER_EPOCH_MS",
+            )
+            dataStore.edit { p ->
+                p.remove(KEY_LAST_SMS_ID)
+                p.remove(KEY_LAST_SMS_DATE)
+                p[KEY_SMS_CURSOR_SCHEMA_VERSION] = SMS_CURSOR_VERSION
+            }
+        }
+    }
+
+    /**
+     * One-time call-log cursor reset guarded by [CALL_CURSOR_VERSION].
+     *
+     * Same semantics as [migrateSmsCursorIfNeeded]: clears the call-log cursor when
+     * the stored version differs from [CALL_CURSOR_VERSION], allowing re-collection
+     * of call records since [CUTOVER_EPOCH_MS].
+     *
+     * Call this from [SyncWorker] before reading the cursor snapshot.
+     */
+    suspend fun migrateCallCursorIfNeeded() {
+        val prefs = dataStore.data.first()
+        val storedVersion = prefs[KEY_CALL_CURSOR_SCHEMA_VERSION] ?: 0
+        if (storedVersion != CALL_CURSOR_VERSION) {
+            android.util.Log.w(
+                "CursorStore",
+                "call cursor RESET to cutover (was version=$storedVersion, now=$CALL_CURSOR_VERSION)" +
+                    " — next sync will re-collect call logs since CUTOVER_EPOCH_MS",
+            )
+            dataStore.edit { p ->
+                p.remove(KEY_LAST_CALL_ID)
+                p.remove(KEY_LAST_CALL_DATE)
+                p[KEY_CALL_CURSOR_SCHEMA_VERSION] = CALL_CURSOR_VERSION
+            }
+        }
+    }
+
+    /**
+     * One-time voice-memo sent-recordings reset guarded by [RECORDING_SENT_VERSION].
+     *
+     * When the persisted version differs from [RECORDING_SENT_VERSION], all entries in
+     * [KEY_SENT_RECORDINGS] whose filename does NOT match the 14-digit call-recording
+     * timestamp pattern (`_\d{14}\.m4a`) are removed from the set. This selectively
+     * clears voice-memo sent flags while preserving call-recording sent flags.
+     *
+     * Call-recording filenames always end with `_YYYYMMDDHHMMSS.m4a` (14 digits), so
+     * the regex `_\d{14}\.m4a$` reliably distinguishes them from voice-memo filenames.
+     *
+     * Safe to call at every sync start — the DataStore read is cheap and the write
+     * only happens once per version bump.
+     *
+     * Call this from [SyncWorker] before reading the cursor snapshot.
+     */
+    suspend fun migrateVoiceMemoSentIfNeeded() {
+        val prefs = dataStore.data.first()
+        val storedVersion = prefs[KEY_RECORDING_SENT_SCHEMA_VERSION] ?: 0
+        if (storedVersion != RECORDING_SENT_VERSION) {
+            val callRecordingPattern = Regex("""_\d{14}\.m4a$""")
+            val current = prefs[KEY_SENT_RECORDINGS] ?: emptySet()
+            val preserved = current.filter { callRecordingPattern.containsMatchIn(it) }.toSet()
+            val removed = current.size - preserved.size
+            android.util.Log.w(
+                "CursorStore",
+                "sent_recordings RESET (was version=$storedVersion, now=$RECORDING_SENT_VERSION)" +
+                    " — removed $removed voice-memo entries, preserved ${preserved.size} call-recording entries",
+            )
+            dataStore.edit { p ->
+                p[KEY_SENT_RECORDINGS] = preserved
+                p[KEY_RECORDING_SENT_SCHEMA_VERSION] = RECORDING_SENT_VERSION
+            }
         }
     }
 
@@ -125,6 +325,22 @@ class CursorStore(private val context: Context) {
             prefs.remove(KEY_RECORDING_DIRS)
             prefs.remove(KEY_RECORDING_DIR) // also clear legacy key if present
         }
+    }
+
+    // ── Detector schema version ───────────────────────────────────────────
+
+    /**
+     * Returns the stored detector schema version, or 0 if not yet written.
+     * Used by [PathDetector] to decide whether the recording-dir cache is still valid.
+     */
+    suspend fun getDetectorSchemaVersion(): Int {
+        val prefs = dataStore.data.first()
+        return prefs[KEY_RECORDING_DIRS_SCHEMA_VERSION] ?: 0
+    }
+
+    /** Persists the detector schema version after a successful auto-detection run. */
+    suspend fun setDetectorSchemaVersion(version: Int) {
+        dataStore.edit { it[KEY_RECORDING_DIRS_SCHEMA_VERSION] = version }
     }
 
     // ── Legacy single-dir accessors (kept for callers not yet migrated) ────
