@@ -167,6 +167,8 @@ services:
       AUTH_URL: "https://your-domain.example"
       NEXT_PUBLIC_APP_URL: "https://your-domain.example"
       NODE_ENV: "production"
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
     depends_on:
       server:
         condition: service_started
