@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -34,9 +35,61 @@ func NewDocumentStore(pg *Postgres) *DocumentStore {
 	return &DocumentStore{pg: pg}
 }
 
+// callTranscriptDupCheckQuery is the existence check used by Upsert to detect
+// call-transcript documents that share identical content under a different
+// source_id. The query is a SELECT 1 probe (LIMIT 1) so it avoids a full scan.
+//
+// Parameters:
+//
+//	$1 — content (text)
+//	$2 — source_id to exclude (the current document's own source_id)
+//
+// The query intentionally targets only status='active' rows so that a previously
+// soft-deleted duplicate does not block re-insertion of a renamed recording.
+const callTranscriptDupCheckQuery = `
+	SELECT 1
+	FROM documents
+	WHERE source_type = 'call-transcript'
+	  AND status      = 'active'
+	  AND content     = $1
+	  AND source_id  <> $2
+	LIMIT 1`
+
 // Upsert inserts a document or updates it when (source_type, source_id) already exists.
 // On conflict the status is reset to 'active' (handles re-appearance of previously deleted files).
+//
+// Duplicate call-transcript guard: for source_type='call-transcript' only, a
+// cheap pre-insert existence check is performed. When an active document with
+// identical content but a DIFFERENT source_id already exists, the upsert is
+// skipped and ErrDuplicateTranscript is returned (the caller may safely ignore
+// or log it). A same-source_id re-upsert is NOT affected: the ON CONFLICT path
+// handles it normally even when the content is identical.
 func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
+	// Duplicate guard: call-transcript content dedup (issue #134).
+	// Only applied when source_type is 'call-transcript'. Other source types are
+	// unaffected. Same-source_id re-upserts bypass this check because the query
+	// excludes the document's own source_id; the ON CONFLICT path below handles them.
+	if doc.SourceType == model.SourceCallTranscript {
+		var exists int
+		err := s.pg.pool.QueryRow(ctx, callTranscriptDupCheckQuery,
+			doc.Content,
+			doc.SourceID,
+		).Scan(&exists)
+		switch {
+		case err == nil:
+			// A duplicate row was found — skip the insert.
+			slog.Info("store: skipping duplicate call-transcript",
+				"source_id", doc.SourceID,
+				"content_len", len(doc.Content),
+			)
+			return ErrDuplicateTranscript
+		case isNoRows(err):
+			// No duplicate — proceed with the normal upsert.
+		default:
+			return fmt.Errorf("call-transcript dup check: %w", err)
+		}
+	}
+
 	meta, err := json.Marshal(doc.Metadata)
 	if err != nil {
 		return fmt.Errorf("marshal metadata: %w", err)
@@ -80,6 +133,18 @@ func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
 		doc.CollectedAt,
 	)
 	return row.Scan(&doc.ID, &doc.CreatedAt, &doc.UpdatedAt)
+}
+
+// ErrDuplicateTranscript is returned by Upsert when a call-transcript document
+// with identical content already exists under a different source_id.
+// Callers in the collector pipeline should log and skip this document; they
+// MUST NOT treat it as a fatal error that aborts the entire collection cycle.
+var ErrDuplicateTranscript = fmt.Errorf("store: call-transcript with identical content already exists (different source_id)")
+
+// isNoRows reports whether err is a pgx "no rows" sentinel. Extracted to a
+// helper so the Upsert guard remains readable without importing pgx directly.
+func isNoRows(err error) bool {
+	return err == pgx.ErrNoRows
 }
 
 // GetByID retrieves a single document by primary key.

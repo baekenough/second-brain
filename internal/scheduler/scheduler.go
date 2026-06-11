@@ -4,6 +4,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -332,6 +333,12 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 
 		for i := range batch {
 			if err := s.store.Upsert(ctx, &batch[i]); err != nil {
+				if errors.Is(err, store.ErrDuplicateTranscript) {
+					slog.Debug("scheduler: skipped duplicate call-transcript",
+						"collector", col.Name(),
+						"source_id", batch[i].SourceID)
+					continue
+				}
 				slog.Warn("scheduler: upsert failed",
 					"collector", col.Name(),
 					"source_id", batch[i].SourceID,
@@ -763,6 +770,11 @@ func (s *Scheduler) ForceCollectSlackChannel(ctx context.Context, channelID, cha
 	count := 0
 	for i := range docs {
 		if err := s.store.Upsert(ctx, &docs[i]); err != nil {
+			if errors.Is(err, store.ErrDuplicateTranscript) {
+				slog.Debug("scheduler: skipped duplicate call-transcript",
+					"source_id", docs[i].SourceID)
+				continue
+			}
 			slog.Warn("scheduler: force-collect upsert failed",
 				"channel_id", channelID,
 				"source_id", docs[i].SourceID,
