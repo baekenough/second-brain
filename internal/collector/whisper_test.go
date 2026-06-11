@@ -95,11 +95,26 @@ func makeWhisperCollector(cfg *config.Config, srv *httptest.Server) *WhisperColl
 }
 
 // writeDummyAudio creates a dummy audio file at dir/name with the given mtime.
-// Content is a small placeholder — the mock server does not validate audio bytes.
+//
+// For m4a/mp4 files a minimal valid ISOBMFF container header (32 bytes, "ftyp"
+// at offset 4) is written so that the collector's audio pre-check passes.
+// All other audio formats use a RIFF-style header which satisfies only the
+// minimum-length guard (>= 8 bytes).
 func writeDummyAudio(t *testing.T, dir, name string, mtime time.Time) string {
 	t.Helper()
 	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, []byte("RIFF....dummy audio data"), 0o600); err != nil {
+
+	var content []byte
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".m4a", ".mp4":
+		// Valid ISOBMFF header: 32 bytes with "ftyp" box at offset 4.
+		content = make([]byte, 32)
+		copy(content[4:8], "ftyp")
+	default:
+		content = []byte("RIFF....dummy audio data")
+	}
+
+	if err := os.WriteFile(path, content, 0o600); err != nil {
 		t.Fatalf("writeDummyAudio: %v", err)
 	}
 	if err := os.Chtimes(path, mtime, mtime); err != nil {
@@ -396,8 +411,11 @@ func TestWhisperCollector_Collect_OversizedFileSkipped_ConfigurableCap(t *testin
 	const testCap int64 = 100 // 100 bytes
 
 	// Small file: under cap → should be transcribed.
+	// Must carry a valid ftyp box to pass the audio integrity pre-check.
 	smallPath := filepath.Join(dir, "small.m4a")
-	if err := os.WriteFile(smallPath, make([]byte, 50), 0o600); err != nil { // 50 bytes
+	smallData := make([]byte, 50) // 50 bytes — under the 100-byte cap
+	copy(smallData[4:8], "ftyp")
+	if err := os.WriteFile(smallPath, smallData, 0o600); err != nil {
 		t.Fatalf("write small file: %v", err)
 	}
 
@@ -443,12 +461,20 @@ func TestWhisperCollector_Collect_ZeroCap_Unlimited(t *testing.T) {
 	dir := t.TempDir()
 	srv, _ := newWhisperTestServer(t, "대용량 파일 전사")
 
-	// Write a 10 MB sparse file — well above the old 25 MB constant and only
+	// Write a 10 MiB sparse file — well above the old 25 MB constant and only
 	// limited to keep the test fast.
+	// Write a valid ISOBMFF ftyp header at the start so the audio pre-check passes,
+	// then seek to 10 MiB to create a sparse file of the desired size.
 	bigPath := filepath.Join(dir, "huge.m4a")
 	f, err := os.Create(bigPath)
 	if err != nil {
 		t.Fatalf("create big file: %v", err)
+	}
+	header := make([]byte, 32)
+	copy(header[4:8], "ftyp")
+	if _, err := f.Write(header); err != nil {
+		f.Close()
+		t.Fatalf("write m4a header: %v", err)
 	}
 	if _, err := f.Seek(10<<20, io.SeekStart); err != nil { // 10 MiB
 		f.Close()
@@ -715,8 +741,20 @@ func TestWhisperCollector_Collect_PartialFailureContinues(t *testing.T) {
 
 	now := time.Now().UTC()
 	// Two files with different names so walk order is deterministic by name.
+	// aaa.mp3: generic audio header (RIFF) — passes CheckAudioBytes; server returns 500 for first call.
 	writeDummyAudio(t, dir, "aaa.mp3", now.Add(-2*time.Hour).Truncate(time.Second))
-	writeDummyAudio(t, dir, "bbb.m4a", now.Add(-1*time.Hour).Truncate(time.Second))
+	// bbb.m4a: must carry a valid ftyp box so it passes the pre-check and reaches the server.
+	// The server returns 200 for the second call, producing the expected transcript.
+	validM4APath := filepath.Join(dir, "bbb.m4a")
+	validM4AData := make([]byte, 64)
+	copy(validM4AData[4:8], "ftyp")
+	if err := os.WriteFile(validM4APath, validM4AData, 0o600); err != nil {
+		t.Fatalf("write valid m4a: %v", err)
+	}
+	validM4AMtime := now.Add(-1 * time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(validM4APath, validM4AMtime, validM4AMtime); err != nil {
+		t.Fatalf("chtimes valid m4a: %v", err)
+	}
 
 	cfg := &config.Config{
 		WhisperAudioDir: dir,
@@ -778,5 +816,156 @@ func TestWhisperCollector_Name_And_Source(t *testing.T) {
 	}
 	if c.Source() != model.SourceCallTranscript {
 		t.Errorf("Source() = %q, want %q", c.Source(), model.SourceCallTranscript)
+	}
+}
+
+// writeCorruptM4A creates a corrupt .m4a file at dir/name with the given mtime.
+// The file content is 4096 zero bytes — identical to the garbage uploaded by the
+// mobile app in the production incident (no ftyp box, not a valid m4a container).
+func writeCorruptM4A(t *testing.T, dir, name string, mtime time.Time) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, make([]byte, 4096), 0o600); err != nil {
+		t.Fatalf("writeCorruptM4A: %v", err)
+	}
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatalf("writeCorruptM4A chtimes: %v", err)
+	}
+	return path
+}
+
+// TestWhisperCollector_Collect_CorruptM4ASkipped verifies that a 4096-byte
+// all-zero .m4a file (no ftyp box) is silently skipped and does NOT trigger
+// an HTTP call to the whisper server.
+//
+// This is the collector-side defence against the infinite retry loop: even if
+// such a file somehow gets on disk (e.g. written before the ingest guard was
+// added), the collector must not submit it to the whisper API.
+func TestWhisperCollector_Collect_CorruptM4ASkipped(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	// Track whether the whisper server was called.
+	serverCalled := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverCalled = true
+		http.Error(w, "should not be called", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	writeCorruptM4A(t, dir, "garbage.m4a", now)
+
+	cfg := &config.Config{
+		WhisperAudioDir: dir,
+		WhisperAPIURL:   srv.URL,
+		WhisperModel:    "whisper-1",
+		WhisperLanguage: "ko",
+	}
+	c := makeWhisperCollector(cfg, srv)
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect() should not error on corrupt file: %v", err)
+	}
+	if len(docs) != 0 {
+		t.Errorf("Collect() returned %d docs, want 0 (corrupt file must be skipped)", len(docs))
+	}
+	if serverCalled {
+		t.Error("whisper server was called for corrupt file — must be skipped before HTTP request")
+	}
+}
+
+// TestWhisperCollector_Collect_CorruptM4ASkipped_ValidFileContinues verifies
+// that when the directory contains both a corrupt and a valid .m4a file, the
+// corrupt file is skipped (no server call) and the valid file is transcribed.
+func TestWhisperCollector_Collect_CorruptM4ASkipped_ValidFileContinues(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	const wantTranscript = "정상 파일 전사"
+	srv, captured := newWhisperTestServer(t, wantTranscript)
+
+	now := time.Now().UTC().Truncate(time.Second)
+
+	// Corrupt file — 4096 zero bytes, no ftyp box.
+	writeCorruptM4A(t, dir, "aaa_corrupt.m4a", now)
+
+	// Valid file — has "ftyp" at offset 4.
+	validPath := filepath.Join(dir, "bbb_valid.m4a")
+	validData := make([]byte, 64)
+	copy(validData[4:8], []byte("ftyp"))
+	if err := os.WriteFile(validPath, validData, 0o600); err != nil {
+		t.Fatalf("write valid file: %v", err)
+	}
+	if err := os.Chtimes(validPath, now, now); err != nil {
+		t.Fatalf("chtimes valid: %v", err)
+	}
+
+	cfg := &config.Config{
+		WhisperAudioDir: dir,
+		WhisperAPIURL:   srv.URL,
+		WhisperModel:    "whisper-1",
+		WhisperLanguage: "ko",
+	}
+	c := makeWhisperCollector(cfg, srv)
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect() error: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Errorf("Collect() returned %d docs, want 1 (only valid file)", len(docs))
+	}
+	if len(docs) == 1 && docs[0].Content != wantTranscript {
+		t.Errorf("Content = %q, want %q", docs[0].Content, wantTranscript)
+	}
+	// Server must have been called exactly once (for the valid file).
+	if captured.fileSize == 0 {
+		t.Error("whisper server was not called for the valid file")
+	}
+}
+
+// TestWhisperCollector_Collect_TooSmallFileSkipped verifies that a file shorter
+// than 8 bytes is skipped before the HTTP call.
+func TestWhisperCollector_Collect_TooSmallFileSkipped(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	serverCalled := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverCalled = true
+		http.Error(w, "should not be called", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	tinyPath := filepath.Join(dir, "tiny.m4a")
+	if err := os.WriteFile(tinyPath, []byte{0x00, 0x01}, 0o600); err != nil {
+		t.Fatalf("write tiny file: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := os.Chtimes(tinyPath, now, now); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	cfg := &config.Config{
+		WhisperAudioDir: dir,
+		WhisperAPIURL:   srv.URL,
+		WhisperModel:    "whisper-1",
+		WhisperLanguage: "ko",
+	}
+	c := makeWhisperCollector(cfg, srv)
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect() error: %v", err)
+	}
+	if len(docs) != 0 {
+		t.Errorf("Collect() returned %d docs, want 0 (tiny file must be skipped)", len(docs))
+	}
+	if serverCalled {
+		t.Error("whisper server was called for tiny file — must be skipped")
 	}
 }

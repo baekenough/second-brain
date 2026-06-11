@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/baekenough/second-brain/internal/audiovalidate"
 	"github.com/baekenough/second-brain/internal/collector/smsmap"
 	"github.com/baekenough/second-brain/internal/model"
 )
@@ -153,6 +154,17 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 	}
 	contactName := r.FormValue("contact_name")
 
+	// --- Cutover floor check (before reading file bytes) ---
+	// Skip recordings that pre-date the floor without touching the file data.
+	recordedAt := time.UnixMilli(dateMs).UTC()
+	if !s.recordingCutover.IsZero() && recordedAt.Before(s.recordingCutover) {
+		writeJSON(w, http.StatusOK, IngestRecordingResponse{
+			Accepted: false,
+			Skipped:  true,
+		})
+		return
+	}
+
 	// --- Read the audio file part ---
 	f, fh, err := r.FormFile("file")
 	if err != nil {
@@ -161,13 +173,57 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 	}
 	defer f.Close() //nolint:errcheck // best-effort cleanup
 
-	// --- Cutover floor check ---
-	recordedAt := time.UnixMilli(dateMs).UTC()
-	if !s.recordingCutover.IsZero() && recordedAt.Before(s.recordingCutover) {
-		writeJSON(w, http.StatusOK, IngestRecordingResponse{
-			Accepted: false,
-			Skipped:  true,
-		})
+	// Read the entire upload into memory so we can:
+	//  (a) validate the audio header before touching the disk, and
+	//  (b) write atomically from memory (avoiding partial files on disk when
+	//      the request is rejected after the file was already opened).
+	//
+	// maxBytes is already enforced by MaxBytesReader above, so this read is
+	// bounded. For typical call recordings (< 100 MiB default) this is fine.
+	audioBytes, err := io.ReadAll(f)
+	if err != nil {
+		if isMaxBytesError(err) {
+			writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("file exceeds maximum upload size of %d bytes", maxBytes))
+			return
+		}
+		slog.Error("ingest_recording: read audio bytes", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
+	// --- Validate audio integrity (defence-in-depth layer 1) ---
+	//
+	// Reject obviously-corrupt files before writing to disk. Without this guard
+	// a 4096-byte all-zero garbage .m4a uploaded by the mobile app would be
+	// written to disk and then retried every minute by WhisperCollector, flooding
+	// the whisper server with decode failures (av.error.InvalidDataError).
+	//
+	// HTTP 400 is intentional: the Android app interprets 4xx as PerFileClientError
+	// and calls markRecordingSent(), permanently stopping retries for that file.
+	//
+	// m4a/mp4 containers must carry an "ftyp" box at bytes[4:8]; all other audio
+	// formats only require the minimum-length check.
+	uploadedFilename := ""
+	if fh != nil {
+		uploadedFilename = fh.Filename
+	}
+	fileExt := strings.ToLower(filepath.Ext(uploadedFilename))
+	var validationErr error
+	switch fileExt {
+	case ".m4a", ".mp4":
+		validationErr = audiovalidate.CheckM4A(audioBytes)
+	default:
+		validationErr = audiovalidate.CheckAudioBytes(audioBytes)
+	}
+	if validationErr != nil {
+		slog.Warn("ingest_recording: rejecting corrupt audio upload",
+			"filename", uploadedFilename,
+			"size_bytes", len(audioBytes),
+			"reason", validationErr,
+		)
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("audio file appears corrupt or invalid: %v", validationErr))
 		return
 	}
 
@@ -245,29 +301,12 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// --- Write audio file ---
+	// audioBytes was validated above; write from memory to disk.
 	destPath := filepath.Join(s.recordingDir, audioFilename)
-	destFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		slog.Error("ingest_recording: open dest file", "path", destPath, "error", err)
-		writeError(w, http.StatusInternalServerError, "internal server error")
-		return
-	}
-
-	if _, err := io.Copy(destFile, f); err != nil {
-		_ = destFile.Close()
-		_ = os.Remove(destPath) // clean up partial file
-		if isMaxBytesError(err) {
-			writeError(w, http.StatusRequestEntityTooLarge,
-				fmt.Sprintf("file exceeds maximum upload size of %d bytes", maxBytes))
-			return
-		}
+	if err := os.WriteFile(destPath, audioBytes, 0o644); err != nil {
 		slog.Error("ingest_recording: write audio file", "path", destPath, "error", err)
 		writeError(w, http.StatusInternalServerError, "internal server error")
 		return
-	}
-	if err := destFile.Close(); err != nil {
-		// Sync / close failure is unexpected but non-fatal for the response.
-		slog.Warn("ingest_recording: close audio file (non-fatal)", "path", destPath, "error", err)
 	}
 
 	// --- Build document title, content, and metadata by kind ---

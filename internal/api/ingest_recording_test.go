@@ -16,6 +16,19 @@ import (
 
 // --- helpers ---
 
+// validM4ABytes returns a minimal byte slice that passes the m4a audio
+// validation check (audiovalidate.CheckM4A). The slice contains a valid
+// ISOBMFF ftyp box marker at offset 4 and is padded to n bytes total.
+// n must be >= 8; any value < 8 is silently bumped to 8.
+func validM4ABytes(n int) []byte {
+	if n < 8 {
+		n = 8
+	}
+	b := make([]byte, n)
+	copy(b[4:8], "ftyp")
+	return b
+}
+
 // newRecordingTestServer creates a Server wired for the ingest-recording handler.
 // If recordingDir is empty a temp dir is created and its path returned.
 func newRecordingTestServer(
@@ -95,7 +108,7 @@ func TestIngestRecording_AuthRequired(t *testing.T) {
 	srv, _ := newRecordingTestServer(t, upserter, "", 0, time.Time{})
 
 	dateMs := time.Now().Add(-time.Hour).UnixMilli()
-	body, ct := buildRecordingForm(t, "audio.m4a", []byte("fake audio"), "010-1234-5678", dateMs)
+	body, ct := buildRecordingForm(t, "audio.m4a", validM4ABytes(32), "010-1234-5678", dateMs)
 	rr := doRecordingPost(t, srv, body, ct, "" /* no auth */)
 
 	if rr.Code != http.StatusUnauthorized {
@@ -113,7 +126,7 @@ func TestIngestRecording_Success(t *testing.T) {
 
 	number := "010-1234-5678"
 	dateMs := time.Now().Add(-time.Hour).UnixMilli()
-	audioData := []byte("fake m4a audio bytes")
+	audioData := validM4ABytes(32)
 
 	body, ct := buildRecordingForm(t, "recording.m4a", audioData, number, dateMs,
 		"duration_sec", "120",
@@ -187,7 +200,7 @@ func TestIngestRecording_StoresPendingDocument(t *testing.T) {
 	dateMs := int64(1705311000000) // 2024-01-15 09:30:00 UTC
 	wantTime := time.Unix(1705311000, 0).UTC()
 
-	body, ct := buildRecordingForm(t, "call.m4a", []byte("audio"), number, dateMs)
+	body, ct := buildRecordingForm(t, "call.m4a", validM4ABytes(32), number, dateMs)
 	rr := doRecordingPost(t, srv, body, ct, "Bearer test-key")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201; body: %s", rr.Code, rr.Body.String())
@@ -231,14 +244,14 @@ func TestIngestRecording_Idempotent(t *testing.T) {
 	durationSec := "60"
 
 	// First upload.
-	b1, ct1 := buildRecordingForm(t, "audio.m4a", []byte("audio"), number, dateMs, "duration_sec", durationSec)
+	b1, ct1 := buildRecordingForm(t, "audio.m4a", validM4ABytes(32), number, dateMs, "duration_sec", durationSec)
 	rr1 := doRecordingPost(t, srv, b1, ct1, "Bearer test-key")
 	if rr1.Code != http.StatusCreated {
 		t.Fatalf("first: status = %d, want 201", rr1.Code)
 	}
 
 	// Second upload (identical metadata).
-	b2, ct2 := buildRecordingForm(t, "audio.m4a", []byte("audio"), number, dateMs, "duration_sec", durationSec)
+	b2, ct2 := buildRecordingForm(t, "audio.m4a", validM4ABytes(32), number, dateMs, "duration_sec", durationSec)
 	rr2 := doRecordingPost(t, srv, b2, ct2, "Bearer test-key")
 	if rr2.Code != http.StatusCreated {
 		t.Fatalf("second: status = %d, want 201", rr2.Code)
@@ -380,7 +393,7 @@ func TestIngestRecording_FilenameEncoding(t *testing.T) {
 	localTime := time.Unix(1705311000, 0).In(time.Local)
 	expectedTimestamp := localTime.Format("20060102150405")
 
-	body, ct := buildRecordingForm(t, "call.m4a", []byte("audio bytes"), number, dateMs)
+	body, ct := buildRecordingForm(t, "call.m4a", validM4ABytes(32), number, dateMs)
 	rr := doRecordingPost(t, srv, body, ct, "Bearer test-key")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201; body: %s", rr.Code, rr.Body.String())
@@ -427,7 +440,7 @@ func TestIngestRecording_VoiceMemoSuccess(t *testing.T) {
 	srv, recordingDir := newRecordingTestServer(t, upserter, "", 0, time.Time{})
 
 	dateMs := time.Now().Add(-time.Hour).UnixMilli()
-	audioData := []byte("fake voice memo audio bytes")
+	audioData := validM4ABytes(32)
 
 	body, ct := buildRecordingForm(t, "memo.m4a", audioData, "" /* no number */, dateMs,
 		"kind", "voice-memo",
@@ -505,7 +518,7 @@ func TestIngestRecording_VoiceMemoNoNumberAllowed(t *testing.T) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	fw, _ := mw.CreateFormFile("file", "audio.m4a")
-	_, _ = fw.Write([]byte("audio bytes"))
+	_, _ = fw.Write(validM4ABytes(32))
 	// number intentionally omitted
 	_ = mw.WriteField("kind", "voice-memo")
 	_ = mw.WriteField("date_ms", fmt.Sprintf("%d", dateMs))
@@ -552,7 +565,7 @@ func TestIngestRecording_InvalidKind(t *testing.T) {
 	srv, _ := newRecordingTestServer(t, upserter, "", 0, time.Time{})
 
 	dateMs := time.Now().Add(-time.Hour).UnixMilli()
-	body, ct := buildRecordingForm(t, "audio.m4a", []byte("audio"), "010-1234-5678", dateMs,
+	body, ct := buildRecordingForm(t, "audio.m4a", validM4ABytes(32), "010-1234-5678", dateMs,
 		"kind", "unknown-kind",
 	)
 	rr := doRecordingPost(t, srv, body, ct, "Bearer test-key")
@@ -571,7 +584,7 @@ func TestIngestRecording_CallRecordingType(t *testing.T) {
 	srv, _ := newRecordingTestServer(t, upserter, "", 0, time.Time{})
 
 	dateMs := time.Now().Add(-time.Hour).UnixMilli()
-	body, ct := buildRecordingForm(t, "call.m4a", []byte("audio"), "010-1234-5678", dateMs,
+	body, ct := buildRecordingForm(t, "call.m4a", validM4ABytes(32), "010-1234-5678", dateMs,
 		"kind", "call",
 	)
 	rr := doRecordingPost(t, srv, body, ct, "Bearer test-key")
@@ -606,14 +619,14 @@ func TestIngestRecording_VoiceMemoIdempotent(t *testing.T) {
 	dateMs := time.Now().Add(-time.Hour).UnixMilli()
 
 	// First upload.
-	b1, ct1 := buildRecordingForm(t, "memo.m4a", []byte("audio"), "", dateMs, "kind", "voice-memo")
+	b1, ct1 := buildRecordingForm(t, "memo.m4a", validM4ABytes(32), "", dateMs, "kind", "voice-memo")
 	rr1 := doRecordingPost(t, srv, b1, ct1, "Bearer test-key")
 	if rr1.Code != http.StatusCreated {
 		t.Fatalf("first: status = %d, want 201", rr1.Code)
 	}
 
 	// Second upload (identical metadata).
-	b2, ct2 := buildRecordingForm(t, "memo.m4a", []byte("audio"), "", dateMs, "kind", "voice-memo")
+	b2, ct2 := buildRecordingForm(t, "memo.m4a", validM4ABytes(32), "", dateMs, "kind", "voice-memo")
 	rr2 := doRecordingPost(t, srv, b2, ct2, "Bearer test-key")
 	if rr2.Code != http.StatusCreated {
 		t.Fatalf("second: status = %d, want 201", rr2.Code)
@@ -649,13 +662,13 @@ func TestIngestRecording_VoiceMemoSameFileDifferentDateMs(t *testing.T) {
 	// Second upload: client sends actual recording time on the same day.
 	actualMs := int64(1749361234000) // 2025-06-08 05:40:34 UTC
 
-	b1, ct1 := buildRecordingForm(t, filename, []byte("audio"), "", midnightMs, "kind", "voice-memo")
+	b1, ct1 := buildRecordingForm(t, filename, validM4ABytes(32), "", midnightMs, "kind", "voice-memo")
 	rr1 := doRecordingPost(t, srv, b1, ct1, "Bearer test-key")
 	if rr1.Code != http.StatusCreated {
 		t.Fatalf("first upload: status = %d, want 201; body: %s", rr1.Code, rr1.Body.String())
 	}
 
-	b2, ct2 := buildRecordingForm(t, filename, []byte("audio"), "", actualMs, "kind", "voice-memo")
+	b2, ct2 := buildRecordingForm(t, filename, validM4ABytes(32), "", actualMs, "kind", "voice-memo")
 	rr2 := doRecordingPost(t, srv, b2, ct2, "Bearer test-key")
 	if rr2.Code != http.StatusCreated {
 		t.Fatalf("second upload: status = %d, want 201; body: %s", rr2.Code, rr2.Body.String())
@@ -696,14 +709,14 @@ func TestIngestRecording_VoiceMemoSameDateMsDifferentFilename(t *testing.T) {
 	dateMs := int64(1749340800000) // 2025-06-08 00:00:00 UTC (midnight, same for all same-day memos)
 
 	// Upload first voice-memo.
-	b1, ct1 := buildRecordingForm(t, "음성 260608_애니.m4a", []byte("audio-one"), "", dateMs, "kind", "voice-memo")
+	b1, ct1 := buildRecordingForm(t, "음성 260608_애니.m4a", validM4ABytes(32), "", dateMs, "kind", "voice-memo")
 	rr1 := doRecordingPost(t, srv, b1, ct1, "Bearer test-key")
 	if rr1.Code != http.StatusCreated {
 		t.Fatalf("first upload: status = %d, want 201; body: %s", rr1.Code, rr1.Body.String())
 	}
 
 	// Upload second voice-memo with different filename but same dateMs.
-	b2, ct2 := buildRecordingForm(t, "260608_JTF회의_2.m4a", []byte("audio-two"), "", dateMs, "kind", "voice-memo")
+	b2, ct2 := buildRecordingForm(t, "260608_JTF회의_2.m4a", validM4ABytes(32), "", dateMs, "kind", "voice-memo")
 	rr2 := doRecordingPost(t, srv, b2, ct2, "Bearer test-key")
 	if rr2.Code != http.StatusCreated {
 		t.Fatalf("second upload: status = %d, want 201; body: %s", rr2.Code, rr2.Body.String())
@@ -750,7 +763,7 @@ func TestIngestRecording_VoiceMemoSameFilenameIdempotent(t *testing.T) {
 	dateMs := int64(1749340800000) // 2025-06-08 00:00:00 UTC
 
 	upload := func() string {
-		b, ct := buildRecordingForm(t, "음성 260608_애니.m4a", []byte("audio"), "", dateMs, "kind", "voice-memo")
+		b, ct := buildRecordingForm(t, "음성 260608_애니.m4a", validM4ABytes(32), "", dateMs, "kind", "voice-memo")
 		rr := doRecordingPost(t, srv, b, ct, "Bearer test-key")
 		if rr.Code != http.StatusCreated {
 			t.Fatalf("upload: status = %d, want 201; body: %s", rr.Code, rr.Body.String())
@@ -767,6 +780,128 @@ func TestIngestRecording_VoiceMemoSameFilenameIdempotent(t *testing.T) {
 
 	if id1 != id2 {
 		t.Errorf("idempotency broken: first=%q second=%q", id1, id2)
+	}
+}
+
+// TestIngestRecording_CorruptM4AIsRejected verifies that a file whose content
+// is obviously-corrupt (4096 bytes of zeros, no ftyp box) is rejected with
+// HTTP 400 and NOT written to disk.
+//
+// This guards against the production scenario where the mobile app uploads a
+// 4096-byte garbage .m4a. Without this guard the file would be written to disk
+// and then retried every minute by WhisperCollector, spamming 500 errors from
+// the whisper server (av.error.InvalidDataError).
+func TestIngestRecording_CorruptM4AIsRejected(t *testing.T) {
+	t.Parallel()
+
+	upserter := &stubIngestUpserter{}
+	srv, recordingDir := newRecordingTestServer(t, upserter, "", 0, time.Time{})
+
+	// 4096-byte all-zero payload — exactly the garbage uploaded by the mobile app.
+	garbageAudio := make([]byte, 4096)
+	dateMs := time.Now().Add(-time.Hour).UnixMilli()
+
+	body, ct := buildRecordingForm(t, "recording.m4a", garbageAudio, "010-1234-5678", dateMs)
+	rr := doRecordingPost(t, srv, body, ct, "Bearer test-key")
+
+	// Must be rejected with 400 so the mobile client marks the recording as
+	// PerFileClientError and stops retrying (contract with Android app).
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d; body: %s", rr.Code, http.StatusBadRequest, rr.Body.String())
+	}
+
+	// No document must be stored.
+	if len(upserter.upserted) != 0 {
+		t.Errorf("expected 0 upserted docs for corrupt file, got %d", len(upserter.upserted))
+	}
+
+	// No file must be written to disk.
+	entries, err := os.ReadDir(recordingDir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("expected 0 files on disk for corrupt upload, got %d: %v",
+			len(entries), entries[0].Name())
+	}
+}
+
+// TestIngestRecording_TooSmallIsRejected verifies that files below the minimum
+// viable audio size (< 8 bytes) are rejected with HTTP 400.
+func TestIngestRecording_TooSmallIsRejected(t *testing.T) {
+	t.Parallel()
+
+	upserter := &stubIngestUpserter{}
+	srv, recordingDir := newRecordingTestServer(t, upserter, "", 0, time.Time{})
+
+	tinyAudio := []byte{0x00, 0x01, 0x02} // 3 bytes — too small
+	dateMs := time.Now().Add(-time.Hour).UnixMilli()
+
+	body, ct := buildRecordingForm(t, "tiny.m4a", tinyAudio, "010-1234-5678", dateMs)
+	rr := doRecordingPost(t, srv, body, ct, "Bearer test-key")
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d; body: %s", rr.Code, http.StatusBadRequest, rr.Body.String())
+	}
+
+	// No file must be written to disk.
+	entries, _ := os.ReadDir(recordingDir)
+	if len(entries) != 0 {
+		t.Errorf("expected 0 files on disk for tiny upload, got %d", len(entries))
+	}
+}
+
+// TestIngestRecording_ValidM4AIsAccepted verifies that a file with a proper
+// ftyp box at offset 4 is accepted normally (regression guard: validation must
+// not reject valid files).
+func TestIngestRecording_ValidM4AIsAccepted(t *testing.T) {
+	t.Parallel()
+
+	upserter := &stubIngestUpserter{}
+	srv, recordingDir := newRecordingTestServer(t, upserter, "", 0, time.Time{})
+
+	// Minimal valid m4a header: 8+ bytes with "ftyp" at offset 4.
+	validM4A := make([]byte, 32)
+	copy(validM4A[4:8], []byte("ftyp"))
+
+	dateMs := time.Now().Add(-time.Hour).UnixMilli()
+	body, ct := buildRecordingForm(t, "valid.m4a", validM4A, "010-1234-5678", dateMs)
+	rr := doRecordingPost(t, srv, body, ct, "Bearer test-key")
+
+	if rr.Code != http.StatusCreated {
+		t.Errorf("status = %d, want %d (valid m4a must be accepted); body: %s",
+			rr.Code, http.StatusCreated, rr.Body.String())
+	}
+
+	entries, _ := os.ReadDir(recordingDir)
+	if len(entries) != 1 {
+		t.Errorf("expected 1 file on disk for valid upload, got %d", len(entries))
+	}
+}
+
+// TestIngestRecording_NonM4ANotValidated verifies that non-m4a extensions (e.g.
+// .mp3, .wav) are not subject to the ftyp check and are accepted as-is.
+func TestIngestRecording_NonM4ANotValidated(t *testing.T) {
+	t.Parallel()
+
+	upserter := &stubIngestUpserter{}
+	srv, recordingDir := newRecordingTestServer(t, upserter, "", 0, time.Time{})
+
+	// RIFF-style header (wav) — valid audio but no ftyp box.
+	wavData := []byte{'R', 'I', 'F', 'F', 'W', 'A', 'V', 'E', 0x00, 0x00}
+	dateMs := time.Now().Add(-time.Hour).UnixMilli()
+
+	body, ct := buildRecordingForm(t, "audio.wav", wavData, "010-1234-5678", dateMs)
+	rr := doRecordingPost(t, srv, body, ct, "Bearer test-key")
+
+	if rr.Code != http.StatusCreated {
+		t.Errorf("status = %d, want %d (non-m4a must not be rejected by ftyp check); body: %s",
+			rr.Code, http.StatusCreated, rr.Body.String())
+	}
+
+	entries, _ := os.ReadDir(recordingDir)
+	if len(entries) != 1 {
+		t.Errorf("expected 1 file on disk for wav upload, got %d", len(entries))
 	}
 }
 

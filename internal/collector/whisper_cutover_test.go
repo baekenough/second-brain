@@ -154,8 +154,12 @@ func TestWhisperCollector_Cutover_AtExactBoundary(t *testing.T) {
 	cutover := time.Now().UTC().Add(-24 * time.Hour).Truncate(time.Second)
 
 	// File mtime exactly equals cutover.
+	// Use a valid m4a header so the audio pre-check does not reject it before
+	// the boundary condition can be exercised.
 	exactPath := filepath.Join(dir, "exact.m4a")
-	if err := os.WriteFile(exactPath, []byte("dummy audio"), 0o600); err != nil {
+	exactData := make([]byte, 32)
+	copy(exactData[4:8], "ftyp")
+	if err := os.WriteFile(exactPath, exactData, 0o600); err != nil {
 		t.Fatalf("write exact file: %v", err)
 	}
 	if err := os.Chtimes(exactPath, cutover, cutover); err != nil {

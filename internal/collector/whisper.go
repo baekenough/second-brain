@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/baekenough/second-brain/internal/audiovalidate"
 	"github.com/baekenough/second-brain/internal/config"
 	"github.com/baekenough/second-brain/internal/model"
 )
@@ -358,6 +359,28 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 			return nil
 		}
 
+		// Audio integrity pre-check (defence-in-depth layer 2):
+		// Read only the first 8 bytes to validate the file header before sending
+		// the full file to the whisper server. This prevents the infinite-retry
+		// loop caused by 4096-byte garbage .m4a files (no ftyp box) that the
+		// whisper server declines with av.error.InvalidDataError (HTTP 500).
+		//
+		// The ingest handler (layer 1) prevents new corrupt files from reaching
+		// disk; this guard protects against files already on disk before the fix.
+		//
+		// Only one warning is emitted per walk — subsequent runs re-warn because
+		// the file is still present. This is intentional: the warning serves as a
+		// reminder to remove the corrupt file. Suppressing repeat warnings would
+		// require persistent state (a blacklist file), which complicates restarts.
+		if err := checkAudioFileHeader(path, ext); err != nil {
+			slog.Warn("whisper: skipping unreadable or corrupt audio file (pre-check failed)",
+				"path", path,
+				"size_bytes", info.Size(),
+				"reason", err,
+			)
+			return nil
+		}
+
 		text, err := c.transcribeFile(ctx, path)
 		if err != nil {
 			slog.Warn("whisper: transcription failed", "path", path, "error", err)
@@ -394,6 +417,38 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 
 	slog.Info("whisper: collected transcripts", "count", len(docs), "audio_dir", c.cfg.WhisperAudioDir)
 	return docs, nil
+}
+
+// checkAudioFileHeader reads the first 8 bytes of the file at path and runs
+// the appropriate audiovalidate check for the given extension.
+//
+// m4a/mp4 files are checked for the ISOBMFF "ftyp" box at offset 4.
+// All other audio formats only require the minimum-length (8-byte) guard.
+//
+// Returns nil when the header is plausible, an error when the file appears
+// corrupt or truncated. The caller should log once and skip the file.
+func checkAudioFileHeader(path, ext string) error {
+	const headerSize = 8
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
+	defer f.Close() //nolint:errcheck // read-only, close error is irrelevant
+
+	header := make([]byte, headerSize)
+	n, err := io.ReadFull(f, header)
+	if err != nil {
+		// io.ErrUnexpectedEOF means the file is shorter than headerSize bytes.
+		// That is itself a validation failure, so we fall through to the check.
+		header = header[:n]
+	}
+
+	switch strings.ToLower(ext) {
+	case ".m4a", ".mp4":
+		return audiovalidate.CheckM4A(header)
+	default:
+		return audiovalidate.CheckAudioBytes(header)
+	}
 }
 
 // transcribeFile posts the audio file at path to the Whisper transcription
