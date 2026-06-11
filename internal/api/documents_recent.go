@@ -14,15 +14,23 @@ const (
 )
 
 // RecentItemsQuerier is the store interface required by recentDocumentsHandler.
-// Keeping it narrow (single method) makes the handler easy to test in isolation.
+// It combines the paginated list query and the total-count query so the handler
+// can report both the current page size and the true DB total in one response.
 type RecentItemsQuerier interface {
 	ListRecentByKind(ctx context.Context, kind store.RecentKind, limit int) ([]store.RecentItem, error)
+	CountByKind(ctx context.Context, kind store.RecentKind) (int, error)
 }
 
 // recentDocumentsResponse is the JSON envelope returned by GET /api/v1/documents/recent.
+//
+// Fields:
+//   - count — number of items in this response (≤ limit, ≤ 200).
+//   - total — true DB count for this kind, independent of limit. Mobile clients
+//     must use this field for "X items collected" display to avoid the cap bug.
 type recentDocumentsResponse struct {
-	Kind  string           `json:"kind"`
-	Count int              `json:"count"`
+	Kind  string             `json:"kind"`
+	Count int                `json:"count"`
+	Total int                `json:"total"`
 	Items []store.RecentItem `json:"items"`
 }
 
@@ -67,9 +75,17 @@ func (s *Server) recentDocumentsHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	total, err := querier.CountByKind(r.Context(), kind)
+	if err != nil {
+		slog.Error("recent documents: count failed", "kind", kindStr, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
 	writeJSON(w, http.StatusOK, recentDocumentsResponse{
 		Kind:  kindStr,
 		Count: len(items),
+		Total: total,
 		Items: items,
 	})
 }

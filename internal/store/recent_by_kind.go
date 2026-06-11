@@ -115,3 +115,46 @@ func (s *DocumentStore) ListRecentByKind(ctx context.Context, kind RecentKind, l
 	}
 	return items, nil
 }
+
+// CountByKind returns the total number of active documents matching the given
+// kind filter, regardless of any pagination limit.
+//
+// The WHERE predicates are identical to those used by ListRecentByKind so both
+// methods always agree on which rows belong to each kind. This count is used by
+// the dashboard API to report the true total (e.g. "500 SMS messages collected")
+// rather than the capped page size.
+func (s *DocumentStore) CountByKind(ctx context.Context, kind RecentKind) (int, error) {
+	const base = `
+		SELECT COUNT(*)
+		FROM documents
+		WHERE status = 'active'`
+
+	var q string
+	switch kind {
+	case RecentKindSMS:
+		q = base + `
+		  AND source_type = 'sms'`
+
+	case RecentKindCallRecording:
+		// Mirrors the ListRecentByKind filter: call-log rows that carry an
+		// audio_file but are NOT voice-memos (IS DISTINCT FROM handles NULLs).
+		q = base + `
+		  AND source_type = 'call-log'
+		  AND metadata ? 'audio_file'
+		  AND (metadata->>'recording_type' IS DISTINCT FROM 'voice-memo')`
+
+	case RecentKindVoiceMemo:
+		q = base + `
+		  AND source_type = 'call-log'
+		  AND metadata->>'recording_type' = 'voice-memo'`
+
+	default:
+		return 0, fmt.Errorf("count by kind: unknown kind %q", kind)
+	}
+
+	var count int
+	if err := s.pg.pool.QueryRow(ctx, q).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count by kind %s: %w", kind, err)
+	}
+	return count, nil
+}

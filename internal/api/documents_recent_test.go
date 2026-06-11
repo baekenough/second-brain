@@ -13,11 +13,15 @@ import (
 	"github.com/baekenough/second-brain/internal/store"
 )
 
-// stubRecentStore extends stubDocumentStore to also implement RecentItemsQuerier.
+// stubRecentStore extends stubDocumentStore to also implement RecentItemsQuerier
+// (which includes both ListRecentByKind and CountByKind).
 type stubRecentStore struct {
 	stubDocumentStore
 	items    []store.RecentItem
 	queryErr error
+	// total is the value returned by CountByKind.  Defaults to 0 when not set.
+	total    int
+	countErr error
 	// gotKind captures the kind passed to ListRecentByKind so tests can assert it.
 	gotKind  store.RecentKind
 	// gotLimit captures the limit passed to ListRecentByKind.
@@ -28,6 +32,10 @@ func (s *stubRecentStore) ListRecentByKind(_ context.Context, kind store.RecentK
 	s.gotKind = kind
 	s.gotLimit = limit
 	return s.items, s.queryErr
+}
+
+func (s *stubRecentStore) CountByKind(_ context.Context, _ store.RecentKind) (int, error) {
+	return s.total, s.countErr
 }
 
 // makeTime is a helper that creates a UTC time pointer.
@@ -392,6 +400,84 @@ func TestRecentDocuments_StoreError(t *testing.T) {
 
 	if rr.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want %d", rr.Code, http.StatusInternalServerError)
+	}
+
+	var body map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if _, ok := body["error"]; !ok {
+		t.Error("response missing 'error' key")
+	}
+}
+
+// TestRecentDocuments_TotalReflectsCountByKind verifies that the response
+// "total" field carries the value returned by CountByKind regardless of the
+// number of items returned by ListRecentByKind.
+//
+// This is the core regression guard for the dashboard upload-count bug:
+// the mobile app was displaying len(items) (capped at 200) as the "total",
+// which under-reported when the real count exceeded the page limit.
+func TestRecentDocuments_TotalReflectsCountByKind(t *testing.T) {
+	t.Parallel()
+
+	// The store has 1 item to return but reports 500 total in the DB.
+	stub := &stubRecentStore{
+		items: []store.RecentItem{
+			{
+				ID:          uuid.MustParse("00000000-0000-0000-0000-000000000099"),
+				Title:       "SMS 최근 1건",
+				OccurredAt:  makeTime(2026, 6, 11, 0, 0, 0),
+				CollectedAt: time.Date(2026, 6, 11, 1, 0, 0, 0, time.UTC),
+			},
+		},
+		total: 500, // CountByKind returns 500 — far more than the 1 item in the page
+	}
+
+	srv := newTestServer(stub)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/documents/recent?kind=sms&limit=1", nil)
+	srv.recentDocumentsHandler(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	var resp recentDocumentsResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	// count = len(items) = 1 (current page)
+	if resp.Count != 1 {
+		t.Errorf("count = %d, want 1 (page items)", resp.Count)
+	}
+	// total = CountByKind = 500 (all records in DB)
+	if resp.Total != 500 {
+		t.Errorf("total = %d, want 500 (full DB count from CountByKind)", resp.Total)
+	}
+}
+
+// TestRecentDocuments_CountByKindError verifies that a CountByKind error causes
+// the handler to return HTTP 500.
+func TestRecentDocuments_CountByKindError(t *testing.T) {
+	t.Parallel()
+
+	stub := &stubRecentStore{
+		items:    []store.RecentItem{},
+		countErr: errors.New("db connection lost"),
+	}
+
+	srv := newTestServer(stub)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/documents/recent?kind=sms", nil)
+	srv.recentDocumentsHandler(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want %d (CountByKind error must surface as 500)",
+			rr.Code, http.StatusInternalServerError)
 	}
 
 	var body map[string]string
