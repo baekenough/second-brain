@@ -9,6 +9,7 @@ import com.baekenough.secondbrain.cursor.CursorStore
 import com.baekenough.secondbrain.detect.PathDetector
 import com.baekenough.secondbrain.reader.CallLogReader
 import com.baekenough.secondbrain.reader.RecordingScanner
+import com.baekenough.secondbrain.reader.RecordingSourceType
 import com.baekenough.secondbrain.reader.SmsReader
 import com.baekenough.secondbrain.ui.SettingsRepository
 import com.baekenough.secondbrain.ui.StatsRepository
@@ -81,6 +82,13 @@ class SyncWorker(
         // ── Stage: cursor ──────────────────────────────────────────────────
         Log.d(TAG, "stage=cursor")
         val cursorStore = CursorStore(applicationContext)
+        // One-time migration: reset SMS/call cursors when schema version bumps.
+        // These are no-ops once the current version is already stored.
+        cursorStore.migrateSmsCursorIfNeeded()
+        cursorStore.migrateCallCursorIfNeeded()
+        // One-time migration: remove voice-memo entries from sent_recordings so they are
+        // re-uploaded after the timestamp precision fix. Call-recording entries are preserved.
+        cursorStore.migrateVoiceMemoSentIfNeeded()
         val cursor = cursorStore.snapshot()
 
         // ── Stage: sms_read ────────────────────────────────────────────────
@@ -182,7 +190,12 @@ class SyncWorker(
                     break
                 }
                 is UploadResult.Success -> {
-                    if (recResult.accepted > 0) statsRepo.incrementRecordingsUploaded(1)
+                    if (recResult.accepted > 0) {
+                        when (classified.sourceType) {
+                            RecordingSourceType.VOICE_MEMO -> statsRepo.incrementVoiceMemoUploaded(1)
+                            RecordingSourceType.CALL -> statsRepo.incrementRecordingsUploaded(1)
+                        }
+                    }
                 }
                 else -> Unit
             }

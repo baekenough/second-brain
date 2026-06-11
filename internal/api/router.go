@@ -138,6 +138,7 @@ func (s *Server) buildHandler() http.Handler {
 		r.Get("/api/v1/search", s.searchGetHandler)
 
 		r.Get("/api/v1/documents", s.listDocumentsHandler)
+		r.Get("/api/v1/documents/recent", s.recentDocumentsHandler)
 		r.Get("/api/v1/documents/{id}", s.getDocumentHandler)
 		r.Get("/api/v1/documents/{id}/raw", s.getDocumentRawHandler)
 

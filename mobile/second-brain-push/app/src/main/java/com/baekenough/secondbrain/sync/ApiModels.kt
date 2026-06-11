@@ -46,3 +46,21 @@ data class RecordingResponse(
     val skipped: Boolean = false,
     @SerialName("document_id") val documentId: String? = null,
 )
+
+// ── Recent documents — GET /api/v1/documents/recent ───────────────────────
+
+@Serializable
+data class RecentDocumentsResponse(
+    val kind: String,
+    val count: Int,
+    val items: List<RecentItem> = emptyList(),
+)
+
+@Serializable
+data class RecentItem(
+    val title: String,
+    /** ISO-8601 UTC timestamp; may be null for items without a source timestamp. */
+    @SerialName("occurred_at") val occurredAt: String? = null,
+    /** ISO-8601 UTC timestamp; always present — when the server ingested this item. */
+    @SerialName("collected_at") val collectedAt: String? = null,
+)

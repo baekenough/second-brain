@@ -57,6 +57,12 @@
             android:name=".ui.SettingsActivity"
             android:exported="false" />
 
+        <!-- DocumentListActivity — shows recently collected items for a given kind -->
+        <activity
+            android:name=".ui.DocumentListActivity"
+            android:exported="false"
+            android:parentActivityName=".ui.MainActivity" />
+
         <!-- WorkManager initializer (use default initializer; no custom provider needed) -->
 
     </application>
