@@ -38,6 +38,18 @@ Before [Done]: (1) Verify ACTUAL outcome not just attempt — "ran command" ≠ 
 | "Issue closed" | Related issues not updated | Check parent epic, cross-refs |
 | "Tests pass" | Only ran subset | Run full test suite |
 
+### Deploy / User-Facing Verification
+
+For deployments and user-facing changes, an HTTP status code or command exit code is NOT sufficient evidence of success. Verify the actual user-facing OUTCOME end-to-end.
+
+| Checked | Insufficient because | Verify instead |
+|---------|---------------------|----------------|
+| `curl` returns 200/307 | A 307 can be a redirect LOOP; a 200 can be an error page | The target page renders the expected content; the flow (e.g. login → dashboard) completes |
+| Container "Started" | The app inside may bind the wrong port / crash on first request | Hit the real endpoint and confirm the expected body/behavior |
+| "Deploy succeeded" | The change may not be wired end-to-end | Exercise the actual user path (auth, render, data round-trip) before declaring [Done] |
+
+Status codes confirm reachability, not correctness. Never declare a deploy "verified" on status codes alone.
+
 ## Completion Contract Format
 
 For complex tasks, declare completion contract upfront:

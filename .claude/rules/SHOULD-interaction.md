@@ -73,3 +73,14 @@ Changes:
 
 Trade-offs: RS256 is ~10x slower than HS256 but enables asymmetric key management.
 ```
+
+## Blocked Actions (Permission / Classifier)
+
+When the safety classifier or a permission gate blocks a USER-REQUESTED action, surface it explicitly and request the specific authorization needed — do NOT silently mark the task "blocked", "deferred", or de-scope it.
+
+| Situation | Wrong | Right |
+|-----------|-------|-------|
+| Classifier denies a prod read/write the user asked for | Mark the item "blocked" and move on | State exactly what was blocked and why; offer the unblock path (user grants a permission rule, or runs the command themselves via the `!` prefix) |
+| Blanket "approve all" doesn't satisfy the classifier | Assume it can never be done | Explain that destructive/prod actions need specific authorization; provide a ready-to-paste command for the user |
+
+A classifier denial is a request for specific authorization, not a dead end. Push the decision to the user with a concrete next step.
