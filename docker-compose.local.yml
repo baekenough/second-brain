@@ -146,6 +146,30 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
+  # web — Next.js 프론트엔드 (포트 3000).
+  #   server 가 기동된 뒤 시작한다.
+  #   BRAIN_API_URL 로 내부 API 서버를 가리켜 ingest 프록시가 올바르게 포워딩된다.
+  # ---------------------------------------------------------------------------
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    image: second-brain-web:local
+    ports:
+      - "3000:3000"
+    env_file:
+      - web/.env.local
+    environment:
+      BRAIN_API_URL: "http://server:8080"
+      AUTH_TRUST_HOST: "true"
+      AUTH_URL: "https://your-domain.example"
+      NEXT_PUBLIC_APP_URL: "https://your-domain.example"
+    depends_on:
+      server:
+        condition: service_started
+    restart: unless-stopped
+
 # -----------------------------------------------------------------------------
 # Named volumes
 # -----------------------------------------------------------------------------
