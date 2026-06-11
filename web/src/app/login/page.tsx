@@ -5,8 +5,15 @@ interface LoginPageProps {
   searchParams: Promise<{ callbackUrl?: string }>;
 }
 
+function safeCallback(url: string | undefined): string {
+  if (typeof url !== "string") return "/";
+  // Must be a site-relative path; reject absolute, protocol-relative (//evil), and backslash tricks
+  if (!url.startsWith("/") || url.startsWith("//") || url.startsWith("/\\")) return "/";
+  return url;
+}
+
 export default async function LoginPage({ searchParams }: LoginPageProps) {
-  const { callbackUrl = "/" } = await searchParams;
+  const callbackUrl = safeCallback((await searchParams).callbackUrl);
 
   // If already signed in, skip the login screen
   const session = await auth();
