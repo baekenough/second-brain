@@ -48,7 +48,7 @@ export function toMarkdownSource(content: string, ext: string): string {
     // Pretty-print JSON specifically for readability
     if (lang === "json") {
       try {
-        const parsed = JSON.parse(content) as unknown;
+        const parsed: unknown = JSON.parse(content);
         content = JSON.stringify(parsed, null, 2);
       } catch {
         // leave as-is if invalid JSON

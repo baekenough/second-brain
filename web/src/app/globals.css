@@ -1,15 +1,439 @@
 @import "tailwindcss";
 @plugin "@tailwindcss/typography";
-@import "highlight.js/styles/github-dark.css";
+@import "highlight.js/styles/github.css";
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   DESIGN SYSTEM — Claude Aesthetic (Impeccable Design v1.0.0)
+   Source: plan/design-system.md (design-expert, Task 6)
+   ─────────────────────────────────────────────────────────────────────────
+   Warm cream · coral-rust accent · Lora serif · DM Sans body
+   OKLCH perceptual color model · system dark mode (prefers-color-scheme)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+@theme {
+  /* ── Font families ─────────────────────────────────── */
+  --font-sans: "DM Sans", system-ui, -apple-system, sans-serif;
+  --font-serif: "Lora", Georgia, "Times New Roman", serif;
+  --font-mono: "JetBrains Mono", "Courier New", monospace;
+
+  /* ── Type scale ────────────────────────────────────── */
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.25rem;
+  --text-2xl: 1.5rem;
+  --text-3xl: 2rem;
+  --text-4xl: 2.5rem;
+
+  /* ── Border radius ─────────────────────────────────── */
+  --radius-sm: 0.25rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+  --radius-2xl: 1.5rem;
+  --radius-full: 9999px;
+
+  /* ── Raw accent palette — coral rust (hue 30) ──────── */
+  --color-accent-50: oklch(96% 0.04 30);
+  --color-accent-100: oklch(91% 0.08 30);
+  --color-accent-200: oklch(84% 0.13 30);
+  --color-accent-300: oklch(74% 0.17 30);
+  --color-accent-400: oklch(64% 0.19 30);
+  --color-accent-500: oklch(54% 0.2 30);
+  --color-accent-600: oklch(45% 0.19 30);
+  --color-accent-700: oklch(36% 0.17 30);
+  --color-accent-800: oklch(26% 0.13 30);
+  --color-accent-900: oklch(17% 0.08 30);
+
+  /* ── Raw neutral palette — amber brown (hue 55) ────── */
+  --color-warm-50: oklch(97.5% 0.007 60);
+  --color-warm-100: oklch(94% 0.01 58);
+  --color-warm-200: oklch(88% 0.012 57);
+  --color-warm-300: oklch(79% 0.013 56);
+  --color-warm-400: oklch(67% 0.013 56);
+  --color-warm-500: oklch(55% 0.013 55);
+  --color-warm-600: oklch(44% 0.014 54);
+  --color-warm-700: oklch(33% 0.014 53);
+  --color-warm-800: oklch(23% 0.013 52);
+  --color-warm-900: oklch(14% 0.011 50);
+
+  /* ── Semantic color aliases (light mode defaults) ──── */
+  --color-surface-base: oklch(97.5% 0.007 60);
+  --color-surface-raised: oklch(99% 0.005 60);
+  --color-surface-sunken: oklch(95% 0.009 58);
+  --color-surface-overlay: oklch(99% 0.004 60);
+
+  --color-text-primary: oklch(18% 0.012 52);
+  --color-text-secondary: oklch(42% 0.013 54);
+  --color-text-muted: oklch(57% 0.011 56);
+  --color-text-accent: oklch(45% 0.19 30);
+  --color-text-inverse: oklch(97% 0.007 60);
+  --color-text-danger: oklch(40% 0.2 25);
+
+  --color-border-subtle: oklch(89% 0.009 60);
+  --color-border-default: oklch(83% 0.011 58);
+  --color-border-strong: oklch(68% 0.013 55);
+  --color-border-accent: oklch(54% 0.2 30);
+
+  /* ── Motion ────────────────────────────────────────── */
+  --duration-instant: 50ms;
+  --duration-fast: 100ms;
+  --duration-normal: 200ms;
+  --duration-slow: 300ms;
+  --duration-deliberate: 500ms;
+
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in: cubic-bezier(0.7, 0, 0.84, 0);
+  --ease-inout: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-spring: cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+/*
+  @theme inline: component utility aliases.
+  Using var() references means dark-mode CSS var overrides (below) propagate
+  automatically — bg-background etc. respond to prefers-color-scheme without
+  any dark: prefix needed.
+*/
+@theme inline {
+  /* Convenience aliases used by page components */
+  --color-background: var(--color-surface-base);
+  --color-surface: var(--color-surface-raised);
+  --color-surface-subtle: var(--color-surface-sunken);
+  --color-foreground: var(--color-text-primary);
+  --color-foreground-muted: var(--color-text-secondary);
+  --color-foreground-subtle: var(--color-text-muted);
+  --color-border: var(--color-border-default);
+  --color-accent: var(--color-accent-500);
+  --color-accent-hover: var(--color-accent-600);
+  --color-accent-subtle: var(--color-accent-50);
+  --color-danger: var(--color-text-danger);
+  --color-success: var(--status-success);
+  --color-disabled: var(--color-text-muted);
+  --color-warning: var(--status-warning);
+}
+
+/* ── CSS custom properties (semantic, theme-aware) ─── */
 @layer base {
   :root {
     color-scheme: light dark;
+
+    /* Status colors */
+    --status-success: oklch(50% 0.17 145);
+    --status-success-light: oklch(93% 0.06 145);
+    --status-warning: oklch(60% 0.2 80);
+    --status-warning-light: oklch(94% 0.07 80);
+    --status-danger: oklch(50% 0.2 25);
+    --status-danger-light: oklch(94% 0.06 25);
+
+    /* Shadows */
+    --shadow-sm: 0 1px 2px oklch(18% 0.011 52 / 0.07);
+    --shadow-md: 0 2px 8px oklch(18% 0.011 52 / 0.08), 0 1px 2px oklch(18% 0.011 52 / 0.05);
+    --shadow-lg: 0 8px 24px oklch(18% 0.011 52 / 0.1), 0 2px 6px oklch(18% 0.011 52 / 0.06);
+    --shadow-xl: 0 20px 48px oklch(18% 0.011 52 / 0.14), 0 6px 16px oklch(18% 0.011 52 / 0.08);
+    --shadow-inset: inset 0 1px 3px oklch(18% 0.011 52 / 0.08);
   }
 
-  body {
-    @apply bg-white text-gray-900 dark:bg-gray-950 dark:text-gray-100;
-    font-family: "Noto Sans KR", -apple-system, BlinkMacSystemFont, "Segoe UI",
-      Roboto, sans-serif;
+  /* ── Dark mode overrides ────────────────────────────── */
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --color-surface-base: oklch(13% 0.011 50);
+      --color-surface-raised: oklch(18% 0.011 50);
+      --color-surface-sunken: oklch(10% 0.01 50);
+      --color-surface-overlay: oklch(22% 0.012 50);
+
+      --color-text-primary: oklch(92% 0.008 60);
+      --color-text-secondary: oklch(72% 0.01 58);
+      --color-text-muted: oklch(54% 0.01 56);
+      --color-text-accent: oklch(64% 0.17 30);
+      --color-text-inverse: oklch(18% 0.012 52);
+      --color-text-danger: oklch(62% 0.17 25);
+
+      --color-border-subtle: oklch(24% 0.012 50);
+      --color-border-default: oklch(30% 0.013 50);
+      --color-border-strong: oklch(45% 0.013 52);
+      --color-border-accent: oklch(64% 0.17 30);
+
+      --color-accent-500: oklch(62% 0.17 30);
+      --color-accent-600: oklch(68% 0.15 30);
+      --color-accent-50: oklch(22% 0.06 30);
+
+      --status-success: oklch(62% 0.15 145);
+      --status-warning: oklch(72% 0.18 80);
+      --status-danger: oklch(62% 0.17 25);
+      --status-success-light: oklch(22% 0.06 145);
+      --status-warning-light: oklch(24% 0.07 80);
+      --status-danger-light: oklch(22% 0.06 25);
+
+      --shadow-sm: 0 1px 2px oklch(0% 0 0 / 0.25);
+      --shadow-md: 0 2px 8px oklch(0% 0 0 / 0.3), 0 1px 2px oklch(0% 0 0 / 0.2);
+      --shadow-lg: 0 8px 24px oklch(0% 0 0 / 0.4), 0 2px 6px oklch(0% 0 0 / 0.25);
+      --shadow-xl: 0 20px 48px oklch(0% 0 0 / 0.55), 0 6px 16px oklch(0% 0 0 / 0.35);
+      --shadow-inset: inset 0 1px 3px oklch(0% 0 0 / 0.35);
+    }
+  }
+
+  /* ── Reduced motion ─────────────────────────────────── */
+  @media (prefers-reduced-motion: reduce) {
+    :root {
+      --duration-instant: 0.01ms;
+      --duration-fast: 0.01ms;
+      --duration-normal: 0.01ms;
+      --duration-slow: 0.01ms;
+      --duration-deliberate: 0.01ms;
+    }
+  }
+
+  /* ── Base typography & layout ───────────────────────── */
+  html {
+    font-family: var(--font-sans);
+    font-size: 1rem;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background-color: var(--color-surface-base);
+    color: var(--color-text-primary);
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: var(--font-serif);
+    color: var(--color-text-primary);
+  }
+  h5,
+  h6 {
+    font-family: var(--font-sans);
+    color: var(--color-text-primary);
+  }
+
+  h1 {
+    font-size: var(--text-4xl);
+    font-weight: 600;
+    line-height: 1.2;
+    letter-spacing: -0.03em;
+  }
+  h2 {
+    font-size: var(--text-3xl);
+    font-weight: 600;
+    line-height: 1.25;
+    letter-spacing: -0.02em;
+  }
+  h3 {
+    font-size: var(--text-2xl);
+    font-weight: 500;
+    line-height: 1.3;
+    letter-spacing: -0.02em;
+  }
+  h4 {
+    font-size: var(--text-xl);
+    font-weight: 500;
+    line-height: 1.4;
+    letter-spacing: -0.01em;
+  }
+  h5 {
+    font-size: var(--text-sm);
+    font-weight: 600;
+    line-height: 1.5;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--color-text-secondary);
+  }
+  h6 {
+    font-size: var(--text-xs);
+    font-weight: 600;
+    line-height: 1.5;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--color-text-muted);
+  }
+
+  code,
+  pre,
+  kbd,
+  samp {
+    font-family: var(--font-mono);
+    font-variant-ligatures: none;
+  }
+
+  td,
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    body {
+      line-height: 1.65;
+    }
+  }
+}
+
+/* ── Source badge color classes (section 9 of design-system.md) ─── */
+@layer components {
+  /* Skeleton shimmer */
+  .skeleton {
+    background: linear-gradient(
+      90deg,
+      var(--color-warm-200) 0%,
+      var(--color-warm-100) 50%,
+      var(--color-warm-200) 100%
+    );
+    background-size: 200% 100%;
+    border-radius: var(--radius-md);
+    animation: skeleton-shimmer 1.5s ease-in-out infinite;
+  }
+  @keyframes skeleton-shimmer {
+    0% {
+      background-position: 200% 0;
+    }
+    100% {
+      background-position: -200% 0;
+    }
+  }
+  @media (prefers-color-scheme: dark) {
+    .skeleton {
+      background: linear-gradient(
+        90deg,
+        var(--color-warm-800) 0%,
+        var(--color-warm-700) 50%,
+        var(--color-warm-800) 100%
+      );
+      background-size: 200% 100%;
+    }
+  }
+
+  /* Source type badges — light */
+  .badge-sms {
+    background: oklch(92% 0.09 145);
+    color: oklch(30% 0.15 145);
+  }
+  .badge-call-log {
+    background: oklch(91% 0.07 250);
+    color: oklch(30% 0.14 250);
+  }
+  .badge-call-transcript {
+    background: oklch(90% 0.07 240);
+    color: oklch(28% 0.13 240);
+  }
+  .badge-gmail {
+    background: oklch(92% 0.08 25);
+    color: oklch(38% 0.18 25);
+  }
+  .badge-calendar {
+    background: oklch(92% 0.07 200);
+    color: oklch(30% 0.13 200);
+  }
+  .badge-filesystem {
+    background: oklch(92% 0.06 80);
+    color: oklch(35% 0.15 80);
+  }
+  .badge-upload {
+    background: oklch(91% 0.08 310);
+    color: oklch(32% 0.14 310);
+  }
+  .badge-voice-memo {
+    background: oklch(91% 0.07 30);
+    color: oklch(36% 0.17 30);
+  }
+  .badge-slack {
+    background: oklch(92% 0.09 310);
+    color: oklch(30% 0.16 310);
+  }
+  .badge-github {
+    background: oklch(92% 0.03 50);
+    color: oklch(22% 0.01 50);
+  }
+  .badge-llm-memory {
+    background: oklch(92% 0.06 200);
+    color: oklch(30% 0.12 200);
+  }
+  .badge-secretary {
+    background: oklch(91% 0.08 260);
+    color: oklch(32% 0.15 260);
+  }
+  .badge-gdrive {
+    background: oklch(93% 0.07 80);
+    color: oklch(33% 0.15 80);
+  }
+  .badge-notion {
+    background: oklch(93% 0.03 50);
+    color: oklch(20% 0.01 50);
+  }
+  .badge-telegram {
+    background: oklch(91% 0.07 215);
+    color: oklch(28% 0.12 215);
+  }
+  .badge-discord {
+    background: oklch(91% 0.08 275);
+    color: oklch(30% 0.15 275);
+  }
+
+  /* Source type badges — dark */
+  @media (prefers-color-scheme: dark) {
+    .badge-sms {
+      background: oklch(20% 0.07 145);
+      color: oklch(62% 0.15 145);
+    }
+    .badge-call-log {
+      background: oklch(19% 0.06 250);
+      color: oklch(62% 0.13 250);
+    }
+    .badge-call-transcript {
+      background: oklch(18% 0.06 240);
+      color: oklch(60% 0.12 240);
+    }
+    .badge-gmail {
+      background: oklch(22% 0.07 25);
+      color: oklch(62% 0.17 25);
+    }
+    .badge-calendar {
+      background: oklch(19% 0.06 200);
+      color: oklch(60% 0.12 200);
+    }
+    .badge-filesystem {
+      background: oklch(20% 0.05 80);
+      color: oklch(65% 0.13 80);
+    }
+    .badge-upload {
+      background: oklch(20% 0.07 310);
+      color: oklch(62% 0.13 310);
+    }
+    .badge-voice-memo {
+      background: oklch(20% 0.06 30);
+      color: oklch(64% 0.15 30);
+    }
+    .badge-slack {
+      background: oklch(21% 0.07 310);
+      color: oklch(62% 0.14 310);
+    }
+    .badge-github {
+      background: oklch(18% 0.02 50);
+      color: oklch(72% 0.02 50);
+    }
+    .badge-llm-memory {
+      background: oklch(20% 0.05 200);
+      color: oklch(60% 0.11 200);
+    }
+    .badge-secretary {
+      background: oklch(20% 0.07 260);
+      color: oklch(62% 0.13 260);
+    }
+    .badge-gdrive {
+      background: oklch(20% 0.05 80);
+      color: oklch(65% 0.13 80);
+    }
+    .badge-notion {
+      background: oklch(18% 0.02 50);
+      color: oklch(70% 0.02 50);
+    }
+    .badge-telegram {
+      background: oklch(19% 0.06 215);
+      color: oklch(60% 0.11 215);
+    }
+    .badge-discord {
+      background: oklch(20% 0.07 275);
+      color: oklch(62% 0.13 275);
+    }
   }
 }

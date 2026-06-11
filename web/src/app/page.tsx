@@ -1,38 +1,18 @@
 "use client";
 
-import { useState, useEffect, Suspense } from "react";
+import { useState, useEffect, useTransition, Suspense } from "react";
+import Link from "next/link";
 import { useRouter, useSearchParams, usePathname } from "next/navigation";
-import { searchDocuments, listRecentDocuments, getStats } from "@/lib/api";
-import type { DocumentDetail, SearchResultItem, SourceType, StatsResponse } from "@/lib/types";
+import { searchDocuments, listDocuments, getStats } from "@/lib/api";
+import type { DocumentDetail, SearchResultItem, StatsResponse } from "@/lib/types";
 import { getExtension, rawUrl } from "@/lib/preview";
 import { extractSummary } from "@/lib/summary";
 import { formatDateTime } from "@/lib/dates";
+import { SOURCE_LABELS, SEARCH_FILTER_SOURCES, DEFAULT_EXCLUDED_SOURCES } from "@/lib/constants";
+import type { SourceType } from "@/lib/types";
+import { Button, SourceBadge } from "@/components/ui";
 
 type FilterValue = SourceType | "all";
-
-interface FilterOption {
-  value: FilterValue;
-  label: string;
-}
-
-const FILTER_OPTIONS: FilterOption[] = [
-  { value: "all", label: "전체" },
-  { value: "filesystem", label: "Drive" },
-  { value: "slack", label: "Slack" },
-  { value: "github", label: "GitHub" },
-];
-
-const SOURCE_BADGE_STYLES: Record<SourceType, string> = {
-  slack: "bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300",
-  github: "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300",
-  filesystem: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300",
-};
-
-const SOURCE_LABELS: Record<SourceType, string> = {
-  slack: "Slack",
-  github: "GitHub",
-  filesystem: "Drive",
-};
 
 const MATCH_TYPE_LABELS: Record<string, string> = {
   fulltext: "전문",
@@ -42,10 +22,8 @@ const MATCH_TYPE_LABELS: Record<string, string> = {
 
 function countForFilter(stats: StatsResponse | null, filter: FilterValue): number | null {
   if (!stats) return null;
-  if (filter === "all") {
-    return (stats.total ?? 0) - (stats.by_source.slack ?? 0);
-  }
-  return stats.by_source[filter] ?? 0;
+  if (filter === "all") return stats.total;
+  return (stats.by_source as Record<string, number>)[filter] ?? 0;
 }
 
 function adaptDocument(doc: DocumentDetail): SearchResultItem {
@@ -54,8 +32,10 @@ function adaptDocument(doc: DocumentDetail): SearchResultItem {
     title: doc.title,
     content: doc.content,
     source_type: doc.source_type,
+    source_id: doc.source_id ?? "",
     match_type: "fulltext",
     score: 0,
+    status: doc.status,
     collected_at: doc.collected_at,
     created_at: doc.created_at,
     updated_at: doc.updated_at,
@@ -63,19 +43,9 @@ function adaptDocument(doc: DocumentDetail): SearchResultItem {
   };
 }
 
-function SourceBadge({ sourceType }: { sourceType: SourceType }) {
-  return (
-    <span
-      className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${SOURCE_BADGE_STYLES[sourceType]}`}
-    >
-      {SOURCE_LABELS[sourceType]}
-    </span>
-  );
-}
-
 function MatchTypeBadge({ matchType }: { matchType: string }) {
   return (
-    <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400">
+    <span className="inline-flex items-center rounded bg-surface-subtle px-2 py-0.5 text-xs font-medium text-foreground-subtle">
       {MATCH_TYPE_LABELS[matchType] ?? matchType}
     </span>
   );
@@ -83,10 +53,8 @@ function MatchTypeBadge({ matchType }: { matchType: string }) {
 
 function ResultCardPreview({ item }: { item: SearchResultItem }) {
   const [imgError, setImgError] = useState(false);
-  const ext = getExtension(item.id, item.metadata);
-  const isImage = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"].includes(
-    ext.toLowerCase()
-  );
+  const ext = getExtension(item.source_id ?? item.id, item.metadata);
+  const isImage = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"].includes(ext.toLowerCase());
 
   if (isImage && !imgError) {
     return (
@@ -103,11 +71,7 @@ function ResultCardPreview({ item }: { item: SearchResultItem }) {
   const summary = extractSummary(item.content);
   if (!summary) return null;
 
-  return (
-    <p className="text-sm text-gray-500 dark:text-gray-400 leading-relaxed line-clamp-3">
-      {summary}
-    </p>
-  );
+  return <p className="line-clamp-3 text-sm leading-relaxed text-foreground-muted">{summary}</p>;
 }
 
 function ResultCard({
@@ -118,39 +82,38 @@ function ResultCard({
   showMatchType?: boolean;
 }) {
   return (
-    <a
+    <Link
       href={`/documents/${item.id}`}
-      className="block p-4 border border-gray-200 dark:border-gray-800 rounded-lg hover:border-gray-400 dark:hover:border-gray-600 transition-colors"
+      className="block rounded-lg border border-border bg-surface p-4 transition-all hover:border-accent/40 hover:shadow-sm"
     >
-      <div className="flex items-start gap-2 mb-2">
-        <h2 className="flex-1 text-sm font-medium text-gray-900 dark:text-gray-100 leading-snug">
-          {item.title}
-        </h2>
-        <div className="flex items-center gap-1 shrink-0">
+      <div className="mb-2 flex items-start gap-2">
+        <h2 className="flex-1 text-sm leading-snug font-medium text-foreground">{item.title}</h2>
+        <div className="flex shrink-0 items-center gap-1.5">
           <SourceBadge sourceType={item.source_type} />
           {showMatchType && <MatchTypeBadge matchType={item.match_type} />}
         </div>
       </div>
       <ResultCardPreview item={item} />
-      <div className="mt-2 space-y-0.5 text-xs text-gray-400 dark:text-gray-500">
+      <div className="mt-2 space-y-0.5 text-xs text-foreground-subtle">
         {item.created_at && (
           <div>
-            <span className="inline-block w-8 text-gray-500 dark:text-gray-500">생성</span>
+            <span className="mr-1">생성</span>
             <span>{formatDateTime(item.created_at)}</span>
           </div>
         )}
         <div>
-          <span className="inline-block w-8 text-gray-500 dark:text-gray-500">수정</span>
+          <span className="mr-1">수집</span>
           <span>{formatDateTime(item.collected_at)}</span>
         </div>
       </div>
-    </a>
+    </Link>
   );
 }
 
 function parseFilter(raw: string | null): FilterValue {
-  const allowed: FilterValue[] = ["all", "filesystem", "slack", "github"];
-  if (raw && (allowed as string[]).includes(raw)) return raw as FilterValue;
+  if (!raw) return "all";
+  const allFilters: (SourceType | "all")[] = [...SEARCH_FILTER_SOURCES];
+  if ((allFilters as string[]).includes(raw)) return raw as FilterValue;
   return "all";
 }
 
@@ -171,17 +134,26 @@ function SearchPageInner() {
   const [submittedQuery, setSubmittedQuery] = useState(initialQuery);
   const [activeFilter, setActiveFilter] = useState<FilterValue>(initialFilter);
   const [sort, setSort] = useState<"relevance" | "recent">(initialSort);
+
+  // Advanced options
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [useHyDE, setUseHyDE] = useState(false);
+  const [useRerank, setUseRerank] = useState(false);
+  const [useCurated, setUseCurated] = useState(false);
+
   const [results, setResults] = useState<SearchResultItem[]>([]);
   const [recent, setRecent] = useState<DocumentDetail[]>([]);
   const [total, setTotal] = useState(0);
   const [tookMs, setTookMs] = useState<number | null>(null);
-  const [loading, setLoading] = useState(false);
+  // React 19 useTransition: isPending = loading; avoids synchronous setState in effects
+  const [isPending, startTransition] = useTransition();
+  const loading = isPending;
   const [error, setError] = useState<string | null>(null);
   const [stats, setStats] = useState<StatsResponse | null>(null);
 
   const isSearchMode = submittedQuery !== "";
 
-  // URL sync: state -> searchParams (router.replace, no history entry)
+  // URL sync
   useEffect(() => {
     const params = new URLSearchParams();
     if (activeFilter !== "all") params.set("filter", activeFilter);
@@ -192,7 +164,7 @@ function SearchPageInner() {
     router.replace(target, { scroll: false });
   }, [activeFilter, sort, submittedQuery, pathname, router]);
 
-  // 소스별 통계 초기 로드 (1회)
+  // Load stats once
   useEffect(() => {
     let cancelled = false;
     getStats()
@@ -207,47 +179,48 @@ function SearchPageInner() {
     };
   }, []);
 
-  // 검색 모드: submittedQuery, activeFilter, sort 변경 시 자동 재검색
+  // Search mode — React 19 async transition: no synchronous setState in effect body
   useEffect(() => {
     if (!isSearchMode) return;
     let cancelled = false;
-    setLoading(true);
-    setError(null);
     const isAll = activeFilter === "all";
-    searchDocuments({
-      query: submittedQuery,
-      source_type: isAll ? undefined : activeFilter,
-      exclude_source_types: isAll ? ["slack"] : undefined,
-      sort,
-    })
-      .then((r) => {
+    startTransition(async () => {
+      // Error reset inside transition — not at synchronous effect top-level
+      setError(null);
+      try {
+        const r = await searchDocuments({
+          query: submittedQuery,
+          source_type: isAll ? undefined : activeFilter,
+          exclude_source_types: isAll ? DEFAULT_EXCLUDED_SOURCES : undefined,
+          sort,
+          use_hyde: useHyDE,
+          use_rerank: useRerank,
+          curated: useCurated,
+        });
         if (cancelled) return;
         setResults(r.results ?? []);
-        setTotal(r.total ?? 0);
+        setTotal(r.count ?? 0);
         setTookMs(r.took_ms ?? null);
-      })
-      .catch((e) => {
+      } catch (e: unknown) {
         if (cancelled) return;
         setError(e instanceof Error ? e.message : "검색 중 오류가 발생했습니다.");
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+      }
+    });
     return () => {
       cancelled = true;
     };
-  }, [submittedQuery, activeFilter, sort, isSearchMode]);
+  }, [submittedQuery, activeFilter, sort, useHyDE, useRerank, useCurated, isSearchMode]);
 
-  // 최근 문서 모드: 검색 전 상태, activeFilter 변경 시 자동 갱신
+  // Recent documents mode
   useEffect(() => {
     if (isSearchMode) return;
     let cancelled = false;
     const isAll = activeFilter === "all";
-    listRecentDocuments(
-      10,
-      isAll ? undefined : activeFilter,
-      isAll ? ["slack"] : undefined,
-    )
+    listDocuments({
+      limit: 10,
+      source: isAll ? undefined : activeFilter,
+      excludeSource: isAll ? DEFAULT_EXCLUDED_SOURCES.join(",") : undefined,
+    })
       .then((r) => {
         if (!cancelled) setRecent(r);
       })
@@ -259,7 +232,7 @@ function SearchPageInner() {
     };
   }, [activeFilter, isSearchMode]);
 
-  function handleSearch(e: React.FormEvent) {
+  function handleSearch(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const trimmed = query.trim();
     if (!trimmed) return;
@@ -268,49 +241,49 @@ function SearchPageInner() {
 
   return (
     <div className="space-y-6">
+      {/* Search form */}
       <form onSubmit={handleSearch} className="space-y-3">
         <div className="flex gap-2">
           <input
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="검색"
-            className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-gray-400 dark:focus:ring-gray-600"
+            placeholder="검색…"
+            aria-label="검색어"
+            className="flex-1 rounded-lg border border-border bg-surface px-3 py-2.5 text-sm text-foreground transition-shadow placeholder:text-foreground-subtle focus:ring-2 focus:ring-accent/40 focus:outline-none disabled:opacity-50"
             disabled={loading}
           />
-          <button
+          <Button
             type="submit"
+            variant="primary"
+            size="md"
+            loading={loading}
             disabled={loading || !query.trim()}
-            className="px-4 py-2 text-sm font-medium bg-gray-900 text-white dark:bg-white dark:text-gray-900 rounded-lg disabled:opacity-40 hover:opacity-80 transition-opacity"
+            icon={loading ? undefined : <span aria-hidden="true">⌕</span>}
           >
             {loading ? "검색 중…" : "검색"}
-          </button>
+          </Button>
         </div>
 
-        <div className="flex items-center justify-between gap-2 flex-wrap">
-          <div className="flex gap-1.5 flex-wrap">
-            {FILTER_OPTIONS.map((option) => {
-              const count = countForFilter(stats, option.value);
+        {/* Filter chips + sort */}
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap gap-1.5">
+            {SEARCH_FILTER_SOURCES.map((src) => {
+              const count = countForFilter(stats, src);
               return (
                 <button
-                  key={option.value}
+                  key={src}
                   type="button"
-                  onClick={() => setActiveFilter(option.value)}
-                  className={`inline-flex items-center gap-1 px-3 py-1 text-xs rounded-full border transition-colors ${
-                    activeFilter === option.value
-                      ? "border-gray-900 bg-gray-900 text-white dark:border-white dark:bg-white dark:text-gray-900"
-                      : "border-gray-300 text-gray-600 dark:border-gray-700 dark:text-gray-400 hover:border-gray-500 dark:hover:border-gray-500"
+                  onClick={() => setActiveFilter(src)}
+                  className={`inline-flex items-center gap-1 rounded-full border px-3 py-1 text-xs transition-colors ${
+                    activeFilter === src
+                      ? "border-accent bg-accent text-white"
+                      : "border-border text-foreground-muted hover:border-accent/50 hover:text-foreground"
                   }`}
                 >
-                  {option.label}
+                  {src === "all" ? "전체" : SOURCE_LABELS[src]}
                   {count !== null && (
-                    <span
-                      className={`text-[10px] tabular-nums leading-none ${
-                        activeFilter === option.value
-                          ? "opacity-60"
-                          : "opacity-50"
-                      }`}
-                    >
+                    <span className="leading-none tabular-nums opacity-60">
                       {count.toLocaleString()}
                     </span>
                   )}
@@ -318,34 +291,73 @@ function SearchPageInner() {
               );
             })}
           </div>
-          <select
-            value={sort}
-            onChange={(e) => setSort(e.target.value as "relevance" | "recent")}
-            disabled={loading}
-            aria-label="정렬 기준"
-            className="px-3 py-1 text-xs rounded-full border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 text-gray-700 dark:text-gray-300 focus:outline-none focus:ring-1 focus:ring-gray-400 dark:focus:ring-gray-600 disabled:opacity-40 transition-opacity"
-          >
-            <option value="relevance">관련도 순</option>
-            <option value="recent">최신순</option>
-          </select>
+          <div className="flex items-center gap-2">
+            <select
+              value={sort}
+              onChange={(e) => setSort(e.target.value as "relevance" | "recent")}
+              disabled={loading}
+              aria-label="정렬 기준"
+              className="rounded-full border border-border bg-surface px-3 py-1 text-xs text-foreground-muted transition-opacity focus:ring-1 focus:ring-accent/40 focus:outline-none disabled:opacity-40"
+            >
+              <option value="relevance">관련도 순</option>
+              <option value="recent">최신순</option>
+            </select>
+            <button
+              type="button"
+              onClick={() => setShowAdvanced((v) => !v)}
+              className="rounded-full border border-border px-3 py-1 text-xs text-foreground-muted transition-colors hover:border-accent/50 hover:text-foreground"
+            >
+              고급 {showAdvanced ? "▲" : "▼"}
+            </button>
+          </div>
         </div>
+
+        {/* Advanced options */}
+        {showAdvanced && (
+          <div className="flex flex-wrap gap-4 rounded-lg border border-border bg-surface-subtle px-4 py-3 text-sm">
+            <label className="flex cursor-pointer items-center gap-2">
+              <input
+                type="checkbox"
+                checked={useHyDE}
+                onChange={(e) => setUseHyDE(e.target.checked)}
+                className="accent-accent"
+              />
+              <span className="text-foreground-muted">HyDE 쿼리 확장</span>
+            </label>
+            <label className="flex cursor-pointer items-center gap-2">
+              <input
+                type="checkbox"
+                checked={useRerank}
+                onChange={(e) => setUseRerank(e.target.checked)}
+                className="accent-accent"
+              />
+              <span className="text-foreground-muted">Cross-encoder 재순위</span>
+            </label>
+            <label className="flex cursor-pointer items-center gap-2">
+              <input
+                type="checkbox"
+                checked={useCurated}
+                onChange={(e) => setUseCurated(e.target.checked)}
+                className="accent-accent"
+              />
+              <span className="text-foreground-muted">LLM 큐레이션 (kimi-k2.6)</span>
+            </label>
+          </div>
+        )}
       </form>
 
-      {error && (
-        <p className="text-sm text-red-500 dark:text-red-400">{error}</p>
-      )}
+      {/* Error */}
+      {error && <p className="text-sm text-danger">{error}</p>}
 
+      {/* Search results */}
       {isSearchMode && !loading && !error && results.length === 0 && (
-        <p className="text-sm text-gray-400 dark:text-gray-500 text-center py-12">
-          결과가 없습니다
-        </p>
+        <p className="py-12 text-center text-sm text-foreground-subtle">결과가 없습니다</p>
       )}
 
       {isSearchMode && results.length > 0 && (
         <div className="space-y-3">
-          <p className="text-xs text-gray-400 dark:text-gray-500">
-            {total}건
-            {tookMs !== null && ` · ${tookMs}ms`}
+          <p className="text-xs text-foreground-subtle">
+            {total}건{tookMs !== null && ` · ${tookMs}ms`}
           </p>
           {results.map((item) => (
             <ResultCard key={item.id} item={item} showMatchType />
@@ -353,28 +365,17 @@ function SearchPageInner() {
         </div>
       )}
 
+      {/* Recent documents */}
       {!isSearchMode && !loading && !error && (
         <div className="space-y-3">
-          {recent.length > 0 && (
-            <p className="text-xs text-gray-400 dark:text-gray-500">
-              {stats && countForFilter(stats, activeFilter) !== null
-                ? activeFilter === "all"
-                  ? `전체 ${countForFilter(stats, "all")?.toLocaleString()}건 중 최근 ${recent.length}건`
-                  : `${SOURCE_LABELS[activeFilter as SourceType] ?? activeFilter} ${countForFilter(stats, activeFilter)?.toLocaleString()}건 중 최근 ${recent.length}건`
-                : "최근 추가된 문서"}
-            </p>
-          )}
+          {recent.length > 0 && <p className="text-xs text-foreground-subtle">최근 추가된 문서</p>}
           {recent.length === 0 && (
-            <p className="text-sm text-gray-400 dark:text-gray-500 text-center py-12">
+            <p className="py-12 text-center text-sm text-foreground-subtle">
               {activeFilter === "all" ? "검색어를 입력하세요" : "해당 소스의 문서가 없습니다"}
             </p>
           )}
           {recent.map((doc) => (
-            <ResultCard
-              key={doc.id}
-              item={adaptDocument(doc)}
-              showMatchType={false}
-            />
+            <ResultCard key={doc.id} item={adaptDocument(doc)} showMatchType={false} />
           ))}
         </div>
       )}

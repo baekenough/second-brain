@@ -1,9 +1,7 @@
-import { NextRequest, NextResponse } from "next/server";
+import { type NextRequest, NextResponse } from "next/server";
 
 const BACKEND_URL =
-  process.env.BRAIN_API_URL ??
-  process.env.NEXT_PUBLIC_API_URL ??
-  "http://localhost:9200";
+  process.env.BRAIN_API_URL ?? process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:9200";
 const API_KEY = process.env.API_KEY ?? "";
 
 export async function GET(request: NextRequest) {

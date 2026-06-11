@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from "next/server";
+import { type NextRequest, NextResponse } from "next/server";
 
 const BACKEND_URL =
   process.env.BRAIN_API_URL ?? process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:9200";
@@ -21,8 +21,7 @@ async function proxySearch(body: Record<string, unknown>) {
     const data: unknown = await response.json();
     return NextResponse.json(data, { status: response.status });
   } catch (error: unknown) {
-    const message =
-      error instanceof Error ? error.message : "Upstream request failed";
+    const message = error instanceof Error ? error.message : "Upstream request failed";
     return NextResponse.json({ error: message }, { status: 502 });
   }
 }

@@ -13,12 +13,8 @@ export function extractSummary(content: string, maxChars = 180): string {
   // Detect xlsx TSV output
   if (trimmed.startsWith("##SHEET")) {
     const lines = trimmed.split("\n");
-    const sheets = lines
-      .filter((l) => l.startsWith("##SHEET "))
-      .map((l) => l.slice(8).trim());
-    const dataLines = lines.filter(
-      (l) => l && !l.startsWith("##SHEET ")
-    ).length;
+    const sheets = lines.filter((l) => l.startsWith("##SHEET ")).map((l) => l.slice(8).trim());
+    const dataLines = lines.filter((l) => l && !l.startsWith("##SHEET ")).length;
     const head = sheets.length > 0 ? `시트 ${sheets.length}개` : "";
     return [head, `약 ${dataLines}행`].filter(Boolean).join(" · ");
   }
