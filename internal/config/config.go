@@ -155,12 +155,18 @@ type Config struct {
 	// WHISPER_LANGUAGE: BCP-47 language hint (default: "ko")
 	// WHISPER_MAX_FILE_BYTES: per-file size cap (bytes, int64, default: 100 MiB).
 	// Set 0 to disable the cap entirely (no limit). Invalid values use the default.
+	// WHISPER_HTTP_TIMEOUT: per-request HTTP timeout for transcription calls
+	// (Go duration string, default: "2h"). Raise for long audio files that exceed
+	// the previous hardcoded 10-minute limit. Invalid values use the 2h default.
+	// A zero duration (e.g. "0") falls back to the 2h default so a misconfigured
+	// value never produces an infinite (zero) timeout.
 	WhisperAPIKey       string
 	WhisperAPIURL       string
 	WhisperAudioDir     string
 	WhisperModel        string
 	WhisperLanguage     string
 	WhisperMaxFileBytes int64
+	WhisperHTTPTimeout  time.Duration
 
 	// IngestMaxFileBytes is the per-upload file size cap for POST /api/v1/ingest/file
 	// and POST /api/v1/ingest/recording.
@@ -402,6 +408,7 @@ func Load() (*Config, error) {
 		WhisperModel:        getenv("WHISPER_MODEL", "whisper-1"),
 		WhisperLanguage:     getenv("WHISPER_LANGUAGE", "ko"),
 		WhisperMaxFileBytes: whisperMaxFileBytes(),
+		WhisperHTTPTimeout:  whisperHTTPTimeout(),
 
 		IngestMaxFileBytes: ingestMaxFileBytes(),
 
@@ -495,6 +502,28 @@ func whisperMaxFileBytes() int64 {
 		return defaultCap
 	}
 	return n // 0 means no limit (caller checks maxFileBytes <= 0)
+}
+
+// whisperHTTPTimeout parses WHISPER_HTTP_TIMEOUT from the environment.
+// Default is 2h (covers long audio files that previously exceeded the old 10m limit).
+// Invalid values are ignored and the default is used.
+// A zero duration falls back to the default so a misconfigured value never
+// produces a zero (= infinite) timeout.
+func whisperHTTPTimeout() time.Duration {
+	const defaultTimeout = 2 * time.Hour
+	v := os.Getenv("WHISPER_HTTP_TIMEOUT")
+	if v == "" {
+		return defaultTimeout
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		slog.Warn("config: WHISPER_HTTP_TIMEOUT is invalid; using default 2h",
+			"value", v,
+			"error", err,
+		)
+		return defaultTimeout
+	}
+	return d
 }
 
 // ingestMaxFileBytes parses INGEST_MAX_FILE_BYTES from the environment.

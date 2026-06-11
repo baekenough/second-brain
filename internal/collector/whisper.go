@@ -23,11 +23,11 @@ import (
 	"github.com/baekenough/second-brain/internal/model"
 )
 
-const (
-	// whisperHTTPTimeout is the per-request timeout for Whisper transcription.
-	// Audio files can be long; allow up to 10 minutes for transcription.
-	whisperHTTPTimeout = 10 * time.Minute
-)
+// whisperDefaultHTTPTimeout is the fallback per-request timeout used when the
+// config value is zero (misconfigured). 2 hours covers long audio recordings
+// without producing an infinite (zero) timeout. Prefer cfg.WhisperHTTPTimeout
+// over this constant; this constant exists only as a defence-in-depth fallback.
+const whisperDefaultHTTPTimeout = 2 * time.Hour
 
 // whisperAudioExts is the set of audio file extensions that the collector will
 // submit for transcription. Extensions are lowercase and include the leading dot.
@@ -179,11 +179,21 @@ type WhisperCollector struct {
 // NewWhisperCollector returns a WhisperCollector configured from cfg.
 // When WhisperAudioDir or WhisperAPIURL is empty, Enabled() returns false
 // and the scheduler will not call Collect.
+//
+// The HTTP client timeout is sourced from cfg.WhisperHTTPTimeout (set via
+// WHISPER_HTTP_TIMEOUT env var; default 2h). If cfg.WhisperHTTPTimeout is
+// zero (e.g. a zero-value Config in tests), whisperDefaultHTTPTimeout (2h)
+// is used as a defence-in-depth fallback so a zero config value never
+// yields an infinite (zero-timeout) HTTP client.
 func NewWhisperCollector(cfg *config.Config) *WhisperCollector {
+	httpTimeout := cfg.WhisperHTTPTimeout
+	if httpTimeout <= 0 {
+		httpTimeout = whisperDefaultHTTPTimeout
+	}
 	return &WhisperCollector{
 		cfg: cfg,
 		httpClient: &http.Client{
-			Timeout: whisperHTTPTimeout,
+			Timeout: httpTimeout,
 		},
 		baseURL:      cfg.WhisperAPIURL,
 		maxFileBytes: cfg.WhisperMaxFileBytes,
