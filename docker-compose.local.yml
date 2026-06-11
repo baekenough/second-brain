@@ -71,12 +71,17 @@ services:
     image: second-brain-collector:local
     env_file:
       - .env.local
+    environment:
+      DIARIZATION_API_URL: "http://diarization:8001"
+      DIARIZATION_ENABLED: "${DIARIZATION_ENABLED:-false}"
     depends_on:
       postgres:
         condition: service_healthy
       ollama:
         condition: service_started
       whisper:
+        condition: service_started
+      diarization:
         condition: service_started
     volumes:
       - ${SECRETARY_DB_HOST_PATH:-/Users/user/workspace/private/secretary/assistant/secretary.db}:/data/secretary.db:ro
@@ -101,6 +106,27 @@ services:
     container_name: second-brain-ollama
     volumes:
       - ollama_models:/root/.ollama
+    restart: unless-stopped
+    networks:
+      - default
+
+  # ---------------------------------------------------------------------------
+  # diarization — pyannote.audio 기반 화자 분리 서버 (#111, 내부 포트 8001).
+  #   엔드포인트: POST /diarize, GET /health
+  #   HF_TOKEN: HuggingFace 토큰 (gated 모델 다운로드에 필수 — .env 또는 셸에 설정).
+  #   DIARIZATION_DEVICE: cpu (macOS arm64 CPU 전용; 느림).
+  #   collector 가 DIARIZATION_ENABLED=true 일 때 http://diarization:8001 로 호출.
+  #   주의: pyannote/speaker-diarization-3.x 모델 사용 전 HuggingFace 모델 페이지에서
+  #         약관 동의(gated-model acceptance) 필요.
+  # ---------------------------------------------------------------------------
+  diarization:
+    build:
+      context: ./deploy/diarization
+      dockerfile: Dockerfile
+    image: second-brain-diarization:local
+    environment:
+      HF_TOKEN: "${HF_TOKEN}"
+      DIARIZATION_DEVICE: "cpu"
     restart: unless-stopped
     networks:
       - default

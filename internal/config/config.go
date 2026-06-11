@@ -168,6 +168,19 @@ type Config struct {
 	WhisperMaxFileBytes int64
 	WhisperHTTPTimeout  time.Duration
 
+	// Speaker diarization (optional — feature-flagged OFF by default).
+	//
+	// DIARIZATION_ENABLED: set "true" to enable speaker diarization post-processing
+	// after each successful Whisper transcription. Default false (no behaviour change).
+	//
+	// DIARIZATION_API_URL: base URL of the local diarization microservice
+	// (e.g. "http://localhost:8765"). Required when DIARIZATION_ENABLED=true.
+	// The collector POSTs audio bytes to {DIARIZATION_API_URL}/diarize and
+	// receives speaker-segment JSON. When empty, diarization is disabled even
+	// if DIARIZATION_ENABLED=true.
+	DiarizationEnabled bool   // DIARIZATION_ENABLED — default false
+	DiarizationAPIURL  string // DIARIZATION_API_URL — default ""
+
 	// IngestMaxFileBytes is the per-upload file size cap for POST /api/v1/ingest/file
 	// and POST /api/v1/ingest/recording.
 	// Default 100 MiB. Set INGEST_MAX_FILE_BYTES=0 to disable the cap entirely.
@@ -409,6 +422,9 @@ func Load() (*Config, error) {
 		WhisperLanguage:     getenv("WHISPER_LANGUAGE", "ko"),
 		WhisperMaxFileBytes: whisperMaxFileBytes(),
 		WhisperHTTPTimeout:  whisperHTTPTimeout(),
+
+		DiarizationEnabled: os.Getenv("DIARIZATION_ENABLED") == "true",
+		DiarizationAPIURL:  os.Getenv("DIARIZATION_API_URL"),
 
 		IngestMaxFileBytes: ingestMaxFileBytes(),
 

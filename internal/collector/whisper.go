@@ -48,9 +48,168 @@ var whisperAudioExts = map[string]bool{
 }
 
 // whisperTranscribeResponse is the JSON response body from the Whisper
-// transcription endpoint (/v1/audio/transcriptions).
+// transcription endpoint (/v1/audio/transcriptions) when response_format is
+// NOT set (simple text response). Kept for backward-compatibility.
 type whisperTranscribeResponse struct {
 	Text string `json:"text"`
+}
+
+// whisperSegment is a single time-stamped segment from the Whisper
+// verbose_json response format.
+type whisperSegment struct {
+	Start float64 `json:"start"` // segment start time in seconds
+	End   float64 `json:"end"`   // segment end time in seconds
+	Text  string  `json:"text"`  // transcribed text for this segment
+}
+
+// whisperVerboseResponse is the JSON response body when response_format=verbose_json
+// is requested. The Segments field may be absent/empty for older server versions,
+// in which case callers fall back to the flat Text field.
+type whisperVerboseResponse struct {
+	Text     string           `json:"text"`
+	Segments []whisperSegment `json:"segments"`
+}
+
+// diarSegment is a single speaker-labelled segment from the diarization
+// microservice (POST {DIARIZATION_API_URL}/diarize).
+type diarSegment struct {
+	Start   float64 `json:"start"`   // segment start time in seconds
+	End     float64 `json:"end"`     // segment end time in seconds
+	Speaker string  `json:"speaker"` // e.g. "SPEAKER_00", "SPEAKER_01"
+}
+
+// diarizeResponse is the JSON body returned by the diarization microservice.
+type diarizeResponse struct {
+	Segments []diarSegment `json:"segments"`
+}
+
+// labelTranscript aligns whisper transcript segments with speaker diarization
+// segments and returns speaker-labelled content and the number of distinct
+// speakers.
+//
+// Alignment strategy:
+//   - For each whisper segment, find the diarization speaker whose time
+//     interval has the maximum overlap (overlap = max(0, min(ends)-max(starts))).
+//   - When no diarization segment overlaps a whisper segment at all, the
+//     nearest diarization speaker by midpoint distance is assigned.
+//   - Diarization speaker IDs (e.g. "SPEAKER_00") are mapped to 화자1, 화자2, …
+//     in order of first appearance across the whisper segments.
+//
+// Consecutive whisper segments assigned to the same speaker are grouped into a
+// single block; blocks are rendered as "[화자N] text" and separated by newlines.
+//
+// If whisperSegs or diarSegs is empty the function returns ("", 0) so callers
+// can fall back to the plain transcript text.
+func labelTranscript(whisperSegs []whisperSegment, diarSegs []diarSegment) (content string, speakerCount int) {
+	if len(whisperSegs) == 0 || len(diarSegs) == 0 {
+		return "", 0
+	}
+
+	// speakerMap maps raw diarization speaker IDs → 화자N labels in order of
+	// first appearance. A slice is used to keep insertion-order traversal O(n).
+	speakerMap := map[string]string{}
+	var speakerOrder []string // raw IDs in order of first appearance
+
+	speakerLabel := func(rawID string) string {
+		if label, ok := speakerMap[rawID]; ok {
+			return label
+		}
+		label := fmt.Sprintf("화자%d", len(speakerOrder)+1)
+		speakerMap[rawID] = label
+		speakerOrder = append(speakerOrder, rawID)
+		return label
+	}
+
+	// assignSpeaker returns the diarization speaker for a given whisper segment.
+	assignSpeaker := func(ws whisperSegment) string {
+		bestSpeaker := ""
+		bestOverlap := -1.0 // negative sentinel: no overlap found yet
+
+		for _, ds := range diarSegs {
+			overlapStart := ws.Start
+			if ds.Start > overlapStart {
+				overlapStart = ds.Start
+			}
+			overlapEnd := ws.End
+			if ds.End < overlapEnd {
+				overlapEnd = ds.End
+			}
+			overlap := overlapEnd - overlapStart
+			if overlap < 0 {
+				overlap = 0
+			}
+			if overlap > bestOverlap {
+				bestOverlap = overlap
+				bestSpeaker = ds.Speaker
+			}
+		}
+
+		// If no diarization segment overlapped (bestOverlap == 0), fall back to
+		// the nearest segment by midpoint distance.
+		if bestOverlap <= 0 {
+			wsMid := (ws.Start + ws.End) / 2
+			minDist := -1.0
+			for _, ds := range diarSegs {
+				dsMid := (ds.Start + ds.End) / 2
+				dist := wsMid - dsMid
+				if dist < 0 {
+					dist = -dist
+				}
+				if minDist < 0 || dist < minDist {
+					minDist = dist
+					bestSpeaker = ds.Speaker
+				}
+			}
+		}
+
+		return bestSpeaker
+	}
+
+	// Assign each whisper segment a speaker label.
+	type labelledSeg struct {
+		speaker string
+		text    string
+	}
+	labelled := make([]labelledSeg, len(whisperSegs))
+	for i, ws := range whisperSegs {
+		raw := assignSpeaker(ws)
+		labelled[i] = labelledSeg{
+			speaker: speakerLabel(raw),
+			text:    strings.TrimSpace(ws.Text),
+		}
+	}
+
+	// Group consecutive segments with the same speaker into blocks.
+	var sb strings.Builder
+	blockSpeaker := labelled[0].speaker
+	var blockTexts []string
+
+	flushBlock := func() {
+		if len(blockTexts) == 0 {
+			return
+		}
+		if sb.Len() > 0 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString("[")
+		sb.WriteString(blockSpeaker)
+		sb.WriteString("] ")
+		sb.WriteString(strings.Join(blockTexts, " "))
+	}
+
+	for _, seg := range labelled {
+		if seg.speaker != blockSpeaker {
+			flushBlock()
+			blockSpeaker = seg.speaker
+			blockTexts = blockTexts[:0]
+		}
+		if seg.text != "" {
+			blockTexts = append(blockTexts, seg.text)
+		}
+	}
+	flushBlock()
+
+	return sb.String(), len(speakerOrder)
 }
 
 // Filename patterns for recording timestamps.
@@ -381,7 +540,7 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 			return nil
 		}
 
-		text, err := c.transcribeFile(ctx, path)
+		txResult, err := c.transcribeFile(ctx, path)
 		if err != nil {
 			slog.Warn("whisper: transcription failed", "path", path, "error", err)
 			return nil // partial success — continue
@@ -398,12 +557,44 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 			"model":         c.cfg.WhisperModel,
 		}
 
+		// Use the plain transcript as the default content.
+		content := txResult.text
+
+		// Diarization post-processing (feature-flagged OFF by default).
+		// Only attempted when:
+		//   1. DiarizationEnabled=true AND DiarizationAPIURL is set
+		//   2. Whisper returned at least one segment (verbose_json)
+		// On any error the warning is logged and the plain transcript is used.
+		if c.cfg.DiarizationEnabled && c.cfg.DiarizationAPIURL != "" && len(txResult.segments) > 0 {
+			audioBytes, readErr := os.ReadFile(path)
+			if readErr != nil {
+				slog.Warn("whisper: diarization skipped — cannot re-read audio file",
+					"path", path, "error", readErr)
+			} else {
+				isCall := isTPhoneCallPath(path)
+				diarSegs, diarErr := c.diarizeAudio(ctx, path, audioBytes, isCall)
+				if diarErr != nil {
+					slog.Warn("whisper: diarization failed — using plain transcript",
+						"path", path, "error", diarErr)
+				} else {
+					labelled, nSpeakers := labelTranscript(txResult.segments, diarSegs)
+					if labelled != "" {
+						content = labelled
+						meta["speaker_count"] = nSpeakers
+					} else {
+						slog.Warn("whisper: labelTranscript produced empty output — using plain transcript",
+							"path", path)
+					}
+				}
+			}
+		}
+
 		docs = append(docs, model.Document{
 			ID:          uuid.New(),
 			SourceType:  model.SourceCallTranscript,
 			SourceID:    sourceID,
 			Title:       title,
-			Content:     text,
+			Content:     content,
 			Metadata:    meta,
 			OccurredAt:  &mtime,
 			CollectedAt: now,
@@ -451,21 +642,33 @@ func checkAudioFileHeader(path, ext string) error {
 	}
 }
 
+// transcribeFileResult holds the output of a transcription call.
+type transcribeFileResult struct {
+	text     string           // flat transcript text
+	segments []whisperSegment // time-stamped segments; may be nil/empty for older servers
+}
+
 // transcribeFile posts the audio file at path to the Whisper transcription
-// endpoint and returns the transcript text.
+// endpoint and returns both the flat transcript text and time-stamped segments
+// (from response_format=verbose_json).
 //
 // The request is a multipart/form-data POST to {baseURL}/audio/transcriptions
 // with the following fields:
 //   - file: audio file bytes (filename preserved for MIME detection by the server)
 //   - model: cfg.WhisperModel
 //   - language: cfg.WhisperLanguage (omitted when empty)
+//   - response_format: "verbose_json" (to obtain per-segment timestamps)
+//
+// Backward-compatibility: if the server response lacks a "segments" array (older
+// server versions or simple-format responses), result.segments will be nil and
+// callers fall back to result.text for the document content.
 //
 // The Authorization header is set only when cfg.WhisperAPIKey is non-empty,
 // enabling use with local whisper.cpp servers that do not require authentication.
-func (c *WhisperCollector) transcribeFile(ctx context.Context, path string) (string, error) {
+func (c *WhisperCollector) transcribeFile(ctx context.Context, path string) (transcribeFileResult, error) {
 	audioBytes, err := os.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("read audio file: %w", err)
+		return transcribeFileResult{}, fmt.Errorf("read audio file: %w", err)
 	}
 
 	var buf bytes.Buffer
@@ -474,32 +677,39 @@ func (c *WhisperCollector) transcribeFile(ctx context.Context, path string) (str
 	// file field
 	fw, err := mw.CreateFormFile("file", filepath.Base(path))
 	if err != nil {
-		return "", fmt.Errorf("create form file: %w", err)
+		return transcribeFileResult{}, fmt.Errorf("create form file: %w", err)
 	}
 	if _, err := fw.Write(audioBytes); err != nil {
-		return "", fmt.Errorf("write audio bytes: %w", err)
+		return transcribeFileResult{}, fmt.Errorf("write audio bytes: %w", err)
 	}
 
 	// model field
 	if err := mw.WriteField("model", c.cfg.WhisperModel); err != nil {
-		return "", fmt.Errorf("write model field: %w", err)
+		return transcribeFileResult{}, fmt.Errorf("write model field: %w", err)
 	}
 
 	// language field (optional — omit when empty to let the API auto-detect)
 	if c.cfg.WhisperLanguage != "" {
 		if err := mw.WriteField("language", c.cfg.WhisperLanguage); err != nil {
-			return "", fmt.Errorf("write language field: %w", err)
+			return transcribeFileResult{}, fmt.Errorf("write language field: %w", err)
 		}
 	}
 
+	// response_format=verbose_json to obtain per-segment timestamps for
+	// diarization alignment. The response is still valid JSON with a "text"
+	// field, so backward-compat is maintained even when diarization is off.
+	if err := mw.WriteField("response_format", "verbose_json"); err != nil {
+		return transcribeFileResult{}, fmt.Errorf("write response_format field: %w", err)
+	}
+
 	if err := mw.Close(); err != nil {
-		return "", fmt.Errorf("close multipart writer: %w", err)
+		return transcribeFileResult{}, fmt.Errorf("close multipart writer: %w", err)
 	}
 
 	endpoint := strings.TrimRight(c.baseURL, "/") + "/audio/transcriptions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, &buf)
 	if err != nil {
-		return "", fmt.Errorf("build request: %w", err)
+		return transcribeFileResult{}, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 
@@ -511,23 +721,100 @@ func (c *WhisperCollector) transcribeFile(ctx context.Context, path string) (str
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("http request: %w", err)
+		return transcribeFileResult{}, fmt.Errorf("http request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("read response body: %w", err)
+		return transcribeFileResult{}, fmt.Errorf("read response body: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("whisper API returned %d: %s", resp.StatusCode, body)
+		return transcribeFileResult{}, fmt.Errorf("whisper API returned %d: %s", resp.StatusCode, body)
 	}
 
-	var result whisperTranscribeResponse
+	var result whisperVerboseResponse
 	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("decode response JSON: %w", err)
+		return transcribeFileResult{}, fmt.Errorf("decode response JSON: %w", err)
 	}
 
-	return result.Text, nil
+	return transcribeFileResult{
+		text:     result.Text,
+		segments: result.Segments,
+	}, nil
+}
+
+// isTPhoneCallPath reports whether path looks like a TPhoneCallRecords audio
+// file based on the reTPhone filename pattern. When true, the diarization
+// request is sent with num_speakers=2 (phone calls are always two-party).
+//
+// Heuristic: the TPhone pattern requires a phone-number prefix followed by
+// a 14-digit timestamp (see reTPhone). Voice memos and other recordings do
+// not match, so num_speakers is omitted for them.
+func isTPhoneCallPath(path string) bool {
+	return reTPhone.MatchString(filepath.Base(path))
+}
+
+// diarizeAudio posts the audio bytes to the diarization microservice and
+// returns the speaker segments. On any error (service unavailable, bad
+// response, empty segments) the error is returned and the caller should
+// fall back to the plain transcript.
+//
+// When isTPhoneCall is true the request includes num_speakers=2; otherwise
+// the field is omitted and the service auto-detects the number of speakers.
+func (c *WhisperCollector) diarizeAudio(ctx context.Context, path string, audioBytes []byte, isTPhoneCall bool) ([]diarSegment, error) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+
+	fw, err := mw.CreateFormFile("file", filepath.Base(path))
+	if err != nil {
+		return nil, fmt.Errorf("create form file: %w", err)
+	}
+	if _, err := fw.Write(audioBytes); err != nil {
+		return nil, fmt.Errorf("write audio bytes: %w", err)
+	}
+
+	if isTPhoneCall {
+		if err := mw.WriteField("num_speakers", "2"); err != nil {
+			return nil, fmt.Errorf("write num_speakers field: %w", err)
+		}
+	}
+
+	if err := mw.Close(); err != nil {
+		return nil, fmt.Errorf("close multipart writer: %w", err)
+	}
+
+	endpoint := strings.TrimRight(c.cfg.DiarizationAPIURL, "/") + "/diarize"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, &buf)
+	if err != nil {
+		return nil, fmt.Errorf("build diarization request: %w", err)
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("diarization http request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read diarization response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("diarization API returned %d: %s", resp.StatusCode, body)
+	}
+
+	var result diarizeResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("decode diarization response JSON: %w", err)
+	}
+
+	if len(result.Segments) == 0 {
+		return nil, fmt.Errorf("diarization returned empty segments")
+	}
+
+	return result.Segments, nil
 }

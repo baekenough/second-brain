@@ -1,0 +1,21 @@
+# Speaker Diarization Service dependencies
+#
+# NOTE: torch CPU-only wheels are installed via --index-url in the Dockerfile:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+# If you install locally without that flag you may pull a large GPU wheel.
+
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.20
+anyio==4.7.0
+
+# pyannote.audio 3.x — gated models require:
+#   1. A HuggingFace account + accepted license at:
+#      https://huggingface.co/pyannote/speaker-diarization-3.1
+#      https://huggingface.co/pyannote/segmentation-3.0
+#   2. HF_TOKEN env var set to a read-capable HF access token
+pyannote.audio==3.3.2
+
+# CPU-only torch (installed separately in Dockerfile with --index-url)
+torch==2.5.1
+torchaudio==2.5.1
