@@ -53,6 +53,13 @@ data class RecordingResponse(
 data class RecentDocumentsResponse(
     val kind: String,
     val count: Int,
+    /**
+     * Total number of documents of this kind stored on the server.
+     * Added server-side when the /recent endpoint was updated to cap [count] at 200
+     * but expose the true aggregate here.  Null when talking to an older server that
+     * does not yet emit this field — callers should fall back to [count] in that case.
+     */
+    val total: Int? = null,
     val items: List<RecentItem> = emptyList(),
 )
 

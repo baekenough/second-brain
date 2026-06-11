@@ -233,18 +233,20 @@ class DashboardFragment : Fragment() {
             val voiceResult = voiceDeferred.await()
 
             // Apply server counts; keep local fallback on failure.
+            // Prefer total (full aggregate) over count (capped at server limit of 200).
+            // Falls back to count when talking to an older server that does not emit total.
             withContext(Dispatchers.Main) {
                 if (_binding == null) return@withContext
-                smsResult.getOrNull()?.body()?.count?.let {
-                    binding.tvSmsCount.text = it.toString()
+                smsResult.getOrNull()?.body()?.let { body ->
+                    binding.tvSmsCount.text = (body.total ?: body.count).toString()
                 }
-                callResult.getOrNull()?.body()?.count?.let {
+                callResult.getOrNull()?.body()?.let { body ->
                     // tvCallsCount shows call-recordings (TPhone/One UI, kind=call-recording)
-                    binding.tvCallsCount.text = it.toString()
+                    binding.tvCallsCount.text = (body.total ?: body.count).toString()
                 }
-                voiceResult.getOrNull()?.body()?.count?.let {
+                voiceResult.getOrNull()?.body()?.let { body ->
                     // tvRecordingsCount shows voice memos (Samsung Voice Recorder, kind=voice-memo)
-                    binding.tvRecordingsCount.text = it.toString()
+                    binding.tvRecordingsCount.text = (body.total ?: body.count).toString()
                 }
             }
         } catch (_: Exception) {

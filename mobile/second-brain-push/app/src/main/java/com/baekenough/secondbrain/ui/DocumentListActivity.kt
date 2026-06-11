@@ -23,10 +23,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
-import java.text.SimpleDateFormat
-import java.util.Date
+import java.time.Instant
+import java.time.OffsetDateTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Locale
-import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 
 /**
@@ -185,22 +186,35 @@ class DocumentListActivity : AppCompatActivity() {
     // ── Time formatting ───────────────────────────────────────────────────
 
     /**
-     * Formats an ISO-8601 UTC string as Korean local time "MM월 dd일 HH:mm".
-     * Returns "시각 미상" when the input is null or unparseable.
+     * Formats an ISO-8601 timestamp as Korean local time "MM월 dd일 HH:mm".
+     * Handles Go [time.Time] RFC3339Nano strings such as
+     * "2026-06-10T09:44:25.540492687+09:00" (nanosecond precision, any UTC offset).
+     *
+     * Strategy:
+     *  1. Try [OffsetDateTime.parse] with [DateTimeFormatter.ISO_OFFSET_DATE_TIME] —
+     *     handles any offset (+09:00, -05:00, Z) and fractional seconds.
+     *  2. Fall back to [Instant.parse] for bare UTC strings like "2026-06-10T09:44:25Z".
+     *  3. Return "시각 미상" only when both attempts fail.
+     *
+     * Note: [java.time] is available without desugaring from minSdk 26.
      */
     private fun formatDisplayTime(isoUtc: String?): String {
         if (isoUtc.isNullOrBlank()) return getString(R.string.doc_list_time_unknown)
+        val kstZone = ZoneId.of("Asia/Seoul")
+        val outputFmt = DateTimeFormatter.ofPattern("MM월 dd일 HH:mm", Locale.KOREAN)
         return try {
-            val parser = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
-                timeZone = TimeZone.getTimeZone("UTC")
-            }
-            val date: Date = parser.parse(isoUtc) ?: return getString(R.string.doc_list_time_unknown)
-            val formatter = SimpleDateFormat("MM월 dd일 HH:mm", Locale.KOREAN).apply {
-                timeZone = TimeZone.getTimeZone("Asia/Seoul")
-            }
-            formatter.format(date)
+            // Primary: OffsetDateTime handles fractional seconds + any UTC offset.
+            val zdt = OffsetDateTime.parse(isoUtc, DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+                .atZoneSameInstant(kstZone)
+            outputFmt.format(zdt)
         } catch (_: Exception) {
-            getString(R.string.doc_list_time_unknown)
+            try {
+                // Fallback: Instant.parse handles bare "Z" suffix strings.
+                val zdt = Instant.parse(isoUtc).atZone(kstZone)
+                outputFmt.format(zdt)
+            } catch (_: Exception) {
+                getString(R.string.doc_list_time_unknown)
+            }
         }
     }
 
