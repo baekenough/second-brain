@@ -72,10 +72,4 @@ export const { auth, handlers, signIn, signOut } = NextAuth({
       return !!session?.user;
     },
   },
-
-  pages: {
-    // Use Auth.js built-in sign-in page (auto-generated)
-    signIn: "/api/auth/signin",
-    error: "/api/auth/error",
-  },
 });
