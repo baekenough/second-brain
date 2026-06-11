@@ -20,8 +20,8 @@ export default auth((req: NextRequest & { auth: unknown }) => {
   const session = (req as { auth: unknown }).auth;
 
   if (!session) {
-    // Redirect to GitHub sign-in, preserving the original URL as callbackUrl
-    const signInUrl = new URL("/api/auth/signin", req.url);
+    // Redirect to custom login page, preserving the original URL as callbackUrl
+    const signInUrl = new URL("/login", req.url);
     signInUrl.searchParams.set("callbackUrl", req.url);
     return NextResponse.redirect(signInUrl);
   }
@@ -40,5 +40,5 @@ export default auth((req: NextRequest & { auth: unknown }) => {
  *             future mobile-facing endpoints under /api/v1.
  */
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon\\.ico|robots\\.txt|api/auth|api/v1).*)"],
+  matcher: ["/((?!_next/static|_next/image|favicon\\.ico|robots\\.txt|api/auth|api/v1|login).*)"],
 };

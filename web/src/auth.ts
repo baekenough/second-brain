@@ -21,6 +21,10 @@ export const { auth, handlers, signIn, signOut } = NextAuth({
     }),
   ],
 
+  pages: {
+    signIn: "/login",
+  },
+
   callbacks: {
     /**
      * Whitelist check — called after the OAuth provider returns a profile.

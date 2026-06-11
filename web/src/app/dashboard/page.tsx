@@ -4,7 +4,7 @@ import { useState, useEffect } from "react";
 import { getStats, getBaselineStats, listRecentByKind } from "@/lib/api";
 import type { StatsResponse, RecentItem, RecentItemsResponse } from "@/lib/types";
 import { formatDateTime, formatRelative } from "@/lib/dates";
-import { SOURCE_LABELS, DASHBOARD_SOURCES, CUTOVER_DATE } from "@/lib/constants";
+import { SOURCE_LABELS, DASHBOARD_SOURCES } from "@/lib/constants";
 import type { SourceType } from "@/lib/types";
 
 // ── Source stats card ─────────────────────────────────────────────────────
@@ -125,21 +125,6 @@ function WhisperQueue({ callLogCount, callTranscriptCount }: WhisperQueueProps) 
   );
 }
 
-// ── Cutover boundary ─────────────────────────────────────────────────────
-
-function CutoverBanner({ total }: { total: number | undefined }) {
-  return (
-    <div className="rounded-lg border border-border bg-surface-subtle px-4 py-3 text-xs text-foreground-muted">
-      <span className="font-medium text-foreground">Cutover </span>
-      <span className="font-mono">{CUTOVER_DATE}</span>
-      {" — "}이 날짜 이후 수집된 문서는 신규 파이프라인을 사용합니다.
-      {total !== undefined && (
-        <span className="ml-2 text-foreground-subtle">전체 {total.toLocaleString()}건</span>
-      )}
-    </div>
-  );
-}
-
 // ── Page ─────────────────────────────────────────────────────────────────
 
 export default function DashboardPage() {
@@ -209,9 +194,6 @@ export default function DashboardPage() {
           소스별 문서 수, 모바일 동기화 상태, Whisper 전사 큐
         </p>
       </header>
-
-      {/* Cutover banner */}
-      {!loadingStats && <CutoverBanner total={stats?.total} />}
 
       {/* Source stats grid */}
       <section className="space-y-3">
