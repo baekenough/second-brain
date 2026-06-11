@@ -14,7 +14,8 @@ import androidx.security.crypto.MasterKeys
  *  - [lastSyncOk]: whether the last sync completed without error.
  *  - [smsUploaded]: cumulative SMS records accepted by the server.
  *  - [callsUploaded]: cumulative call records accepted.
- *  - [recordingsUploaded]: cumulative recordings accepted.
+ *  - [recordingsUploaded]: cumulative call-recordings (kind=call) accepted.
+ *  - [voiceMemoUploaded]: cumulative voice memos (kind=voice-memo) accepted.
  *
  * NOTE: DataStore is intentionally NOT used here. A top-level preferencesDataStore
  * delegate (required to avoid "multiple DataStores active" crashes) would add a new
@@ -29,7 +30,10 @@ class StatsRepository(context: Context) {
         private const val KEY_LAST_SYNC_OK = "stats_last_sync_ok"
         private const val KEY_SMS_UPLOADED = "stats_sms_uploaded"
         private const val KEY_CALLS_UPLOADED = "stats_calls_uploaded"
+        /** Cumulative call-recordings (TPhone/One UI, kind=call) uploaded. */
         private const val KEY_RECORDINGS_UPLOADED = "stats_recordings_uploaded"
+        /** Cumulative voice memos (Samsung Voice Recorder, kind=voice-memo) uploaded. */
+        private const val KEY_VOICE_MEMO_UPLOADED = "stats_voice_memo_uploaded"
     }
 
     private val prefs: SharedPreferences by lazy {
@@ -47,7 +51,10 @@ class StatsRepository(context: Context) {
     fun isLastSyncOk(): Boolean = prefs.getBoolean(KEY_LAST_SYNC_OK, false)
     fun getSmsUploaded(): Int = prefs.getInt(KEY_SMS_UPLOADED, 0)
     fun getCallsUploaded(): Int = prefs.getInt(KEY_CALLS_UPLOADED, 0)
+    /** Returns the cumulative count of call-recordings (kind=call) uploaded. */
     fun getRecordingsUploaded(): Int = prefs.getInt(KEY_RECORDINGS_UPLOADED, 0)
+    /** Returns the cumulative count of voice memos (kind=voice-memo) uploaded. */
+    fun getVoiceMemoUploaded(): Int = prefs.getInt(KEY_VOICE_MEMO_UPLOADED, 0)
 
     fun recordSyncCompleted(ok: Boolean) {
         prefs.edit()
@@ -72,5 +79,12 @@ class StatsRepository(context: Context) {
         if (count <= 0) return
         val current = getRecordingsUploaded()
         prefs.edit().putInt(KEY_RECORDINGS_UPLOADED, current + count).apply()
+    }
+
+    /** Increments the voice-memo upload counter. */
+    fun incrementVoiceMemoUploaded(count: Int) {
+        if (count <= 0) return
+        val current = getVoiceMemoUploaded()
+        prefs.edit().putInt(KEY_VOICE_MEMO_UPLOADED, current + count).apply()
     }
 }

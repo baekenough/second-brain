@@ -13,13 +13,22 @@ import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import com.baekenough.secondbrain.R
 import com.baekenough.secondbrain.databinding.FragmentDashboardBinding
+import com.baekenough.secondbrain.sync.ApiService
+import com.baekenough.secondbrain.sync.AuthInterceptor
 import com.baekenough.secondbrain.sync.SyncWorker
 import com.baekenough.secondbrain.util.BatteryOptimizationHelper
+import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import com.baekenough.secondbrain.ui.DocumentListActivity
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 /**
  * Dashboard — the home screen of the app.
@@ -89,6 +98,7 @@ class DashboardFragment : Fragment() {
         stats = StatsRepository(requireContext())
         setupSyncButton()
         setupBatteryOptButton()
+        setupStatsTileClicks()
     }
 
     override fun onResume() {
@@ -119,7 +129,7 @@ class DashboardFragment : Fragment() {
         updateConnectionCard()
         updateBatteryStatusCard()
         updateLastSyncCard()
-        updateStatsCards()
+        lifecycleScope.launch { updateStatsCards() }
     }
 
     private fun updateConnectionCard() {
@@ -189,10 +199,98 @@ class DashboardFragment : Fragment() {
         binding.tvSyncInterval.text = getString(R.string.last_sync_auto_interval, intervalMin)
     }
 
-    private fun updateStatsCards() {
+    /**
+     * Fetches server-side document counts for all three kinds in parallel,
+     * then updates the stat cards on the UI thread.
+     *
+     * Falls back to local [StatsRepository] values when the server is
+     * unreachable or the app is not yet configured — prevents blank cards.
+     */
+    private suspend fun updateStatsCards() {
+        // Always show local counts first so the cards are never empty.
         binding.tvSmsCount.text = stats.getSmsUploaded().toString()
-        binding.tvCallsCount.text = stats.getCallsUploaded().toString()
-        binding.tvRecordingsCount.text = stats.getRecordingsUploaded().toString()
+        binding.tvCallsCount.text = stats.getRecordingsUploaded().toString()
+        binding.tvRecordingsCount.text = stats.getVoiceMemoUploaded().toString()
+
+        if (!settings.isConfigured()) return
+
+        try {
+            val api = buildApiService(settings.getServerUrl(), settings.getApiToken())
+
+            // Fetch all three kinds concurrently.
+            val smsDeferred = lifecycleScope.async(Dispatchers.IO) {
+                runCatching { api.getRecentDocuments(kind = DocumentListActivity.KIND_SMS, limit = 1000) }
+            }
+            val callDeferred = lifecycleScope.async(Dispatchers.IO) {
+                runCatching { api.getRecentDocuments(kind = DocumentListActivity.KIND_CALL_RECORDING, limit = 1000) }
+            }
+            val voiceDeferred = lifecycleScope.async(Dispatchers.IO) {
+                runCatching { api.getRecentDocuments(kind = DocumentListActivity.KIND_VOICE_MEMO, limit = 1000) }
+            }
+
+            val smsResult = smsDeferred.await()
+            val callResult = callDeferred.await()
+            val voiceResult = voiceDeferred.await()
+
+            // Apply server counts; keep local fallback on failure.
+            withContext(Dispatchers.Main) {
+                if (_binding == null) return@withContext
+                smsResult.getOrNull()?.body()?.count?.let {
+                    binding.tvSmsCount.text = it.toString()
+                }
+                callResult.getOrNull()?.body()?.count?.let {
+                    // tvCallsCount shows call-recordings (TPhone/One UI, kind=call-recording)
+                    binding.tvCallsCount.text = it.toString()
+                }
+                voiceResult.getOrNull()?.body()?.count?.let {
+                    // tvRecordingsCount shows voice memos (Samsung Voice Recorder, kind=voice-memo)
+                    binding.tvRecordingsCount.text = it.toString()
+                }
+            }
+        } catch (_: Exception) {
+            // Network error or misconfiguration — local fallback already shown above.
+        }
+    }
+
+    /**
+     * Builds a Retrofit [ApiService] for the given [serverUrl] and [apiToken].
+     *
+     * Mirrors the pattern in [DocumentListActivity.buildApiService].
+     */
+    private fun buildApiService(serverUrl: String, apiToken: String): ApiService {
+        val okHttp = okhttp3.OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .addInterceptor(AuthInterceptor { apiToken })
+            .build()
+
+        val json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+        val contentType = "application/json".toMediaType()
+        val retrofit = retrofit2.Retrofit.Builder()
+            .baseUrl(serverUrl.trimEnd('/') + '/')
+            .client(okHttp)
+            .addConverterFactory(json.asConverterFactory(contentType))
+            .build()
+
+        return retrofit.create(ApiService::class.java)
+    }
+
+    // ── Stats tile clicks ──────────────────────────────────────────────────
+
+    /**
+     * Attaches click listeners to each of the three upload-stat tiles.
+     * Each tap opens [DocumentListActivity] for the corresponding document kind.
+     */
+    private fun setupStatsTileClicks() {
+        binding.tileSms.setOnClickListener {
+            DocumentListActivity.start(requireContext(), DocumentListActivity.KIND_SMS)
+        }
+        binding.tileCalls.setOnClickListener {
+            DocumentListActivity.start(requireContext(), DocumentListActivity.KIND_CALL_RECORDING)
+        }
+        binding.tileRecordings.setOnClickListener {
+            DocumentListActivity.start(requireContext(), DocumentListActivity.KIND_VOICE_MEMO)
+        }
     }
 
     // ── Battery optimization button ────────────────────────────────────────

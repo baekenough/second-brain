@@ -16,8 +16,8 @@
     <string name="last_sync_auto_interval">자동 동기화: %1$d분마다</string>
     <string name="card_stats_title">업로드 현황</string>
     <string name="stats_sms_label">SMS</string>
-    <string name="stats_calls_label">통화</string>
-    <string name="stats_recordings_label">녹음</string>
+    <string name="stats_calls_label">통화녹음</string>
+    <string name="stats_recordings_label">음성녹음</string>
     <string name="btn_sync_now">지금 동기화</string>
 
     <!-- Background execution status card -->
@@ -72,6 +72,16 @@
     <string name="recording_path_auto">자동 감지</string>
     <string name="btn_browse_folder">폴더 선택</string>
     <string name="btn_reset_path">자동 감지로 초기화</string>
+
+    <!-- Document list screen -->
+    <string name="doc_list_title_sms">SMS 수집 항목</string>
+    <string name="doc_list_title_calls">통화녹음 수집 항목</string>
+    <string name="doc_list_title_recordings">음성녹음 수집 항목</string>
+    <string name="doc_list_empty">아직 수집된 항목이 없습니다</string>
+    <string name="doc_list_time_unknown">시각 미상</string>
+    <string name="doc_list_error_auth">인증에 실패했습니다. API 토큰을 확인하세요.</string>
+    <string name="doc_list_error_server">서버 오류 (HTTP %1$d)</string>
+    <string name="doc_list_error_network">네트워크 연결을 확인하세요.</string>
 
     <!-- Toasts / messages -->
     <string name="settings_saved">설정이 저장되었습니다.</string>
