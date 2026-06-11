@@ -12,22 +12,40 @@ import type {
 /**
  * Resolve the API base URL depending on execution environment.
  *
- * - Browser (client components): relative path → Next.js API proxy on same origin.
- * - Node.js (server components / SSR): fetch needs an absolute URL.
- *   We route through the Next.js proxy running on APP_URL so that the
- *   proxy's server-side env vars (BRAIN_API_URL, API_KEY) are applied.
+ * - Browser (client components): relative path → Next.js API proxy on same origin
+ *   (cookie-based OAuth auth handled by the browser automatically).
+ * - Node.js (server components / SSR): talk directly to the backend API server,
+ *   bypassing the OAuth-gated Next.js proxy.  The page is already protected by
+ *   proxy.ts middleware, so a logged-out user never reaches the Server Component;
+ *   using API_KEY here is safe.
+ *   Path prefix is /api/v1 because the backend routes are mounted there, and the
+ *   relative sub-paths used by each helper (e.g. /documents, /search) are the
+ *   same as the /api/* proxy paths they mirror.
  */
 function getApiBase(): string {
   if (typeof window !== "undefined") {
     return "/api";
   }
-  const appUrl =
-    process.env.NEXT_PUBLIC_APP_URL ?? `http://localhost:${process.env.PORT ?? "3000"}`;
-  return `${appUrl}/api`;
+  const backendBase =
+    process.env.BRAIN_API_URL ?? process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:9200";
+  return `${backendBase}/api/v1`;
 }
 
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
+  let options = init;
+  // On the server, authenticate directly against the backend with the API key.
+  // On the client, the browser cookie carries the session — never expose the key.
+  if (typeof window === "undefined" && process.env.API_KEY) {
+    const authHeader = { Authorization: `Bearer ${process.env.API_KEY}` };
+    options = {
+      ...init,
+      headers: {
+        ...init?.headers,
+        ...authHeader,
+      },
+    };
+  }
+  const response = await fetch(url, options);
   if (!response.ok) {
     throw new Error(`API error: ${response.status} ${response.statusText}`);
   }
