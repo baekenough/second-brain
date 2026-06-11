@@ -8,8 +8,11 @@ import com.baekenough.secondbrain.classify.SmsDirection
 import com.baekenough.secondbrain.cursor.CursorStore
 import io.mockk.coEvery
 import io.mockk.coVerify
+import io.mockk.every
 import io.mockk.mockk
+import io.mockk.mockkObject
 import io.mockk.slot
+import io.mockk.unmockkObject
 import kotlinx.coroutines.runBlocking
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
@@ -312,7 +315,130 @@ class UploaderBatchTest {
         coVerify(exactly = 1) { cursorStore.markRecordingSent(file.name) }
     }
 
+    // ── uploadRecording integrity guard integration ───────────────────────
+
+    @Test
+    fun `uploadRecording CorruptSource returns TransientError without advancing cursor`() = runBlocking {
+        mockkObject(RecordingIntegrityGuard)
+        try {
+            val api = mockk<ApiService>()
+            val cursorStore = mockk<CursorStore>(relaxed = true)
+            val cacheDir = tmpFolder.newFolder("cache_corrupt")
+            val uploader = Uploader(api, cursorStore, cacheDir)
+
+            val file = tmpFolder.newFile("+821012345678_20260601143022.m4a")
+            file.writeBytes(ByteArray(1024))
+            val recording = makeRecording(file)
+
+            every { RecordingIntegrityGuard.prepareForUpload(any(), any()) } returns
+                RecordingIntegrityGuard.IntegrityResult.CorruptSource("simulated fuse truncation")
+
+            val result = uploader.uploadRecording(recording)
+
+            assertTrue("Expected TransientError, got $result", result is UploadResult.TransientError)
+            val err = result as UploadResult.TransientError
+            assertTrue("Reason must mention 'integrity'", err.message.contains("integrity"))
+            // Cursor must NOT be advanced — next sync will retry from the same file
+            coVerify(exactly = 0) { cursorStore.markRecordingSent(any()) }
+        } finally {
+            unmockkObject(RecordingIntegrityGuard)
+        }
+    }
+
+    @Test
+    fun `uploadRecording InvalidContent returns PerFileClientError and marks file sent`() = runBlocking {
+        mockkObject(RecordingIntegrityGuard)
+        try {
+            val api = mockk<ApiService>()
+            val cursorStore = mockk<CursorStore>(relaxed = true)
+            val cacheDir = tmpFolder.newFolder("cache_invalid")
+            val uploader = Uploader(api, cursorStore, cacheDir)
+
+            val file = tmpFolder.newFile("+821099887766_20260602090000.m4a")
+            file.writeBytes(ByteArray(4096))  // zero-fill, no ftyp
+            val recording = makeRecording(file)
+
+            every { RecordingIntegrityGuard.prepareForUpload(any(), any()) } returns
+                RecordingIntegrityGuard.IntegrityResult.InvalidContent("missing ftyp box at offset 4")
+
+            val result = uploader.uploadRecording(recording)
+
+            assertTrue("Expected PerFileClientError, got $result", result is UploadResult.PerFileClientError)
+            val err = result as UploadResult.PerFileClientError
+            assertEquals(400, err.code)
+            assertEquals(file.name, err.filename)
+            // Cursor MUST be advanced so this permanently-corrupt file is never retried
+            coVerify(exactly = 1) { cursorStore.markRecordingSent(file.name) }
+        } finally {
+            unmockkObject(RecordingIntegrityGuard)
+        }
+    }
+
+    @Test
+    fun `uploadRecording with valid cacheDir upload succeeds via cache copy`() = runBlocking {
+        val api = mockk<ApiService>()
+        val cursorStore = mockk<CursorStore>(relaxed = true)
+        val cacheDir = tmpFolder.newFolder("cache_valid")
+        val uploader = Uploader(api, cursorStore, cacheDir)
+
+        // Write a real valid m4a so RecordingIntegrityGuard passes (no mock needed)
+        val file = tmpFolder.newFile("+821012345678_20260601143022.m4a")
+        file.writeBytes(buildValidM4aBytes())
+
+        val recording = makeRecording(file)
+
+        coEvery { api.postRecording(any(), any(), any(), any(), any(), any()) } returns
+            retrofit2.Response.success(RecordingResponse(accepted = true, skipped = false, documentId = "doc-1"))
+
+        val result = uploader.uploadRecording(recording)
+
+        assertTrue("Expected Success, got $result", result is UploadResult.Success)
+        val success = result as UploadResult.Success
+        assertEquals(1, success.accepted)
+        coVerify(exactly = 1) { cursorStore.markRecordingSent(file.name) }
+        // Cache copy must be cleaned up after upload
+        val leftover = cacheDir.listFiles()?.filter { it.exists() } ?: emptyList()
+        assertTrue("Cache copy must be deleted after upload", leftover.isEmpty())
+    }
+
+    @Test
+    fun `uploadRecording with cacheDir TransientError does NOT mark file sent`() = runBlocking {
+        mockkObject(RecordingIntegrityGuard)
+        try {
+            val api = mockk<ApiService>()
+            val cursorStore = mockk<CursorStore>(relaxed = true)
+            val cacheDir = tmpFolder.newFolder("cache_transient")
+            val uploader = Uploader(api, cursorStore, cacheDir)
+
+            val file = tmpFolder.newFile("+821012345678_20260601200000.m4a")
+            file.writeBytes(ByteArray(1024))
+            val recording = makeRecording(file)
+
+            every { RecordingIntegrityGuard.prepareForUpload(any(), any()) } returns
+                RecordingIntegrityGuard.IntegrityResult.CorruptSource("fuse page cache miss")
+
+            val result = uploader.uploadRecording(recording)
+
+            // Transient → WorkManager will retry; cursor stays at same position
+            assertTrue(result is UploadResult.TransientError)
+            coVerify(exactly = 0) { cursorStore.markRecordingSent(any()) }
+        } finally {
+            unmockkObject(RecordingIntegrityGuard)
+        }
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────────
+
+    /** Builds a minimal valid m4a byte array (ftyp at offset 4). */
+    private fun buildValidM4aBytes(size: Int = 256): ByteArray {
+        require(size >= 8)
+        val buf = ByteArray(size)
+        buf[4] = 'f'.code.toByte()
+        buf[5] = 't'.code.toByte()
+        buf[6] = 'y'.code.toByte()
+        buf[7] = 'p'.code.toByte()
+        return buf
+    }
 
     private fun makeUploader(
         api: ApiService = mockk(),

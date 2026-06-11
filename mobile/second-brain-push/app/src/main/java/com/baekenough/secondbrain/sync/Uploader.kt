@@ -29,6 +29,13 @@ import java.io.File
 class Uploader(
     private val api: ApiService,
     private val cursorStore: CursorStore,
+    /**
+     * App-private cache directory used to stage recording files before upload.
+     * [RecordingIntegrityGuard.prepareForUpload] copies each source file here so
+     * uploads are served from app-private storage instead of FUSE-backed shared
+     * storage.  Null disables staging (for tests that supply pre-validated files).
+     */
+    private val cacheDir: java.io.File? = null,
 ) {
 
     companion object {
@@ -180,31 +187,72 @@ class Uploader(
     /**
      * Uploads a single call recording as multipart/form-data.
      *
+     * ## Integrity guard
+     *
+     * When [cacheDir] is set, each file is first copied to app-private cache via
+     * [RecordingIntegrityGuard.prepareForUpload], which verifies:
+     *  1. Byte count matches [File.length] (catches silent FUSE truncation).
+     *  2. m4a/mp4 ftyp magic at offset 4 (catches zero-filled page reads).
+     *
+     * | Guard result          | Action                                         |
+     * |-----------------------|------------------------------------------------|
+     * | CorruptSource         | Return TransientError — cursor NOT advanced.   |
+     * | InvalidContent        | Return PerFileClientError — cursor advanced.   |
+     * | Ready                 | Upload from cache copy, delete cache after.    |
+     *
      * On HTTP 2xx: marks the filename as sent in [CursorStore].
      * On HTTP 4xx: [UploadResult.AuthError] — no retry.
      * On HTTP 5xx / network: [UploadResult.TransientError] — WorkManager retries.
      */
     suspend fun uploadRecording(recording: ClassifiedRecording): UploadResult {
-        val file = File(recording.filePath)
-        if (!file.exists()) {
+        val sourceFile = File(recording.filePath)
+        if (!sourceFile.exists()) {
             Log.w(TAG, "Recording file missing: ${recording.filePath}")
             return UploadResult.Skipped("file not found")
         }
 
-        val linkedCall = recording.linkedCall
-        val numberBody = (linkedCall?.number ?: recording.parsedNumber ?: "").asTextPart()
-        val dateMsBody = (linkedCall?.dateMs ?: recording.recordingTimeMs).toString().asTextPart()
-        val durationSecBody = (linkedCall?.durationSec ?: 0L).toString().asTextPart()
-        val contactNameBody = (recording.parsedContactName ?: "").asTextPart()
-        val kindBody = when (recording.sourceType) {
-            RecordingSourceType.VOICE_MEMO -> "voice-memo"
-            RecordingSourceType.CALL -> "call"
-        }.asTextPart()
+        // ── Integrity guard: copy to cache + validate before upload ───────────
+        val uploadFile: File
+        val cacheHandle: RecordingIntegrityGuard.IntegrityResult.Ready?
 
-        val fileBody = file.asRequestBody(MEDIA_AUDIO)
-        val filePart = MultipartBody.Part.createFormData("file", recording.filename, fileBody)
+        if (cacheDir != null) {
+            val guardResult = RecordingIntegrityGuard.prepareForUpload(sourceFile, cacheDir)
+            when (guardResult) {
+                is RecordingIntegrityGuard.IntegrityResult.Ready -> {
+                    uploadFile = guardResult.cacheFile
+                    cacheHandle = guardResult
+                }
+                is RecordingIntegrityGuard.IntegrityResult.CorruptSource -> {
+                    Log.e(TAG, "uploadRecording integrity failed (transient): ${recording.filename} — ${guardResult.reason}")
+                    return UploadResult.TransientError("integrity: ${guardResult.reason}")
+                }
+                is RecordingIntegrityGuard.IntegrityResult.InvalidContent -> {
+                    Log.w(TAG, "uploadRecording integrity failed (permanent): ${recording.filename} — ${guardResult.reason}")
+                    // Advance cursor so this permanently-corrupt file is never retried.
+                    cursorStore.markRecordingSent(recording.filename)
+                    return UploadResult.PerFileClientError(400, recording.filename)
+                }
+            }
+        } else {
+            // No cache dir: use source file directly (test paths, pre-validated files).
+            uploadFile = sourceFile
+            cacheHandle = null
+        }
 
         return try {
+            val linkedCall = recording.linkedCall
+            val numberBody = (linkedCall?.number ?: recording.parsedNumber ?: "").asTextPart()
+            val dateMsBody = (linkedCall?.dateMs ?: recording.recordingTimeMs).toString().asTextPart()
+            val durationSecBody = (linkedCall?.durationSec ?: 0L).toString().asTextPart()
+            val contactNameBody = (recording.parsedContactName ?: "").asTextPart()
+            val kindBody = when (recording.sourceType) {
+                RecordingSourceType.VOICE_MEMO -> "voice-memo"
+                RecordingSourceType.CALL -> "call"
+            }.asTextPart()
+
+            val fileBody = uploadFile.asRequestBody(MEDIA_AUDIO)
+            val filePart = MultipartBody.Part.createFormData("file", recording.filename, fileBody)
+
             val response = api.postRecording(
                 file = filePart,
                 number = numberBody,
@@ -217,6 +265,9 @@ class Uploader(
         } catch (e: Exception) {
             Log.e(TAG, "uploadRecording network error: ${recording.filename}", e)
             UploadResult.TransientError(e.message ?: "network error")
+        } finally {
+            // Always delete the cache copy — whether the upload succeeded or failed.
+            cacheHandle?.cleanup()
         }
     }
 

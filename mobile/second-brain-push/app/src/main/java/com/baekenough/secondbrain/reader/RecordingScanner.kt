@@ -61,8 +61,11 @@ class RecordingScanner {
          *
          * Examples:
          *   `음성 260610_163304.m4a` → 2026-06-10 16:33:04 KST
-         *   `260602_농심NDS.m4a`     → 2026-06-02 00:00:00 KST
+         *   `260602_농심NDS.m4a`     → 2026-06-02 00:00:00 KST  (date-only, midnight)
          *   `정코치_1차모의면접.m4a`  → null
+         *
+         * Use [hasVoiceMemoTimeComponent] to distinguish date-only results from full
+         * datetime results (relevant for collision avoidance in [buildRawRecording]).
          */
         internal fun parseVoiceMemoDate(filename: String): Long? {
             val base = filename.removeSuffix(".m4a")
@@ -141,6 +144,23 @@ class RecordingScanner {
                 number = numberRaw,
                 timestampRaw = timestampRaw,
             )
+        }
+
+        /**
+         * Returns true if [filename] contains a YYMMDD_HHMMSS time component in its
+         * [VOICE_DATE_PATTERN] match (i.e. hours/minutes/seconds were captured).
+         * Returns false for date-only matches such as `260602_농심NDS.m4a` or
+         * `음성 260610_1_리암.m4a`.
+         *
+         * Used by [buildRawRecording] to prefer [File.lastModified] over a midnight
+         * fallback when the filename only encodes a date, avoiding same-day timestamp
+         * collisions between multiple voice memos recorded on the same day.
+         */
+        internal fun hasVoiceMemoTimeComponent(filename: String): Boolean {
+            val base = filename.removeSuffix(".m4a")
+            val match = VOICE_DATE_PATTERN.find(base) ?: return false
+            val (_, _, _, hh, mi, ss) = match.destructured
+            return hh.isNotEmpty() && mi.isNotEmpty() && ss.isNotEmpty()
         }
 
         /**
@@ -226,8 +246,15 @@ class RecordingScanner {
                     val filenameTs = parseVoiceMemoDate(file.name)
                     val lastModified = file.lastModified()
                     val tsMs: Long? = when {
-                        filenameTs != null -> filenameTs
+                        // Full datetime in filename (e.g. "음성 260610_163304") — highest precision.
+                        filenameTs != null && hasVoiceMemoTimeComponent(file.name) -> filenameTs
+                        // Date-only filename or no parseable date: use lastModified so that
+                        // multiple memos recorded on the same day (e.g. "음성 260610_1_리암"
+                        // and "음성 260610_2_홍길동") get distinct timestamps instead of both
+                        // falling to midnight and colliding at the server.
                         lastModified > 0L -> lastModified
+                        // No lastModified (scoped-storage returned 0) — use midnight as last resort.
+                        filenameTs != null -> filenameTs
                         else -> null
                     }
                     if (tsMs == null) {

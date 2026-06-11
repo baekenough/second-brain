@@ -238,6 +238,11 @@ class SyncWorker(
         return Uploader(
             api = retrofit.create(ApiService::class.java),
             cursorStore = cursorStore,
+            // Pass app-private cache dir so RecordingIntegrityGuard copies files off the
+            // FUSE-backed /storage/emulated/0 path before upload.  This prevents the
+            // "4 KB garbage upload" caused by sdcardfs page-cache misses in OkHttp's
+            // FileInputStream streaming path.
+            cacheDir = applicationContext.cacheDir,
         )
     }
 }

@@ -4,6 +4,7 @@ import com.baekenough.secondbrain.cursor.CursorSnapshot
 import com.baekenough.secondbrain.cursor.CursorStore
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -534,6 +535,101 @@ class RecordingScannerTest {
     @Test fun `parseVoiceMemoDate returns null for no-digit filename`() {
         val ms = RecordingScanner.parseVoiceMemoDate("인터뷰내용.m4a")
         assertNull(ms)
+    }
+
+    // ── hasVoiceMemoTimeComponent ─────────────────────────────────────────
+
+    @Test fun `hasVoiceMemoTimeComponent returns true for filename with HHMMSS segment`() {
+        assertTrue(RecordingScanner.hasVoiceMemoTimeComponent("음성 260610_163304.m4a"))
+        assertTrue(RecordingScanner.hasVoiceMemoTimeComponent("음성 260528_095839.m4a"))
+    }
+
+    @Test fun `hasVoiceMemoTimeComponent returns false for date-only filename`() {
+        // "260602_농심NDS" — after the date, the underscore-delimited token is not 6 digits
+        assertFalse(RecordingScanner.hasVoiceMemoTimeComponent("260602_농심NDS.m4a"))
+        // "음성 260610_1_리암" — "1" after the underscore is not a 6-digit time group
+        assertFalse(RecordingScanner.hasVoiceMemoTimeComponent("음성 260610_1_리암.m4a"))
+    }
+
+    @Test fun `hasVoiceMemoTimeComponent returns false for filename with no date at all`() {
+        assertFalse(RecordingScanner.hasVoiceMemoTimeComponent("정코치_1차모의면접.m4a"))
+        assertFalse(RecordingScanner.hasVoiceMemoTimeComponent("인터뷰내용.m4a"))
+    }
+
+    // ── timestamp collision avoidance (date-only filenames prefer lastModified) ──
+
+    @Test fun `buildRawRecording VOICE_MEMO prefers lastModified over date-only midnight`() {
+        val dir = tmpFolder.newFolder("voiceDateOnly")
+        val file = File(dir, "음성 260610_1_리암.m4a").also { it.createNewFile() }
+        val mtime = 1_780_291_822_000L
+        file.setLastModified(mtime)
+
+        val raw = RecordingScanner.buildRawRecording(file, RecordingSourceType.VOICE_MEMO)
+
+        assertNotNull(raw)
+        // date-only filename → lastModified preferred over midnight fallback
+        assertEquals(
+            "Date-only filename must use lastModified to avoid same-day collision",
+            mtime, raw!!.recordingTimeMs,
+        )
+    }
+
+    @Test fun `buildRawRecording VOICE_MEMO uses full datetime from filename even when lastModified differs`() {
+        val dir = tmpFolder.newFolder("voiceDateFull")
+        val file = File(dir, "음성 260610_163304.m4a").also { it.createNewFile() }
+        // lastModified is an arbitrary value different from the filename timestamp
+        file.setLastModified(1_000_000L)
+
+        val raw = RecordingScanner.buildRawRecording(file, RecordingSourceType.VOICE_MEMO)
+
+        assertNotNull(raw)
+        val expected = LocalDateTime.of(2026, 6, 10, 16, 33, 4)
+            .toInstant(ZoneOffset.ofHours(9))
+            .toEpochMilli()
+        // Full datetime filename takes priority over lastModified
+        assertEquals("Full-datetime filename must override lastModified", expected, raw!!.recordingTimeMs)
+    }
+
+    @Test fun `buildRawRecording VOICE_MEMO same-day date-only memos get distinct timestamps via lastModified`() {
+        val dir = tmpFolder.newFolder("voiceCollision")
+        val file1 = File(dir, "음성 260610_1_리암.m4a").also { it.createNewFile() }
+        val file2 = File(dir, "음성 260610_2_홍길동.m4a").also { it.createNewFile() }
+        val mtime1 = 1_780_291_000_000L   // recording 1 — earlier
+        val mtime2 = 1_780_291_822_000L   // recording 2 — later
+        file1.setLastModified(mtime1)
+        file2.setLastModified(mtime2)
+
+        val raw1 = RecordingScanner.buildRawRecording(file1, RecordingSourceType.VOICE_MEMO)
+        val raw2 = RecordingScanner.buildRawRecording(file2, RecordingSourceType.VOICE_MEMO)
+
+        assertNotNull(raw1)
+        assertNotNull(raw2)
+        // Both date-only filenames → each uses its own lastModified → no collision
+        assertEquals(mtime1, raw1!!.recordingTimeMs)
+        assertEquals(mtime2, raw2!!.recordingTimeMs)
+        assertTrue(
+            "Same-day date-only memos must have distinct timestamps",
+            raw1.recordingTimeMs != raw2.recordingTimeMs,
+        )
+    }
+
+    @Test fun `buildRawRecording VOICE_MEMO date-only with lastModified=0 falls back to midnight`() {
+        val dir = tmpFolder.newFolder("voiceDateOnlyNoMtime")
+        val file = File(dir, "음성 260610_1_리암.m4a").also { it.createNewFile() }
+        file.setLastModified(0L)  // scoped-storage returned 0
+
+        val raw = RecordingScanner.buildRawRecording(file, RecordingSourceType.VOICE_MEMO)
+
+        assertNotNull("Must not be skipped even without lastModified", raw)
+        // lastModified=0 → falls through to filename date → midnight KST
+        val expectedMidnight = LocalDate.of(2026, 6, 10)
+            .atStartOfDay()
+            .toInstant(ZoneOffset.ofHours(9))
+            .toEpochMilli()
+        assertEquals(
+            "With lastModified=0, date-only filename falls back to midnight",
+            expectedMidnight, raw!!.recordingTimeMs,
+        )
     }
 
     // ── date_ms=0 guard ───────────────────────────────────────────────────
