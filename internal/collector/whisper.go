@@ -557,6 +557,15 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 			"model":         c.cfg.WhisperModel,
 		}
 
+		// Merge sidecar metadata when present (written by the ingest-recording
+		// handler alongside the audio file). Missing sidecar = historical file or
+		// OneDrive-staged file — silently skip, no error.
+		if sidecarMeta, ok := readRecordingSidecar(path); ok {
+			for k, v := range sidecarMeta {
+				meta[k] = v
+			}
+		}
+
 		// Use the plain transcript as the default content.
 		content := txResult.text
 
@@ -610,6 +619,57 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 	return docs, nil
 }
 
+// readRecordingSidecar attempts to read and parse the sidecar metadata file
+// written by the ingest-recording handler at audioPath + ".meta.json".
+//
+// When the sidecar exists and is valid JSON, the function returns a map
+// containing the recording metadata fields present in the file
+// (contact_name, direction, recording_type, duration_seconds) and true.
+// Only non-empty/non-zero values are included so callers do not overwrite
+// existing metadata with zero-value defaults.
+//
+// When the sidecar is absent, unreadable, or unparseable, the function returns
+// (nil, false) so the caller can proceed with existing metadata unchanged. This
+// is the expected path for historical files and OneDrive-staged files that were
+// present before the sidecar feature was introduced.
+func readRecordingSidecar(audioPath string) (map[string]any, bool) {
+	data, err := os.ReadFile(audioPath + ".meta.json")
+	if err != nil {
+		// Not present or unreadable — expected for pre-sidecar files.
+		return nil, false
+	}
+
+	var raw struct {
+		ContactName     string `json:"contact_name"`
+		Direction       string `json:"direction"`
+		RecordingType   string `json:"recording_type"`
+		DurationSeconds int    `json:"duration_seconds"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		// Corrupt sidecar — skip without surfacing an error.
+		return nil, false
+	}
+
+	result := make(map[string]any, 4)
+	if raw.ContactName != "" {
+		result["contact_name"] = raw.ContactName
+	}
+	if raw.Direction != "" {
+		result["direction"] = raw.Direction
+	}
+	if raw.RecordingType != "" {
+		result["recording_type"] = raw.RecordingType
+	}
+	if raw.DurationSeconds != 0 {
+		result["duration_seconds"] = raw.DurationSeconds
+	}
+
+	if len(result) == 0 {
+		return nil, false
+	}
+	return result, true
+}
+
 // checkAudioFileHeader reads the first 8 bytes of the file at path and runs
 // the appropriate audiovalidate check for the given extension.
 //
@@ -649,19 +709,24 @@ type transcribeFileResult struct {
 }
 
 // transcribeFile posts the audio file at path to the Whisper transcription
-// endpoint and returns both the flat transcript text and time-stamped segments
-// (from response_format=verbose_json).
+// endpoint and returns the transcript text and, when diarization is enabled,
+// time-stamped segments.
 //
 // The request is a multipart/form-data POST to {baseURL}/audio/transcriptions
 // with the following fields:
 //   - file: audio file bytes (filename preserved for MIME detection by the server)
 //   - model: cfg.WhisperModel
 //   - language: cfg.WhisperLanguage (omitted when empty)
-//   - response_format: "verbose_json" (to obtain per-segment timestamps)
+//   - response_format: "verbose_json" (ONLY when cfg.DiarizationEnabled is true)
 //
-// Backward-compatibility: if the server response lacks a "segments" array (older
-// server versions or simple-format responses), result.segments will be nil and
-// callers fall back to result.text for the document content.
+// When DiarizationEnabled is false the request is identical to the pre-diarization
+// implementation: no response_format field, plain {"text":"..."} response parsed
+// via whisperTranscribeResponse. This ensures zero behaviour change for deployments
+// running with the flag off.
+//
+// When DiarizationEnabled is true, response_format=verbose_json is added and the
+// response is parsed via whisperVerboseResponse to extract per-segment timestamps
+// needed for speaker alignment.
 //
 // The Authorization header is set only when cfg.WhisperAPIKey is non-empty,
 // enabling use with local whisper.cpp servers that do not require authentication.
@@ -695,11 +760,13 @@ func (c *WhisperCollector) transcribeFile(ctx context.Context, path string) (tra
 		}
 	}
 
-	// response_format=verbose_json to obtain per-segment timestamps for
-	// diarization alignment. The response is still valid JSON with a "text"
-	// field, so backward-compat is maintained even when diarization is off.
-	if err := mw.WriteField("response_format", "verbose_json"); err != nil {
-		return transcribeFileResult{}, fmt.Errorf("write response_format field: %w", err)
+	// response_format=verbose_json is only added when diarization is enabled.
+	// When the flag is off this field is absent, preserving the original
+	// request format byte-for-byte.
+	if c.cfg.DiarizationEnabled {
+		if err := mw.WriteField("response_format", "verbose_json"); err != nil {
+			return transcribeFileResult{}, fmt.Errorf("write response_format field: %w", err)
+		}
 	}
 
 	if err := mw.Close(); err != nil {
@@ -734,11 +801,21 @@ func (c *WhisperCollector) transcribeFile(ctx context.Context, path string) (tra
 		return transcribeFileResult{}, fmt.Errorf("whisper API returned %d: %s", resp.StatusCode, body)
 	}
 
+	// Parse response according to the requested format.
+	// Flag OFF: plain {"text":"..."} — identical to the original pre-#111 path.
+	// Flag ON:  verbose_json {"text":"...","segments":[...]} for diarization alignment.
+	if !c.cfg.DiarizationEnabled {
+		var result whisperTranscribeResponse
+		if err := json.Unmarshal(body, &result); err != nil {
+			return transcribeFileResult{}, fmt.Errorf("decode response JSON: %w", err)
+		}
+		return transcribeFileResult{text: result.Text}, nil
+	}
+
 	var result whisperVerboseResponse
 	if err := json.Unmarshal(body, &result); err != nil {
 		return transcribeFileResult{}, fmt.Errorf("decode response JSON: %w", err)
 	}
-
 	return transcribeFileResult{
 		text:     result.Text,
 		segments: result.Segments,

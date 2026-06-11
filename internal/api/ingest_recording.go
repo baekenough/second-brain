@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -309,6 +310,36 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// --- Write sidecar metadata file ---
+	// The sidecar decouples the call-log doc (created here) from the
+	// call-transcript doc (created later by WhisperCollector). WhisperCollector
+	// reads {audioPath}.meta.json and merges its fields into the transcript
+	// document metadata, giving call-transcript docs the full recording context
+	// (contact_name, direction, recording_type, duration_seconds) without
+	// requiring any coupling between the two pipelines.
+	//
+	// On write failure: log a warning and continue — the audio file and call-log
+	// doc already succeeded, and missing sidecars are handled gracefully by
+	// WhisperCollector (historical files have no sidecar).
+	sidecarDirection := ""
+	if kind == "call" {
+		sidecarDirection = "incoming"
+	}
+	sidecar := recordingSidecar{
+		ContactName:     contactName,
+		Number:          number,
+		Direction:       sidecarDirection,
+		RecordingType:   kind,
+		DurationSeconds: durationSec,
+		DateMs:          dateMs,
+		Kind:            kind,
+	}
+	if sidecarData, marshalErr := json.Marshal(sidecar); marshalErr != nil {
+		slog.Warn("ingest_recording: marshal sidecar", "path", destPath, "error", marshalErr)
+	} else if writeErr := os.WriteFile(destPath+".meta.json", sidecarData, 0o644); writeErr != nil {
+		slog.Warn("ingest_recording: write sidecar", "path", destPath+".meta.json", "error", writeErr)
+	}
+
 	// --- Build document title, content, and metadata by kind ---
 	var title, content string
 	var meta map[string]any
@@ -377,6 +408,24 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 		Skipped:    false,
 		DocumentID: doc.ID.String(),
 	})
+}
+
+// recordingSidecar is the JSON structure written alongside each uploaded audio
+// file as {audioPath}.meta.json. WhisperCollector reads this file and merges
+// its fields into the call-transcript document's metadata, bridging the two
+// independent pipelines without changing SourceIDs or the dedup logic.
+//
+// All fields are JSON-tagged with omitempty so that absent optional fields
+// (e.g. contact_name for an anonymous call, direction for a voice-memo) are
+// omitted from the sidecar rather than stored as empty strings.
+type recordingSidecar struct {
+	ContactName     string `json:"contact_name,omitempty"`
+	Number          string `json:"number,omitempty"`
+	Direction       string `json:"direction,omitempty"`
+	RecordingType   string `json:"recording_type,omitempty"`
+	DurationSeconds int    `json:"duration_seconds,omitempty"`
+	DateMs          int64  `json:"date_ms,omitempty"`
+	Kind            string `json:"kind,omitempty"`
 }
 
 // sanitizeFilename converts an arbitrary string (e.g. a user-supplied audio

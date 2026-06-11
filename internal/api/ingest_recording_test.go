@@ -16,6 +16,25 @@ import (
 
 // --- helpers ---
 
+// audioFilesInDir returns the names of non-sidecar files in dir (i.e. files
+// that do NOT end in ".meta.json"). Use this in tests that assert on the number
+// of audio files written by the ingest-recording handler, since the handler now
+// also writes a {audio}.meta.json sidecar alongside every audio file.
+func audioFilesInDir(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("audioFilesInDir readdir: %v", err)
+	}
+	var names []string
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".meta.json") {
+			names = append(names, e.Name())
+		}
+	}
+	return names
+}
+
 // validM4ABytes returns a minimal byte slice that passes the m4a audio
 // validation check (audiovalidate.CheckM4A). The slice contains a valid
 // ISOBMFF ftyp box marker at offset 4 and is padded to n bytes total.
@@ -157,15 +176,12 @@ func TestIngestRecording_Success(t *testing.T) {
 		t.Fatalf("expected 1 upserted doc, got %d", len(upserter.upserted))
 	}
 
-	// Audio file written to recordingDir.
-	entries, err := os.ReadDir(recordingDir)
-	if err != nil {
-		t.Fatalf("readdir: %v", err)
+	// Audio file written to recordingDir (sidecar .meta.json is excluded).
+	audioFiles := audioFilesInDir(t, recordingDir)
+	if len(audioFiles) != 1 {
+		t.Fatalf("expected 1 audio file in recordingDir, got %d", len(audioFiles))
 	}
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 audio file in recordingDir, got %d", len(entries))
-	}
-	audioFile := entries[0].Name()
+	audioFile := audioFiles[0]
 
 	// Filename must encode the recording timestamp in TPhoneCallRecords format
 	// so WhisperCollector.recordingTime() can parse it.
@@ -399,11 +415,11 @@ func TestIngestRecording_FilenameEncoding(t *testing.T) {
 		t.Fatalf("status = %d, want 201; body: %s", rr.Code, rr.Body.String())
 	}
 
-	entries, _ := os.ReadDir(recordingDir)
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 file, got %d", len(entries))
+	audioFiles := audioFilesInDir(t, recordingDir)
+	if len(audioFiles) != 1 {
+		t.Fatalf("expected 1 audio file, got %d", len(audioFiles))
 	}
-	audioFile := entries[0].Name()
+	audioFile := audioFiles[0]
 
 	wantName := fmt.Sprintf("%s_%s.m4a", sanitizePhoneNumber(number), expectedTimestamp)
 	if audioFile != wantName {
@@ -480,15 +496,13 @@ func TestIngestRecording_VoiceMemoSuccess(t *testing.T) {
 		t.Errorf("metadata[transcription]=%q, want pending", transcription)
 	}
 
-	// Audio file must exist in recordingDir with voice-memo prefix.
-	entries, err := os.ReadDir(recordingDir)
-	if err != nil {
-		t.Fatalf("readdir: %v", err)
+	// Audio file must exist in recordingDir with voice-memo prefix
+	// (sidecar .meta.json is excluded from the count).
+	audioFiles := audioFilesInDir(t, recordingDir)
+	if len(audioFiles) != 1 {
+		t.Fatalf("expected 1 audio file, got %d", len(audioFiles))
 	}
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 audio file, got %d", len(entries))
-	}
-	audioFile := entries[0].Name()
+	audioFile := audioFiles[0]
 	// New format: voice-memo_{YYYYMMDDHHMMSS}_{sanitizedOriginalName}.ext
 	const voiceMemoPrefix = "voice-memo_"
 	if !strings.HasPrefix(audioFile, voiceMemoPrefix) {
@@ -741,13 +755,10 @@ func TestIngestRecording_VoiceMemoSameDateMsDifferentFilename(t *testing.T) {
 		}
 	}
 
-	// Both audio files must be written to disk (different paths).
-	entries, err := os.ReadDir(recordingDir)
-	if err != nil {
-		t.Fatalf("readdir: %v", err)
-	}
-	if len(entries) != 2 {
-		t.Fatalf("expected 2 audio files on disk, got %d", len(entries))
+	// Both audio files must be written to disk (sidecar files excluded).
+	audioFiles := audioFilesInDir(t, recordingDir)
+	if len(audioFiles) != 2 {
+		t.Fatalf("expected 2 audio files on disk, got %d", len(audioFiles))
 	}
 }
 
@@ -873,9 +884,8 @@ func TestIngestRecording_ValidM4AIsAccepted(t *testing.T) {
 			rr.Code, http.StatusCreated, rr.Body.String())
 	}
 
-	entries, _ := os.ReadDir(recordingDir)
-	if len(entries) != 1 {
-		t.Errorf("expected 1 file on disk for valid upload, got %d", len(entries))
+	if audioFiles := audioFilesInDir(t, recordingDir); len(audioFiles) != 1 {
+		t.Errorf("expected 1 audio file on disk for valid upload, got %d", len(audioFiles))
 	}
 }
 
@@ -899,9 +909,8 @@ func TestIngestRecording_NonM4ANotValidated(t *testing.T) {
 			rr.Code, http.StatusCreated, rr.Body.String())
 	}
 
-	entries, _ := os.ReadDir(recordingDir)
-	if len(entries) != 1 {
-		t.Errorf("expected 1 file on disk for wav upload, got %d", len(entries))
+	if audioFiles := audioFilesInDir(t, recordingDir); len(audioFiles) != 1 {
+		t.Errorf("expected 1 audio file on disk for wav upload, got %d", len(audioFiles))
 	}
 }
 

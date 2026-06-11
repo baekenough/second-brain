@@ -693,3 +693,126 @@ func TestWhisperCollector_DiarizationVoiceMemoOmitsNumSpeakers(t *testing.T) {
 		t.Error("num_speakers field was sent for a voice-memo file — should be omitted")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// response_format gating tests
+// ---------------------------------------------------------------------------
+
+// TestWhisperCollector_ResponseFormatAbsentWhenDiarizationDisabled asserts that
+// with DiarizationEnabled=false the multipart request to Whisper does NOT
+// include the response_format field — preserving the original pre-#111 request
+// format byte-for-byte.
+func TestWhisperCollector_ResponseFormatAbsentWhenDiarizationDisabled(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	const wantTranscript = "원본 요청 포맷 확인"
+
+	// newWhisperTestServer (defined in whisper_test.go) captures all multipart
+	// fields excluding "file". We use it here to inspect whether response_format
+	// was sent.
+	srv, captured := newWhisperTestServer(t, wantTranscript)
+
+	mtime := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+	writeDummyAudio(t, dir, "call.m4a", mtime)
+
+	cfg := &config.Config{
+		WhisperAudioDir:    dir,
+		WhisperAPIURL:      srv.URL,
+		WhisperModel:       "whisper-1",
+		WhisperLanguage:    "ko",
+		DiarizationEnabled: false, // flag OFF
+	}
+	c := makeWhisperCollector(cfg, srv)
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect() error: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("Collect() returned %d docs, want 1", len(docs))
+	}
+
+	// response_format must be absent from the multipart fields.
+	if v, present := captured.fields["response_format"]; present {
+		t.Errorf("response_format field present in request when DiarizationEnabled=false: %q", v)
+	}
+
+	// Plain transcript must be used as content.
+	if docs[0].Content != wantTranscript {
+		t.Errorf("Content = %q, want %q", docs[0].Content, wantTranscript)
+	}
+}
+
+// TestWhisperCollector_ResponseFormatVerboseJsonWhenDiarizationEnabled asserts
+// that with DiarizationEnabled=true the multipart request includes
+// response_format=verbose_json.
+func TestWhisperCollector_ResponseFormatVerboseJsonWhenDiarizationEnabled(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	// Whisper server that captures fields and returns a verbose_json response.
+	var capturedResponseFormat string
+	whisperSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		contentType := r.Header.Get("Content-Type")
+		_, params, _ := mime.ParseMediaType(contentType)
+		mr := multipart.NewReader(r.Body, params["boundary"])
+		for {
+			p, err := mr.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				break
+			}
+			data, _ := io.ReadAll(p)
+			if p.FormName() == "response_format" {
+				capturedResponseFormat = string(data)
+			}
+			p.Close()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(whisperVerboseResponse{
+			Text: "verbose 응답",
+			Segments: []whisperSegment{
+				{Start: 0.0, End: 3.0, Text: "verbose 응답"},
+			},
+		})
+	}))
+	defer whisperSrv.Close()
+
+	// Diarization server (minimal — just needs to not 500 so Collect proceeds).
+	diarSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(diarizeResponse{
+			Segments: []diarSegment{
+				{Start: 0.0, End: 3.0, Speaker: "SPEAKER_00"},
+			},
+		})
+	}))
+	defer diarSrv.Close()
+
+	mtime := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+	writeDummyAudio(t, dir, "call.m4a", mtime)
+
+	cfg := &config.Config{
+		WhisperAudioDir:    dir,
+		WhisperAPIURL:      whisperSrv.URL,
+		WhisperModel:       "whisper-1",
+		WhisperLanguage:    "ko",
+		DiarizationEnabled: true, // flag ON
+		DiarizationAPIURL:  diarSrv.URL,
+	}
+	c := makeWhisperCollector(cfg, whisperSrv)
+
+	_, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect() error: %v", err)
+	}
+
+	if capturedResponseFormat != "verbose_json" {
+		t.Errorf("response_format = %q, want %q when DiarizationEnabled=true",
+			capturedResponseFormat, "verbose_json")
+	}
+}
