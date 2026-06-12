@@ -80,15 +80,10 @@ jobs:
         working-directory: web
     steps:
       - uses: actions/checkout@v5
-      - uses: pnpm/action-setup@v5
+      - uses: oven-sh/setup-bun@v2
         with:
-          version: 9
-      - uses: actions/setup-node@v5
-        with:
-          node-version: '20'
-          cache: 'pnpm'
-          cache-dependency-path: web/pnpm-lock.yaml
-      - name: pnpm install
-        run: pnpm install --frozen-lockfile
+          bun-version: '1.3'
+      - name: bun install
+        run: bun install --frozen-lockfile
       - name: next build
-        run: pnpm run build
+        run: bun run build
