@@ -129,12 +129,12 @@ NO EXCEPTIONS. NO EXCUSES.
 project/
 +-- CLAUDE.md                    # Entry point
 +-- .claude/
-|   +-- agents/                  # Subagent definitions (44 files)
+|   +-- agents/                  # Subagent definitions (48 files)
 |   +-- skills/                  # Skills (106 directories)
 |   +-- rules/                   # Global rules (R000-R020)
 |   +-- hooks/                   # Hook scripts (security, validation, HUD)
 |   +-- contexts/                # Context files (ecomode)
-+-- guides/                      # Reference docs (26 topics)
++-- guides/                      # Reference docs (36 topics)
 ```
 
 ## Orchestration
@@ -164,17 +164,17 @@ This is the core oh-my-customcode philosophy: **"No expert? CREATE one, connect 
 |------|-------|--------|
 | SW Engineer/Language | 6 | lang-golang-expert, lang-python-expert, lang-rust-expert, lang-kotlin-expert, lang-typescript-expert, lang-java21-expert |
 | SW Engineer/Backend | 6 | be-fastapi-expert, be-springboot-expert, be-go-backend-expert, be-express-expert, be-nestjs-expert, be-django-expert |
-| SW Engineer/Frontend | 4 | fe-vercel-agent, fe-vuejs-agent, fe-svelte-agent, fe-flutter-agent |
-| SW Engineer/Tooling | 3 | tool-npm-expert, tool-optimizer, tool-bun-expert |
+| SW Engineer/Frontend | 5 | fe-vercel-agent, fe-vuejs-agent, fe-svelte-agent, fe-flutter-agent, fe-design-expert |
+| SW Engineer/Tooling | 4 | tool-npm-expert, tool-optimizer, tool-bun-expert, slack-cli-expert |
 | DE Engineer | 6 | de-airflow-expert, de-dbt-expert, de-spark-expert, de-kafka-expert, de-snowflake-expert, de-pipeline-expert |
-| SW Engineer/Database | 3 | db-supabase-expert, db-postgres-expert, db-redis-expert |
+| SW Engineer/Database | 4 | db-supabase-expert, db-postgres-expert, db-redis-expert, db-alembic-expert |
 | Security | 1 | sec-codeql-expert |
 | SW Architect | 2 | arch-documenter, arch-speckit-agent |
 | Infra Engineer | 2 | infra-docker-expert, infra-aws-expert |
 | QA Team | 3 | qa-planner, qa-writer, qa-engineer |
 | Manager | 6 | mgr-creator, mgr-updater, mgr-supplier, mgr-gitnerd, mgr-sauron, mgr-claude-code-bible |
-| System | 2 | sys-memory-keeper, sys-naggy |
-| **Total** | **44** | |
+| System | 3 | sys-memory-keeper, sys-naggy, wiki-curator |
+| **Total** | **48** | |
 
 ## Agent Teams (MUST when enabled)
 
@@ -387,12 +387,12 @@ NO EXCEPTIONS. NO EXCUSES.
 project/
 +-- CLAUDE.md                    # Entry point
 +-- .claude/
-|   +-- agents/                  # Subagent definitions (44 files)
+|   +-- agents/                  # Subagent definitions (48 files)
 |   +-- skills/                  # Skills (106 directories)
 |   +-- rules/                   # Global rules (R000-R020)
 |   +-- hooks/                   # Hook scripts (security, validation, HUD)
 |   +-- contexts/                # Context files (ecomode)
-+-- guides/                      # Reference docs (26 topics)
++-- guides/                      # Reference docs (36 topics)
 ```
 
 ## Orchestration
@@ -422,17 +422,17 @@ This is the core oh-my-customcode philosophy: **"No expert? CREATE one, connect 
 |------|-------|--------|
 | SW Engineer/Language | 6 | lang-golang-expert, lang-python-expert, lang-rust-expert, lang-kotlin-expert, lang-typescript-expert, lang-java21-expert |
 | SW Engineer/Backend | 6 | be-fastapi-expert, be-springboot-expert, be-go-backend-expert, be-express-expert, be-nestjs-expert, be-django-expert |
-| SW Engineer/Frontend | 4 | fe-vercel-agent, fe-vuejs-agent, fe-svelte-agent, fe-flutter-agent |
-| SW Engineer/Tooling | 3 | tool-npm-expert, tool-optimizer, tool-bun-expert |
+| SW Engineer/Frontend | 5 | fe-vercel-agent, fe-vuejs-agent, fe-svelte-agent, fe-flutter-agent, fe-design-expert |
+| SW Engineer/Tooling | 4 | tool-npm-expert, tool-optimizer, tool-bun-expert, slack-cli-expert |
 | DE Engineer | 6 | de-airflow-expert, de-dbt-expert, de-spark-expert, de-kafka-expert, de-snowflake-expert, de-pipeline-expert |
-| SW Engineer/Database | 3 | db-supabase-expert, db-postgres-expert, db-redis-expert |
+| SW Engineer/Database | 4 | db-supabase-expert, db-postgres-expert, db-redis-expert, db-alembic-expert |
 | Security | 1 | sec-codeql-expert |
 | SW Architect | 2 | arch-documenter, arch-speckit-agent |
 | Infra Engineer | 2 | infra-docker-expert, infra-aws-expert |
 | QA Team | 3 | qa-planner, qa-writer, qa-engineer |
 | Manager | 6 | mgr-creator, mgr-updater, mgr-supplier, mgr-gitnerd, mgr-sauron, mgr-claude-code-bible |
-| System | 2 | sys-memory-keeper, sys-naggy |
-| **Total** | **44** | |
+| System | 3 | sys-memory-keeper, sys-naggy, wiki-curator |
+| **Total** | **48** | |
 
 ## Agent Teams (MUST when enabled)
 
