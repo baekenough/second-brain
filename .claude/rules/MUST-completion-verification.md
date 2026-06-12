@@ -10,12 +10,22 @@ Before declaring any task `[Done]`, verify completion against task-type-specific
 
 | Task Type | REQUIRED Verification Before [Done] |
 |-----------|-------------------------------------|
-| Release | All issues closed, version bumped, PR merged, GitHub Release created |
+| Release | **CI green on the release commit (ALL workflow jobs success)**, all issues closed, version bumped, PR merged, GitHub Release created |
 | Implementation | Code compiles/passes lint, tests pass (if exist), no TODO markers left |
 | Documentation | Links valid, counts accurate, cross-references updated |
 | Git Operations | Operation succeeded (check exit code), working tree clean |
 | Code Review | All findings addressed or explicitly deferred with justification |
 | Agent/Skill Creation | Frontmatter valid, referenced skills exist, routing updated |
+
+### Release CI Gate (MUST)
+
+A release (git tag push `v*` OR `gh release create`) MUST NEVER be cut while CI is failing on the target commit. Before tagging or creating any GitHub Release:
+
+1. Verify the CI run for the release commit concluded `success` for EVERY job (`gh run list --limit 1`, `gh run view <id>`).
+2. If ANY CI job is failing or the run is still in progress → STOP. Fix all CI failures first, push the fix, wait for the new run to go green, THEN release.
+3. Never tag/release on red or in-progress CI. "Code works locally / in prod" is NOT a substitute for green CI.
+
+(Session 2026-06-11: v0.19.0–v0.19.2 were released on red CI — the frontend-build job had been failing since the web rebuild. This gate prevents recurrence.)
 
 ## Self-Check (Before Declaring Done)
 

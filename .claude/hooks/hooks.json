@@ -103,6 +103,16 @@
         "description": "Block rule file deletion — requires individual user confirmation per rule (R001 safety)"
       },
       {
+        "matcher": "tool == \"Bash\" && tool_input.command matches \"(gh release create|git push)\"",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/release-ci-gate.sh"
+          }
+        ],
+        "description": "Block releases (gh release create / v* tag push) when CI is not green on HEAD (R020 Release CI Gate, #133)"
+      },
+      {
         "matcher": "tool == \"Task\" || tool == \"Agent\"",
         "hooks": [
           {
