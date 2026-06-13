@@ -4,6 +4,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -225,9 +226,11 @@ type ChunkEmbedding struct {
 }
 
 // updateEmbeddingsBatchSize is the maximum number of UPDATE statements per
-// transaction in UpdateChunkEmbeddings. Splitting large batches prevents
-// long-held DB connections and reduces lock contention.
-const updateEmbeddingsBatchSize = 500
+// transaction in UpdateChunkEmbeddings. Kept small (50) to minimise lock-hold
+// duration per transaction: shorter transactions reduce the window during which
+// another writer (persistChunks → embedChunks path) can be blocked waiting for
+// the same row locks, cutting the probability of a 40P01 deadlock cycle (#157).
+const updateEmbeddingsBatchSize = 50
 
 // UpdateChunkEmbeddings persists embedding vectors for a batch of chunks.
 // When the batch exceeds updateEmbeddingsBatchSize entries, it is split into
@@ -260,14 +263,27 @@ func (s *ChunkStore) UpdateChunkEmbeddings(ctx context.Context, embeddings []Chu
 
 // updateEmbeddingsBatch persists a single sub-batch of embeddings in one
 // transaction. It is called exclusively by UpdateChunkEmbeddings.
+//
+// Lock-order discipline (#157): rows are updated in ascending chunk ID order.
+// The concurrent persistChunks → embedChunks path also reaches the same rows;
+// sorting by ID here ensures both paths acquire row locks in the same direction,
+// eliminating the circular wait that causes 40P01 deadlocks.
 func (s *ChunkStore) updateEmbeddingsBatch(ctx context.Context, embeddings []ChunkEmbedding) error {
+	// Sort by ChunkID ascending to establish a consistent lock-acquisition order.
+	// This prevents circular waits with other writers that touch the same rows.
+	sorted := make([]ChunkEmbedding, len(embeddings))
+	copy(sorted, embeddings)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].ChunkID < sorted[j].ChunkID
+	})
+
 	tx, err := s.pg.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("chunk update embeddings begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	for _, ce := range embeddings {
+	for _, ce := range sorted {
 		if len(ce.Embedding) == 0 {
 			continue
 		}
@@ -294,8 +310,16 @@ type UnembeddedChunk struct {
 }
 
 // ListUnembeddedChunks returns up to limit chunks whose embedding column is
-// NULL, ordered by created_at ASC (oldest first) so backfill progresses
-// forward in time.
+// NULL, ordered by id ASC (primary key order) so backfill progresses in a
+// stable direction that matches the lock-acquisition order used by
+// updateEmbeddingsBatch (#157).
+//
+// FOR UPDATE SKIP LOCKED: rows that are currently locked by another writer
+// (e.g. the persistChunks → embedChunks path racing on the same chunks) are
+// skipped rather than waited on. Skipped rows will be picked up by the next
+// backfill cycle, which is correct because backfill runs repeatedly.
+// This eliminates the primary source of 40P01 deadlock cycles: the backfill
+// reader no longer queues behind the inline writer on the same row locks.
 //
 // Only chunks belonging to active documents are included. Chunks for
 // soft-deleted documents are excluded — re-embedding them would waste quota.
@@ -308,8 +332,9 @@ func (s *ChunkStore) ListUnembeddedChunks(ctx context.Context, limit int) ([]Une
 		JOIN documents d ON d.id = c.document_id
 		WHERE c.embedding IS NULL
 		  AND d.status = 'active'
-		ORDER BY c.created_at ASC
-		LIMIT $1`
+		ORDER BY c.id ASC
+		LIMIT $1
+		FOR UPDATE OF c SKIP LOCKED`
 
 	rows, err := s.pg.pool.Query(ctx, q, limit)
 	if err != nil {
