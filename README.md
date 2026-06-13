@@ -98,6 +98,8 @@ flowchart LR
     class Agent,MCP,EvalRunner muted;
 ```
 
+![System Runtime Topology](docs/diagrams/01-system-runtime-topology.png)
+
 서버(API)와 수집기(Collector)는 독립된 바이너리로 분리되어 있습니다. 수집기는 소스별 `COLLECT_INTERVAL`로 실행되며, 수집된 텍스트는 rune 기반 chunker로 분할 후 임베딩되어 `pgvector` 컬럼에 저장됩니다. 프로덕션은 **Mac mini docker-compose** (`docker-compose.local.yml`) 기반이며 `deploy/k8s/`는 향후 Kubernetes 전환용입니다.
 
 ### 주요 컴포넌트
@@ -246,6 +248,8 @@ curl http://localhost:8081/health
 ### POST /api/v1/search
 
 JSON 바디 기반 5-lane 하이브리드 검색. FTS(tsvector BM25) + pgvector 코사인 + pg_bigm + 요약 임베딩 + 엔티티를 RRF로 결합합니다.
+
+![Hybrid Search RRF](docs/diagrams/05-hybrid-search-rrf.png)
 
 **요청 바디**
 

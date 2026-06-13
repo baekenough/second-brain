@@ -98,6 +98,8 @@ flowchart LR
     class Agent,MCP,EvalRunner muted;
 ```
 
+![System Runtime Topology](docs/diagrams/01-system-runtime-topology.png)
+
 The server (API) and collector are separate binaries. Each collector runs on a configurable per-source `COLLECT_INTERVAL`. Collected text is split by a rune-based chunker, then embedded and stored in a `pgvector` column. Production runs on **Mac mini docker-compose** (`docker-compose.local.yml`); `deploy/k8s/` is the future Kubernetes target.
 
 ### Components
@@ -246,6 +248,8 @@ curl http://localhost:8081/health
 ### POST /api/v1/search
 
 JSON body-based 5-lane hybrid search. Combines FTS (tsvector BM25) + pgvector cosine + pg_bigm + summary embedding + entity via RRF.
+
+![Hybrid Search RRF](docs/diagrams/05-hybrid-search-rrf.png)
 
 **Request Body**
 

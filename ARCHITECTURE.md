@@ -133,6 +133,10 @@ flowchart TD
     class OLLAMA,WHISPER,DIARIZATION,WEB,MCP,EVALRUNNER,ANDROID muted;
 ```
 
+> **eraser 렌더** ([편집](https://app.eraser.io/workspace/PyHgjPmM97MYtJNoVD5H)):
+>
+> ![시스템 런타임 토폴로지](docs/diagrams/01-system-runtime-topology.png)
+
 ### docker-compose.local.yml 서비스 목록
 
 | 서비스 | 이미지 | 포트 | 역할 |
@@ -213,6 +217,10 @@ flowchart LR
     class STORE data;
     class MODEL,CFG muted;
 ```
+
+> **eraser 렌더** ([편집](https://app.eraser.io/workspace/Z8JviN6EySSKzjgtXNp4)):
+>
+> ![백엔드 서비스 레이어 맵](docs/diagrams/02-service-layer-map.png)
 
 ### 패키지별 주요 심볼
 
@@ -331,6 +339,10 @@ erDiagram
     chunks ||--o{ feedback : "chunk_id"
 ```
 
+> **eraser 렌더** ([편집](https://app.eraser.io/workspace/O901Iet3HpcIaldLfQ1e)):
+>
+> ![데이터 모델 ERD](docs/diagrams/03-data-model-erd.png)
+
 ### 마이그레이션 목록 (001~019)
 
 | # | 파일 | 주요 변경 |
@@ -445,6 +457,10 @@ sequenceDiagram
         FRESH-->>SCHED: alert if stale or consecutive failures
     end
 ```
+
+> **eraser 렌더** ([편집](https://app.eraser.io/workspace/2NzpSSDbSx4Oh3gCs6DV)):
+>
+> ![수집 파이프라인 시퀀스](docs/diagrams/04-collection-pipeline-sequence.png)
 
 ### Scheduler 구조 (`internal/scheduler/scheduler.go`)
 
@@ -647,6 +663,10 @@ flowchart TD
     class RRF,RERANK data;
 ```
 
+> **eraser 렌더** ([편집](https://app.eraser.io/workspace/K10FmwBysYGTBVp8E9Wb)):
+>
+> ![5-lane 하이브리드 검색 RRF](docs/diagrams/05-hybrid-search-rrf.png)
+
 ### hybridSearch CTE 구조 (`internal/store/document.go`)
 
 5개의 CTE(fts, vec, bigm, summvec, entity)를 FULL OUTER JOIN으로 결합:
@@ -766,6 +786,10 @@ flowchart LR
     class METRICS,EVALSET data;
     class FEEDBACK,WEBHOOK,REINDEXACT muted;
 ```
+
+> **eraser 렌더** ([편집](https://app.eraser.io/workspace/pWBbodLRKu5nxflA5yjJ)):
+>
+> ![eval 자기개선 루프](docs/diagrams/06-eval-self-improvement-loop.png)
 
 ### eval-runner 동작
 

@@ -133,6 +133,10 @@ flowchart TD
     class OLLAMA,WHISPER,DIARIZATION,WEB,MCP,EVALRUNNER,ANDROID muted;
 ```
 
+> **eraser render** ([edit](https://app.eraser.io/workspace/PyHgjPmM97MYtJNoVD5H)):
+>
+> ![System Runtime Topology](docs/diagrams/01-system-runtime-topology.png)
+
 ### docker-compose.local.yml Services
 
 | Service | Image | Port | Role |
@@ -213,6 +217,10 @@ flowchart LR
     class STORE data;
     class MODEL,CFG muted;
 ```
+
+> **eraser render** ([edit](https://app.eraser.io/workspace/Z8JviN6EySSKzjgtXNp4)):
+>
+> ![Backend Service Layer Map](docs/diagrams/02-service-layer-map.png)
 
 ### Key Symbols by Package
 
@@ -331,6 +339,10 @@ erDiagram
     chunks ||--o{ feedback : "chunk_id"
 ```
 
+> **eraser render** ([edit](https://app.eraser.io/workspace/O901Iet3HpcIaldLfQ1e)):
+>
+> ![Data Model ERD](docs/diagrams/03-data-model-erd.png)
+
 ### Migration List (001–019)
 
 | # | File | Key Change |
@@ -445,6 +457,10 @@ sequenceDiagram
         FRESH-->>SCHED: alert if stale or consecutive failures
     end
 ```
+
+> **eraser render** ([edit](https://app.eraser.io/workspace/2NzpSSDbSx4Oh3gCs6DV)):
+>
+> ![Collection Pipeline Sequence](docs/diagrams/04-collection-pipeline-sequence.png)
 
 ### Scheduler Structure (`internal/scheduler/scheduler.go`)
 
@@ -647,6 +663,10 @@ flowchart TD
     class RRF,RERANK data;
 ```
 
+> **eraser render** ([edit](https://app.eraser.io/workspace/K10FmwBysYGTBVp8E9Wb)):
+>
+> ![5-lane Hybrid Search RRF](docs/diagrams/05-hybrid-search-rrf.png)
+
 ### hybridSearch CTE Structure (`internal/store/document.go`)
 
 Five CTEs (fts, vec, bigm, summvec, entity) combined via FULL OUTER JOIN:
@@ -748,6 +768,10 @@ flowchart LR
     class METRICS,EVALSET data;
     class FEEDBACK,WEBHOOK,REINDEXACT muted;
 ```
+
+> **eraser render** ([edit](https://app.eraser.io/workspace/pWBbodLRKu5nxflA5yjJ)):
+>
+> ![Eval Self-improvement Loop](docs/diagrams/06-eval-self-improvement-loop.png)
 
 ### eval-runner Behavior
 
