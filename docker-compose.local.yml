@@ -171,21 +171,22 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+    # Dockerfile eval 스테이지에 ENTRYPOINT ["/app/eval"] 이 있어 command 가
+    # eval 의 인수로 전달되면 /app/eval sh -c '...' 가 실행되어 즉시 exit → restart-loop.
+    # /bin/sh 로 ENTRYPOINT 를 오버라이드하면 command 스크립트가 sh -c "<script>" 로 실행된다.
+    entrypoint: ["/bin/sh", "-c"]
     command:
-      - sh
-      - -c
       - |
         while true; do
           now=$$(date +%s)
-          target=$$(date -d "today 03:00" +%s 2>/dev/null)
+          target=$$(date -d "today 03:00" +%s 2>/dev/null || echo $$((now + 86400)))
           [ "$$target" -le "$$now" ] && target=$$(($$target + 86400))
           sleep_sec=$$(($$target - $$now))
-          echo "[eval-runner] next run at $$(date -d "@$${target}" '+%Y-%m-%d %H:%M:%S %Z'), sleeping $${sleep_sec}s"
+          echo "[eval-runner] sleeping $${sleep_sec}s until next 03:00 KST"
           sleep "$$sleep_sec"
           echo "[eval-runner] starting /app/eval --check-reindex at $$(date '+%Y-%m-%d %H:%M:%S %Z')"
           /app/eval --check-reindex
-          code=$$?
-          echo "[eval-runner] exited $$code"
+          echo "[eval-runner] eval exited $$?"
         done
 
   # ---------------------------------------------------------------------------
