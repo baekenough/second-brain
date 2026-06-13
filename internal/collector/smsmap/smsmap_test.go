@@ -18,12 +18,12 @@ func TestMapSMS_SourceIDFormat(t *testing.T) {
 	addr := "010-1111-2222"
 	body := "hello"
 	dateMs := int64(1705311000000)
-
+	// typ=1 → direction="received"
 	doc := smsmap.MapSMS(addr, body, dateMs, 1, "Alice")
 
 	wantAddrHash := smsmap.ShortHash(addr)
-	wantBodyHash := smsmap.BodyShortHash(body)
-	want := fmt.Sprintf("sms:%d:%s:%s", dateMs, wantAddrHash, wantBodyHash)
+	// SourceID now uses direction (stable) instead of bodyHash.
+	want := fmt.Sprintf("sms:%d:%s:received", dateMs, wantAddrHash)
 
 	if doc.SourceID != want {
 		t.Errorf("SourceID=%q, want %q", doc.SourceID, want)
@@ -358,11 +358,10 @@ func TestMapSMS_ParityWithSMSCollector(t *testing.T) {
 	body := "안녕하세요"
 	dateMs := int64(1705311000000)
 
-	// sms.go computes: fmt.Sprintf("sms:%d:%s:%s", rec.Date, smsShortHash(rec.Address), smsBodyHash(rec.Body))
-	// where smsShortHash = sha256[:8] (16 hex), smsBodyHash = sha256[:4] (8 hex).
+	// sms.go now computes: fmt.Sprintf("sms:%d:%s:%s", rec.Date, smsShortHash(rec.Address), direction)
+	// where direction is the human-readable type string (e.g. "received" for type=1).
 	wantAddrHash := smsmap.ShortHash(addr)
-	wantBodyHash := smsmap.BodyShortHash(body)
-	wantSourceID := fmt.Sprintf("sms:%d:%s:%s", dateMs, wantAddrHash, wantBodyHash)
+	wantSourceID := fmt.Sprintf("sms:%d:%s:received", dateMs, wantAddrHash)
 
 	doc := smsmap.MapSMS(addr, body, dateMs, 1, "Alice")
 	if doc.SourceID != wantSourceID {

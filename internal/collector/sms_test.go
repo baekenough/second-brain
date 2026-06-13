@@ -225,11 +225,12 @@ func TestSMSCollector_Collect_SourceIDFormat(t *testing.T) {
 		t.Fatalf("expected 1 doc, got %d", len(docs))
 	}
 
-	// SourceID format: sms:{dateMs}:{sha256(addr)[:16]}:{sha256(body)[:8]}
+	// SourceID format: sms:{dateMs}:{sha256(addr)[:16]}:{direction}
+	// direction replaces bodyHash for a stable ID that survives body edits.
 	// Raw PII (phone number) must NOT appear in the source_id.
 	wantAddrHash := smsShortHash(addr)
-	wantBodyHash := smsBodyHash(body)
-	want := fmt.Sprintf("sms:%d:%s:%s", dateMs, wantAddrHash, wantBodyHash)
+	// type=1 → direction="received"
+	want := fmt.Sprintf("sms:%d:%s:received", dateMs, wantAddrHash)
 	if docs[0].SourceID != want {
 		t.Errorf("SourceID=%q, want %q", docs[0].SourceID, want)
 	}

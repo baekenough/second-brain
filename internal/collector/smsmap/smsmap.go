@@ -29,8 +29,14 @@ var otpDigitsRe = regexp.MustCompile(`\b\d{4,8}\b`)
 
 // MapSMS maps raw SMS fields to a model.Document.
 //
-// SourceID format: sms:{dateMs}:{sha256(addr)[:16]}:{sha256(body)[:8]}
+// SourceID format: sms:{dateMs}:{sha256(addr)[:16]}:{direction}
 // Phone numbers (addr) are hashed so raw PII is not stored in the SourceID.
+// direction (received/sent/draft/…) replaces the old bodyHash discriminator so
+// that the SourceID is stable across body edits — enabling ON CONFLICT UPDATE
+// (upsert) to overwrite content rather than inserting a duplicate document.
+// Two messages from the same address at the same millisecond with different
+// directions (e.g. a simultaneous inbound + outbound) are still uniquely
+// identified because the direction segment differs.
 // Auth-like bodies have their OTP digit runs replaced with [REDACTED].
 // OccurredAt is time.UnixMilli(dateMs).UTC().
 //
@@ -45,10 +51,9 @@ var otpDigitsRe = regexp.MustCompile(`\b\d{4,8}\b`)
 func MapSMS(addr, body string, dateMs int64, typ int, contactName string) model.Document {
 	occurredAt := time.UnixMilli(dateMs).UTC()
 	addrHash := shortHash(addr)
-	bodyHash := bodyShortHash(body)
-	sourceID := fmt.Sprintf("sms:%d:%s:%s", dateMs, addrHash, bodyHash)
-
 	direction := smsDirection(typ)
+	sourceID := fmt.Sprintf("sms:%d:%s:%s", dateMs, addrHash, direction)
+
 	contact := firstNonEmpty(contactName, addr)
 	title := fmt.Sprintf("SMS %s %s", direction, contact)
 

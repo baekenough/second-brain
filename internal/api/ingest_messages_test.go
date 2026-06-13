@@ -145,9 +145,10 @@ func TestIngestMessages_SMSMapsCorrectly(t *testing.T) {
 		t.Errorf("SourceType=%q, want %q", doc.SourceType, model.SourceSMS)
 	}
 
-	wantSourceID := fmt.Sprintf("sms:%d:%s:%s", dateMs,
-		smsmap.ShortHash(addr),
-		smsmap.BodyShortHash(body))
+	// SourceID uses direction (stable) instead of bodyHash since #144.
+	// type=1 → direction="received"
+	wantSourceID := fmt.Sprintf("sms:%d:%s:received", dateMs,
+		smsmap.ShortHash(addr))
 	if doc.SourceID != wantSourceID {
 		t.Errorf("SourceID=%q, want %q", doc.SourceID, wantSourceID)
 	}

@@ -224,9 +224,11 @@ func (c *SMSCollector) streamSMSFile(ctx context.Context, path string, since tim
 		}
 
 		occurredAt := msToUTC(rec.Date)
+		// Compute the stable sourceID using direction (not bodyHash) so that the
+		// index-aware dedup check matches the ID that MapSMS will emit.
 		addrHash := smsmap.ShortHash(rec.Address)
-		bodyHash := smsmap.BodyShortHash(rec.Body)
-		sourceID := fmt.Sprintf("sms:%d:%s:%s", rec.Date, addrHash, bodyHash)
+		direction := smsDirectionStr(rec.Type)
+		sourceID := fmt.Sprintf("sms:%d:%s:%s", rec.Date, addrHash, direction)
 
 		if !c.shouldEmitSMS(occurredAt, sourceID, since) {
 			continue
@@ -513,9 +515,11 @@ func (c *SMSCollector) parseSMSFile(ctx context.Context, path string, since time
 		occurredAt := msToUTC(rec.Date)
 
 		// PII fix (MEDIUM): hash address to avoid logging raw phone numbers.
+		// Stable sourceID: direction replaces bodyHash so re-delivered messages
+		// with amended bodies do not create duplicates (matched via ON CONFLICT).
 		addrHash := smsmap.ShortHash(rec.Address)
-		bodyHash := smsmap.BodyShortHash(rec.Body)
-		sourceID := fmt.Sprintf("sms:%d:%s:%s", rec.Date, addrHash, bodyHash)
+		direction := smsDirectionStr(rec.Type)
+		sourceID := fmt.Sprintf("sms:%d:%s:%s", rec.Date, addrHash, direction)
 
 		if !c.shouldEmitSMS(occurredAt, sourceID, since) {
 			continue
@@ -674,4 +678,28 @@ func smsShortHash(s string) string { return smsmap.ShortHash(s) }
 // smsBodyHash is a package-level alias for smsmap.BodyShortHash retained for
 // backward compatibility with existing same-package tests that call this helper.
 func smsBodyHash(s string) string { return smsmap.BodyShortHash(s) }
+
+// smsDirectionStr maps an SMS Backup & Restore type code to the human-readable
+// direction string used in stable SourceIDs. It mirrors the unexported
+// smsDirection helper in package smsmap and must stay in sync with it.
+//
+//	1 = received, 2 = sent, 3 = draft, 4 = outbox, 5 = failed, 6 = queued
+func smsDirectionStr(t int) string {
+	switch t {
+	case 1:
+		return "received"
+	case 2:
+		return "sent"
+	case 3:
+		return "draft"
+	case 4:
+		return "outbox"
+	case 5:
+		return "failed"
+	case 6:
+		return "queued"
+	default:
+		return "unknown"
+	}
+}
 
