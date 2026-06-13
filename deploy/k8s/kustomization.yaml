@@ -14,3 +14,4 @@ resources:
   - second-brain-deployment.yaml
   - second-brain-service.yaml
   - collector-deployment.yaml
+  - eval-cronjob.yaml

@@ -14,14 +14,17 @@ spec:
   failedJobsHistoryLimit: 5
   jobTemplate:
     spec:
-      backoffLimit: 1
+      # Only retry on true regression (exit 1). exit 2 (reindex recommended)
+      # is converted to exit 0 by the shell wrapper below, so backoffLimit
+      # matters only for unexpected failures or real regressions.
+      backoffLimit: 0
       activeDeadlineSeconds: 3600
       template:
         metadata:
           labels:
             app: eval-runner
         spec:
-          restartPolicy: OnFailure
+          restartPolicy: Never
           initContainers:
             - name: wait-for-postgres
               image: busybox:1.36
@@ -30,7 +33,22 @@ spec:
             - name: eval-runner
               image: second-brain:dev
               imagePullPolicy: IfNotPresent
-              command: ["/app/eval"]
+              # Exit-code contract:
+              #   0 — eval passed (no regression, no reindex signal)
+              #   1 — regression detected → job FAILS (triggers k8s failure alert)
+              #   2 — reindex recommended (eval binary already sent webhook alert)
+              #         → treated as success so CronJob does not re-run or fire
+              #           a redundant k8s failure notification
+              command:
+                - sh
+                - -c
+                - |
+                  /app/eval --check-reindex
+                  code=$?
+                  if [ $code -eq 1 ]; then
+                    exit 1
+                  fi
+                  exit 0
               env:
                 # MIGRATIONS_DIR is already set in the configmap but we set it
                 # explicitly here as well so the eval job is self-contained and
