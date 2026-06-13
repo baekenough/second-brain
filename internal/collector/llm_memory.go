@@ -3,9 +3,12 @@ package collector
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,8 +30,18 @@ import (
 //
 // The kind value (e.g. "session", "note", "fact") is preserved verbatim as
 // metadata["kind"]. source_type is always "llm-memory".
+//
+// Graceful skip: when the SQLite database file does not exist at the
+// configured path, Collect logs a single info-level message and returns an
+// empty document list without error. Subsequent calls are silenced to avoid
+// log spam — only the first absence is logged. This matches the behaviour of
+// SecretaryCollector (#151) and prevents "open db" error flooding when the
+// volume is not mounted.
 type LLMMemoryCollector struct {
 	dbPath string
+	// missingLogged is set atomically to 1 the first time a missing-db skip is
+	// logged, suppressing repeated log entries on subsequent ticks.
+	missingLogged atomic.Int32
 }
 
 // NewLLMMemoryCollector returns an LLMMemoryCollector. When dbPath is empty the
@@ -47,6 +60,17 @@ func (c *LLMMemoryCollector) Enabled() bool            { return c.dbPath != "" }
 // The watermark (since) is passed in by the scheduler via the collector_state
 // table. On the first run since is the zero time, causing a full collection.
 func (c *LLMMemoryCollector) Collect(ctx context.Context, since time.Time) ([]model.Document, error) {
+	// Graceful skip: if the SQLite file does not exist, return an empty list
+	// without error.  This prevents repeated "open db" error log spam when the
+	// volume is not mounted (issue #156).  Only log once to keep logs clean.
+	if _, statErr := os.Stat(c.dbPath); errors.Is(statErr, os.ErrNotExist) {
+		if c.missingLogged.CompareAndSwap(0, 1) {
+			slog.Info("llm-memory: db file not found, skipping collector (will not repeat)",
+				"path", c.dbPath)
+		}
+		return nil, nil
+	}
+
 	// immutable=1 is appropriate for a read-only snapshot; it tells SQLite to skip
 	// shared-cache locking, which is safe when we know no writer holds the db.
 	// Use _busy_timeout as a fallback for the non-immutable case where the writer

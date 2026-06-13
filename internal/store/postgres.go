@@ -64,9 +64,27 @@ func NewPostgres(ctx context.Context, databaseURL string) (*Postgres, error) {
 	return &Postgres{pool: pool}, nil
 }
 
+// migrationAdvisoryLockKey is a stable 64-bit integer used as the PostgreSQL
+// advisory lock key that serialises concurrent RunMigrations calls.  The value
+// is arbitrary but must be unique within the application and constant across
+// releases so that all instances agree on the same lock.
+//
+// The mnemonic: 0x5B_4149_4E is "BRAIN" in ASCII (0x42=B, 0x52=R, 0x41=A, 0x49=I, 0x4E=N).
+// Chosen to be memorable and unlikely to collide with any library-owned advisory lock.
+const migrationAdvisoryLockKey = int64(0x5B4149494E000001)
+
 // RunMigrations executes all *.sql files inside the given directory in
 // lexicographic order. Files already applied are safe to re-run because each
 // migration is idempotent (CREATE TABLE IF NOT EXISTS, etc.).
+//
+// Concurrent-startup serialisation: before executing any migration file,
+// RunMigrations acquires a PostgreSQL session-level advisory lock
+// (pg_advisory_lock) on migrationAdvisoryLockKey. When multiple service
+// instances (server, collector, eval-runner) start simultaneously each one
+// blocks on pg_advisory_lock until the holder finishes and releases via
+// pg_advisory_unlock. This prevents the 40P01 deadlock that previously
+// occurred when concurrent instances raced on DDL statements in the same
+// migration file.
 //
 // embeddingDim is the configured vector dimension (from EMBEDDING_DIM env var,
 // default 1536). When a migration file is named "011_configurable_embedding_dim.sql",
@@ -79,6 +97,40 @@ func NewPostgres(ctx context.Context, databaseURL string) (*Postgres, error) {
 // transaction, which is exactly what migration 011 reads via current_setting().
 // Any other migration file is executed via the pool as before.
 func (pg *Postgres) RunMigrations(ctx context.Context, migrationsDir string, embeddingDim int) error {
+	// Acquire a dedicated connection for the advisory lock.  The lock is
+	// session-level (not transaction-level) so it survives individual migration
+	// statements and is released when the connection is returned to the pool or
+	// explicitly unlocked below.
+	lockConn, err := pg.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire lock connection: %w", err)
+	}
+	defer lockConn.Release()
+
+	slog.Info("migration: acquiring advisory lock", "key", migrationAdvisoryLockKey)
+	if _, err := lockConn.Exec(ctx, "SELECT pg_advisory_lock($1)", migrationAdvisoryLockKey); err != nil {
+		return fmt.Errorf("acquire migration advisory lock: %w", err)
+	}
+	slog.Info("migration: advisory lock acquired")
+
+	// Always release the advisory lock, even on error.  pg_advisory_unlock on
+	// a connection that is about to be returned to the pool (or closed) would
+	// release automatically, but explicit unlock is cleaner and more readable.
+	//
+	// context.Background() is used intentionally: the caller's ctx may be
+	// cancelled (e.g. SIGTERM) by the time the defer fires. Using a cancelled
+	// context would cause pg_advisory_unlock to fail, leaking the session-level
+	// lock until the connection is closed by the pool. Background context ensures
+	// the unlock always succeeds even when the parent context is done.
+	defer func() {
+		unlockCtx := context.Background()
+		if _, unlockErr := lockConn.Exec(unlockCtx, "SELECT pg_advisory_unlock($1)", migrationAdvisoryLockKey); unlockErr != nil {
+			slog.Warn("migration: failed to release advisory lock", "error", unlockErr)
+		} else {
+			slog.Info("migration: advisory lock released")
+		}
+	}()
+
 	entries, err := os.ReadDir(migrationsDir)
 	if err != nil {
 		return fmt.Errorf("read migrations dir %q: %w", migrationsDir, err)
