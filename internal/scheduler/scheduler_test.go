@@ -90,6 +90,13 @@ func (m *mockStore) ActiveSourceIDSet(_ context.Context, _ model.SourceType) (ma
 	return map[string]struct{}{}, nil
 }
 
+// CountActiveDocuments satisfies DocumentUpserter (#148: promoted from optional
+// ActiveDocumentCounter to required interface method).
+// Returns 0 by default so the deletion-ratio guard never blocks in pure-mock tests.
+func (m *mockStore) CountActiveDocuments(_ context.Context, _ model.SourceType) (int, error) {
+	return 0, nil
+}
+
 // mockStoreErrorIDs is like mockStore but returns an error from ActiveSourceIDSet,
 // simulating a transient store failure during the indexed-ID pre-load.
 type mockStoreErrorIDs struct {

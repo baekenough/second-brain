@@ -463,6 +463,10 @@ func TestIsLocalWhisperEndpoint(t *testing.T) {
 		{"RFC1918 10.x", "http://10.0.0.5:9000/v1", true},
 		{"RFC1918 172.16.x", "http://172.16.1.1:9000/v1", true},
 		{"RFC1918 192.168.x", "http://192.168.1.100:9000/v1", true},
+		// Docker / compose single-label service names must be treated as local (#153).
+		{"docker service name whisper", "http://whisper:8000/v1", true},
+		{"docker service name whisper-api", "http://whisper-api:8000/v1", true},
+		{"docker service name myscvc", "http://myscvc:9000", true},
 		{"public OpenAI API", "https://api.openai.com/v1", false},
 		{"public IP", "http://1.2.3.4:9000/v1", false},
 		{"custom domain", "http://whisper.example.com/v1", false},

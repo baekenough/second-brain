@@ -109,6 +109,61 @@ func TestEvalPair_ZeroDocIDs(t *testing.T) {
 	}
 }
 
+// TestEvalPair_IrrelevantDocIDs verifies that IrrelevantDocIDs round-trips
+// through JSON correctly and is omitted when empty (omitempty).
+func TestEvalPair_IrrelevantDocIDs(t *testing.T) {
+	t.Parallel()
+
+	p := EvalPair{
+		ID:               3,
+		Query:            "search test",
+		RelevantDocIDs:   []string{"doc-001"},
+		IrrelevantDocIDs: []string{"doc-002", "doc-003"},
+		Source:           "feedback",
+		CreatedAt:        time.Now(),
+	}
+
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var got EvalPair
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.IrrelevantDocIDs) != 2 {
+		t.Errorf("IrrelevantDocIDs len = %d, want 2", len(got.IrrelevantDocIDs))
+	}
+	if got.IrrelevantDocIDs[0] != "doc-002" {
+		t.Errorf("IrrelevantDocIDs[0] = %q, want %q", got.IrrelevantDocIDs[0], "doc-002")
+	}
+}
+
+// TestEvalPair_IrrelevantDocIDs_OmitEmpty verifies that an EvalPair with nil
+// IrrelevantDocIDs does not include the field in the JSON output.
+func TestEvalPair_IrrelevantDocIDs_OmitEmpty(t *testing.T) {
+	t.Parallel()
+
+	p := EvalPair{
+		ID:             4,
+		Query:          "no negatives",
+		RelevantDocIDs: []string{"doc-100"},
+		Source:         "feedback",
+		CreatedAt:      time.Now(),
+		// IrrelevantDocIDs is nil — should be omitted
+	}
+
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	if strings.Contains(string(b), `"irrelevant_doc_ids"`) {
+		t.Errorf("expected irrelevant_doc_ids to be omitted, got: %s", b)
+	}
+}
+
 // TestEvalStore_ExportJSONL_InMemory exercises ExportJSONL with a fabricated
 // pairs slice by monkey-patching BuildFromFeedback via a helper that accepts
 // pairs directly — no database required.

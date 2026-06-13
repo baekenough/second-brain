@@ -125,7 +125,10 @@ services:
       dockerfile: Dockerfile
     image: second-brain-diarization:local
     environment:
-      HF_TOKEN: "${HF_TOKEN}"
+      # HF_TOKEN: required for first-time gated-model download; safe blank default
+      # suppresses the "variable is not set" compose warning when token is absent.
+      # Set HF_TOKEN in .env.local (see .env.local.example) or export it in your shell.
+      HF_TOKEN: "${HF_TOKEN:-}"
       DIARIZATION_DEVICE: "cpu"
     restart: unless-stopped
     networks:
@@ -142,6 +145,11 @@ services:
     environment:
       WHISPER__MODEL: Systran/faster-whisper-medium
       WHISPER__INFERENCE_DEVICE: cpu
+      # Explicitly set int8 to prevent the float16→float32 auto-fallback warning
+      # on Apple Silicon (arm64 CPU does not support efficient float16).
+      # int8 is the recommended CTranslate2 quantization for CPU-only inference:
+      # ~50% less memory than float32, faster decoding, negligible accuracy delta.
+      WHISPER__COMPUTE_TYPE: int8
       UVICORN_HOST: "0.0.0.0"
       UVICORN_PORT: "8000"
     restart: unless-stopped

@@ -118,6 +118,14 @@ func (s *ChunkStore) SearchFTS(ctx context.Context, query string, limit int) ([]
 		limit = 20
 	}
 
+	// The WHERE clause uses both the tsvector (GIN idx_chunks_tsv) and the
+	// pg_bigm LIKE condition (GIN idx_chunks_content_bigm) so that Korean
+	// partial-match queries that do not produce tsquery tokens still hit the
+	// bigm index (#146). The GREATEST() rank expression prefers the FTS rank
+	// when both conditions match; the bigm lane adds a small constant (0.01)
+	// so bigm-only matches rank above zero but well below true FTS hits.
+	// 0.01 (not 0.1) avoids over-weighting bigm-only matches relative to the
+	// ts_rank distribution, which typically ranges from 0.01 to ~0.5 (#146).
 	const q = `
 		SELECT
 			c.id,
@@ -126,13 +134,17 @@ func (s *ChunkStore) SearchFTS(ctx context.Context, query string, limit int) ([]
 			c.content,
 			c.byte_size,
 			c.created_at,
-			ts_rank(c.content_tsv, plainto_tsquery('simple', $1)) AS rank,
+			GREATEST(
+				ts_rank(c.content_tsv, plainto_tsquery('simple', $1)),
+				CASE WHEN c.content LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+			) AS rank,
 			d.title          AS document_title,
 			d.source_type    AS document_source,
 			d.status         AS document_status
 		FROM chunks c
 		JOIN documents d ON d.id = c.document_id
-		WHERE c.content_tsv @@ plainto_tsquery('simple', $1)
+		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
+		   OR c.content LIKE '%%' || $1 || '%%')
 		  AND d.status = 'active'
 		ORDER BY rank DESC
 		LIMIT $2`
@@ -272,6 +284,51 @@ func (s *ChunkStore) updateEmbeddingsBatch(ctx context.Context, embeddings []Chu
 		return fmt.Errorf("chunk update embeddings commit: %w", err)
 	}
 	return nil
+}
+
+// UnembeddedChunk is a minimal chunk record used for embedding backfill.
+// Only the fields necessary for embedding (ID and Content) are included.
+type UnembeddedChunk struct {
+	ID      int64
+	Content string
+}
+
+// ListUnembeddedChunks returns up to limit chunks whose embedding column is
+// NULL, ordered by created_at ASC (oldest first) so backfill progresses
+// forward in time.
+//
+// Only chunks belonging to active documents are included. Chunks for
+// soft-deleted documents are excluded — re-embedding them would waste quota.
+//
+// This is the per-chunk analogue of DocumentStore.ListUnembedded (#141).
+func (s *ChunkStore) ListUnembeddedChunks(ctx context.Context, limit int) ([]UnembeddedChunk, error) {
+	const q = `
+		SELECT c.id, c.content
+		FROM chunks c
+		JOIN documents d ON d.id = c.document_id
+		WHERE c.embedding IS NULL
+		  AND d.status = 'active'
+		ORDER BY c.created_at ASC
+		LIMIT $1`
+
+	rows, err := s.pg.pool.Query(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("chunks list unembedded: %w", err)
+	}
+	defer rows.Close()
+
+	var chunks []UnembeddedChunk
+	for rows.Next() {
+		var c UnembeddedChunk
+		if err := rows.Scan(&c.ID, &c.Content); err != nil {
+			return nil, fmt.Errorf("chunks list unembedded scan: %w", err)
+		}
+		chunks = append(chunks, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("chunks list unembedded iter: %w", err)
+	}
+	return chunks, nil
 }
 
 // SearchVector performs approximate nearest-neighbour (ANN) vector search over

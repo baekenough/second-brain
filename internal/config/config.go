@@ -213,6 +213,18 @@ type Config struct {
 
 	// Scheduler
 	CollectInterval time.Duration
+	// CollectIntervalPerSource holds per-source overrides for the global
+	// CollectInterval. Keys are the collector Name() strings; values are the
+	// desired intervals. Populated from COLLECT_INTERVAL_<NAME> env vars where
+	// <NAME> is the upper-cased, underscore-normalised collector name
+	// (e.g. COLLECT_INTERVAL_WHISPER, COLLECT_INTERVAL_FILESYSTEM).
+	// Only positive durations are stored; invalid or zero values are ignored.
+	CollectIntervalPerSource map[string]time.Duration
+
+	// DeletionRatioOverride bypasses the 50% deletion-ratio guard when true.
+	// Controlled by DELETION_RATIO_OVERRIDE=true. Use only for legitimate large
+	// one-off deletions (see scheduler.WithDeletionRatioOverride for trade-offs).
+	DeletionRatioOverride bool
 
 	// CollectorInstance is the per-host identifier used to key the
 	// collector_state watermark table. Defaults to os.Hostname() (or
@@ -433,9 +445,14 @@ func Load() (*Config, error) {
 
 		SummarizerBackfillEnabled: summarizerBackfill,
 
-		CollectInterval:   interval,
-		CollectorInstance: collectorInstance,
-		CollectorCutover:  collectorCutover(),
+		CollectInterval:          interval,
+		CollectIntervalPerSource: collectIntervalPerSource(),
+		CollectorInstance:        collectorInstance,
+		CollectorCutover:         collectorCutover(),
+
+		// #147 escape hatch: bypasses deletion-ratio guard when set.
+		// See Scheduler.WithDeletionRatioOverride for trade-offs.
+		DeletionRatioOverride: os.Getenv("DELETION_RATIO_OVERRIDE") == "true",
 	}, nil
 }
 
@@ -646,6 +663,57 @@ func collectorCutover() time.Time {
 		return time.Time{}
 	}
 	return t.UTC()
+}
+
+// collectIntervalPerSource reads per-source interval overrides from the environment.
+//
+// For each known collector name N (in its canonical form), it looks for
+// COLLECT_INTERVAL_<UPPER_N> where hyphens and spaces are replaced by underscores.
+// For example:
+//   - COLLECT_INTERVAL_WHISPER    → "whisper"
+//   - COLLECT_INTERVAL_FILESYSTEM → "filesystem"
+//   - COLLECT_INTERVAL_SMS        → "sms"
+//   - COLLECT_INTERVAL_GMAIL      → "gmail"
+//
+// Only positive, parseable durations are stored; missing or invalid values are
+// silently ignored so unrelated collectors fall back to the global COLLECT_INTERVAL.
+func collectIntervalPerSource() map[string]time.Duration {
+	// Canonical collector names (must match collector.Name() return values).
+	knownCollectors := []string{
+		"whisper",
+		"filesystem",
+		"sms",
+		"gmail",
+		"calendar",
+		"slack",
+		"discord",
+		"github",
+		"gdrive",
+		"notion",
+		"telegram",
+		"llm-memory",
+	}
+
+	result := make(map[string]time.Duration, len(knownCollectors))
+	for _, name := range knownCollectors {
+		// Transform "llm-memory" → "LLM_MEMORY" for the env var key.
+		envKey := "COLLECT_INTERVAL_" + strings.ToUpper(strings.NewReplacer("-", "_", " ", "_").Replace(name))
+		v := os.Getenv(envKey)
+		if v == "" {
+			continue
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			slog.Warn("config: per-source COLLECT_INTERVAL is invalid; using global interval",
+				"env", envKey,
+				"value", v,
+				"error", err,
+			)
+			continue
+		}
+		result[name] = d
+	}
+	return result
 }
 
 // normalizeExts ensures every extension starts with a leading dot and is lowercase.

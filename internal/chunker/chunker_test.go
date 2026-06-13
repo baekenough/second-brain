@@ -165,6 +165,63 @@ func TestSplit_DefaultOptions(t *testing.T) {
 	}
 }
 
+// TestSplit_Korean_RuneBasedSize verifies that TargetSize operates on runes,
+// not bytes. A Korean text with N runes should be treated identically to an
+// ASCII text with the same N characters when deciding whether to split (#145).
+func TestSplit_Korean_RuneBasedSize(t *testing.T) {
+	t.Parallel()
+
+	// "가" is 3 bytes in UTF-8 but 1 rune.
+	// With TargetSize=10 (runes), a 10-rune Korean string must fit in ONE chunk.
+	// Previously (byte-based) this would have split at ~3-4 runes.
+	koreanChar := "가"
+	text10Runes := strings.Repeat(koreanChar, 10) // 10 runes = 30 bytes
+	got := Split(text10Runes, Options{TargetSize: 10, MaxSize: 20})
+	if len(got) != 1 {
+		t.Fatalf("10-rune Korean text with TargetSize=10 should be 1 chunk (rune-based), got %d: %v", len(got), got)
+	}
+
+	// A 25-rune Korean string must be split when TargetSize=10.
+	text25Runes := strings.Repeat(koreanChar, 5) + "\n\n" +
+		strings.Repeat(koreanChar, 5) + "\n\n" +
+		strings.Repeat(koreanChar, 5) // 15 runes across 3 paragraphs
+	got2 := Split(text25Runes, Options{TargetSize: 7, MaxSize: 14})
+	if len(got2) < 2 {
+		t.Fatalf("15-rune Korean text (3 paragraphs) with TargetSize=7 should split, got %d", len(got2))
+	}
+	// All chunks must be valid UTF-8 (no mid-rune cuts).
+	for i, c := range got2 {
+		for _, r := range c {
+			if r == '�' {
+				t.Errorf("chunk %d contains invalid UTF-8 replacement rune", i)
+			}
+		}
+	}
+}
+
+// TestSplit_Korean_RuneBasedOverlap verifies that overlap is applied in runes
+// so Korean overlap windows contain the expected number of characters (#145).
+func TestSplit_Korean_RuneBasedOverlap(t *testing.T) {
+	t.Parallel()
+
+	// Two paragraphs each of 5 Korean characters. With TargetSize=5 they stay
+	// separate. Overlap=2 runes should prepend the last 2 Korean chars of
+	// chunk[0] to chunk[1].
+	para1 := strings.Repeat("가", 5) // 5 runes
+	para2 := strings.Repeat("나", 5) // 5 runes
+	text := para1 + "\n\n" + para2
+
+	got := Split(text, Options{TargetSize: 5, MaxSize: 10, Overlap: 2})
+	if len(got) < 2 {
+		t.Fatalf("expected at least 2 chunks, got %d", len(got))
+	}
+	// chunk[1] should start with the last 2 runes of chunk[0]: "가가"
+	expectedPrefix := strings.Repeat("가", 2)
+	if !strings.HasPrefix(got[1], expectedPrefix) {
+		t.Errorf("chunk[1] should start with 2-rune overlap %q, got: %q", expectedPrefix, got[1])
+	}
+}
+
 // ---------------------------------------------------------------------------
 // detectSections tests
 // ---------------------------------------------------------------------------

@@ -95,12 +95,22 @@ type SearchWeights struct {
 	// This disambiguates "I haven't set SummaryVec" (zero, gate applies) from
 	// "I explicitly want SummaryVec disabled" (DisableSummaryVec=true).
 	DisableSummaryVec bool `json:"disable_summary_vec,omitempty"`
-	RRFK              float64 `json:"rrf_k"`
+	// EntityWeight is the RRF weight for the entity-match lane (#139).
+	// When zero (the default) the entity lane is enabled at DefaultEntityWeight
+	// when ENTITY_EXTRACTION_ENABLED env var is set; set to a negative value
+	// to explicitly disable. The lane is a no-op when no entity rows exist for
+	// the query's matched entities.
+	EntityWeight float64 `json:"entity_weight,omitempty"`
+	RRFK         float64 `json:"rrf_k"`
 }
 
 // DefaultSummaryVecWeight is the weight used for the summary_embedding RRF
 // signal once summary coverage exceeds SummaryVecCoverageThreshold.
 const DefaultSummaryVecWeight = 0.8
+
+// DefaultEntityWeight is the RRF weight used for the entity-match lane (#139)
+// when ENTITY_EXTRACTION_ENABLED is set and EntityWeight is unset (zero).
+const DefaultEntityWeight = 0.5
 
 // SummaryVecCoverageThreshold returns the minimum fraction (0–1) of active
 // documents that must have a non-NULL summary_embedding before the summvec
@@ -152,6 +162,12 @@ func (w SearchWeights) Defaults() SearchWeights {
 	// DefaultSummaryVecWeight (0.8) when coverage is sufficient, or 0.0 when not.
 	if math.IsNaN(w.SummaryVec) || math.IsInf(w.SummaryVec, 0) || w.SummaryVec < 0 {
 		w.SummaryVec = DefaultSummaryVecWeight
+	}
+	// EntityWeight (#139): negative values explicitly disable the lane (weight=0).
+	// Zero (unset) is resolved in hybridSearch based on ENTITY_EXTRACTION_ENABLED.
+	// NaN/Inf are invalid and are treated as "unset" (zero).
+	if math.IsNaN(w.EntityWeight) || math.IsInf(w.EntityWeight, 0) {
+		w.EntityWeight = 0.0 // treat invalid as unset; gate resolves in hybridSearch
 	}
 	return w
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -16,6 +17,41 @@ import (
 
 	"github.com/baekenough/second-brain/internal/auth"
 )
+
+// embedRetryDelays defines the exponential backoff delays applied between
+// embed request retries. Consistent with the R004 error handling policy and
+// the llm.Client pattern (maxRetries=2): attempt 0 succeeds or falls through
+// to attempt 1 after 1s, then attempt 2 after 2s, then attempt 3 after 4s.
+var embedRetryDelays = []time.Duration{
+	1 * time.Second,
+	2 * time.Second,
+	4 * time.Second,
+}
+
+// embedMaxRetries is the maximum number of retry attempts for transient errors
+// (5xx, network failures) and 429 rate-limit responses. Must equal len(embedRetryDelays).
+const embedMaxRetries = 3
+
+// parseRetryAfter parses the Retry-After header value. It supports both the
+// delay-seconds form (integer number of seconds) and the HTTP-date form.
+// Returns 0 when the header is absent or cannot be parsed.
+func parseRetryAfter(h string) time.Duration {
+	if h == "" {
+		return 0
+	}
+	// Try delay-seconds first (most common for OpenAI / 429 responses).
+	if secs, err := strconv.Atoi(h); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	// Try HTTP-date form.
+	if t, err := http.ParseTime(h); err == nil {
+		d := time.Until(t)
+		if d > 0 {
+			return d
+		}
+	}
+	return 0
+}
 
 // maxEmbedTokens is the token ceiling for a single embedding input.
 // OpenAI text-embedding-3-small hard limit is 8,192 tokens; we use 8,000
@@ -146,6 +182,12 @@ func (c *EmbedClient) Enabled() bool { return c.apiURL != "" }
 // text is silently truncated to maxEmbedTokens cl100k_base tokens before
 // sending to the API (falls back to rune-based truncation when the offline
 // encoder is unavailable).
+//
+// Transient errors (5xx, network failures) and 429 rate-limit responses are
+// retried up to embedMaxRetries times with exponential backoff (1s/2s/4s).
+// When the server returns a Retry-After header with a longer delay, that delay
+// is honoured instead of the default backoff interval.
+// 4xx errors other than 429 are not retried.
 func (c *EmbedClient) Embed(ctx context.Context, text string) ([]float32, error) {
 	if !c.Enabled() {
 		return nil, nil
@@ -162,42 +204,95 @@ func (c *EmbedClient) Embed(ctx context.Context, text string) ([]float32, error)
 		return nil, fmt.Errorf("embed marshal: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.apiURL+"/embeddings", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("embed build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if err := c.setAuth(req); err != nil {
-		return nil, err
+	var lastErr error
+	for attempt := 0; attempt <= embedMaxRetries; attempt++ {
+		if attempt > 0 {
+			delay := embedRetryDelays[attempt-1]
+			slog.Warn("embed: retrying after transient error",
+				"attempt", attempt,
+				"max_retries", embedMaxRetries,
+				"delay", delay,
+				"error", lastErr,
+			)
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("embed: context cancelled during retry: %w", ctx.Err())
+			case <-time.After(delay):
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			c.apiURL+"/embeddings", bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("embed build request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if err := c.setAuth(req); err != nil {
+			return nil, err
+		}
+
+		res, err := c.client.Do(req)
+		if err != nil {
+			// Network-level error — retryable.
+			lastErr = fmt.Errorf("embed request: %w", err)
+			continue
+		}
+
+		b, readErr := io.ReadAll(res.Body)
+		res.Body.Close()
+		if readErr != nil {
+			lastErr = fmt.Errorf("embed read response: %w", readErr)
+			continue
+		}
+
+		switch {
+		case res.StatusCode == http.StatusTooManyRequests:
+			// 429 — honour Retry-After if present, else use backoff schedule.
+			retryAfter := parseRetryAfter(res.Header.Get("Retry-After"))
+			if attempt < embedMaxRetries {
+				delay := embedRetryDelays[attempt]
+				if retryAfter > delay {
+					delay = retryAfter
+				}
+				slog.Warn("embed: rate limited (429), backing off",
+					"attempt", attempt,
+					"delay", delay,
+					"retry_after_header", res.Header.Get("Retry-After"),
+				)
+				select {
+				case <-ctx.Done():
+					return nil, fmt.Errorf("embed: context cancelled during 429 backoff: %w", ctx.Err())
+				case <-time.After(delay):
+				}
+			}
+			lastErr = fmt.Errorf("embed API status 429: %s", b)
+			continue
+
+		case res.StatusCode >= 500:
+			// 5xx server error — retryable.
+			lastErr = fmt.Errorf("embed API status %d: %s", res.StatusCode, b)
+			continue
+
+		case res.StatusCode != http.StatusOK:
+			// 4xx (non-429) — not retryable.
+			return nil, fmt.Errorf("embed API status %d: %s", res.StatusCode, b)
+		}
+
+		var resp struct {
+			Data []struct {
+				Embedding []float32 `json:"embedding"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(b, &resp); err != nil {
+			return nil, fmt.Errorf("embed unmarshal: %w", err)
+		}
+		if len(resp.Data) == 0 || len(resp.Data[0].Embedding) == 0 {
+			return nil, fmt.Errorf("embed: empty embedding in response")
+		}
+		return resp.Data[0].Embedding, nil
 	}
 
-	res, err := c.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("embed request: %w", err)
-	}
-	defer res.Body.Close()
-
-	b, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, fmt.Errorf("embed read response: %w", err)
-	}
-	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("embed API status %d: %s", res.StatusCode, b)
-	}
-
-	var resp struct {
-		Data []struct {
-			Embedding []float32 `json:"embedding"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(b, &resp); err != nil {
-		return nil, fmt.Errorf("embed unmarshal: %w", err)
-	}
-	if len(resp.Data) == 0 || len(resp.Data[0].Embedding) == 0 {
-		return nil, fmt.Errorf("embed: empty embedding in response")
-	}
-	return resp.Data[0].Embedding, nil
+	return nil, fmt.Errorf("embed: all retries exhausted: %w", lastErr)
 }
 
 // Sub-batch character budget constants.
@@ -275,6 +370,10 @@ func (c *EmbedClient) EmbedBatch(ctx context.Context, texts []string) ([][]float
 // returns the embedding vectors in the order returned by the API (reordered by
 // the index field). Callers are responsible for ensuring the texts fit within
 // the API's per-request token limit.
+//
+// Transient errors (5xx, network failures) and 429 rate-limit responses are
+// retried up to embedMaxRetries times with exponential backoff (1s/2s/4s),
+// honouring the Retry-After header when present.
 func (c *EmbedClient) embedBatchOnce(ctx context.Context, texts []string) ([][]float32, error) {
 	payload := map[string]interface{}{
 		"input": texts,
@@ -285,47 +384,98 @@ func (c *EmbedClient) embedBatchOnce(ctx context.Context, texts []string) ([][]f
 		return nil, fmt.Errorf("embed batch marshal: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.apiURL+"/embeddings", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if err := c.setAuth(req); err != nil {
-		return nil, err
-	}
-
-	res, err := c.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("embed batch request: %w", err)
-	}
-	defer res.Body.Close()
-
-	b, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, err
-	}
-	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("embed batch API status %d: %s", res.StatusCode, b)
-	}
-
-	var resp struct {
-		Data []struct {
-			Index     int       `json:"index"`
-			Embedding []float32 `json:"embedding"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(b, &resp); err != nil {
-		return nil, err
-	}
-
-	out := make([][]float32, len(texts))
-	for _, d := range resp.Data {
-		if d.Index < len(out) {
-			out[d.Index] = d.Embedding
+	var lastErr error
+	for attempt := 0; attempt <= embedMaxRetries; attempt++ {
+		if attempt > 0 {
+			delay := embedRetryDelays[attempt-1]
+			slog.Warn("embed batch: retrying after transient error",
+				"attempt", attempt,
+				"max_retries", embedMaxRetries,
+				"delay", delay,
+				"error", lastErr,
+			)
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("embed batch: context cancelled during retry: %w", ctx.Err())
+			case <-time.After(delay):
+			}
 		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			c.apiURL+"/embeddings", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if err := c.setAuth(req); err != nil {
+			return nil, err
+		}
+
+		res, err := c.client.Do(req)
+		if err != nil {
+			// Network-level error — retryable.
+			lastErr = fmt.Errorf("embed batch request: %w", err)
+			continue
+		}
+
+		b, readErr := io.ReadAll(res.Body)
+		res.Body.Close()
+		if readErr != nil {
+			lastErr = fmt.Errorf("embed batch read response: %w", readErr)
+			continue
+		}
+
+		switch {
+		case res.StatusCode == http.StatusTooManyRequests:
+			retryAfter := parseRetryAfter(res.Header.Get("Retry-After"))
+			if attempt < embedMaxRetries {
+				delay := embedRetryDelays[attempt]
+				if retryAfter > delay {
+					delay = retryAfter
+				}
+				slog.Warn("embed batch: rate limited (429), backing off",
+					"attempt", attempt,
+					"delay", delay,
+					"retry_after_header", res.Header.Get("Retry-After"),
+				)
+				select {
+				case <-ctx.Done():
+					return nil, fmt.Errorf("embed batch: context cancelled during 429 backoff: %w", ctx.Err())
+				case <-time.After(delay):
+				}
+			}
+			lastErr = fmt.Errorf("embed batch API status 429: %s", b)
+			continue
+
+		case res.StatusCode >= 500:
+			lastErr = fmt.Errorf("embed batch API status %d: %s", res.StatusCode, b)
+			continue
+
+		case res.StatusCode != http.StatusOK:
+			// 4xx (non-429) — not retryable.
+			return nil, fmt.Errorf("embed batch API status %d: %s", res.StatusCode, b)
+		}
+
+		var resp struct {
+			Data []struct {
+				Index     int       `json:"index"`
+				Embedding []float32 `json:"embedding"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(b, &resp); err != nil {
+			return nil, fmt.Errorf("embed batch unmarshal: %w", err)
+		}
+
+		out := make([][]float32, len(texts))
+		for _, d := range resp.Data {
+			if d.Index < len(out) {
+				out[d.Index] = d.Embedding
+			}
+		}
+		return out, nil
 	}
-	return out, nil
+
+	return nil, fmt.Errorf("embed batch: all retries exhausted: %w", lastErr)
 }
 
 // setAuth attaches the Authorization header when a token source is configured.

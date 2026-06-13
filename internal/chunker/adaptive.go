@@ -28,11 +28,14 @@ import (
 	"github.com/baekenough/second-brain/internal/model"
 )
 
-// Per-source-type size constants.
-// Long-form/structured sources keep the global scheduler defaults (2000/4000/100).
+// Per-source-type size constants — all values are in RUNES, not bytes (#145).
+// Using runes ensures Korean text (3 bytes/rune) receives the same information
+// density per chunk as ASCII text. Long-form/structured sources keep the global
+// scheduler defaults (2000/4000/100 runes).
 const (
 	// Long-form structured (filesystem, notion, github, gdrive).
 	// Same as the scheduler's defaultChunk* constants so there is no regression.
+	// Units: runes (previously bytes — value unchanged; rune=byte for ASCII).
 	longFormTargetSize = 2000
 	longFormMaxSize    = 4000
 	longFormOverlap    = 100
@@ -40,12 +43,15 @@ const (
 	// Short chat (slack, discord, telegram).
 	// Chat turns are short and contain no heading structure.  Smaller chunks
 	// improve retrieval granularity (better SC and RC scores).
+	// Units: runes. chatMaxSize=1500 runes ≈ 4500 bytes for Korean, giving
+	// each chunk ~3x more Korean content than the previous byte-based limit.
 	chatTargetSize = 900
 	chatMaxSize    = 1500
 	chatOverlap    = 80
 
 	// Memory / agent sources (secretary, llm-memory).
 	// Mid-sized chunks: these documents are dense but still prose-like.
+	// Units: runes.
 	memTargetSize = 1200
 	memMaxSize    = 2500
 	memOverlap    = 100

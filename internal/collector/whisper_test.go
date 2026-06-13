@@ -969,3 +969,140 @@ func TestWhisperCollector_Collect_TooSmallFileSkipped(t *testing.T) {
 		t.Error("whisper server was called for tiny file — must be skipped")
 	}
 }
+
+// TestWhisperCollector_CorruptM4A_Quarantined verifies that a corrupt audio file
+// is moved to the .quarantine/ subdirectory of the audio dir after the first
+// failed pre-check (#152). The file must no longer exist at its original path,
+// and the quarantine dir must contain the file.
+func TestWhisperCollector_CorruptM4A_Quarantined(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	serverCalled := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverCalled = true
+		http.Error(w, "should not be called", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	corruptPath := writeCorruptM4A(t, dir, "corrupt.m4a", now)
+
+	cfg := &config.Config{
+		WhisperAudioDir: dir,
+		WhisperAPIURL:   srv.URL,
+		WhisperModel:    "whisper-1",
+		WhisperLanguage: "ko",
+	}
+	c := makeWhisperCollector(cfg, srv)
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect() error: %v", err)
+	}
+	if len(docs) != 0 {
+		t.Errorf("Collect() returned %d docs, want 0", len(docs))
+	}
+	if serverCalled {
+		t.Error("whisper server was called for corrupt file — must be quarantined before HTTP call")
+	}
+
+	// Original path must be gone.
+	if _, statErr := os.Stat(corruptPath); !os.IsNotExist(statErr) {
+		t.Errorf("corrupt file still exists at original path %q after quarantine", corruptPath)
+	}
+
+	// Quarantine dir must exist and contain the file.
+	qDir := filepath.Join(dir, ".quarantine")
+	qPath := filepath.Join(qDir, "corrupt.m4a")
+	if _, statErr := os.Stat(qPath); os.IsNotExist(statErr) {
+		t.Errorf("corrupt file not found in quarantine dir %q", qPath)
+	}
+}
+
+// TestWhisperCollector_CorruptM4A_QuarantinedDoesNotRetry verifies that a
+// quarantined corrupt file is NOT retried on a subsequent Collect call — it must
+// no longer be in the audio dir tree after the first quarantine move (#152).
+func TestWhisperCollector_CorruptM4A_QuarantinedDoesNotRetry(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		http.Error(w, "should not be called", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	writeCorruptM4A(t, dir, "corrupt.m4a", now)
+
+	cfg := &config.Config{
+		WhisperAudioDir: dir,
+		WhisperAPIURL:   srv.URL,
+		WhisperModel:    "whisper-1",
+	}
+	c := makeWhisperCollector(cfg, srv)
+
+	// First collect — file is quarantined.
+	if _, err := c.Collect(context.Background(), time.Time{}); err != nil {
+		t.Fatalf("first Collect() error: %v", err)
+	}
+
+	// Second collect — file must not be revisited (it is in .quarantine/, not the audio dir).
+	serverCallsBefore := callCount
+	if _, err := c.Collect(context.Background(), time.Time{}); err != nil {
+		t.Fatalf("second Collect() error: %v", err)
+	}
+	if callCount != serverCallsBefore {
+		t.Errorf("server called on second collect — quarantined file must not be retried")
+	}
+}
+
+// TestWhisperCollector_CorruptM4A_SidecarMovedToQuarantine verifies that when a
+// corrupt audio file has an associated sidecar (.meta.json), both files are moved
+// to the quarantine directory together (#152).
+func TestWhisperCollector_CorruptM4A_SidecarMovedToQuarantine(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "should not be called", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	corruptPath := writeCorruptM4A(t, dir, "corrupt.m4a", now)
+
+	// Write a sidecar alongside the corrupt file.
+	sidecarPath := corruptPath + ".meta.json"
+	sidecarContent := []byte(`{"contact_name":"테스트","direction":"incoming"}`)
+	if err := os.WriteFile(sidecarPath, sidecarContent, 0o600); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+
+	cfg := &config.Config{
+		WhisperAudioDir: dir,
+		WhisperAPIURL:   srv.URL,
+		WhisperModel:    "whisper-1",
+	}
+	c := makeWhisperCollector(cfg, srv)
+
+	if _, err := c.Collect(context.Background(), time.Time{}); err != nil {
+		t.Fatalf("Collect() error: %v", err)
+	}
+
+	// Original sidecar must be gone.
+	if _, statErr := os.Stat(sidecarPath); !os.IsNotExist(statErr) {
+		t.Errorf("sidecar still exists at original path %q", sidecarPath)
+	}
+
+	// Quarantine dir must contain the sidecar.
+	qSidecar := filepath.Join(dir, ".quarantine", "corrupt.m4a.meta.json")
+	if _, statErr := os.Stat(qSidecar); os.IsNotExist(statErr) {
+		t.Errorf("sidecar not found in quarantine dir %q", qSidecar)
+	}
+}

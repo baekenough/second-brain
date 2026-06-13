@@ -222,3 +222,100 @@ func TestAggregate_SinglePerfect(t *testing.T) {
 		t.Fatalf("MRR10: want 1.0, got %f", m.MRR10)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// FalsePositivePenalty tests (#140)
+// ---------------------------------------------------------------------------
+
+func TestFalsePositivePenalty_NoIrrelevant(t *testing.T) {
+	t.Parallel()
+
+	results := []string{"a", "b", "c"}
+	irrelevant := map[string]bool{}
+	got := search.FalsePositivePenalty(results, irrelevant, 3)
+	if got != 0 {
+		t.Fatalf("empty irrelevant: want 0, got %f", got)
+	}
+}
+
+func TestFalsePositivePenalty_AllFP(t *testing.T) {
+	t.Parallel()
+
+	// All top-3 results are irrelevant → penalty = 1.0.
+	results := []string{"a", "b", "c", "d"}
+	irrelevant := map[string]bool{"a": true, "b": true, "c": true}
+	got := search.FalsePositivePenalty(results, irrelevant, 3)
+	if !almostEqual(got, 1.0) {
+		t.Fatalf("all FP: want 1.0, got %f", got)
+	}
+}
+
+func TestFalsePositivePenalty_HalfFP(t *testing.T) {
+	t.Parallel()
+
+	// 1 out of 2 top results is irrelevant → penalty = 0.5 (FP/k = 1/2).
+	results := []string{"a", "b"}
+	irrelevant := map[string]bool{"a": true}
+	got := search.FalsePositivePenalty(results, irrelevant, 2)
+	if !almostEqual(got, 0.5) {
+		t.Fatalf("half FP: want 0.5, got %f", got)
+	}
+}
+
+func TestFalsePositivePenalty_KZero(t *testing.T) {
+	t.Parallel()
+
+	results := []string{"a", "b"}
+	irrelevant := map[string]bool{"a": true}
+	got := search.FalsePositivePenalty(results, irrelevant, 0)
+	if got != 0 {
+		t.Fatalf("k=0: want 0, got %f", got)
+	}
+}
+
+func TestFalsePositivePenalty_IrrelevantBeyondK(t *testing.T) {
+	t.Parallel()
+
+	// Irrelevant doc appears at position 3 but k=2 → not counted.
+	results := []string{"x", "y", "a"}
+	irrelevant := map[string]bool{"a": true}
+	got := search.FalsePositivePenalty(results, irrelevant, 2)
+	if got != 0 {
+		t.Fatalf("irrelevant beyond k: want 0, got %f", got)
+	}
+}
+
+func TestAggregateFPPenalty_NoIrrelevantSets(t *testing.T) {
+	t.Parallel()
+
+	results := [][]string{{"a", "b"}, {"c", "d"}}
+	irrelevant := []map[string]bool{{}, {}} // all empty
+	got := search.AggregateFPPenalty(results, irrelevant, 10)
+	if got != 0 {
+		t.Fatalf("no irrelevant sets: want 0, got %f", got)
+	}
+}
+
+func TestAggregateFPPenalty_Mixed(t *testing.T) {
+	t.Parallel()
+
+	// Query 1: 1/2 FP. Query 2: no irrelevant. Average = 0.5/1 = 0.5.
+	results := [][]string{{"a", "b"}, {"c", "d"}}
+	irrelevant := []map[string]bool{
+		{"a": true}, // 1 FP out of k=2 → 0.5
+		{},          // no irrelevant → skipped
+	}
+	got := search.AggregateFPPenalty(results, irrelevant, 2)
+	if !almostEqual(got, 0.5) {
+		t.Fatalf("mixed: want 0.5, got %f", got)
+	}
+}
+
+func TestAggregateFPPenalty_Empty(t *testing.T) {
+	t.Parallel()
+
+	got := search.AggregateFPPenalty(nil, nil, 10)
+	if got != 0 {
+		t.Fatalf("empty: want 0, got %f", got)
+	}
+}

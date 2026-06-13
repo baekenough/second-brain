@@ -2,6 +2,58 @@ package search
 
 import "math"
 
+// FalsePositivePenalty computes the proportion of top-K results that are
+// explicitly marked as irrelevant (thumbs=-1) for a single query.
+//
+// A false positive (FP) is a document that appears in the top-K results but
+// is in the irrelevant set. The penalty is the fraction of top-K slots that
+// are FPs: penalty = |top-K ∩ irrelevant| / K.
+//
+// Returns 0 when irrelevant is empty or k <= 0.
+// A score of 0 means no false positives; 1.0 means all top-K results are FPs.
+func FalsePositivePenalty(results []string, irrelevant map[string]bool, k int) float64 {
+	if len(irrelevant) == 0 || k <= 0 {
+		return 0
+	}
+	limit := len(results)
+	if k < limit {
+		limit = k
+	}
+	if limit == 0 {
+		return 0
+	}
+	fps := 0
+	for i := 0; i < limit; i++ {
+		if irrelevant[results[i]] {
+			fps++
+		}
+	}
+	return float64(fps) / float64(k)
+}
+
+// AggregateFPPenalty computes the macro-average FalsePositivePenalty over all
+// queries in the eval set. results[i] and irrelevant[i] must have equal length.
+// Returns 0 when the inputs are empty or when no irrelevant sets are provided.
+func AggregateFPPenalty(results [][]string, irrelevant []map[string]bool, k int) float64 {
+	n := len(results)
+	if n == 0 || len(results) != len(irrelevant) {
+		return 0
+	}
+	var total float64
+	count := 0
+	for i := 0; i < n; i++ {
+		if len(irrelevant[i]) == 0 {
+			continue // skip queries with no irrelevant labels
+		}
+		total += FalsePositivePenalty(results[i], irrelevant[i], k)
+		count++
+	}
+	if count == 0 {
+		return 0
+	}
+	return total / float64(count)
+}
+
 // NDCGK computes Normalised Discounted Cumulative Gain at rank K for a single
 // query. results contains document IDs in ranked order (position 0 = rank 1).
 // relevant is the ground-truth set of relevant document IDs. k is the cutoff;

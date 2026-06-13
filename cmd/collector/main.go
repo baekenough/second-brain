@@ -227,9 +227,9 @@ func run() error {
 			collector.NewFilesystemCollectorWithDriveExport(cfg.FilesystemPath, driveExporter).
 				WithExcludes(cfg.FilesystemExcludeDirs, cfg.FilesystemExcludeExts))
 	}
-	if cfg.SecretaryDBPath != "" {
-		collectors = append(collectors, collector.NewSecretaryCollector(cfg.SecretaryDBPath))
-	}
+	// SecretaryCollector was decommissioned in #101 and removed in #151.
+	// The SECRETARY_DB_PATH env var and model.SourceSecretary constant are
+	// intentionally kept for backward-compatibility with existing DB rows.
 	if cfg.LLMMemoryDBPath != "" {
 		collectors = append(collectors, collector.NewLLMMemoryCollector(cfg.LLMMemoryDBPath))
 	}
@@ -240,12 +240,16 @@ func run() error {
 	sched := scheduler.New(docStore, embedClient, collectors...).
 		WithChunkStore(chunkStore).
 		WithInstance(cfg.CollectorInstance).
-		WithCutover(cfg.CollectorCutover)
+		WithCutover(cfg.CollectorCutover).
+		WithDeletionRatioOverride(cfg.DeletionRatioOverride)
 	if entityExtractionEnabled {
 		sched = sched.WithEntityExtraction(entityStore, llmClient)
 	}
+	if cfg.DeletionRatioOverride {
+		slog.Warn("deletion ratio override active — 50% guard bypassed (DELETION_RATIO_OVERRIDE=true)")
+	}
 	slog.Info("collector instance", "id", cfg.CollectorInstance)
-	if err := sched.Register(cfg.CollectInterval); err != nil {
+	if err := sched.Register(cfg.CollectInterval, cfg.CollectIntervalPerSource); err != nil {
 		return err
 	}
 	sched.Start()

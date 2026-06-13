@@ -29,6 +29,12 @@ type DocumentUpserter interface {
 	UpdateCollectorState(ctx context.Context, instanceID string, src model.SourceType, lastCollectedAt time.Time) error
 	RecordCollectionLog(ctx context.Context, src model.SourceType, started time.Time, count int, err error) error
 	MarkDeleted(ctx context.Context, sourceType model.SourceType, activeIDs []string) (int, error)
+	// CountActiveDocuments returns the number of active (non-deleted) documents for
+	// the given source type. Required for the deletion-ratio sanity check (#148):
+	// promoting this from an optional type-assertion to a required interface method
+	// ensures the guard is always enforced at compile time — no store can silently
+	// bypass the ratio check by omitting the method.
+	CountActiveDocuments(ctx context.Context, sourceType model.SourceType) (int, error)
 	// ListUnembedded returns up to limit active documents with a NULL embedding.
 	ListUnembedded(ctx context.Context, limit int) ([]*model.Document, error)
 	// UpdateEmbedding persists the embedding vector for a single document.
@@ -39,12 +45,10 @@ type DocumentUpserter interface {
 	ActiveSourceIDSet(ctx context.Context, sourceType model.SourceType) (map[string]struct{}, error)
 }
 
-// ActiveDocumentCounter is an optional extension of DocumentUpserter. When the
-// store implements it, the scheduler uses it to perform a deletion-ratio
-// sanity check before calling MarkDeleted. If the ratio of documents that
-// would be deleted exceeds deletionRatioThreshold the deletion is skipped and
-// a warning is logged — this guards against bulk data-loss caused by a
-// partially unmounted or glitching filesystem.
+// ActiveDocumentCounter is retained for backward compatibility and for use by
+// external callers that only need the count method (e.g. collection_status store
+// query). It is now also satisfied by any DocumentUpserter implementation since
+// CountActiveDocuments is a required method on that interface (#148).
 type ActiveDocumentCounter interface {
 	CountActiveDocuments(ctx context.Context, sourceType model.SourceType) (int, error)
 }
@@ -93,6 +97,17 @@ type Scheduler struct {
 	llmClient   llm.Completer      // nil when entity extraction is disabled
 	instanceID  string             // per-instance watermark key (e.g., "laptop", "host1", "host2")
 	cutover     time.Time          // zero = floor disabled; propagated to CutoverAwareCollectors
+	// deletionRatioOverride, when true, bypasses the 50% deletion-ratio guard for
+	// a single MarkDeleted pass. This is an escape hatch for legitimate large-scale
+	// deletions (e.g. a user genuinely deletes >50% of a source's files) that would
+	// otherwise be permanently blocked by the guard (#147).
+	//
+	// Trade-off: bypassing the guard removes protection against false-positives caused
+	// by partial unmounts or transient filesystem errors. Use only when you are certain
+	// the source root is fully mounted and the large deletion is intentional.
+	// Set DELETION_RATIO_OVERRIDE=true in the environment; the scheduler reads it at
+	// construction time via WithDeletionRatioOverride.
+	deletionRatioOverride bool
 
 	// running is a global guard used by runAll / TriggerAll to prevent a
 	// "run all collectors" operation from overlapping with another one.
@@ -182,7 +197,43 @@ func (s *Scheduler) WithCutover(t time.Time) *Scheduler {
 	return s
 }
 
-// Register adds ONE cron job PER enabled collector (each "@every interval").
+// WithDeletionRatioOverride enables the escape hatch for the deletion-ratio
+// guard. When enabled=true, the 50% ratio check is skipped for the current
+// scheduler instance — MarkDeleted will run regardless of the deletion fraction.
+//
+// Use this ONLY when you are certain that a legitimate large-scale deletion
+// (>50% of a source's documents) needs to proceed. The guard exists to prevent
+// accidental bulk data-loss caused by partially unmounted or glitching
+// filesystems; bypassing it removes that protection.
+//
+// A warning is always logged when the override is active so that the bypass is
+// visible in production logs. This is an intentional audit trail.
+//
+// Source: DELETION_RATIO_OVERRIDE=true in the environment (parsed in cmd/collector).
+func (s *Scheduler) WithDeletionRatioOverride(enabled bool) *Scheduler {
+	s.deletionRatioOverride = enabled
+	return s
+}
+
+// IntervalPreferrer is an optional interface that a Collector may implement to
+// advertise its preferred collection interval. When implemented, the scheduler
+// uses this interval instead of the global COLLECT_INTERVAL for that collector.
+//
+// This enables per-source freshness SLAs without changing the base Collector
+// interface (#143): push-based sources (SMS, recording ingest) can use a longer
+// interval, while high-frequency sources (Whisper) can use a shorter one.
+// Collectors that do not implement this interface default to the global interval.
+type IntervalPreferrer interface {
+	PreferredInterval() time.Duration
+}
+
+// Register adds ONE cron job PER enabled collector.
+//
+// The interval for each collector is resolved in this order:
+//  1. Per-source env var: COLLECT_INTERVAL_<NAME> (upper-cased collector name,
+//     hyphens and spaces replaced with underscores). E.g. COLLECT_INTERVAL_WHISPER.
+//  2. Collector implements IntervalPreferrer → uses PreferredInterval().
+//  3. Global interval (the interval argument).
 //
 // Cron runs each job in its own goroutine, so distinct collectors execute
 // concurrently. A given collector still skips its own overlapping tick via a
@@ -193,8 +244,14 @@ func (s *Scheduler) WithCutover(t time.Time) *Scheduler {
 //
 // The old single-job / single-lock design that fixed the starvation bug is
 // preserved in runAll, which is still used by TriggerAll.
-func (s *Scheduler) Register(interval time.Duration) error {
-	spec := fmt.Sprintf("@every %s", interval)
+func (s *Scheduler) Register(interval time.Duration, perSource ...map[string]time.Duration) error {
+	// Merge optional per-source override map (e.g. from config).
+	sourceIntervals := map[string]time.Duration{}
+	for _, m := range perSource {
+		for k, v := range m {
+			sourceIntervals[k] = v
+		}
+	}
 
 	for _, col := range s.collectors {
 		col := col // capture loop variable
@@ -202,7 +259,12 @@ func (s *Scheduler) Register(interval time.Duration) error {
 			slog.Info("scheduler: collector disabled, skipping", "name", col.Name())
 			continue
 		}
-		slog.Info("scheduler: registered collector", "name", col.Name(), "interval", interval)
+
+		// Resolve the effective interval for this collector (priority order above).
+		eff := resolveCollectorInterval(col, interval, sourceIntervals)
+		spec := fmt.Sprintf("@every %s", eff)
+
+		slog.Info("scheduler: registered collector", "name", col.Name(), "interval", eff)
 		if _, err := s.cron.AddFunc(spec, func() {
 			s.run(context.Background(), col)
 		}); err != nil {
@@ -210,6 +272,20 @@ func (s *Scheduler) Register(interval time.Duration) error {
 		}
 	}
 	return nil
+}
+
+// resolveCollectorInterval returns the effective cron interval for col.
+// Priority: perSource map > IntervalPreferrer > global default.
+func resolveCollectorInterval(col collector.Collector, global time.Duration, perSource map[string]time.Duration) time.Duration {
+	if d, ok := perSource[col.Name()]; ok && d > 0 {
+		return d
+	}
+	if ip, ok := col.(IntervalPreferrer); ok {
+		if d := ip.PreferredInterval(); d > 0 {
+			return d
+		}
+	}
+	return global
 }
 
 // runAll acquires the GLOBAL running lock and executes all enabled collectors
@@ -458,17 +534,29 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 		}
 
 		// Layer 2b: deletion-ratio sanity check.
-		// If the store supports CountActiveDocuments, verify that the fraction of
-		// documents that would be deleted is within the safe threshold.
-		if counter, ok := s.store.(ActiveDocumentCounter); ok {
-			activeInDB, countErr := counter.CountActiveDocuments(ctx, col.Source())
-			if countErr != nil {
-				slog.Warn("scheduler: deletion detection skipped — could not count active documents",
-					"collector", col.Name(), "error", countErr)
-				return
-			}
-			if deletionRatioWouldExceed(activeInDB, len(allIDs)) {
-				wouldDelete := activeInDB - len(allIDs)
+		// CountActiveDocuments is now a required method on DocumentUpserter (#148),
+		// so the guard is always enforced — no silent bypass via missing type assertion.
+		activeInDB, countErr := s.store.CountActiveDocuments(ctx, col.Source())
+		if countErr != nil {
+			slog.Warn("scheduler: deletion detection skipped — could not count active documents",
+				"collector", col.Name(), "error", countErr)
+			return
+		}
+		if deletionRatioWouldExceed(activeInDB, len(allIDs)) {
+			wouldDelete := activeInDB - len(allIDs)
+			// #147 escape hatch: DELETION_RATIO_OVERRIDE bypasses the ratio guard
+			// for a legitimate one-off large deletion. A warning is always emitted
+			// so the bypass is visible in production logs (intentional audit trail).
+			if s.deletionRatioOverride {
+				slog.Warn("scheduler: deletion ratio exceeds threshold BUT override is active — proceeding with deletion",
+					"collector", col.Name(),
+					"active_in_db", activeInDB,
+					"active_on_source", len(allIDs),
+					"would_delete", wouldDelete,
+					"threshold_pct", int(deletionRatioThreshold*100),
+					"override", "DELETION_RATIO_OVERRIDE=true")
+				// fall through to MarkDeleted
+			} else {
 				slog.Warn("scheduler: deletion detection skipped — ratio exceeds safety threshold",
 					"collector", col.Name(),
 					"active_in_db", activeInDB,
@@ -496,6 +584,13 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 	// scheduler tick makes incremental progress through the NULL-embedding
 	// backlog without requiring a full re-collection.
 	s.backfillEmbeddings(ctx)
+
+	// Backfill chunk embeddings for chunks whose embedding is NULL (e.g. due to
+	// transient 429 errors during initial embedChunks call). Runs after the
+	// document backfill so that document-level embeddings are prioritised.
+	if s.chunkStore != nil {
+		s.backfillChunkEmbeddings(ctx)
+	}
 }
 
 // backfillBatchSize is the number of unembedded documents processed per
@@ -559,6 +654,77 @@ func (s *Scheduler) backfillEmbeddings(ctx context.Context) {
 	slog.Info("scheduler: backfill embeddings complete",
 		"processed", len(docs),
 		"succeeded", succeeded,
+	)
+}
+
+// chunkBackfillBatchSize is the number of unembedded chunks processed per
+// backfill cycle. Smaller than the document backfill batch (200) because each
+// chunk is typically shorter than a full document, but there may be many more
+// of them. Keeping it at 100 limits per-cycle API load.
+const chunkBackfillBatchSize = 100
+
+// backfillChunkEmbeddings queries for active chunks with a NULL embedding and
+// embeds them in batches of chunkBackfillBatchSize. It is called at the end of
+// every collection cycle (after backfillEmbeddings) so that chunks whose
+// embedding failed transiently (e.g. due to a 429 rate limit during
+// embedChunks) are recovered on subsequent ticks.
+//
+// On any EmbedBatch failure the entire cycle is aborted and retried on the
+// next scheduler tick. Chunks that already have an embedding are never returned
+// by ListUnembeddedChunks and are therefore not re-processed.
+//
+// This is the per-chunk analogue of backfillEmbeddings (#141).
+func (s *Scheduler) backfillChunkEmbeddings(ctx context.Context) {
+	if !s.embed.Enabled() {
+		return
+	}
+
+	chunks, err := s.chunkStore.ListUnembeddedChunks(ctx, chunkBackfillBatchSize)
+	if err != nil {
+		slog.Warn("scheduler: chunk backfill list unembedded failed", "error", err)
+		return
+	}
+	if len(chunks) == 0 {
+		return
+	}
+
+	texts := make([]string, len(chunks))
+	for i, c := range chunks {
+		texts[i] = c.Content
+	}
+
+	vecs, err := s.embed.EmbedBatch(ctx, texts)
+	if err != nil {
+		// Rate-limit or transient API error: skip this cycle and retry next tick.
+		slog.Warn("scheduler: chunk backfill embedding failed, will retry next cycle",
+			"error", err, "count", len(chunks))
+		return
+	}
+
+	embeddings := make([]store.ChunkEmbedding, 0, len(chunks))
+	for i, c := range chunks {
+		if i >= len(vecs) || len(vecs[i]) == 0 {
+			continue
+		}
+		embeddings = append(embeddings, store.ChunkEmbedding{
+			ChunkID:   c.ID,
+			Embedding: vecs[i],
+		})
+	}
+
+	if len(embeddings) == 0 {
+		return
+	}
+
+	if err := s.chunkStore.UpdateChunkEmbeddings(ctx, embeddings); err != nil {
+		slog.Warn("scheduler: chunk backfill update embeddings failed",
+			"error", err, "count", len(embeddings))
+		return
+	}
+
+	slog.Info("scheduler: chunk backfill embeddings complete",
+		"processed", len(chunks),
+		"succeeded", len(embeddings),
 	)
 }
 

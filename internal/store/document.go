@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -386,6 +388,8 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 	// args are appended once and referenced by the same positional parameters.
 	// bigm uses pg_bigm's gin_bigm_ops index via LIKE '%%' || $1 || '%%'.
 	// SQL '%%%%' in fmt.Sprintf produces a literal '%%' which pg_bigm needs.
+	// bigm lane ranks by GREATEST(bigm_similarity(content,$1), bigm_similarity(title,$1))
+	// so Korean partial-match is ordered by real relevance, not document length (#138).
 	// summvec uses the same query embedding ($2) as vec for consistency.
 	// Weight parameters are injected as Go-formatted literals (not SQL params)
 	// because they are floats under our control, never from user input.
@@ -418,6 +422,47 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 			w.SummaryVec = 0.0
 		}
 	}
+
+	// Entity lane gate (#139): enable when ENTITY_EXTRACTION_ENABLED env var is set.
+	// EntityWeight<0 means explicit disable by caller; zero means "auto".
+	// The lane is a no-op when entities aren't in the DB — FULL OUTER JOIN is safe.
+	entityEnabled := entityExtractionEnabled()
+	if w.EntityWeight == 0 {
+		if entityEnabled {
+			w.EntityWeight = model.DefaultEntityWeight
+		}
+		// else: leave 0 — entity CTE contributes 0 to RRF score (no-op).
+	} else if w.EntityWeight < 0 {
+		w.EntityWeight = 0 // explicit disable
+	}
+
+	// Build a normalised entity query: lower-cased, whitespace-trimmed tokens
+	// joined by OR for the entity name LIKE match. This enables partial-name
+	// matching (e.g. "홍길동" matches entity with normalized_name='홍길동').
+	// The entity param position depends on how many args are already bound:
+	// $4 when no source filter is active, $5 or $6 when source/exclude filters
+	// push it further. The actual placeholder is computed via len(args)+1.
+	entityFilterParam := ""
+	if w.EntityWeight > 0 {
+		entityFilterParam = fmt.Sprintf("$%d", len(args)+1)
+		args = append(args, strings.ToLower(strings.TrimSpace(query.Query)))
+	}
+
+	// entityCTE is the SQL fragment for the entity lane. When the lane is
+	// disabled (weight=0), we use a trivially-empty CTE to avoid syntax errors.
+	entityCTE := `entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false)`
+	if w.EntityWeight > 0 {
+		entityCTE = fmt.Sprintf(`entity AS (
+			SELECT de.document_id AS id,
+			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			FROM document_entities de
+			JOIN entities e ON e.id = de.entity_id
+			WHERE e.normalized_name LIKE '%%%%' || %s || '%%%%'
+			GROUP BY de.document_id
+			LIMIT $3
+		)`, entityFilterParam)
+	}
+
 	q := fmt.Sprintf(`
 		WITH fts AS (
 			SELECT id,
@@ -445,7 +490,11 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		),
 		bigm AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY length(content) DESC, id ASC) AS rank
+			       row_number() OVER (ORDER BY
+			           GREATEST(
+			               bigm_similarity(content, $1),
+			               bigm_similarity(title,   $1)
+			           ) DESC, id ASC) AS rank
 			FROM documents
 			WHERE (content LIKE '%%%%' || $1 || '%%%%'
 			    OR title   LIKE '%%%%' || $1 || '%%%%')
@@ -464,17 +513,20 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 			%s
 			LIMIT $3
 		),
+		%s,
 		rrf AS (
 			SELECT
-				COALESCE(fts.id, vec.id, bigm.id, summvec.id) AS id,
+				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) AS id,
 				COALESCE(%g/(%g + fts.rank),     0)
 				+ COALESCE(%g/(%g + vec.rank),     0)
 				+ COALESCE(%g/(%g + bigm.rank),    0)
-				+ COALESCE(%g/(%g + summvec.rank), 0) AS score
+				+ COALESCE(%g/(%g + summvec.rank), 0)
+				+ COALESCE(%g/(%g + entity.rank),  0) AS score
 			FROM fts
 			FULL OUTER JOIN vec     ON fts.id = vec.id
 			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
 			FULL OUTER JOIN summvec ON COALESCE(fts.id, vec.id, bigm.id) = summvec.id
+			FULL OUTER JOIN entity  ON COALESCE(fts.id, vec.id, bigm.id, summvec.id) = entity.id
 		)
 		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
 		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
@@ -488,10 +540,12 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		statusFilter, sourceFilter, excludeFilter,
 		statusFilter, sourceFilter, excludeFilter,
 		statusFilter, sourceFilter, excludeFilter,
+		entityCTE,
 		w.FTSWeight, w.RRFK,
 		w.VecWeight, w.RRFK,
 		w.BigmWeight, w.RRFK,
 		w.SummaryVec, w.RRFK,
+		w.EntityWeight, w.RRFK,
 		sortOrder(query.Sort, "d"))
 
 	rows, err := s.pg.pool.Query(ctx, q, args...)
@@ -508,6 +562,15 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		results = results[:query.Limit]
 	}
 	return results, nil
+}
+
+// entityExtractionEnabled reports whether entity extraction has been enabled
+// via the ENTITY_EXTRACTION_ENABLED environment variable (true / 1 / yes).
+// This mirrors the check in cmd/collector/main.go so that the entity RRF lane
+// automatically activates when the feature is running in the same deployment.
+func entityExtractionEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("ENTITY_EXTRACTION_ENABLED")))
+	return v == "true" || v == "1" || v == "yes"
 }
 
 // RecordCollectionLog writes a collection event to the collection_log table.

@@ -387,10 +387,52 @@ func (c *WhisperCollector) WithCutover(t time.Time) {
 	c.cutover = t
 }
 
+// whisperPrivateCIDRs is the set of RFC-1918 and loopback CIDR blocks that are
+// considered local for the purposes of the cloud-endpoint guard (#153).
+var whisperPrivateCIDRs = func() []*net.IPNet {
+	cidrs := []string{
+		"127.0.0.0/8",    // IPv4 loopback
+		"10.0.0.0/8",     // RFC-1918 class A
+		"172.16.0.0/12",  // RFC-1918 class B
+		"192.168.0.0/16", // RFC-1918 class C
+	}
+	nets := make([]*net.IPNet, 0, len(cidrs))
+	for _, cidr := range cidrs {
+		_, block, err := net.ParseCIDR(cidr)
+		if err == nil {
+			nets = append(nets, block)
+		}
+	}
+	return nets
+}()
+
+// isPrivateIP reports whether ip falls within a loopback or RFC-1918 range.
+func isPrivateIP(ip net.IP) bool {
+	if ip.IsLoopback() {
+		return true
+	}
+	for _, block := range whisperPrivateCIDRs {
+		if block.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // isLocalWhisperEndpoint reports whether the given URL host resolves to a
 // loopback, Docker-internal, or RFC-1918 private address. Call-transcription
 // data MUST stay local (issue #100). Misconfiguration producing a cloud endpoint
 // is logged as a prominent warning but does not hard-fail the collector.
+//
+// Locality detection strategy (#153):
+//  1. Well-known literal aliases (localhost, 127.0.0.1, ::1, host.docker.internal).
+//  2. Single-label hostnames without a dot (e.g. "whisper") — these are
+//     Docker / docker-compose service names that only resolve inside a private
+//     network and cannot be public DNS names; treat as local.
+//  3. Numeric IP: check loopback and RFC-1918 ranges directly.
+//  4. Multi-label hostname: attempt DNS resolution; if ALL resolved IPs fall
+//     within private/loopback ranges, treat as local. Resolution failure is
+//     treated as non-local (safer: warn rather than silently suppress).
 func isLocalWhisperEndpoint(rawURL string) bool {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -398,29 +440,40 @@ func isLocalWhisperEndpoint(rawURL string) bool {
 	}
 	host := u.Hostname()
 
-	// Well-known local/docker aliases.
+	// 1. Well-known literal aliases.
 	switch host {
 	case "localhost", "127.0.0.1", "::1", "host.docker.internal":
 		return true
 	}
 
-	// Numeric IP: check for private/loopback ranges.
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return false
-	}
-	if ip.IsLoopback() {
+	// 2. Single-label hostnames (no dot) — Docker / compose service names.
+	// These cannot be public internet hostnames (ICANN requires at least one dot).
+	if !strings.Contains(host, ".") && host != "" {
 		return true
 	}
-	// RFC-1918 private ranges.
-	privateRanges := []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
-	for _, cidr := range privateRanges {
-		_, block, _ := net.ParseCIDR(cidr)
-		if block != nil && block.Contains(ip) {
+
+	// 3. Numeric IP: check directly without DNS.
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() {
 			return true
 		}
+		return isPrivateIP(ip)
 	}
-	return false
+
+	// 4. Multi-label hostname: resolve and check all returned IPs.
+	// Use a short timeout so a misconfigured DNS server does not block a
+	// collection cycle. Treat resolution failure as non-local.
+	addrs, err := net.LookupHost(host)
+	if err != nil || len(addrs) == 0 {
+		return false
+	}
+	for _, addr := range addrs {
+		ip := net.ParseIP(addr)
+		if ip == nil || !isPrivateIP(ip) {
+			return false
+		}
+	}
+	return true
 }
 
 // Collect walks WhisperAudioDir recursively, transcribes audio files modified
@@ -464,6 +517,12 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 		}
 
 		if d.IsDir() {
+			// Skip the quarantine directory entirely — files moved there are
+			// corrupt or unreadable and must not be re-visited on subsequent
+			// collection cycles (#152).
+			if d.Name() == whisperQuarantineDir {
+				return fs.SkipDir
+			}
 			return nil
 		}
 
@@ -527,16 +586,11 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 		// The ingest handler (layer 1) prevents new corrupt files from reaching
 		// disk; this guard protects against files already on disk before the fix.
 		//
-		// Only one warning is emitted per walk — subsequent runs re-warn because
-		// the file is still present. This is intentional: the warning serves as a
-		// reminder to remove the corrupt file. Suppressing repeat warnings would
-		// require persistent state (a blacklist file), which complicates restarts.
+		// On failure the file is quarantined (moved to <audioDir>/.quarantine/)
+		// and logged once. Subsequent walks skip it because it is no longer in the
+		// audio directory tree — breaking the infinite-retry loop (#152).
 		if err := checkAudioFileHeader(path, ext); err != nil {
-			slog.Warn("whisper: skipping unreadable or corrupt audio file (pre-check failed)",
-				"path", path,
-				"size_bytes", info.Size(),
-				"reason", err,
-			)
+			quarantineCorruptAudio(path, c.cfg.WhisperAudioDir, info.Size(), err)
 			return nil
 		}
 
@@ -894,4 +948,66 @@ func (c *WhisperCollector) diarizeAudio(ctx context.Context, path string, audioB
 	}
 
 	return result.Segments, nil
+}
+
+// whisperQuarantineDir is the subdirectory name within WhisperAudioDir where
+// corrupt or unreadable audio files are moved for manual review.
+const whisperQuarantineDir = ".quarantine"
+
+// quarantineCorruptAudio moves a corrupt or unreadable audio file to the
+// quarantine subdirectory (<audioDir>/.quarantine/) and logs a single
+// diagnostic message. After the move the file is no longer in the audio tree
+// so subsequent walks will not revisit it, breaking the infinite-retry loop
+// caused by permanently-corrupt files (#152).
+//
+// Sidecar files (<path>.meta.json) are moved alongside the audio file when
+// present, so that provenance information is preserved for manual inspection.
+//
+// If the quarantine directory cannot be created, or the rename fails (e.g.
+// cross-device move), the function falls back to a warn-and-skip so that the
+// collector still processes the remaining files.
+func quarantineCorruptAudio(path, audioDir string, sizeBytes int64, reason error) {
+	qDir := filepath.Join(audioDir, whisperQuarantineDir)
+	if err := os.MkdirAll(qDir, 0o755); err != nil {
+		slog.Warn("whisper: cannot create quarantine dir — skipping corrupt file without quarantine",
+			"path", path,
+			"quarantine_dir", qDir,
+			"size_bytes", sizeBytes,
+			"reason", reason,
+			"mkdir_error", err,
+		)
+		return
+	}
+
+	dest := filepath.Join(qDir, filepath.Base(path))
+	if err := os.Rename(path, dest); err != nil {
+		slog.Warn("whisper: skipping unreadable or corrupt audio file (quarantine move failed)",
+			"path", path,
+			"dest", dest,
+			"size_bytes", sizeBytes,
+			"reason", reason,
+			"move_error", err,
+		)
+		return
+	}
+
+	slog.Warn("whisper: corrupt audio file quarantined — will not be retried",
+		"path", path,
+		"quarantine", dest,
+		"size_bytes", sizeBytes,
+		"reason", reason,
+	)
+
+	// Move sidecar alongside the audio file (best-effort: no error on absence).
+	sidecar := path + ".meta.json"
+	if _, err := os.Stat(sidecar); err == nil {
+		sidecarDest := dest + ".meta.json"
+		if err := os.Rename(sidecar, sidecarDest); err != nil {
+			slog.Warn("whisper: could not move sidecar to quarantine",
+				"sidecar", sidecar,
+				"dest", sidecarDest,
+				"error", err,
+			)
+		}
+	}
 }

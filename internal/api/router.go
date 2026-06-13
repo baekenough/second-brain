@@ -50,6 +50,12 @@ type Server struct {
 	// is registered. Set via WithReindexCheck before calling Handler().
 	reindexCheck ReindexRecommender
 
+	// reindexAlertWebhookURL is optional. When non-empty and a reindex is
+	// recommended (ShouldReindex=true), a notification is sent to this URL via
+	// the same channel used for eval regression alerts (#142).
+	// Set via WithReindexAlertWebhook before calling Handler().
+	reindexAlertWebhookURL string
+
 	// ingestUpserter, ingestChunks, ingestEmbedder, and ingestMaxFileBytes are
 	// optional. When ingestUpserter is non-nil the POST /api/v1/ingest/file
 	// route is registered. Set via WithIngestFile before calling Handler().
@@ -76,6 +82,10 @@ type Server struct {
 	recordingDir          string
 	recordingMaxFileBytes int64
 	recordingCutover      time.Time
+
+	// collectStatus is optional. When non-nil, the GET /api/v1/collect/status
+	// route is registered. Set via WithCollectStatus before calling Handler().
+	collectStatus CollectionStatusProvider
 
 	// handlerOnce ensures buildHandler is called exactly once per Server so
 	// that the graphql-go schema (and its package-level type objects) are
@@ -161,6 +171,9 @@ func (s *Server) buildHandler() http.Handler {
 		}
 		if s.reindexState != nil {
 			r.Post("/api/v1/reindex", s.reindexHandler)
+		}
+		if s.collectStatus != nil {
+			r.Get("/api/v1/collect/status", s.collectStatusHandler)
 		}
 		if s.ingestUpserter != nil {
 			r.Post("/api/v1/ingest/file", s.ingestFileHandler)

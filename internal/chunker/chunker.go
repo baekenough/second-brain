@@ -24,17 +24,21 @@ import (
 
 // Options controls chunk size and overlap.
 type Options struct {
-	// TargetSize is the preferred chunk size in bytes. The chunker tries to
+	// TargetSize is the preferred chunk size in runes. The chunker tries to
 	// keep chunks at or below this size by merging paragraphs.
+	// Using runes rather than bytes ensures that Korean text (3 bytes/rune)
+	// receives the same information density per chunk as ASCII text (#145).
 	// Default: 2000.
 	TargetSize int
 
-	// MaxSize is the hard upper bound for a single chunk in bytes. Paragraphs
+	// MaxSize is the hard upper bound for a single chunk in runes. Paragraphs
 	// larger than this are split at sentence boundaries.
+	// Using runes rather than bytes ensures Korean text is not under-chunked
+	// relative to ASCII text (#145).
 	// Default: 4000.
 	MaxSize int
 
-	// Overlap is the number of bytes copied from the end of chunk N to the
+	// Overlap is the number of runes copied from the end of chunk N to the
 	// beginning of chunk N+1. This ensures cross-boundary phrases are
 	// searchable. Overlap must be less than TargetSize.
 	// Overlap is only applied within a section when HeadingAware is true.
@@ -100,9 +104,11 @@ func Split(text string, opts Options) []string {
 }
 
 // splitFlat is the original v0.1.9 paragraph/sentence/merge/overlap pipeline.
+// All size comparisons use rune counts so that Korean text (3 bytes/rune)
+// receives the same information density per chunk as ASCII text (#145).
 func splitFlat(text string, o Options) []string {
 	// Fast path: single chunk when text fits comfortably.
-	if len(text) <= o.TargetSize {
+	if utf8.RuneCountInString(text) <= o.TargetSize {
 		return []string{text}
 	}
 
@@ -110,9 +116,10 @@ func splitFlat(text string, o Options) []string {
 	paragraphs := splitParagraphs(text)
 
 	// 2. Split any oversized paragraphs at sentence boundaries.
+	// Use rune count so Korean text is treated consistently with ASCII (#145).
 	segments := make([]string, 0, len(paragraphs)*2)
 	for _, p := range paragraphs {
-		if len(p) > o.MaxSize {
+		if utf8.RuneCountInString(p) > o.MaxSize {
 			segments = append(segments, splitSentences(p, o.MaxSize)...)
 		} else {
 			segments = append(segments, p)
@@ -434,36 +441,42 @@ func splitParagraphs(text string) []string {
 }
 
 // splitSentences splits text at sentence-ending punctuation (. ! ?) followed
-// by whitespace. Resulting pieces are further merged up to maxSize bytes.
+// by whitespace. Resulting pieces are further merged up to maxSize runes (#145).
+// Using rune counts ensures Korean text (3 bytes/rune) is not split more
+// aggressively than equivalent ASCII content.
 func splitSentences(text string, maxSize int) []string {
 	var (
-		chunks []string
-		buf    strings.Builder
+		chunks   []string
+		buf      strings.Builder
+		runeCount int // runes written to buf
 	)
 
 	runes := []rune(text)
 	for i, r := range runes {
 		buf.WriteRune(r)
+		runeCount++
 
 		isSentenceEnd := (r == '.' || r == '!' || r == '?' || r == '。' || r == '！' || r == '？')
 		nextIsSpace := i+1 < len(runes) && (runes[i+1] == ' ' || runes[i+1] == '\n' || runes[i+1] == '\t')
 
-		if isSentenceEnd && nextIsSpace && buf.Len() >= maxSize/4 {
+		if isSentenceEnd && nextIsSpace && runeCount >= maxSize/4 {
 			s := strings.TrimSpace(buf.String())
 			if s != "" {
 				chunks = append(chunks, s)
 			}
 			buf.Reset()
+			runeCount = 0
 			continue
 		}
 
-		if buf.Len() >= maxSize {
+		if runeCount >= maxSize {
 			// Hard cut at a rune boundary — last resort.
 			s := strings.TrimSpace(buf.String())
 			if s != "" {
 				chunks = append(chunks, s)
 			}
 			buf.Reset()
+			runeCount = 0
 		}
 	}
 	if buf.Len() > 0 {
@@ -475,26 +488,35 @@ func splitSentences(text string, maxSize int) []string {
 	return chunks
 }
 
-// mergeSegments greedily merges segments into chunks up to targetSize bytes.
+// mergeSegments greedily merges segments into chunks up to targetSize runes (#145).
+// Using rune counts ensures that Korean text (3 bytes/rune) produces chunks
+// with comparable information density to ASCII content.
 func mergeSegments(segments []string, targetSize int) []string {
 	var (
-		chunks []string
-		buf    strings.Builder
+		chunks    []string
+		buf       strings.Builder
+		runeCount int // runes currently in buf
 	)
 
 	for _, seg := range segments {
 		// If adding this segment would exceed targetSize, flush the buffer first.
 		sep := ""
+		sepRunes := 0
 		if buf.Len() > 0 {
 			sep = "\n\n"
+			sepRunes = 2
 		}
-		if buf.Len() > 0 && buf.Len()+len(sep)+len(seg) > targetSize {
+		segRunes := utf8.RuneCountInString(seg)
+		if buf.Len() > 0 && runeCount+sepRunes+segRunes > targetSize {
 			chunks = append(chunks, strings.TrimSpace(buf.String()))
 			buf.Reset()
+			runeCount = 0
 			sep = ""
+			sepRunes = 0
 		}
 		buf.WriteString(sep)
 		buf.WriteString(seg)
+		runeCount += sepRunes + segRunes
 	}
 
 	if buf.Len() > 0 {
@@ -503,8 +525,9 @@ func mergeSegments(segments []string, targetSize int) []string {
 	return chunks
 }
 
-// addOverlap prepends the last `overlap` bytes of chunk[i] to chunk[i+1].
-// Overlap is trimmed to a valid UTF-8 boundary.
+// addOverlap prepends the last `overlap` runes of chunk[i] to chunk[i+1].
+// Using rune counts ensures Korean text receives the same overlap window
+// as ASCII text in terms of content characters (#145).
 func addOverlap(chunks []string, overlap int) []string {
 	out := make([]string, len(chunks))
 	out[0] = chunks[0]
@@ -520,16 +543,14 @@ func addOverlap(chunks []string, overlap int) []string {
 	return out
 }
 
-// overlapTail returns up to `n` bytes from the end of s, trimmed to a valid
-// UTF-8 rune boundary and leading whitespace stripped.
+// overlapTail returns up to `n` runes from the end of s with leading
+// whitespace stripped. The result is always valid UTF-8 because we operate
+// on rune boundaries (#145).
 func overlapTail(s string, n int) string {
-	if len(s) <= n {
+	runes := []rune(s)
+	if len(runes) <= n {
 		return strings.TrimSpace(s)
 	}
-	tail := s[len(s)-n:]
-	// Advance past any partial multi-byte rune at the start of tail.
-	for len(tail) > 0 && !utf8.RuneStart(tail[0]) {
-		tail = tail[1:]
-	}
+	tail := string(runes[len(runes)-n:])
 	return strings.TrimSpace(tail)
 }

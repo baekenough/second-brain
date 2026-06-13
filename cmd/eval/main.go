@@ -81,6 +81,13 @@ type metricsSnapshot struct {
 	MRR10  float64 `json:"mrr10"`
 	Pairs  int     `json:"pairs"`
 
+	// FPPenalty10 is the macro-average false-positive penalty at rank 10.
+	// It measures the fraction of top-10 results that are explicitly irrelevant
+	// (thumbs=-1). A value of 0 means no false positives; 1.0 means all results
+	// are false positives. This metric is observational only — it does not gate
+	// regressions but surfaces precision degradation that NDCG alone misses.
+	FPPenalty10 float64 `json:"fp_penalty_10"`
+
 	// Read-path latency (observational only — no regression gate).
 	SearchLatencyP50Ms  float64 `json:"search_latency_p50_ms"`
 	SearchLatencyP95Ms  float64 `json:"search_latency_p95_ms"`
@@ -163,10 +170,17 @@ func run() error {
 	}
 
 	// --- Run search for each pair (bounded parallel) ---
+	//
+	// evalResult carries a queryIdx so results can be re-sorted into the
+	// original pairs order after parallel collection. Without this the channel
+	// receive order is non-deterministic, causing results[i] / irrelevantSets[i]
+	// to map to the wrong query and producing incorrect AggregateFPPenalty (#140).
 	type evalResult struct {
+		queryIdx   int
 		docIDs     []string
 		relevant   map[string]bool
-		latencyMs  float64 // wall-clock latency of searchSvc.Search in milliseconds
+		irrelevant map[string]bool // populated from IrrelevantDocIDs (thumbs=-1)
+		latencyMs  float64         // wall-clock latency of searchSvc.Search in milliseconds
 	}
 
 	resultsCh := make(chan evalResult, len(pairs))
@@ -174,8 +188,8 @@ func run() error {
 	g, gCtx := errgroup.WithContext(ctx)
 	g.SetLimit(10) // max 10 concurrent searches
 
-	for _, pair := range pairs {
-		pair := pair // capture loop variable
+	for i, pair := range pairs {
+		i, pair := i, pair // capture loop variables
 		g.Go(func() error {
 			q := model.SearchQuery{
 				Query: pair.Query,
@@ -202,24 +216,48 @@ func run() error {
 				relevant[id] = true
 			}
 
-			resultsCh <- evalResult{docIDs: docIDs, relevant: relevant, latencyMs: latencyMs}
+			// Build irrelevant set from negative feedback (thumbs=-1).
+			irrelevant := make(map[string]bool, len(pair.IrrelevantDocIDs))
+			for _, id := range pair.IrrelevantDocIDs {
+				irrelevant[id] = true
+			}
+
+			resultsCh <- evalResult{
+				queryIdx:   i,
+				docIDs:     docIDs,
+				relevant:   relevant,
+				irrelevant: irrelevant,
+				latencyMs:  latencyMs,
+			}
 			return nil
 		})
 	}
 
 	// Close the channel once all goroutines finish.
-	go func() {
-		_ = g.Wait()
-		close(resultsCh)
-	}()
+	if err := g.Wait(); err != nil {
+		return fmt.Errorf("eval search: %w", err)
+	}
+	close(resultsCh)
 
-	// Collect results from the channel.
-	results := make([][]string, 0, len(pairs))
-	relevantSets := make([]map[string]bool, 0, len(pairs))
-	latencies := make([]float64, 0, len(pairs))
+	// Collect results and sort by queryIdx to restore the original pairs order.
+	// Goroutines deliver to the channel in completion order, which is
+	// non-deterministic, so we must re-sort before computing per-query metrics.
+	collected := make([]evalResult, 0, len(pairs))
 	for r := range resultsCh {
+		collected = append(collected, r)
+	}
+	sort.Slice(collected, func(a, b int) bool {
+		return collected[a].queryIdx < collected[b].queryIdx
+	})
+
+	results := make([][]string, 0, len(collected))
+	relevantSets := make([]map[string]bool, 0, len(collected))
+	irrelevantSets := make([]map[string]bool, 0, len(collected))
+	latencies := make([]float64, 0, len(collected))
+	for _, r := range collected {
 		results = append(results, r.docIDs)
 		relevantSets = append(relevantSets, r.relevant)
+		irrelevantSets = append(irrelevantSets, r.irrelevant)
 		latencies = append(latencies, r.latencyMs)
 	}
 
@@ -231,6 +269,9 @@ func run() error {
 	// --- Compute aggregate metrics ---
 	metrics := search.Aggregate(results, relevantSets)
 
+	// Compute false-positive penalty (top-10 ranked but thumbs=-1).
+	fpPenalty10 := search.AggregateFPPenalty(results, irrelevantSets, 10)
+
 	// --- Compute read-path latency statistics (observational only) ---
 	p50Ms := percentile(latencies, 50)
 	p95Ms := percentile(latencies, 95)
@@ -241,6 +282,7 @@ func run() error {
 		"ndcg10", metrics.NDCG10,
 		"mrr10", metrics.MRR10,
 		"pairs", metrics.Pairs,
+		"fp_penalty_10", fpPenalty10,
 		"search_latency_p50_ms", p50Ms,
 		"search_latency_p95_ms", p95Ms,
 		"search_latency_mean_ms", meanMs,
@@ -265,6 +307,7 @@ func run() error {
 		NDCG10:              metrics.NDCG10,
 		MRR10:               metrics.MRR10,
 		Pairs:               metrics.Pairs,
+		FPPenalty10:         fpPenalty10,
 		SearchLatencyP50Ms:  p50Ms,
 		SearchLatencyP95Ms:  p95Ms,
 		SearchLatencyMeanMs: meanMs,
@@ -326,15 +369,30 @@ func run() error {
 		return fmt.Errorf("encode output: %w", err)
 	}
 
-	// --- Webhook alert (non-blocking) ---
-	// Send an alert when a regression is detected and a webhook URL is configured.
-	// Runs in a goroutine so it does not block the eval exit path; wg.Wait() in the
-	// deferred call above ensures the goroutine finishes before os.Exit is called.
+	// --- Webhook alerts (non-blocking) ---
+	// Alerts are sent in background goroutines so they do not block the eval exit
+	// path. wg.Wait() in the deferred call above ensures all goroutines finish
+	// before os.Exit is called.
+
+	// Alert 1: eval regression.
 	if out.Regression && cfg.AlertWebhookURL != "" {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			sendWebhookAlert(cfg.AlertWebhookURL, out)
+		}()
+	}
+
+	// Alert 2: reindex recommendation (#142).
+	// When ShouldReindex=true (exit-2 path) the recommendation is sent to the
+	// same alert channel so it becomes a tracked, actionable signal rather than
+	// only writing intent to reindex_state. The human operator decides whether
+	// to act on it ("완전 자율 금지" — no automatic reindex execution).
+	if out.Reindex != nil && out.Reindex.ShouldReindex && cfg.AlertWebhookURL != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sendReindexAlert(cfg.AlertWebhookURL, out)
 		}()
 	}
 
@@ -389,6 +447,46 @@ func sendWebhookAlert(webhookURL string, out evalOutput) {
 
 	if resp.StatusCode >= 400 {
 		slog.Warn("eval: webhook: alert returned non-2xx status", "status", resp.StatusCode)
+	}
+}
+
+// sendReindexAlert POSTs a Slack-compatible reindex recommendation alert to
+// webhookURL. Failures are logged but do not affect the eval exit code (#142).
+func sendReindexAlert(webhookURL string, out evalOutput) {
+	reasons := "none"
+	if out.Reindex != nil && len(out.Reindex.Reasons) > 0 {
+		r := out.Reindex.Reasons[0]
+		for _, reason := range out.Reindex.Reasons[1:] {
+			r += "; " + reason
+		}
+		reasons = r
+	}
+	text := fmt.Sprintf(
+		":arrows_counterclockwise: *Reindex recommended*\n"+
+			"NDCG@5: %.4f | NDCG@10: %.4f | MRR@10: %.4f | FP@10: %.4f\n"+
+			"Reasons: %s",
+		out.Current.NDCG5, out.Current.NDCG10, out.Current.MRR10, out.Current.FPPenalty10,
+		reasons,
+	)
+
+	payload := webhookPayload{Text: text}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		slog.Warn("eval: reindex webhook: failed to marshal payload", "error", err)
+		return
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(webhookURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		slog.Warn("eval: reindex webhook: failed to send alert", "error", err)
+		return
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode >= 400 {
+		slog.Warn("eval: reindex webhook: alert returned non-2xx status", "status", resp.StatusCode)
 	}
 }
 
