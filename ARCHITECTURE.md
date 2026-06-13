@@ -1,57 +1,53 @@
 # second-brain 아키텍처
 
-> 비전: LLM 큐레이션 프라이빗 검색 엔진. Google Drive, Slack, GitHub 등 팀 지식을 수집·임베딩하여 AI 에이전트에게 큐레이션된 검색 결과를 제공하는 RAG 인프라.
+> 비전: LLM 큐레이션 프라이빗 검색 엔진. Google Drive, Slack, GitHub, SMS, Gmail 등 개인·팀 지식을 수집·임베딩하여 AI 에이전트에게 큐레이션된 검색 결과를 제공하는 RAG 인프라.
 
 ---
 
 ## 목차
 
 1. [개요](#1-개요)
-2. [시스템 구성도](#2-시스템-구성도)
+2. [시스템 토폴로지](#2-시스템-토폴로지)
 3. [서비스 레이어 맵](#3-서비스-레이어-맵)
 4. [데이터 모델](#4-데이터-모델)
 5. [수집 파이프라인](#5-수집-파이프라인)
 6. [추출 파이프라인](#6-추출-파이프라인)
 7. [임베딩 파이프라인](#7-임베딩-파이프라인)
 8. [검색 파이프라인](#8-검색-파이프라인)
-9. [배포 아키텍처](#9-배포-아키텍처)
-10. [웹 UI 아키텍처](#10-웹-ui-아키텍처)
-11. [설정 및 환경 변수](#11-설정-및-환경-변수)
-12. [설계 결정 ADR](#12-설계-결정-adr)
-13. [알려진 이슈](#13-알려진-이슈)
-14. [로드맵](#14-로드맵)
+9. [eval 자기개선 루프](#9-eval-자기개선-루프)
+10. [배포 아키텍처](#10-배포-아키텍처)
+11. [웹 UI 아키텍처](#11-웹-ui-아키텍처)
+12. [설정 및 환경 변수](#12-설정-및-환경-변수)
+13. [설계 결정 ADR](#13-설계-결정-adr)
+14. [알려진 이슈](#14-알려진-이슈)
+15. [구현 완료 항목](#15-구현-완료-항목)
 
 ---
 
 ## 1. 개요
 
-second-brain은 Go 기반 백엔드 서비스와 Next.js 기반 프론트엔드 UI로 구성된 팀 지식 검색 플랫폼이다.
+second-brain은 Go 기반 백엔드 서비스와 Next.js 기반 프론트엔드 UI로 구성된 개인·팀 지식 검색 플랫폼이다.
 
-**대상 사용자**: 팀 내 문서, Slack 대화, GitHub 이슈·PR을 빠르게 찾고 싶은 팀원. 별도 데이터 엔지니어링 없이 자연어로 전사 지식에 접근하는 것이 목표다.
+**대상 사용자**: 팀 문서, Slack 대화, GitHub 이슈·PR, SMS, 통화 기록, Gmail, Calendar를 자연어로 검색하고 싶은 사용자.
 
-**핵심 설계 철학**: 듀얼 바이너리(API 서버 + 수집 데몬) → 문서 수집 → OpenAI 임베딩 벡터화 → pgvector + pg_bigm + PostgreSQL 하이브리드 검색(BM25+코사인 RRF) → LLM 큐레이션(재랭킹 + 요약). pg_bigm 2-gram 인덱스로 한국어 조사/어미 무관 검색을 지원하고, HyDE 쿼리 확장으로 검색 품질을 향상한다.
+**핵심 설계 철학**: 듀얼 바이너리(API 서버 + 수집 데몬) → 문서 수집 → rune 기반 청킹 → OpenAI 임베딩 → 5-lane 하이브리드 검색(FTS + pgvector + pg_bigm + 요약 임베딩 + 엔티티 RRF) → LLM 큐레이션(재랭킹 + 요약). BGE cross-encoder rerank와 HyDE 쿼리 확장을 옵션으로 제공한다.
 
 **비기능 요구사항**:
 
-| 항목 | 현재 목표 |
+| 항목 | 목표 |
 |---|---|
-| 검색 지연 | p99 < 500ms |
+| 검색 지연 | p99 < 500ms (rerank 미사용 기준) |
 | 수집 멱등성 | `ON CONFLICT(source_type, source_id) DO UPDATE` |
-| 프라이버시 | Slack DM 비수집 설계 (`users.conversations` 사용, DM 채널 제외) |
+| 프라이버시 | Slack DM 비수집 설계 (`users.conversations` — IM 채널 명시적 제외) |
 | 보안 | Bearer 토큰 인증, timing-safe 비교 (`subtle.ConstantTimeCompare`) |
-| 가용성 | 단일 인스턴스, initContainer 기반 의존성 대기 |
+| 삭제 안전성 | 3계층 soft-delete 대량 삭제 가드 (filesystem root stat / 50% 비율 / no-op) |
+| 마이그레이션 | advisory lock 하에 순차 적용 (001~019, 다중 인스턴스 안전) |
 
-**실행 환경**: macOS에서 Docker Desktop 또는 minikube(docker driver)를 사용하여 로컬 Kubernetes 클러스터에 배포한다. macOS docker driver 특성상 NodePort가 호스트에 직접 노출되지 않으므로 `kubectl port-forward` 방식을 권장한다.
-
-**현재 스코프**: Phase 0 완료. 문서 단위 수집(청킹 없음), 단일 Postgres 인스턴스, OpenAI text-embedding-3-small, `atomic.Bool` CAS 기반 스케줄러, 소프트 삭제, 수집 로그 테이블.
+**실행 환경**: 프로덕션은 **Mac mini docker-compose** (`docker-compose.local.yml`). `deploy/k8s/`는 향후 Kubernetes 전환용 Kustomize 매니페스트(현재 미사용).
 
 ---
 
-## 2. 시스템 구성도
-
-![시스템 런타임 토폴로지](docs/diagrams/01-system-runtime-topology.png)
-
-> 인터랙티브 편집: [eraser.io에서 열기](https://app.eraser.io/workspace/PyHgjPmM97MYtJNoVD5H?diagram=CSpF8N1BRvdpM3l5TW2nd)
+## 2. 시스템 토폴로지
 
 ```mermaid
 %%{init: {
@@ -74,73 +70,86 @@ flowchart TD
     classDef data fill:#faf7f2,stroke:#1c1917,color:#1c1917,stroke-width:1.2px;
     classDef ext fill:#faf7f2,stroke:#57534e,color:#1c1917,stroke-width:1px,stroke-dasharray:4 3;
 
-    subgraph HOST["macOS Host"]
-        GD["~/Google Drive\n공유 드라이브/<shared-drive>"]
-        BROWSER["Browser\nlocalhost:30300 또는 port-forward"]
+    subgraph HOST["Mac mini Host (macOS arm64)"]
+        ANDROID["Android App\nsecond-brain-push\nSMS / 통화 / 녹음"]
+        BROWSER["Browser\nlocalhost:3000"]
+        STAGE["~/.second-brain/stage/\nsms / call (OneDrive bridge)"]
     end
 
-    subgraph DOCKER["minikube (docker driver)"]
-        subgraph NS["Namespace: second-brain"]
-            SERVER["second-brain\nAPI Server\nGo HTTP :8080\nNodePort 30080"]
-            COLLECTOR["second-brain\nCollector Daemon\nGo"]
-            PG["postgres StatefulSet\npgvector/pgvector:pg16\n+ pg_bigm\nClusterIP :5432\nPVC 10Gi"]
-            INIT["initContainer\nwait-for-postgres\nbusybox nc -z postgres 5432"]
-            WATCHER["SlackChannelWatcher\ngoroutine 60s poll\nsees new channels → full history collect"]
-            PV["PV hostPath 100Gi\nReadOnlyMany\n/mnt/drive → /data/drive\nuid=10001"]
+    subgraph COMPOSE["docker-compose.local.yml"]
+        subgraph CORE["Core Services"]
+            SERVER["server\nGo API :8080\n(→ host :8081)"]
+            COLLECTOR["collector\nGo 수집 데몬"]
+            MCP["mcp\nMCP HTTP :8090"]
+            EVALRUNNER["eval-runner\nnightly 03:00 KST"]
+            PG["postgres\nPostgreSQL 16\n+ pgvector + pg_bigm\npgdata volume"]
         end
+        subgraph AI["AI Services"]
+            OLLAMA["ollama\ngemma3:12b-it-qat\nollama_models volume"]
+            WHISPER["whisper\nfaster-whisper-medium\nint8 CPU :8000"]
+            DIARIZATION["diarization\npyannote.audio\n:8001"]
+        end
+        WEB["web\nNext.js standalone\n:3000"]
     end
 
     subgraph EXTERNAL["External APIs"]
-        OPENAI["OpenAI API\n/v1/embeddings\ntext-embedding-3-small"]
-        SLACK["Slack Web API\nusers.conversations\nconversations.history\nconversations.replies"]
-        GITHUB["GitHub REST API\n/orgs/{org}/repos\n/repos/{repo}/issues"]
-        GDRIVE_API["Google Drive API\nfiles.export (ADC)\n선택적 활성화"]
+        OPENAI["OpenAI API\ntext-embedding-3-small"]
+        SLACK["Slack Web API"]
+        GITHUB["GitHub REST API"]
+        WEBHOOK["Alert Webhook\n(Slack)"]
     end
 
-    BROWSER -->|HTTP| SERVER
-    GD -->|"minikube mount\nuid=10001 gid=10001"| PV
-    PV -->|ReadOnly mount\n/data/drive| COLLECTOR
+    subgraph MOUNTS["Host Mounts (read-only)"]
+        SECRETARYDB["secretary.db\n(SQLite)"]
+        LLMMEMORY["llm-memory.sqlite"]
+        GMAIL["/data/gmail"]
+        CALENDAR["/data/calendar"]
+    end
+
+    BROWSER --> WEB
+    WEB --> SERVER
+    ANDROID -->|POST /ingest/messages\nPOST /ingest/recording| SERVER
     SERVER --> PG
-    SERVER -->|"LLM curation"| LLM_API["LLM API\n(curation)"]
+    SERVER --> OLLAMA
+    MCP --> PG
+    EVALRUNNER --> PG
+    EVALRUNNER --> WEBHOOK
     COLLECTOR --> PG
-    COLLECTOR -->|"Bearer JWT\n(API Key or CliProxy OAuth)"| OPENAI
-    COLLECTOR -->|"Bearer SLACK_BOT_TOKEN"| SLACK
-    COLLECTOR -->|"Bearer GITHUB_TOKEN"| GITHUB
-    COLLECTOR -.->|ADC 설정 시| GDRIVE_API
-    INIT -->|nc polling| PG
-    INIT -->|ready| SERVER
-    WATCHER -->|goroutine| SLACK
-    WATCHER -->|upsert| PG
+    COLLECTOR --> OPENAI
+    COLLECTOR --> SLACK
+    COLLECTOR --> GITHUB
+    COLLECTOR --> WHISPER
+    COLLECTOR --> DIARIZATION
+    COLLECTOR --> OLLAMA
+    COLLECTOR -.-> SECRETARYDB
+    COLLECTOR -.-> LLMMEMORY
+    COLLECTOR -.-> GMAIL
+    COLLECTOR -.-> CALENDAR
+    STAGE -.->|sms / call 스테이징| COLLECTOR
 
     class SERVER,COLLECTOR focal;
     class PG data;
-    class OPENAI,SLACK,GITHUB,GDRIVE_API,LLM_API ext;
-    class INIT,WATCHER,PV,GD,BROWSER muted;
+    class OPENAI,SLACK,GITHUB,WEBHOOK ext;
+    class OLLAMA,WHISPER,DIARIZATION,WEB,MCP,EVALRUNNER,ANDROID muted;
 ```
 
-### 마운트 경로 상세
+### docker-compose.local.yml 서비스 목록
 
-```
-호스트 경로:     ~/Google Drive/공유 드라이브/<shared-drive>
-minikube 내부:   /mnt/drive    (minikube mount --uid=10001 --gid=10001 ... 으로 생성)
-PV hostPath:     /mnt/drive    (deploy/k8s/second-brain-pv.yaml, 100Gi ReadOnlyMany)
-Pod 마운트:      /data/drive   (deploy/k8s/second-brain-deployment.yaml volumeMounts)
-```
-
-CliProxy 시크릿 마운트:
-```
-Secret key:   auth.json (cliproxy-auth-secret)
-Pod 경로:     /etc/cliproxy/auth.json
-설정 변수:    CLIPROXY_AUTH_FILE=/etc/cliproxy/auth.json (ConfigMap)
-```
+| 서비스 | 이미지 | 포트 | 역할 |
+|--------|--------|------|------|
+| postgres | `second-brain-postgres:local` | 5432 (내부) | PostgreSQL 16 + pgvector + pg_bigm |
+| server | `second-brain-server:local` | 8081→8080 | API 서버, DB 마이그레이션 적용 |
+| collector | `second-brain-collector:local` | — | 수집 데몬, 소스별 주기 실행 |
+| mcp | `second-brain-mcp:local` | 8090 | MCP streamable HTTP 서버 |
+| eval-runner | `second-brain-eval:local` | — | nightly eval 스케줄러 (03:00 KST) |
+| ollama | `ollama/ollama:latest` | 11434 (내부) | 로컬 LLM (gemma3:12b-it-qat) |
+| whisper | `fedirz/faster-whisper-server:latest-cpu` | 8000 (내부) | Whisper ASR (int8 CPU) |
+| diarization | `second-brain-diarization:local` | 8001 (내부) | pyannote.audio 화자 분리 |
+| web | `second-brain-web:local` | 3000 | Next.js 프론트엔드 |
 
 ---
 
 ## 3. 서비스 레이어 맵
-
-![서비스 레이어 맵](docs/diagrams/02-service-layer-map.png)
-
-> 인터랙티브 편집: [eraser.io에서 열기](https://app.eraser.io/workspace/Z8JviN6EySSKzjgtXNp4?diagram=o4bbcT5wpMrwh3nMRPRLm)
 
 ### 백엔드 패키지 의존 관계
 
@@ -163,71 +172,65 @@ flowchart LR
     classDef focal fill:#b5523a,stroke:#b5523a,color:#faf7f2,stroke-width:1px;
     classDef muted fill:#f0ebe3,stroke:#57534e,color:#57534e,stroke-width:1px;
     classDef data fill:#faf7f2,stroke:#1c1917,color:#1c1917,stroke-width:1.2px;
-    classDef ext fill:#faf7f2,stroke:#57534e,color:#1c1917,stroke-width:1px,stroke-dasharray:4 3;
 
-    MAIN["cmd/server/main.go\nDI 조립, 시그널 처리"]
+    CMD["cmd/server + cmd/collector\n+ cmd/mcp + cmd/eval\nDI 조립, 시그널 처리"]
     CFG["internal/config\nConfig.Load()"]
-    API["internal/api\nchi Router\n9개 엔드포인트"]
-    SCHED["internal/scheduler\nScheduler, SlackChannelWatcher\nrobfig/cron"]
-    COL["internal/collector\nFilesystem/Slack/GitHub\nGDriveCollector/Extractor"]
-    SEARCH["internal/search\nService, EmbedClient"]
-    STORE["internal/store\nDocumentStore, Postgres"]
-    MODEL["internal/model\nDocument, SearchQuery\nSearchResult, SourceType"]
+    API["internal/api\nchi Router\n엔드포인트 + 미들웨어\ncollect_status / reindex_check"]
+    SCHED["internal/scheduler\nScheduler\nDeleteGuard (50% ratio)\nFreshnessChecker"]
+    COL["internal/collector\nFilesystem / Slack / GitHub\nSMS / Recording / Secretary\nGmail / Calendar / LlmMemory"]
+    CHUNKER["internal/chunker\nrune 기반 청킹\nHeadingAware / adaptive"]
+    SEARCH["internal/search\nService\nHyDE / Reranker / EntityFetcher\nEmbedClient (static/cliProxy)"]
+    STORE["internal/store\nDocumentStore (5-lane hybridSearch)\nEntityStore\nCollectionStatus\nChunkStore"]
+    MODEL["internal/model\nDocument / SearchQuery\nEntity / SearchWeights"]
+    LLM["internal/llm\nCompleter (Ollama/OpenAI)\ncuration + HyDE + entity extract"]
+    WORKER["internal/worker\n비동기 임베딩 백필"]
 
-    MAIN --> CFG
-    MAIN --> STORE
-    MAIN --> SEARCH
-    MAIN --> COL
-    MAIN --> SCHED
-    MAIN --> API
+    CMD --> CFG
+    CMD --> STORE
+    CMD --> SEARCH
+    CMD --> COL
+    CMD --> SCHED
+    CMD --> API
+    CMD --> LLM
     API --> STORE
     API --> SEARCH
     API --> SCHED
     SCHED --> COL
     SCHED --> STORE
     SCHED --> SEARCH
+    SCHED --> CHUNKER
+    SCHED --> LLM
+    SCHED --> WORKER
     SEARCH --> STORE
-    STORE --> MODEL
+    SEARCH --> LLM
     COL --> MODEL
+    COL --> CHUNKER
+    STORE --> MODEL
     API --> MODEL
+    WORKER --> STORE
 
-    class MAIN focal;
+    class CMD focal;
     class STORE data;
-    class MODEL muted;
+    class MODEL,CFG muted;
 ```
 
-### 패키지별 책임 및 주요 심볼
+### 패키지별 주요 심볼
 
 | 패키지 | 주요 타입 / 함수 | 파일 |
 |---|---|---|
-| `cmd/server` | `run()` — DI 조립, `migrationsPath()` — MIGRATIONS_DIR 우선 해석 | `main.go` |
-| `internal/config` | `Config` struct, `Load()` — 환경변수 파싱, 기본값 처리 | `config.go` |
-| `internal/api` | `Server`, `Handler()` — chi 라우터, `requireAPIKey()` — Bearer 미들웨어 | `router.go`, `middleware.go`, `search.go`, `document.go`, `source.go`, `stats.go`, `collect_channel.go` |
-| `internal/scheduler` | `Scheduler`, `run()`, `runCollector()`, `embedDocuments()`, `TriggerAll()`, `ForceCollectSlackChannel()`, `LookupSlackChannel()` | `scheduler.go` |
-| `internal/collector` | `FilesystemCollector`, `SlackCollector`, `GitHubCollector`, `GDriveCollector`, `SlackChannelWatcher`, `DriveExporter` | `filesystem.go`, `slack.go`, `slack_watcher.go`, `github.go`, `gdrive.go`, `gdrive_export.go` |
-| `internal/collector/extractor` | `Registry`, `SanitizeText()`, `TruncateUTF8()`, `HTMLExtractor`, `PDFExtractor`, `DocxExtractor`, `XlsxExtractor`, `PptxExtractor`, `HwpxExtractor` | `extractor.go`, `html.go`, `pdf.go`, `docx.go`, `xlsx.go`, `pptx.go`, `hwpx.go` |
-| `internal/search` | `Service.Search()` — 임베딩 실패 시 fulltext 폴백, `EmbedClient.Embed()`, `EmbedClient.EmbedBatch()`, `cliProxyToken` (5분 TTL) | `search.go`, `embed.go` |
-| `internal/store` | `DocumentStore`, `Upsert()`, `hybridSearch()`, `fulltextSearch()`, `LastCollectedAt()`, `MarkDeleted()`, `CountBySource()` | `document.go`, `postgres.go` |
-| `internal/model` | `Document`, `SearchQuery`, `SearchResult`, `SourceType` 상수 5개 | `document.go` |
-
-### HTTP 서버 설정 (`cmd/server/main.go:113`)
-
-```
-ReadTimeout:  15s
-WriteTimeout: 30s
-IdleTimeout:  60s
-Port:         cfg.Port (기본 8080, ConfigMap에서 주입)
-```
+| `internal/api` | `Server`, `Handler()`, `requireAPIKey()`, `collectStatusHandler()`, `FreshnessChecker` | `router.go`, `collect_status.go`, `search.go` |
+| `internal/chunker` | `Options{TargetSize, MaxSize, Overlap, HeadingAware}`, `Chunk()`, `SelectOptions()` | `chunker.go`, `adaptive.go` |
+| `internal/search` | `Service.Search()`, `WithHyDE()`, `WithReranker()`, `WithEntityFetcher()`, `EmbedClient`, `HTTPReranker` | `search.go`, `embed.go`, `rerank.go`, `hyde.go`, `tune.go` |
+| `internal/store` | `DocumentStore`, `hybridSearch()` (5-lane CTE), `CollectionStatus()`, `EntityStore`, `CountActiveDocuments()` | `document.go`, `collection_status.go`, `entities.go` |
+| `internal/scheduler` | `Scheduler`, `deletionRatioThreshold=0.50`, `WithEntityExtraction()` | `scheduler.go`, `scheduler_deletion_guard*.go` |
+| `internal/llm` | `Completer` interface (Ollama / OpenAI chat completions), entity extraction, HyDE prompt | `llm.go` |
+| `internal/model` | `Document`, `SearchQuery{UseHyDE, UseRerank}`, `Entity`, `SearchWeights` | `document.go` |
 
 ---
 
 ## 4. 데이터 모델
 
-![데이터 모델 ERD](docs/diagrams/03-data-model-erd.png)
-
-> 인터랙티브 편집: [eraser.io에서 열기](https://app.eraser.io/workspace/O901Iet3HpcIaldLfQ1e?diagram=fo1U7OVZh_I9mVe6OaLfV)
-
-### ERD
+### ERD (migration 001~019)
 
 ```mermaid
 %%{init: {
@@ -247,88 +250,128 @@ Port:         cfg.Port (기본 8080, ConfigMap에서 주입)
 erDiagram
     documents {
         uuid id PK "gen_random_uuid()"
-        text source_type "NOT NULL — filesystem|slack|github|gdrive|notion"
-        text source_id "NOT NULL — 소스 내 고유 식별자"
+        text source_type "NOT NULL — filesystem|slack|github|sms|recording|secretary|gmail|calendar|llm_memory"
+        text source_id "NOT NULL — 소스 내 고유 식별자; sms:{ms}:{addrHash}:{direction}"
         text title "NOT NULL"
         text content "NOT NULL"
         jsonb metadata "default '{}'"
-        vector_1536 embedding "nullable — 임베딩 미완료 시 NULL"
-        tsvector tsv "GENERATED STORED — title(A) + content(B)"
+        vector_1536 embedding "nullable — text-embedding-3-small"
+        vector_1536 summary_embedding "nullable — 요약 임베딩 lane (#013)"
+        text title_summary "nullable — LLM 요약 제목 (#012)"
+        text bullet_summary "nullable — LLM 요약 bullet (#012)"
+        tsvector tsv "GENERATED STORED — english(A+B) + simple(A+B)"
         timestamptz collected_at "NOT NULL — 파일 ModTime 또는 수집 시각"
         timestamptz created_at "default now()"
-        timestamptz updated_at "default now() — Upsert 시 갱신"
+        timestamptz updated_at "default now()"
         text status "default 'active' — active|deleted|moved"
-        timestamptz deleted_at "nullable — 소프트 삭제 시점"
+        timestamptz deleted_at "nullable"
+        timestamptz entity_processed_at "nullable — 엔티티 추출 완료 시각 (#018)"
+    }
+
+    chunks {
+        bigserial id PK
+        uuid document_id FK "→ documents.id ON DELETE CASCADE"
+        int chunk_index "NOT NULL — 청크 순번"
+        text content "NOT NULL"
+        tsvector content_tsv "GENERATED — to_tsvector('simple', content)"
+        int byte_size "NOT NULL"
+        vector_1536 embedding "nullable — per-chunk 임베딩 (#015)"
+        timestamptz created_at "default now()"
+    }
+
+    entities {
+        bigserial id PK
+        text name "NOT NULL"
+        text type "NOT NULL — PERSON|ORG|CONCEPT|OTHER"
+        text normalized_name "NOT NULL — lower(trim(name))"
+        timestamptz created_at "default now()"
+    }
+
+    document_entities {
+        uuid document_id FK "→ documents.id ON DELETE CASCADE"
+        bigint entity_id FK "→ entities.id ON DELETE CASCADE"
     }
 
     collection_log {
         uuid id PK
         text source_type "NOT NULL"
         timestamptz started_at "NOT NULL"
-        timestamptz finished_at
+        timestamptz finished_at "nullable"
         int documents_count "default 0"
         text error "nullable"
         timestamptz created_at "default now()"
     }
 
-    documents ||--o{ collection_log : "source_type 기준"
+    feedback {
+        bigserial id PK
+        text query "nullable"
+        uuid document_id FK "→ documents.id ON DELETE SET NULL"
+        bigint chunk_id FK "→ chunks.id ON DELETE SET NULL"
+        text source "NOT NULL — search|discord_bot|api"
+        text user_id "nullable"
+        smallint thumbs "NOT NULL — +1|-1|0"
+        text comment "nullable"
+        jsonb metadata "default '{}'"
+        timestamptz created_at "NOT NULL default now()"
+    }
+
+    eval_metrics {
+        serial id PK
+        double ndcg5 "NOT NULL"
+        double ndcg10 "NOT NULL"
+        double mrr10 "NOT NULL"
+        int pairs "NOT NULL — eval set 크기"
+        timestamptz run_at "NOT NULL default now()"
+    }
+
+    documents ||--o{ chunks : "document_id"
+    documents ||--o{ document_entities : "document_id"
+    entities ||--o{ document_entities : "entity_id"
+    documents ||--o{ feedback : "document_id"
+    chunks ||--o{ feedback : "chunk_id"
 ```
 
-### `documents` 테이블 (`migrations/001_init.sql`, `migrations/002_soft_delete.sql`)
+### 마이그레이션 목록 (001~019)
 
-| 컬럼 | 타입 | 제약 조건 | 비고 |
-|---|---|---|---|
-| `id` | uuid | PK, `gen_random_uuid()` | |
-| `source_type` | text | NOT NULL | `filesystem`, `slack`, `github`, `gdrive`, `notion` |
-| `source_id` | text | NOT NULL | filesystem: 상대경로, slack: `{channel_id}:{ts}`, github: `{org/repo}#{number}` |
-| `title` | text | NOT NULL | |
-| `content` | text | NOT NULL | |
-| `metadata` | jsonb | default `'{}'` | 소스별 부가 정보 |
-| `embedding` | vector(1536) | nullable | text-embedding-3-small 차원 |
-| `tsv` | tsvector | GENERATED ALWAYS STORED | english(A+B) + simple(A+B) 혼용 |
-| `collected_at` | timestamptz | NOT NULL | 파일 ModTime UTC 기준 |
-| `created_at` | timestamptz | default now() | |
-| `updated_at` | timestamptz | default now() | Upsert 시 갱신 |
-| `status` | text | default `'active'` | `active`, `deleted`, `moved` |
-| `deleted_at` | timestamptz | nullable | 소프트 삭제 시점 |
+| # | 파일 | 주요 변경 |
+|---|------|-----------|
+| 001 | `001_init.sql` | documents, collection_log, HNSW 인덱스, tsvector GENERATED |
+| 002 | `002_soft_delete.sql` | status, deleted_at 컬럼 + 인덱스 |
+| 003 | `003_extraction_failures.sql` | extraction_failures 추적 |
+| 004 | `004_chunks.sql` | chunks 테이블 + content_tsv GIN |
+| 005 | `005_feedback.sql` | feedback 테이블 (thumbs, query, session_id) |
+| 006 | `006_bigm.sql` | pg_bigm 확장 + GIN bigm 인덱스 |
+| 007 | `007_eval_metrics.sql` | eval_metrics (ndcg5, ndcg10, mrr10) |
+| 008 | `008_reindex_state.sql` | reindex_state 추적 테이블 |
+| 009 | `009_collector_state.sql` | collector_state (증분 수집 커서) |
+| 010 | `010_occurred_at.sql` | SMS/통화 occurred_at 컬럼 |
+| 011 | `011_configurable_embedding_dim.sql` | 임베딩 차원 설정 가능 |
+| 012 | `012_summary_columns.sql` | title_summary, bullet_summary 컬럼 |
+| 013 | `013_summary_vector.sql` | summary_embedding vector(1536) + HNSW |
+| 014 | `014_unsummarized_index.sql` | 미요약 문서 조회용 부분 인덱스 |
+| 015 | `015_chunk_embeddings.sql` | chunks.embedding vector(1536) + HNSW |
+| 016 | `016_eval_latency.sql` | eval 실행 latency 기록 |
+| 017 | `017_entities.sql` | entities + document_entities 테이블 |
+| 018 | `018_entity_processed_at.sql` | documents.entity_processed_at 컬럼 |
+| 019 | `019_sms_sourceid_rekey.sql` | SMS source_id bodyHash→direction 재키잉 |
 
-### 인덱스 (`migrations/001_init.sql`, `migrations/002_soft_delete.sql`)
+### `documents` 주요 인덱스
 
 | 인덱스명 | 종류 | 대상 | 목적 |
 |---|---|---|---|
 | `(UNIQUE)` | UNIQUE | `(source_type, source_id)` | Upsert 충돌 키 |
-| `idx_documents_tsv` | GIN | `tsv` | 전문 검색 |
-| `idx_documents_embedding` | HNSW | `embedding vector_cosine_ops` | 코사인 유사도 ANN 검색 |
-| `idx_documents_source` | B-tree | `source_type` | 소스별 필터 |
-| `idx_documents_collected` | B-tree | `collected_at DESC` | 최신순 정렬 |
-| `idx_documents_status` | B-tree | `status` | 소프트 삭제 필터 |
-
-**pgvector 설정**: `HNSW (vector_cosine_ops)` — `migrations/001_init.sql:26`. IVFFlat 대신 HNSW를 선택한 이유는 인덱스 빌드 시점에 lists 파라미터가 필요 없고, 온라인 insert에 더 적합하기 때문이다. 기본 HNSW 파라미터(`m=16`, `ef_construction=64`)를 사용한다.
-
-### `tsvector` 생성 규칙 (`migrations/001_init.sql:12-17`)
-
-```sql
-setweight(to_tsvector('english', coalesce(title,   '')), 'A') ||
-setweight(to_tsvector('simple',  coalesce(title,   '')), 'A') ||
-setweight(to_tsvector('english', coalesce(content, '')), 'B') ||
-setweight(to_tsvector('simple',  coalesce(content, '')), 'B')
-```
-
-영어 형태소 분석(`english`)과 단순 토큰화(`simple`)를 모두 적용하여 영어 단어의 원형 검색과 한국어 키워드 검색을 동시에 지원한다.
-
-### `collection_log` 테이블
-
-수집 실행마다 한 행 기록. `started_at`, `finished_at`, `documents_count`, `error` 컬럼으로 수집 이력 추적. `store.RecordCollectionLog()` (`internal/store/document.go:329`)에서 기록.
+| `idx_documents_tsv` | GIN | `tsv` | BM25 전문 검색 |
+| `idx_documents_embedding` | HNSW | `embedding vector_cosine_ops` | 코사인 ANN |
+| `idx_documents_summary_embedding` | HNSW | `summary_embedding vector_cosine_ops` | 요약 임베딩 ANN |
+| `idx_documents_bigm_content` | GIN bigm | `content gin_bigm_ops` | pg_bigm 2-gram |
+| `idx_documents_bigm_title` | GIN bigm | `title gin_bigm_ops` | pg_bigm 제목 |
+| `idx_documents_entity_processed_at` | B-tree | `entity_processed_at` | 미처리 문서 조회 |
 
 ---
 
 ## 5. 수집 파이프라인
 
-![수집 파이프라인 시퀀스](docs/diagrams/04-collection-pipeline-sequence.png)
-
-> 인터랙티브 편집: [eraser.io에서 열기](https://app.eraser.io/workspace/2NzpSSDbSx4Oh3gCs6DV?diagram=UT0aD63tuIkrRiqLEUgKr)
-
-### 전체 흐름 시퀀스
+### 전체 흐름 시퀀스 (IndexAware + 삭제 가드)
 
 ```mermaid
 %%{init: {
@@ -346,42 +389,60 @@ setweight(to_tsvector('simple',  coalesce(content, '')), 'B')
   }
 }}%%
 sequenceDiagram
-    participant CRON as cron.Cron (robfig/cron)<br/>또는 POST /collect/trigger
+    participant CRON as robfig/cron<br/>또는 POST /collect/trigger
     participant SCHED as Scheduler.run()
-    participant CAS as atomic.Bool
+    participant CAS as atomic.Bool (CAS)
     participant RC as runCollector()
     participant COL as Collector.Collect(ctx, since)
+    participant CHUNK as chunker.Chunk()
     participant EMBED as embedDocuments()
     participant STORE as DocumentStore.Upsert()
-    participant DD as DeletionDetector (fs only)
+    participant GUARD as DeletionGuard (fs only)
+    participant FRESH as FreshnessChecker
 
-    CRON->>SCHED: tick (COLLECT_INTERVAL, default 10m)
+    CRON->>SCHED: tick (per-source COLLECT_INTERVAL)
     SCHED->>CAS: CompareAndSwap(false→true)
     alt 이미 실행 중
         CAS-->>SCHED: false → warn + return
     else
         CAS-->>SCHED: true
         SCHED->>RC: runCollector(col)
-        RC->>STORE: LastCollectedAt(source_type)
-        STORE-->>RC: since timestamp (첫 실행: time.Time{})
+        RC->>STORE: LastCollectedAt(instanceID, source_type)
+        STORE-->>RC: since timestamp
         RC->>COL: Collect(ctx, since)
         COL-->>RC: []model.Document
-        RC->>EMBED: embedDocuments(batch=20)
-        loop 각 배치 20개
-            EMBED->>OpenAI: POST /v1/embeddings
-            OpenAI-->>EMBED: []float32 vectors
-        end
+
         loop 각 Document
-            RC->>STORE: Upsert(doc)
-            STORE-->>RC: id, created_at, updated_at
+            RC->>CHUNK: Chunk(text, adaptive.SelectOptions(sourceType))
+            CHUNK-->>RC: []string chunks
+            RC->>STORE: Upsert(doc + chunks)
         end
+
+        RC->>EMBED: embedDocuments(batch=20)
+        loop 배치 20개
+            EMBED->>OpenAI: POST /v1/embeddings
+            OpenAI-->>EMBED: []float32[1536]
+        end
+
         RC->>STORE: RecordCollectionLog(src, started, count, err)
-        opt FilesystemCollector (DeletionDetector)
-            RC->>DD: ListActiveSourceIDs(ctx)
-            DD-->>RC: []string (현재 파일 목록)
-            RC->>STORE: MarkDeleted(source_type, activeIDs)
+
+        opt FilesystemCollector only
+            RC->>STORE: CountActiveDocuments(source_type)
+            STORE-->>RC: activeInDB
+            RC->>COL: ListActiveSourceIDs()
+            COL-->>RC: activeOnFS (파일시스템 walk)
+
+            alt (activeInDB - activeOnFS) / activeInDB > 0.50
+                RC->>RC: slog.Warn("deletion ratio exceeded") — SKIP MarkDeleted
+            else
+                RC->>STORE: MarkDeleted(source_type, activeOnFS)
+            end
         end
+
         SCHED->>CAS: Store(false)
+        SCHED->>FRESH: Check(ctx)
+        FRESH->>STORE: CollectionStatus(ctx)
+        FRESH-->>SCHED: alert if stale or consecutive failures
     end
 ```
 
@@ -389,131 +450,53 @@ sequenceDiagram
 
 ```go
 type Scheduler struct {
-    cron       *cron.Cron          // robfig/cron v3, seconds resolution
+    cron       *cron.Cron       // robfig/cron v3, seconds resolution
     collectors []collector.Collector
-    store      DocumentUpserter
+    store      DocumentUpserter // includes CountActiveDocuments (required, #148)
     embed      *search.EmbedClient
-    running    atomic.Bool         // CAS 뮤텍스 (scheduler.go:57)
+    running    atomic.Bool      // CAS 뮤텍스
+    freshness  *api.FreshnessChecker // staleness 모니터 (#137)
 }
 ```
 
-- `Register(interval)` — 각 Collector에 cron 스펙 `@every {interval}` 등록 (scheduler.go:73)
-- `TriggerAll()` — `POST /api/v1/collect/trigger` 수동 트리거, goroutine 실행 (scheduler.go:101)
-- `run()` — cron 틱 진입점, CAS 획득 후 단일 Collector 실행 (scheduler.go:119)
-- `runCollector()` — 실제 수집 로직, `LastCollectedAt` → `Collect` → `embedDocuments` → `Upsert` → `RecordCollectionLog` → `MarkDeleted` (scheduler.go:131)
-
-**defaultMaxEmbedChars = 8000** (scheduler.go:25): OpenAI 토큰 한도 회피용 기본 절단값. `MAX_EMBED_CHARS` 환경변수로 오버라이드 가능.
-
-### SlackChannelWatcher (`internal/collector/slack_watcher.go`)
-
-```mermaid
-%%{init: {
-  "theme": "base",
-  "themeVariables": {
-    "background": "#faf7f2",
-    "primaryColor": "#faf7f2",
-    "primaryTextColor": "#1c1917",
-    "primaryBorderColor": "#1c1917",
-    "lineColor": "#57534e",
-    "secondaryColor": "#f0ebe3",
-    "tertiaryColor": "#faf7f2",
-    "fontFamily": "-apple-system, BlinkMacSystemFont, Geist, Inter, sans-serif",
-    "fontSize": "13px"
-  }
-}}%%
-sequenceDiagram
-    participant MAIN as main.go (goroutine)
-    participant W as SlackChannelWatcher.Run()
-    participant SLACK as Slack users.conversations
-    participant STORE as DocumentStore
-
-    MAIN->>W: go watcher.Run(ctx)
-    Note over W: ticker 60s
-    W->>SLACK: 첫 틱: ListMemberChannels()
-    SLACK-->>W: 기존 채널 목록 → seen 맵에 seed (수집 안 함)
-    loop 60초마다
-        W->>SLACK: ListMemberChannels()
-        SLACK-->>W: 현재 채널 목록
-        W->>W: seen 차집합 = 신규 채널
-        loop 각 신규 채널
-            W->>SLACK: CollectChannel(ch.ID, ch.Name, time.Time{})
-            W->>W: embedDocuments(batch=20)
-            W->>STORE: Upsert (각 메시지)
-            W->>STORE: RecordCollectionLog
-        end
-    end
-```
-
-`seen` 맵은 `sync.Mutex`로 보호 (slack_watcher.go:29). 첫 틱에서 기존 채널을 seen에만 추가하고 수집은 스킵 — 재시작 시 전체 재수집 방지.
+**삭제 가드 (`deletionRatioThreshold = 0.50`)**: filesystem 수집 후 DB 활성 문서 대비 삭제 예정 비율이 50% 초과 시 `MarkDeleted`를 건너뛰고 경고 로그만 출력. `CountActiveDocuments`는 `DocumentUpserter` 인터페이스에 필수 메서드로 승격되어 컴파일 타임에 보장됨 (#148).
 
 ### 수집기별 상세
 
-#### FilesystemCollector (`internal/collector/filesystem.go`)
+#### FilesystemCollector
 
 | 항목 | 값 |
 |---|---|
-| 루트 경로 | `FILESYSTEM_PATH` env (ConfigMap: `/data/drive`) |
-| 증분 기준 | `info.ModTime().After(since)` (filesystem.go:145) |
+| 루트 경로 | `FILESYSTEM_PATH` env |
+| 증분 기준 | `info.ModTime().After(since)` |
 | 스킵 디렉토리 | `.git`, `node_modules`, `dist`, `.next`, `.omc`, `.sisyphus`, `.claude` |
-| 스킵 확장자 | `.bak`, `.gitkeep`, `.plist`, `.lock`, `.DS_Store` |
-| 전체 텍스트 확장자 | `.md`, `.txt`, `.csv`, `.json`, `.js`, `.ts`, `.tsx`, `.py`, `.sh` |
-| 텍스트 파일 상한 | 512 KB (`maxTextFileBytes`) |
-| 추출기 확장자 | `.html`, `.htm`, `.pdf`, `.docx`, `.xlsx`, `.pptx`, `.hwpx` (Registry) |
-| Google Workspace | `.gsheet`, `.gdoc`, `.gscript`, `.gslides`, `.gform` — URL 추출 + Drive API export 시도 |
-| 이미지 처리 | `.png`, `.jpg`, `.jpeg`, `.gif`, `.svg` — 메타데이터 전용 |
-| 아카이브 처리 | `.zip`, `.apk`, `.tar`, `.gz` — 메타데이터 전용 |
-| 읽기 타임아웃 | 텍스트 파일: 3s (`fileReadTimeout`), GWorkspace: 2s, 바이너리 추출: 10s (`extractTimeout`) |
-| 소프트 삭제 지원 | `ListActiveSourceIDs()` 구현 → `DeletionDetector` 인터페이스 충족 |
+| 텍스트 파일 상한 | 512 KB |
+| DeletionDetector | `ListActiveSourceIDs()` 구현 |
 
-`SourceID` = `filepath.Rel(rootPath, absPath)` (filesystem.go:225) — 상대 경로를 중복 검사 키로 사용.
-
-**알려진 이슈**: minikube의 9P 파일시스템 드라이버는 한국어 장파일명 처리 시 `lstat: file name too long` 오류를 반환. `filepath.WalkDir` 콜백에서 warn 로그 후 스킵 처리 (filesystem.go:126-130).
-
-#### SlackCollector (`internal/collector/slack.go`)
+#### SlackCollector
 
 | 항목 | 값 |
 |---|---|
-| 채널 범위 | `users.conversations` — 봇이 member인 채널만 (public + private) |
-| DM 비수집 | `types=public_channel,private_channel` 파라미터 — IM/MPIM 명시적 제외 |
-| 증분 기준 | `since.Unix() > 0`일 때만 `oldest` 파라미터 전송 (slack.go:225) |
-| 쓰레드 처리 | `reply_count > 0`인 메시지마다 `conversations.replies` 호출 → 독립 Document로 저장 |
-| 페이지네이션 | cursor 기반, limit=200 (slack.go:183, 218, 266) |
-| HTTP 타임아웃 | 30s (`http.Client{Timeout: 30 * time.Second}`) |
-| SourceID | `{channel_id}:{ts}` (slack.go:119) |
-| Title 형식 | `#{channel_name} — {ts}` |
+| 채널 범위 | `users.conversations` — 봇 member 채널만 |
+| DM 비수집 | `types=public_channel,private_channel` — IM 명시적 제외 |
+| 쓰레드 | `reply_count > 0` → `conversations.replies` → 독립 Document |
+| SourceID | `{channel_id}:{ts}` |
 
-**알려진 한계**: 부모 메시지가 `since` 이전에 작성되었지만 그 이후에 thread reply가 달린 경우, 증분 수집에서 해당 reply를 놓침 (slack.go:45 주석).
+#### SMSCollector / RecordingCollector
 
-#### GitHubCollector (`internal/collector/github.go`)
+SMS·통화: Android second-brain-push 앱이 `POST /api/v1/ingest/messages`로 전송. `source_id = sms:{dateMs}:{sha256(addr)[:16]}:{direction}`. migration 019로 이전 bodyHash 기반 source_id를 재키잉.
 
-| 항목 | 값 |
-|---|---|
-| 수집 단위 | `GITHUB_ORG` 내 비아카이브 레포지터리 전체 |
-| 수집 대상 | Issues + Pull Requests (PR은 `pull_request` 필드 non-nil로 구분) |
-| 증분 기준 | `/repos/{repo}/issues?state=all&since={RFC3339}` |
-| 페이지네이션 | page 기반, per_page=100 |
-| API 버전 | `X-GitHub-Api-Version: 2022-11-28` |
-| HTTP 타임아웃 | 30s |
-| SourceID | `{org/repo}#{number}` (github.go:122) |
-| Title 형식 | `[{org/repo}] {issue_title}` |
+녹음: `POST /api/v1/ingest/recording`으로 `.m4a` multipart 수신 → Whisper ASR → 텍스트 변환 후 저장. 손상 오디오는 격리 처리 (#152).
 
-#### GDriveCollector (`internal/collector/gdrive.go`, `gdrive_export.go`)
+#### secretary / gmail / calendar / llm-memory
 
-스캐폴드 상태. `Enabled()` = `false` (credentials 없을 때). Drive API는 `FilesystemCollector`와 연동된 `DriveExporter`를 통해 Google Workspace stub 파일(`.gdoc`, `.gsheet` 등)의 내용을 export하는 형태로만 활성화.
-
-`DriveExporter.Export()` MIME 매핑:
-- `.gsheet` → `text/csv`
-- `.gdoc`, `.gscript`, `.gform`, `.gslides` → `text/plain`
-
-#### NotionCollector (`internal/collector/notion.go`)
-
-비활성화. `cmd/server/main.go:75` 주석 참조 — 재활성화 시 `NewNotionCollector()` 등록 필요.
+호스트 SQLite·파일을 docker volume ro 마운트로 직접 접근. secretary collector는 v0.20.x에서 정리됨 (#151).
 
 ---
 
 ## 6. 추출 파이프라인
 
-`internal/collector/extractor/` 패키지의 `Registry`가 확장자별 Extractor를 선택한다. 모든 추출기는 같은 인터페이스를 구현한다.
+`internal/collector/extractor/` 패키지의 `Registry`가 확장자별 Extractor를 선택한다.
 
 ```go
 type Extractor interface {
@@ -522,78 +505,90 @@ type Extractor interface {
 }
 ```
 
-Registry 등록 순서 (extractor.go:42-50): `HTMLExtractor` → `PDFExtractor` → `DocxExtractor` → `XlsxExtractor` → `PptxExtractor` → `HwpxExtractor`
+Registry 등록 순서: `HTMLExtractor` → `PDFExtractor` → `DocxExtractor` → `XlsxExtractor` → `PptxExtractor` → `HwpxExtractor`
 
-### SanitizeText (`internal/collector/extractor/extractor.go:92`)
+### SanitizeText
 
 모든 추출기 출력에 공통 적용:
-
-1. `\x00` → `" "` (space) — Postgres TEXT 저장 오류 방지
-2. `strings.ToValidUTF8(s, "\uFFFD")` — 유효하지 않은 UTF-8 치환
-3. 연속 `\n\n\n` → `\n\n` 압축 (문단 구조 유지)
-
-### TruncateUTF8 (`extractor.go:64`)
-
-추출 완료 후 `MaxExtractedBytes = 512 KB` 상한 적용. UTF-8 경계를 지켜 절단하고 `\n[content truncated]` 접미사 추가.
-
-### 추출기별 상세
-
-| 확장자 | 추출기 | 라이브러리 | 처리 방식 | 특이사항 |
-|---|---|---|---|---|
-| `.html`, `.htm` | `HTMLExtractor` | `x/net/html` | 태그 파싱 후 텍스트 노드 연결 | 인라인 스크립트/스타일 제외 |
-| `.pdf` | `PDFExtractor` | `github.com/ledongthuc/pdf` | 페이지별 `GetPlainText()` 순차 연결 | 10s ctx 타임아웃, goroutine abandon 패턴 (pdf.go:25-44) |
-| `.docx` | `DocxExtractor` | 표준 `archive/zip` + `encoding/xml` | OOXML 압축 해제 → `word/document.xml` → `<w:t>` 노드 | `</w:p>` 마다 개행 삽입 (docx.go:93) |
-| `.xlsx` | `XlsxExtractor` | `github.com/xuri/excelize/v2` | `RawCellValue:true` → 시트별 TSV 블록 | 200 KiB 상한 (`xlsxMaxBytes`), 빈 행/시트 스킵, 셀 내 `\t`/`\n` → 공백 |
-| `.pptx` | `PptxExtractor` | 표준 `archive/zip` + `encoding/xml` | OOXML 압축 해제 → `ppt/slides/*.xml` → `<a:t>` 노드 | |
-| `.hwpx` | `HwpxExtractor` | 표준 `archive/zip` + `encoding/xml` | OWPML 압축 해제 → `Contents/section*.xml` → `<hp:t>` 노드 | 섹션 번호 numeric sort (section10 > section2), `</hp:p>` 마다 개행 삽입 |
-
-### XLSX TSV 출력 형식
-
-```
-##SHEET Sheet1
-col_a\tcol_b\tcol_c
-val1\tval2\tval3
-
-##SHEET Summary
-name\ttotal
-Alice\t100
-```
-
-- 프론트엔드 `XlsxTable.tsx`가 `##SHEET` 구분자를 파싱하여 시트당 최대 200행 렌더링
-- 200 KiB 초과 시 `\n...(truncated)` 접미사 추가 후 조기 종료 (xlsx.go:116)
+1. `\x00` → `" "` — Postgres TEXT 저장 오류 방지
+2. `strings.ToValidUTF8(s, "�")` — 유효하지 않은 UTF-8 치환
+3. 연속 `\n\n\n` → `\n\n` 압축
 
 ### 컨텐츠 크기 계층
 
-| 레이어 | 상한 | 위치 |
-|---|---|---|
-| 텍스트 파일 인라인 읽기 | 512 KB | `filesystem.go:43 (maxContentBytes = 1MB` → `maxTextFileBytes = 512KB`) |
-| 추출기 출력 | 512 KB | `extractor.go:16 (MaxExtractedBytes)` |
-| XLSX 중간 버퍼 | 200 KB | `xlsx.go:16 (xlsxMaxBytes)` |
-| 임베딩 입력 | 8000자 (기본) | `scheduler.go:25 (defaultMaxEmbedChars)` |
-| raw 파일 API | 50 MiB | `internal/api/document.go` |
+| 레이어 | 상한 |
+|---|---|
+| 텍스트 파일 인라인 읽기 | 512 KB |
+| 추출기 출력 (`MaxExtractedBytes`) | 512 KB |
+| XLSX 중간 버퍼 (`xlsxMaxBytes`) | 200 KB |
+| 임베딩 입력 (`defaultMaxEmbedChars`) | 8000자 (기본) |
+| raw 파일 API | 50 MiB |
+
+### rune 기반 청킹 (`internal/chunker/`)
+
+```go
+type Options struct {
+    TargetSize  int  // 청크 목표 크기 (rune 단위, 기본 2000)
+    MaxSize     int  // 청크 최대 크기 (rune 단위, 기본 4000)
+    Overlap     int  // 청크 간 오버랩 (rune 단위, 기본 100)
+    HeadingAware bool // 마크다운/HTML 헤딩 기반 섹션 분리
+}
+```
+
+rune 단위 사용으로 한국어(3바이트/rune)·영어(1바이트/rune) 동일한 정보 밀도 보장 (#145). `adaptive.SelectOptions(sourceType)`이 소스 타입별 최적 옵션을 자동 선택.
 
 ---
 
 ## 7. 임베딩 파이프라인
 
-### 토큰 소스 우선순위 (`internal/search/embed.go:92`)
+### 토큰 소스 우선순위 (`internal/search/embed.go`)
 
 ```go
-func NewEmbedClient(apiURL, apiKey, authFilePath, model string) *EmbedClient {
-    var ts tokenSource
-    switch {
-    case apiKey != "":        // 1순위: EMBEDDING_API_KEY 환경변수
-        ts = &staticToken{t: apiKey}
-    case authFilePath != "": // 2순위: CliProxy JSON 파일 (5분 TTL 자동 갱신)
-        ts = newCliProxyToken(authFilePath)
-    }
-    // 3순위: Authorization 헤더 없음 (자체 호스팅 호환)
+switch {
+case apiKey != "":        // 1순위: EMBEDDING_API_KEY
+    ts = &staticToken{t: apiKey}
+case authFilePath != "": // 2순위: CliProxy JSON (5분 TTL 자동 갱신)
+    ts = newCliProxyToken(authFilePath)
 }
+// 3순위: Authorization 헤더 없음 (자체 호스팅 호환)
 ```
 
-`cliProxyToken` (embed.go:29): 5분 TTL 캐시, 만료 시 파일 재읽기. `access_token` 필드 파싱. `sync.Mutex`로 동시성 보호.
+### 임베딩 흐름
 
-### EmbedBatch 흐름 (`internal/scheduler/scheduler.go:198`)
+```
+embedDocuments(batch=20)
+  └─ 각 Document:
+       text = title + "\n\n" + content
+       if len(text) > maxLen: text = text[:maxLen] + warn
+       EmbedBatch(ctx, texts[20]) → OpenAI /v1/embeddings
+         → []float32[1536]
+       docs[i].Embedding = vecs[i]
+
+chunks 임베딩 (#015):
+  └─ 각 Chunk:
+       EmbedBatch(ctx, chunkTexts[20]) → chunk.embedding
+```
+
+**임베딩 실패 시**: 배치 오류가 전체 수집을 중단하지 않음. 해당 배치만 WARN 로그 후 스킵. worker 패키지가 비동기 백필 처리 (#141).
+
+### 검색 시 쿼리 임베딩
+
+```go
+// search.go
+if q.UseHyDE && s.llmClient != nil {
+    hydeDoc := s.llmClient.Complete(ctx, hydePrompt(q.Query))
+    vec, _ = s.embed.Embed(ctx, hydeDoc)  // HyDE 문서 임베딩
+} else {
+    vec, _ = s.embed.Embed(ctx, q.Query)  // 쿼리 직접 임베딩
+}
+q.Embedding = vec
+```
+
+---
+
+## 8. 검색 파이프라인
+
+### 5-lane 하이브리드 검색 RRF
 
 ```mermaid
 %%{init: {
@@ -610,63 +605,97 @@ func NewEmbedClient(apiURL, apiKey, authFilePath, model string) *EmbedClient {
     "fontSize": "13px"
   }
 }}%%
-sequenceDiagram
-    participant SCHED as embedDocuments()
-    participant EMBED as EmbedClient.EmbedBatch()
-    participant OAI as OpenAI /v1/embeddings
+flowchart TD
+    classDef focal fill:#b5523a,stroke:#b5523a,color:#faf7f2,stroke-width:1px;
+    classDef lane fill:#f0ebe3,stroke:#57534e,color:#57534e,stroke-width:1px;
+    classDef data fill:#faf7f2,stroke:#1c1917,color:#1c1917,stroke-width:1.2px;
 
-    loop docs를 batchSize=20 단위로
-        SCHED->>SCHED: text = title + "\n\n" + content
-        alt len(text) > maxLen (default 8000)
-            SCHED->>SCHED: text = text[:maxLen]
-            SCHED->>SCHED: slog.Warn("content truncated")
-        end
-        SCHED->>EMBED: EmbedBatch(ctx, texts[20])
-        EMBED->>OAI: POST /v1/embeddings\n{input: [...], model: "text-embedding-3-small"}
-        OAI-->>EMBED: [{index, embedding: float32[1536]}]
-        alt API 오류
-            EMBED-->>SCHED: error
-            SCHED->>SCHED: slog.Warn("batch failed, skipping chunk")
-            Note over SCHED: 배치 실패가 전체 수집을 중단하지 않음
-        else 성공
-            EMBED-->>SCHED: [][]float32
-            SCHED->>SCHED: docs[i].Embedding = vecs[i]
-        end
+    QUERY["User Query"]
+    HYDE["HyDE 확장\n(opt-in)\nLLM → 가상 문서\n→ embed"]
+    EMBED["Query Embedding\ntext-embedding-3-small\nvec: float32[1536]"]
+
+    subgraph LANES["5-lane Retrieval (hybridSearch CTE)"]
+        FTS["FTS lane\ntsv @@ plainto_tsquery\n(simple + english)\nts_rank 내림차순"]
+        VEC["Vec lane\nembedding <=> vec\n코사인 ANN (HNSW)"]
+        BIGM["bigm lane\nLIKE '%' || query || '%'\nbigm_similarity 정렬 (#138)\n한국어 부분 매칭"]
+        SUMMVEC["summvec lane\nsummary_embedding <=> vec\n80% coverage gate (#63)"]
+        ENTITY["entity lane\nnormalized_name LIKE query\nentity join rank (#139)\nENTITY_EXTRACTION_ENABLED 필요"]
     end
+
+    RRF["RRF Fusion\nscore = Σ weight / (60 + rank)\nFULL OUTER JOIN\nk=60 표준값"]
+    RERANK["BGE cross-encoder\nrerank (opt-in)\njina-reranker-v2-base-multilingual"]
+    RESULT["Search Results\n+ Entities 부착\n(EntityFetcher)"]
+
+    QUERY --> HYDE
+    HYDE --> EMBED
+    QUERY --> EMBED
+    EMBED --> VEC
+    EMBED --> SUMMVEC
+    QUERY --> FTS
+    QUERY --> BIGM
+    QUERY --> ENTITY
+    FTS --> RRF
+    VEC --> RRF
+    BIGM --> RRF
+    SUMMVEC --> RRF
+    ENTITY --> RRF
+    RRF --> RERANK
+    RERANK --> RESULT
+
+    class QUERY focal;
+    class FTS,VEC,BIGM,SUMMVEC,ENTITY lane;
+    class RRF,RERANK data;
 ```
 
-### 검색 시 쿼리 임베딩 (`internal/search/search.go:34`)
+### hybridSearch CTE 구조 (`internal/store/document.go`)
 
-```go
-func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.SearchResult, error) {
-    if s.embed.Enabled() {
-        vec, err := s.embed.Embed(ctx, q.Query)  // 단일 쿼리 임베딩
-        if err != nil {
-            slog.Warn("search: embedding failed, falling back to full-text", "error", err)
-            // 임베딩 실패 시 FTS 전용으로 그레이스풀 폴백
-        } else {
-            q.Embedding = vec
-        }
-    }
-    return s.store.Search(ctx, q)
-}
+5개의 CTE(fts, vec, bigm, summvec, entity)를 FULL OUTER JOIN으로 결합:
+
+```sql
+WITH fts AS (
+    SELECT id, row_number() OVER (ORDER BY
+        GREATEST(ts_rank(tsv, plainto_tsquery('simple', $1)),
+                 ts_rank(tsv, plainto_tsquery('english', $1))) DESC) AS rank
+    FROM documents WHERE tsv @@ ... LIMIT $3
+),
+vec AS (
+    SELECT id, row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
+    FROM documents WHERE embedding IS NOT NULL LIMIT $3
+),
+bigm AS (
+    SELECT id, row_number() OVER (ORDER BY
+        GREATEST(bigm_similarity(content, $1),
+                 bigm_similarity(title, $1)) DESC, id ASC) AS rank
+    FROM documents WHERE content LIKE '%' || $1 || '%' ... LIMIT $3
+),
+summvec AS (
+    SELECT id, row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
+    FROM documents WHERE summary_embedding IS NOT NULL LIMIT $3
+),
+entity AS (
+    SELECT de.document_id AS id,
+           row_number() OVER (ORDER BY COUNT(*) DESC) AS rank
+    FROM document_entities de JOIN entities e ON e.id = de.entity_id
+    WHERE e.normalized_name LIKE '%' || $N || '%'
+    GROUP BY de.document_id LIMIT $3
+)
+SELECT d.*, (
+    w.FTS    / (60 + COALESCE(fts.rank,    0)) +
+    w.Vec    / (60 + COALESCE(vec.rank,    0)) +
+    w.Bigm   / (60 + COALESCE(bigm.rank,   0)) +
+    w.SummVec/ (60 + COALESCE(summvec.rank,0)) +
+    w.Entity / (60 + COALESCE(entity.rank, 0))
+) AS score
+FROM ... FULL OUTER JOIN ... ORDER BY score DESC
 ```
 
-**임베딩 비활성화 시 동작**: `EMBEDDING_API_URL`이 빈 문자열이면 `EmbedClient.Enabled()` = false. 수집 시 임베딩 스킵, 검색 시 FTS 전용.
+**커버리지 게이트**: `summvec` 레인은 summary_embedding 커버리지 80% 미만 시 자동 비활성화 (백필 중 순위 편향 방지, #63).
 
----
-
-## 8. 검색 파이프라인
-
-![하이브리드 검색 파이프라인 RRF](docs/diagrams/05-hybrid-search-rrf.png)
-
-> 인터랙티브 편집: [eraser.io에서 열기](https://app.eraser.io/workspace/K10FmwBysYGTBVp8E9Wb?diagram=xJgZnmmbfRJL2Ox_bMd_i)
+**엔티티 레인**: `ENTITY_EXTRACTION_ENABLED=true` 설정 시 활성화. FULL OUTER JOIN이므로 엔티티 없는 문서도 다른 레인에서 정상 랭킹됨 (#139).
 
 ### API 엔드포인트
 
 `POST /api/v1/search` — Bearer 인증 필요 (API_KEY 설정 시)
-
-`GET /api/v1/stats/baseline` — Bearer 인증 필요. 문서 수·컨텐츠 길이 백분위수(p50/p95), 청크 집계, 추출 실패 수, 소스별 최신 수집 시각을 JSON으로 반환. 스키마: `{documents, chunks, extraction_failures, collection}`.
 
 **요청 스키마**:
 ```json
@@ -676,377 +705,24 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
   "exclude_source_types": ["slack"],
   "limit": 10,
   "sort": "relevance",
-  "include_deleted": false
+  "include_deleted": false,
+  "use_hyde": false,
+  "use_rerank": false
 }
 ```
 
-**응답 스키마**:
-```json
-{
-  "results": [
-    {
-      "id": "uuid",
-      "source_type": "filesystem",
-      "source_id": "docs/meeting.md",
-      "title": "meeting.md",
-      "content": "...",
-      "match_type": "hybrid",
-      "score": 0.0165,
-      "collected_at": "2026-04-01T09:00:00Z",
-      "created_at": "2026-04-01T09:01:00Z",
-      "updated_at": "2026-04-13T12:00:00Z",
-      "metadata": {"path": "docs/meeting.md", "ext": ".md"}
-    }
-  ],
-  "count": 10,
-  "total": 10,
-  "query": "BBQ 미팅",
-  "took_ms": 42
-}
-```
-
-### hybridSearch CTE (`internal/store/document.go:242`)
-
-```sql
-WITH fts AS (
-    SELECT id,
-           row_number() OVER (ORDER BY GREATEST(
-               ts_rank(tsv, plainto_tsquery('simple',  $1)),
-               ts_rank(tsv, plainto_tsquery('english', $1))
-           ) DESC) AS rank
-    FROM documents
-    WHERE (tsv @@ plainto_tsquery('simple',  $1)
-        OR tsv @@ plainto_tsquery('english', $1))
-    AND status = 'active'  -- include_deleted=false 시
-    AND source_type = $4   -- source_type 필터 시
-    LIMIT $3               -- limit * 2 (RRF 후보 확장)
-),
-vec AS (
-    SELECT id,
-           row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
-    FROM documents
-    WHERE embedding IS NOT NULL
-    AND status = 'active'
-    LIMIT $3
-),
-rrf AS (
-    SELECT
-        COALESCE(fts.id, vec.id) AS id,
-        COALESCE(1.0/(60.0 + fts.rank), 0)
-      + COALESCE(1.0/(60.0 + vec.rank), 0) AS score
-    FROM fts
-    FULL OUTER JOIN vec ON fts.id = vec.id
-)
-SELECT d.*, rrf.score
-FROM rrf
-JOIN documents d ON d.id = rrf.id
-ORDER BY {sortOrder}   -- "recent": collected_at DESC | else: score DESC
-LIMIT $3
-```
-
-**RRF 상수 k=60**: 고순위 문서의 기여를 과도하게 증폭시키지 않으면서 순위 결합 효과를 안정적으로 제공하는 검색 커뮤니티 표준값.
-
-### 검색 모드 결정
-
-| 조건 | 모드 | 함수 |
-|---|---|---|
-| `query.Embedding` 비어 있지 않음 | hybrid (RRF) | `hybridSearch()` |
-| `query.Embedding` nil 또는 빈 슬라이스 | fulltext only | `fulltextSearch()` |
-
-임베딩 실패 시 자동으로 fulltext 모드로 폴백 (search.go:40-46).
-
-### 필터 파라미터
-
-| 파라미터 | 타입 | 기본값 | 설명 |
-|---|---|---|---|
-| `query` | string | (필수) | 검색어 |
-| `source_type` | string | — | 단일 소스 필터 (`filesystem`, `slack`, `github`) |
-| `exclude_source_types` | []string | — | 제외할 소스 목록 |
-| `limit` | int | 20 | 결과 수, 0 이하면 20 적용 |
-| `sort` | string | `"relevance"` | `"relevance"` (score DESC) 또는 `"recent"` (collected_at DESC) |
-| `include_deleted` | bool | false | true 시 `status='deleted'` 문서 포함 |
-
-`sortOrder()` 화이트리스트 (`store/document.go:188`): `"recent"` 외 모든 값은 `"score DESC"` — SQL 인젝션 방지.
-
-### sortOrder 동작 차이
+### sortOrder 동작
 
 | sort 값 | SQL | 의미 |
 |---|---|---|
-| `"recent"` | `collected_at DESC` | 최근 수집 순 (파일 ModTime 기준) |
+| `"recent"` | `collected_at DESC` | 최근 수집 순 |
 | `"relevance"` 또는 그 외 | `rrf.score DESC` | RRF 점수 내림차순 |
 
----
-
-## 9. 배포 아키텍처
-
-### Kubernetes 리소스 맵
-
-```mermaid
-%%{init: {
-  "theme": "base",
-  "themeVariables": {
-    "background": "#faf7f2",
-    "primaryColor": "#faf7f2",
-    "primaryTextColor": "#1c1917",
-    "primaryBorderColor": "#1c1917",
-    "lineColor": "#57534e",
-    "secondaryColor": "#f0ebe3",
-    "tertiaryColor": "#faf7f2",
-    "fontFamily": "-apple-system, BlinkMacSystemFont, Geist, Inter, sans-serif",
-    "fontSize": "13px"
-  }
-}}%%
-flowchart TB
-    classDef focal fill:#b5523a,stroke:#b5523a,color:#faf7f2,stroke-width:1px;
-    classDef muted fill:#f0ebe3,stroke:#57534e,color:#57534e,stroke-width:1px;
-    classDef data fill:#faf7f2,stroke:#1c1917,color:#1c1917,stroke-width:1.2px;
-    classDef ext fill:#faf7f2,stroke:#57534e,color:#1c1917,stroke-width:1px,stroke-dasharray:4 3;
-
-    subgraph Cluster["minikube Cluster"]
-        NS["Namespace: second-brain"]
-
-        subgraph NS
-            CM["ConfigMap\nsecond-brain-config\n환경변수 (비민감)"]
-            SEC1["Secret\nsecond-brain-secret\nDB PASSWORD, API_KEY 등"]
-            SEC2["Secret\ncliproxy-auth-secret\nauth.json (out-of-band)"]
-
-            PV["PV\nsecond-brain-drive-pv\nhostPath /mnt/drive\n100Gi ReadOnlyMany"]
-            PVC_PG["PVC (StatefulSet)\npgdata 10Gi\nReadWriteOnce"]
-
-            PGSVC["Service\npostgres\nClusterIP :5432"]
-            PGSF["StatefulSet\npostgres\npgvector/pgvector:pg16\nreadiness: pg_isready"]
-
-            BRSVC["Service\nsecond-brain\nNodePort 30080→:8080"]
-            BRDEP["Deployment\nsecond-brain\nsecond-brain:dev ~34.5MB\nrequests: 128Mi/100m\nlimits: 512Mi/500m"]
-            COLDEP["Deployment\nsecond-brain-collector\nsecond-brain-collector:dev ~34.5MB"]
-            INIT["initContainer\nwait-for-postgres\nbusybox nc -z postgres 5432"]
-
-            WSVC["Service\n<web-app>\nNodePort 30300→:3000"]
-            WDEP["Deployment\n<web-app>\n<web-app>:dev ~195MB"]
-        end
-    end
-
-    CM --> BRDEP
-    SEC1 --> BRDEP
-    SEC2 -->|/etc/cliproxy/auth.json| BRDEP
-    PV -->|ReadOnly /data/drive| BRDEP
-    INIT -->|ready| BRDEP
-    PGSF --> PGSVC
-    PVC_PG --> PGSF
-    BRDEP --> BRSVC
-    WDEP --> WSVC
-    BRSVC -->|BRAIN_API_URL| WDEP
-
-    class BRDEP,COLDEP focal;
-    class PGSF,PV,PVC_PG data;
-    class CM,SEC1,SEC2,INIT muted;
-```
-
-### K8s 리소스 목록 (`deploy/k8s/`)
-
-| 파일 | 리소스 종류 | 역할 |
-|---|---|---|
-| `namespace.yaml` | Namespace | `second-brain` 네임스페이스 |
-| `second-brain-configmap.yaml` | ConfigMap | 비민감 설정 (`COLLECT_INTERVAL=5m`, `MAX_EMBED_CHARS=8000` 등) |
-| `second-brain-secret.yaml` | Secret | placeholder (`POSTGRES_PASSWORD`, `API_KEY`, `SLACK_BOT_TOKEN`, `GITHUB_TOKEN`) |
-| `second-brain-pv.yaml` | PersistentVolume | hostPath `/mnt/drive` 100Gi ReadOnlyMany (클러스터 스코프) |
-| `second-brain-deployment.yaml` | Deployment | second-brain 앱, initContainer, volume mounts, probe |
-| `second-brain-service.yaml` | Service | NodePort 30080 → 컨테이너 8080 |
-| `second-brain-web-deployment.yaml` | Deployment | <web-app>, BRAIN_API_URL 참조 |
-| `second-brain-web-service.yaml` | Service | NodePort 30300 → 컨테이너 3000 |
-| `postgres-statefulset.yaml` | StatefulSet | pgvector:pg16, PVC 10Gi, `pg_isready` probe |
-| `postgres-service.yaml` | Service | ClusterIP :5432 |
-| `kustomization.yaml` | Kustomize | 리소스 목록 |
-
-### 이미지 빌드
-
-macOS docker driver 환경에서는 `eval $(minikube docker-env)`로 minikube의 Docker 데몬을 사용해야 한다:
-
-```bash
-eval $(minikube docker-env)
-docker build -t second-brain:dev .
-docker build -t <web-app>:dev ./web
-```
-
-| 이미지 | 빌드 베이스 | 런타임 베이스 | 크기 | UID |
-|---|---|---|---|---|
-| `second-brain:dev` | `golang:1.24-alpine` | `alpine:3.21` | ~34.5 MB | 10001 |
-| `<web-app>:dev` | `node:22-alpine` | `node:22-alpine` (standalone) | ~195 MB | 10001 |
-
-### 초기 배포 순서
-
-```bash
-# 1. minikube 마운트 (백그라운드 유지)
-minikube mount "/Users/user/Google Drive/공유 드라이브/<shared-drive>:/mnt/drive" --uid=10001 --gid=10001 &
-
-# 2. PV 먼저 생성 (클러스터 스코프)
-kubectl apply -f deploy/k8s/second-brain-pv.yaml
-
-# 3. 나머지 리소스
-kubectl apply -k deploy/k8s/
-
-# 4. out-of-band Secret 수동 생성 (git 미포함)
-kubectl create secret generic cliproxy-auth-secret \
-  --from-file=auth.json=/path/to/auth.json \
-  -n second-brain
-```
-
-### 접근 방법 (port-forward)
-
-```bash
-# 웹 UI
-kubectl port-forward svc/<web-app> 30300:80 -n second-brain
-
-# 백엔드 API
-kubectl port-forward svc/second-brain 30920:8080 -n second-brain
-```
-
-### Probe 설정
-
-| 컨테이너 | Probe 종류 | 엔드포인트 | initialDelay | period |
-|---|---|---|---|---|
-| second-brain | readiness | `GET /health :8080` | 10s | 10s |
-| second-brain | liveness | `GET /health :8080` | 30s | 15s |
-| postgres | readiness | `pg_isready -U brain -d second_brain` | 10s | 5s |
-| postgres | liveness | `pg_isready -U brain -d second_brain` | 30s | 10s |
+SQL 인젝션 방지: `sortOrder()` 화이트리스트 — `"recent"` 외 모든 값은 `"score DESC"`.
 
 ---
 
-## 10. 웹 UI 아키텍처
-
-### Next.js App Router 구조
-
-```
-web/src/app/
-├── page.tsx                    # 검색 메인 — 검색바, 필터, 결과 카드 목록
-├── layout.tsx                  # 헤더 네비게이션, dark mode 지원
-├── api-docs/page.tsx           # API 레퍼런스 — 9개 엔드포인트 카드
-├── documents/[id]/page.tsx     # 문서 상세 — 포맷별 렌더링 분기
-├── documents/[id]/MarkdownContent.tsx  # react-markdown + remark-gfm + rehype-highlight
-├── documents/[id]/XlsxTable.tsx        # ##SHEET TSV 파싱, 시트당 최대 200행
-└── api/                        # Next.js API 라우트 (백엔드 프록시)
-    ├── search/route.ts         # GET+POST → BRAIN /api/v1/search
-    ├── documents/route.ts      # GET → BRAIN /api/v1/documents
-    ├── documents/[id]/route.ts # GET → BRAIN /api/v1/documents/{id}
-    ├── documents/[id]/raw/route.ts # GET → BRAIN /api/v1/documents/{id}/raw
-    └── stats/route.ts          # GET → BRAIN /api/v1/stats
-```
-
-### API 프록시 패턴 (`web/src/app/api/search/route.ts`)
-
-```typescript
-const BACKEND_URL =
-  process.env.BRAIN_API_URL          // 1순위: K8s 서비스 URL
-  ?? process.env.NEXT_PUBLIC_API_URL // 2순위: 공개 URL
-  ?? "http://localhost:8080";        // 3순위: 로컬 개발 기본값
-
-const API_KEY = process.env.API_KEY ?? "";  // 백엔드 Bearer 토큰 서버사이드 주입
-```
-
-클라이언트에 백엔드 주소나 API 키를 노출하지 않는 서버사이드 프록시 패턴.
-
-### 필터 옵션 (`web/src/app/page.tsx:18`)
-
-```typescript
-const FILTER_OPTIONS: FilterOption[] = [
-  { value: "all",        label: "전체"   },
-  { value: "filesystem", label: "Drive"  },
-  { value: "slack",      label: "Slack"  },
-  { value: "github",     label: "GitHub" },
-];
-```
-
-카운터 표시: `전체` 필터 선택 시 Slack 카운트를 제외한 합계 표시 (`page.tsx:43` — `total - by_source.slack`).
-
-### 반응성 패턴
-
-검색 결과 자동 재요청 트리거:
-- `[submittedQuery, activeFilter, sort]` 변경 — 검색 모드
-- `[activeFilter, isSearchMode]` 변경 — 초기 문서 목록 모드
-
-`cancelled` 플래그로 응답 경쟁 상태 방지. 초기 상태(검색어 없음): `listRecentDocuments(10, source)` 호출.
-
-### 문서 상세 렌더링 분기
-
-`getRenderKind(ext)` 함수가 확장자로 렌더링 방식 결정:
-
-| 종류 | 확장자 | 렌더러 |
-|---|---|---|
-| `image` | `.png`, `.jpg`, `.gif` 등 | `<img>` 태그 |
-| `markdown` | `.md`, `.mdx` | `MarkdownContent` — react-markdown + remark-gfm + rehype-highlight |
-| `xlsx` | `.xlsx` | `XlsxTable` — `##SHEET` TSV 파싱, 시트당 최대 200행 |
-| `code` | `.ts`, `.go`, `.py` 등 | 코드 블록 (highlight.js github-dark) |
-| `text` | 그 외 | `<pre>` plain text |
-
-### match_type 배지 (`page.tsx:37`)
-
-| match_type | 한국어 배지 |
-|---|---|
-| `fulltext` | 전문 |
-| `vector` | 의미 |
-| `hybrid` | 복합 |
-
----
-
-## 11. 설정 및 환경 변수
-
-### 백엔드 (`internal/config/config.go`)
-
-| 환경 변수 | 필수 | 기본값 | 사용 위치 | 설명 |
-|---|---|---|---|---|
-| `DATABASE_URL` | 선택 | `postgres://brain:brain@localhost:5432/second_brain?sslmode=disable` | `store/postgres.go` | Postgres 연결 문자열 |
-| `PORT` | 선택 | `8080` | `cmd/server/main.go:113` | HTTP 서버 포트 |
-| `EMBEDDING_API_URL` | 선택 | `https://api.openai.com/v1` | `search/embed.go:92` | OpenAI 호환 엔드포인트 |
-| `EMBEDDING_API_KEY` | 선택 | — | `search/embed.go:95` | Static API 키 (1순위 토큰) |
-| `EMBEDDING_MODEL` | 선택 | `text-embedding-3-small` | `search/embed.go:101` | 임베딩 모델 |
-| `CLIPROXY_AUTH_FILE` | 선택 | — | `search/embed.go:98` | auth.json 경로 (2순위 토큰) |
-| `COLLECT_INTERVAL` | 선택 | `10m` | `scheduler/scheduler.go:73` | 수집 주기 (Go duration) |
-| `MAX_EMBED_CHARS` | 선택 | `8000` | `scheduler/scheduler.go:29` | 임베딩 입력 최대 문자 수 |
-| `MIGRATIONS_DIR` | 선택 | 자동 탐지 | `cmd/server/main.go:153` | SQL 마이그레이션 디렉토리 |
-| `FILESYSTEM_PATH` | 선택 | — | `collector/filesystem.go:101` | 파일시스템 수집 루트 |
-| `FILESYSTEM_ENABLED` | 선택 | `false` | `cmd/server/main.go:77` | 파일시스템 수집기 활성화 |
-| `SLACK_BOT_TOKEN` | 선택 | — | `collector/slack.go:28` | Slack Bot User OAuth 토큰 |
-| `SLACK_TEAM_ID` | 선택 | — | `collector/slack.go:28` | Slack 팀 ID |
-| `GITHUB_TOKEN` | 선택 | — | `collector/github.go:26` | GitHub Personal Access Token |
-| `GITHUB_ORG` | 선택 | — | `collector/github.go:26` | GitHub 조직명 |
-| `GDRIVE_CREDENTIALS_JSON` | 선택 | — | `collector/gdrive.go` | Google Drive 서비스 계정 JSON |
-| `NOTION_TOKEN` | 선택 | — | `config/config.go:37` | Notion 토큰 (현재 미사용) |
-| `API_KEY` | 선택 | — | `api/middleware.go:15` | Bearer 토큰 인증 (빈 문자열 시 비활성) |
-
-### ConfigMap에서 주입되는 값 (`deploy/k8s/second-brain-configmap.yaml`)
-
-| 키 | 값 |
-|---|---|
-| `COLLECT_INTERVAL` | `5m` |
-| `MAX_EMBED_CHARS` | `8000` |
-| `EMBEDDING_API_URL` | `https://api.openai.com/v1` |
-| `EMBEDDING_MODEL` | `text-embedding-3-small` |
-| `CLIPROXY_AUTH_FILE` | `/etc/cliproxy/auth.json` |
-| `FILESYSTEM_PATH` | `/data/drive` |
-| `FILESYSTEM_ENABLED` | `true` |
-| `PORT` | `8080` |
-| `MIGRATIONS_DIR` | `/app/migrations` |
-
-### Secret 관리 원칙
-
-| 종류 | 관리 방법 |
-|---|---|
-| `second-brain-secret` | `deploy/k8s/second-brain-secret.yaml` placeholder → 배포 시 실제 값 치환 |
-| `cliproxy-auth-secret` | out-of-band 수동 `kubectl create secret` — git 미포함 |
-
-### 프론트엔드 (`web/.env.example` 기반)
-
-| 환경 변수 | 필수 | 설명 |
-|---|---|---|
-| `BRAIN_API_URL` | 선택 | 백엔드 서비스 URL (K8s 내부: `http://second-brain:8080`) |
-| `NEXT_PUBLIC_API_URL` | 선택 | 클라이언트 접근 가능 URL (미사용 권장) |
-| `API_KEY` | 선택 | 백엔드 Bearer 토큰 (서버사이드만 사용) |
-
-### 11.1 cliproxy 통합
-
-**목적**: OpenAI 호환 API 호출(embeddings, chat completions)을 ChatGPT Pro / Claude Pro / Gemini OAuth 기반으로 프록시. second-brain은 cliproxy를 **로컬 HTTP 프록시**로 사용하며, cliproxy 자체가 OAuth 토큰 갱신 · 라우팅 · rate limit을 담당한다.
-
-#### 배포 모델
+## 9. eval 자기개선 루프
 
 ```mermaid
 %%{init: {
@@ -1067,283 +743,342 @@ flowchart LR
     classDef focal fill:#b5523a,stroke:#b5523a,color:#faf7f2,stroke-width:1px;
     classDef muted fill:#f0ebe3,stroke:#57534e,color:#57534e,stroke-width:1px;
     classDef data fill:#faf7f2,stroke:#1c1917,color:#1c1917,stroke-width:1.2px;
-    classDef ext fill:#faf7f2,stroke:#57534e,color:#1c1917,stroke-width:1px,stroke-dasharray:4 3;
 
-    pod[second-brain Pod<br/>:8080] -- "HTTP<br/>Bearer inbound key" --> cliproxy[cliproxy<br/>127.0.0.1:8317]
-    cliproxy -- "OAuth access_token<br/>refresh 자동" --> upstream[(OpenAI API<br/>chat.openai.com)]
+    FEEDBACK["사용자 피드백\nfeedback 테이블\n+1 / -1 thumbs\nFP penalty (#140)"]
+    EVALSET["eval set 구축\nfeedback → query+relevant_doc_ids\nJSONL 형식\n(GET /api/v1/eval/export)"]
+    EVALRUN["eval-runner\nnightly 03:00 KST\n/app/eval --check-reindex"]
+    METRICS["NDCG@5, NDCG@10, MRR@10\neval_metrics 테이블에 기록\nlatency 포함 (#016)"]
+    REGCHECK["회귀 감지\n이전 실행 대비\n임계치 이하 시 exit 1"]
+    REINDEX["reindex 추천\nExit 2 → 웹훅 알림\n(#142)"]
+    WEBHOOK["Alert Webhook\nSlack 알림\nALERT_WEBHOOK_URL"]
+    REINDEXACT["재인덱싱 실행\n수동 또는 자동\n임베딩 백필 워커"]
 
-    subgraph host["host (<deploy-host>)"]
-      cliproxy
-      auth["~/.cli-proxy-api/<br/>codex-*.json<br/>claude-*.json<br/>gemini-*.json"]
-      cliproxy -.-> auth
-    end
+    FEEDBACK --> EVALSET
+    EVALSET --> EVALRUN
+    EVALRUN --> METRICS
+    METRICS --> REGCHECK
+    REGCHECK -->|"exit 1\n(회귀)"| WEBHOOK
+    REGCHECK -->|"exit 2\n(reindex 추천)"| REINDEX
+    REINDEX --> WEBHOOK
+    WEBHOOK --> REINDEXACT
 
-    subgraph minikube["minikube docker driver"]
-      pod
-    end
-
-    pod -->|host.minikube.internal:8317| cliproxy
-
-    class pod focal;
-    class upstream ext;
-    class auth muted;
+    class EVALRUN focal;
+    class METRICS,EVALSET data;
+    class FEEDBACK,WEBHOOK,REINDEXACT muted;
 ```
 
-#### 인증 계층 (2단계)
+### eval-runner 동작
 
-1. **Inbound (second-brain → cliproxy)**: 정적 API key — cliproxy `config.yaml`의 `api-keys` 리스트에 등록된 값. 환경변수 `LLM_API_KEY`, `EMBEDDING_API_KEY`에 저장.
-2. **Upstream (cliproxy → OpenAI/Claude/Gemini)**: OAuth access_token (`~/.cli-proxy-api/*.json`). cliproxy가 자동 갱신하므로 second-brain은 개입 불필요.
+`docker-compose.local.yml`의 `eval-runner` 서비스가 셸 루프로 매일 03:00 KST에 `/app/eval --check-reindex`를 실행:
 
-#### 환경변수 매핑
-
-| 변수 | 용도 | 서버 값 예시 |
+| Exit code | 의미 | 동작 |
 |---|---|---|
-| `LLM_API_URL` | chat completions 엔드포인트 | `http://host.minikube.internal:8317/v1` |
-| `LLM_API_KEY` | inbound API key | cliproxy `config.yaml`의 키 |
-| `LLM_MODEL` | 모델 식별자 | `gpt-codex-5.3` |
-| `EMBEDDING_API_URL` | embeddings 엔드포인트 (cliproxy 미지원 시 404 → FTS 폴백) | 동일 |
-| `EMBEDDING_API_KEY` | inbound API key (LLM과 동일 가능) | 동일 |
-| `CLIPROXY_AUTH_FILE` | 폐기 예정 — static key 경로가 우선 | unused |
+| 0 | eval 통과 (회귀 없음) | 다음 사이클 대기 |
+| 1 | 회귀 감지 | 로그 기록 + 웹훅 알림 |
+| 2 | reindex 권장 | 웹훅 알림 발송 후 계속 |
 
-#### 지원 엔드포인트
-
-| Path | cliproxy | OpenAI 직접 | 현재 second-brain |
-|---|---|---|---|
-| `/v1/chat/completions` | ✅ | ✅ | cliproxy 사용 |
-| `/v1/embeddings` | ❌ (404) | ✅ | FTS 폴백 중, 결정 대기 (#34) |
-| `/v1/models` | ✅ | ✅ | 미사용 |
-
-#### 실패 모드
-
-| 상황 | 증상 | 대응 |
-|---|---|---|
-| cliproxy 다운 | 모든 LLM 호출 실패 → Discord 멘션 응답 에러 | `pm2 restart cli-proxy-api` |
-| inbound key 불일치 | `401 Invalid API key` | `LLM_API_KEY` / `EMBEDDING_API_KEY` 와 cliproxy `config.yaml` 키 일치 확인 |
-| embeddings 호출 | `404 page not found` | 정상 — FTS 폴백으로 처리됨 |
-| OAuth 토큰 만료 | cliproxy가 자동 refresh | second-brain 영향 없음 |
-
-#### 운영 명령
-
-```bash
-# cliproxy 상태 확인
-pm2 list | grep cli-proxy-api
-pm2 logs cli-proxy-api
-
-# cliproxy 재시작
-pm2 restart cli-proxy-api
-
-# systemd user service (현재 disabled, 전환 가능)
-systemctl --user status cliproxy.service
-```
-
-**관련 이슈**: #33 (본 문서화) · #34 (embedding 라우팅 결정) · #4 (JWT 폐기 — cliproxy로 대체됨)
+**FP penalty** (#140): feedback에 false positive가 기록되면 eval set 구성 시 해당 쌍의 가중치를 낮춰 오분류 쿼리에 의한 NDCG 과추정을 방지.
 
 ---
 
-## 12. 설계 결정 ADR
+## 10. 배포 아키텍처
 
-### ADR-001: pgvector 하이브리드 검색 (RRF 결합)
+### 현행: Mac mini docker-compose (프로덕션)
 
-**Context**: 자연어 쿼리에서 의미 검색(벡터)만으로는 키워드 정확도가 떨어지고, 전문 검색(FTS)만으로는 의미적 유사 문서를 놓친다.
+프로덕션 환경은 `docker-compose.local.yml`로 운영한다. 외부 접근은 `your-domain.example` 터널을 통해 처리.
 
-**Decision**: Reciprocal Rank Fusion(RRF) 알고리즘으로 FTS와 벡터 검색 결과를 결합한다. k=60 상수, FULL OUTER JOIN으로 한쪽에만 존재하는 결과도 포함한다 (`store/document.go:296`).
+```bash
+# 배포 / 업데이트
+docker compose -f docker-compose.local.yml pull
+docker compose -f docker-compose.local.yml up -d --build
 
-**Consequences**: 검색 품질이 단일 방식 대비 향상. 쿼리당 OpenAI 임베딩 API 호출이 필요하여 지연 증가. 임베딩 실패 시 FTS 폴백으로 가용성 유지. rerank/HyDE는 Phase 3 계획.
+# 상태 확인
+docker compose -f docker-compose.local.yml ps
+docker compose -f docker-compose.local.yml logs --tail=50
+```
+
+### 향후: Kubernetes (`deploy/k8s/`)
+
+`deploy/k8s/`에 Kustomize 매니페스트가 있으나 현재 미사용. 전환 시 참고:
+
+| 파일 | 리소스 | 역할 |
+|---|---|---|
+| `namespace.yaml` | Namespace | `second-brain` |
+| `second-brain-configmap.yaml` | ConfigMap | 비민감 설정 |
+| `second-brain-secret.yaml` | Secret | 민감 설정 placeholder |
+| `second-brain-pv.yaml` | PersistentVolume | hostPath 100Gi ReadOnlyMany |
+| `second-brain-deployment.yaml` | Deployment | API 서버 + initContainer |
+| `second-brain-service.yaml` | Service | NodePort 30080 |
+| `postgres-statefulset.yaml` | StatefulSet | pgvector:pg16, PVC 10Gi |
+| `postgres-service.yaml` | Service | ClusterIP :5432 |
+| `kustomization.yaml` | Kustomize | 리소스 목록 |
+
+---
+
+## 11. 웹 UI 아키텍처
+
+### Next.js App Router 구조
+
+```
+web/src/app/
+├── page.tsx                    # 검색 메인
+├── layout.tsx                  # 헤더, dark mode
+├── api-docs/page.tsx           # API 레퍼런스
+├── documents/[id]/page.tsx     # 문서 상세
+├── documents/[id]/MarkdownContent.tsx  # react-markdown + rehype-highlight
+├── documents/[id]/XlsxTable.tsx        # ##SHEET TSV 파싱, 200행
+└── api/                        # Next.js API 라우트 (백엔드 프록시)
+    ├── search/route.ts
+    ├── documents/route.ts
+    ├── documents/[id]/route.ts
+    ├── documents/[id]/raw/route.ts
+    └── stats/route.ts
+```
+
+### API 프록시 패턴
+
+```typescript
+const BACKEND_URL =
+  process.env.BRAIN_API_URL          // 1순위: docker-compose 내부 URL
+  ?? process.env.NEXT_PUBLIC_API_URL // 2순위: 공개 URL
+  ?? "http://localhost:8080";        // 3순위: 로컬 개발
+
+const API_KEY = process.env.API_KEY ?? "";  // 서버사이드만 사용 (클라이언트 미노출)
+```
+
+클라이언트에 백엔드 주소·API 키를 노출하지 않는 서버사이드 프록시 패턴.
+
+---
+
+## 12. 설정 및 환경 변수
+
+### 백엔드 (`internal/config/config.go`)
+
+| 환경 변수 | 기본값 | 설명 |
+|---|---|---|
+| `DATABASE_URL` | `postgres://brain:brain@localhost:5432/second_brain?sslmode=disable` | Postgres 연결 문자열 |
+| `PORT` | `8080` | HTTP 서버 포트 |
+| `EMBEDDING_API_URL` | `https://api.openai.com/v1` | OpenAI 호환 임베딩 엔드포인트 |
+| `EMBEDDING_API_KEY` | — | Static API 키 (1순위) |
+| `EMBEDDING_MODEL` | `text-embedding-3-small` | 임베딩 모델 |
+| `CLIPROXY_AUTH_FILE` | — | auth.json 경로 (2순위) |
+| `COLLECT_INTERVAL` | `1h` | 기본 수집 주기 |
+| `MAX_EMBED_CHARS` | `8000` | 임베딩 입력 최대 문자 수 |
+| `LLM_API_URL` | — | LLM 엔드포인트 (curation·HyDE·엔티티) |
+| `LLM_API_KEY` | — | LLM API 키 |
+| `LLM_MODEL` | — | LLM 모델 |
+| `RERANK_API_URL` | — | BGE cross-encoder 엔드포인트 |
+| `API_KEY` | — | Bearer 토큰 인증 |
+| `ALERT_WEBHOOK_URL` | — | Slack 웹훅 URL (신선도 알림) |
+| `ENTITY_EXTRACTION_ENABLED` | `false` | 엔티티 추출 + 검색 레인 활성화 |
+| `FILESYSTEM_PATH` | — | 파일시스템 수집 루트 |
+| `FILESYSTEM_ENABLED` | `false` | 파일시스템 수집기 활성화 |
+| `DIARIZATION_API_URL` | — | 화자 분리 서버 URL |
+| `DIARIZATION_ENABLED` | `false` | 화자 분리 활성화 |
+
+### cliproxy 통합
+
+```
+second-brain Pod
+  → HTTP Bearer inbound key
+  → cliproxy 127.0.0.1:8317
+  → OAuth access_token (자동 갱신)
+  → OpenAI API / chat.openai.com
+```
+
+| Path | cliproxy | 비고 |
+|---|---|---|
+| `/v1/chat/completions` | 지원 | LLM curation·HyDE·엔티티 |
+| `/v1/embeddings` | 미지원 (404) | FTS 폴백 또는 직접 OpenAI 사용 |
+
+---
+
+## 13. 설계 결정 ADR
+
+### ADR-001: pgvector 5-lane 하이브리드 검색 (RRF)
+
+**Context**: 단일 검색 방식(FTS 또는 벡터)은 한국어 검색 품질이 불충분하다.
+
+**Decision**: FTS + pgvector 코사인 + pg_bigm + 요약 임베딩 + 엔티티 RRF. k=60 상수, FULL OUTER JOIN.
+
+**Consequences**: 검색 품질 향상. 쿼리당 임베딩 API 호출 필요. 임베딩 실패 시 FTS 폴백으로 가용성 유지.
 
 ---
 
 ### ADR-002: pgvector on Postgres 16 단일 DB
 
-**Context**: 벡터 스토어와 관계형 메타데이터를 분리할 경우(Pinecone + RDS 등) 운영 복잡도 급증.
+**Context**: 벡터 스토어와 관계형 메타데이터 분리 시 운영 복잡도 급증.
 
-**Decision**: `pgvector/pgvector:pg16` StatefulSet 단일 인스턴스. PVC(10Gi ReadWriteOnce) 기반 데이터 영속성.
+**Decision**: `pgvector/pgvector:pg16` 단일 인스턴스. PVC 기반 데이터 영속성.
 
-**Consequences**: 운영 단순화, 단일 백업 대상. Go + pgx/v5 + pgvector-go 스택으로 타입 안전한 벡터 조작. 수억 벡터 수준에서는 전용 벡터 DB 마이그레이션 검토 필요.
-
----
-
-### ADR-003: Go + Next.js 분리 서비스, App Router 프록시
-
-**Context**: 백엔드와 프론트엔드를 단일 서버에 통합하면 개발 속도와 배포 독립성 저하.
-
-**Decision**: Go HTTP 서버(백엔드)와 Next.js App Router(프론트엔드)를 독립 서비스로 분리. `web/src/app/api/` 라우트가 BRAIN 백엔드로 서버사이드 프록시하여 CORS 문제 회피, 클라이언트에 백엔드 주소 미노출.
-
-**Consequences**: 서비스 독립 배포 가능. Next.js API 라우트라는 추가 레이어가 생기지만 클라이언트 코드 단순화.
+**Consequences**: 운영 단순화. 수억 벡터 수준에서는 전용 벡터 DB 마이그레이션 검토 필요.
 
 ---
 
-### ADR-004: minikube docker driver + port-forward
+### ADR-003: Mac mini docker-compose (현행 프로덕션)
 
-**Context**: 프로덕션 환경과 동일한 K8s 매니페스트로 로컬 개발이 가능해야 하며, 멀티 컨테이너 오케스트레이션 필요.
+**Context**: minikube k8s는 로컬 개발 복잡도가 높고, 단일 머신 배포에 오버엔지니어링이다.
 
-**Decision**: docker driver 기반 minikube를 표준 로컬 환경으로 채택. macOS docker driver는 NodePort를 호스트에 직접 노출하지 않으므로 `kubectl port-forward`를 권장한다.
+**Decision**: `docker-compose.local.yml`을 프로덕션으로 채택. `deploy/k8s/`는 향후 전환용으로 보존.
 
-**Consequences**: 프로덕션 매니페스트와 로컬 환경 동일 유지. `eval $(minikube docker-env)`로 이미지 빌드 시 내부 데몬 사용 필수.
-
----
-
-### ADR-005: CliProxy OAuth 토큰을 K8s Secret 볼륨 마운트
-
-**Context**: ChatGPT Plus Codex OAuth 토큰은 정기 갱신되며, 환경변수 주입 시 재배포 없이 갱신이 어렵다.
-
-**Decision**: `cliproxy-auth-secret` Secret을 out-of-band 관리, Pod의 `/etc/cliproxy/auth.json`에 볼륨 마운트. `cliProxyToken`이 5분 TTL로 파일 재읽기 (`embed.go:46`).
-
-**Consequences**: 토큰 갱신 시 Pod 재시작 불필요. Secret은 git 미포함, 배포마다 수동 `kubectl create secret` 필요.
+**Consequences**: 배포 단순화. 클러스터 수준 HA는 제공하지 않음.
 
 ---
 
-### ADR-006: `-trimpath` 빌드 + `MIGRATIONS_DIR` env
+### ADR-004: rune 기반 청킹 (#145)
 
-**Context**: Go 바이너리에 절대 경로 포함 시 빌드 재현성 저하, 경로 노출 보안 이슈.
+**Context**: 바이트 기반 청킹은 한국어(3바이트/rune)를 영어 대비 1/3 크기로 과다 분할한다.
 
-**Decision**: `go build -trimpath` 빌드. 마이그레이션 경로는 `MIGRATIONS_DIR` 환경변수로 주입 (`cmd/server/main.go:153`). ConfigMap에서 `/app/migrations`로 설정.
+**Decision**: `chunker.Options{TargetSize, MaxSize, Overlap}`을 rune 단위로 정의.
 
-**Consequences**: 빌드 재현성 향상. `runtime.Caller(0)` 결과가 모듈 상대 경로가 되어 `filepath.IsAbs()` 검사로 폴백 처리 필요 (main.go:163).
-
----
-
-### ADR-007: `atomic.Bool` CAS scheduler 뮤텍스
-
-**Context**: 수집 작업 실행 중 cron 틱 또는 수동 트리거가 중복 실행을 시도할 수 있다.
-
-**Decision**: `sync/atomic.Bool.CompareAndSwap(false, true)`로 논블로킹 skip 구현 (`scheduler.go:57`). `sync.Mutex` 대신 CAS를 선택하여 교착 상태 위험 제거.
-
-**Consequences**: 코드 단순, 교착 상태 없음. 분산 환경(멀티 Pod)에서는 Redis 등 외부 잠금 필요. 현재 단일 Pod이므로 충분.
+**Consequences**: 한국어·영어 동일한 정보 밀도. `adaptive.SelectOptions(sourceType)`으로 소스별 최적화.
 
 ---
 
-### ADR-008: `SanitizeText` 공유 함수 (Postgres 0x00 회피)
+### ADR-005: SMS stable source_id (#144)
 
-**Context**: Postgres `text` 타입은 NULL 바이트(`\x00`)를 저장 불가. PDF, Office 파일에서 유효하지 않은 UTF-8 포함 가능.
+**Context**: 기존 `sms:{ms}:{addrHash}:{bodyHash}` 형식은 본문 수정 시 중복 문서를 생성한다.
 
-**Decision**: 모든 추출기 출력에 `SanitizeText` 공통 적용 (`extractor.go:92`). NULL 바이트 제거 → 유효 UTF-8 치환 → 과도한 개행 압축 순서.
+**Decision**: `sms:{ms}:{addrHash}:{direction}`으로 변경. migration 019로 기존 데이터 재키잉.
 
-**Consequences**: DB 저장 오류 제거. 미미한 정보 손실(NULL 바이트, 잘못된 바이트)이 있으나 검색 품질에 영향 없음.
-
----
-
-### ADR-009: `MAX_EMBED_CHARS` env (청킹 전 임시 완화책)
-
-**Context**: OpenAI 임베딩 API 토큰 한도(8191 토큰). 대형 파일 전체 내용이 초과 가능.
-
-**Decision**: `MAX_EMBED_CHARS` 환경변수(기본 8000자)로 문자 수 기준 절단 (`scheduler.go:25`). Phase 1 청킹 구현 전 임시 완화책.
-
-**Consequences**: 긴 문서 뒷부분이 임베딩에서 누락, 검색 재현율 저하. 청킹 구현 후 이 환경변수 제거 예정 (Phase 1 TODO 주석: scheduler.go:213).
+**Consequences**: 동일 메시지는 항상 동일 source_id → ON CONFLICT DO UPDATE로 멱등 upsert 보장.
 
 ---
 
-### ADR-010: OpenAI ChatGPT Codex OAuth JWT 직접 Bearer
+### ADR-006: 삭제 가드 3계층 (#135, #147, #148)
 
-**Context**: OpenAI API 키 없이 ChatGPT Plus Codex OAuth 토큰 활용. 미들웨어(`cli-proxy-api` 데몬) 필요로 알려져 있었음.
+**Context**: 마운트 해제나 임시 오류로 파일시스템 워크가 빈 목록을 반환할 경우 전체 문서가 soft-delete될 수 있다.
 
-**Decision**: `iss: auth.openai.com`, `aud: api.openai.com/v1` JWT를 `/v1/embeddings` Bearer 헤더에 직접 사용. 데몬 없이 동작 직접 검증 완료.
+**Decision**:
+1. filesystem root stat: 루트 디렉터리가 없으면 수집 스킵
+2. 50% 비율 가드: `(activeInDB - activeOnFS) / activeInDB > 0.50` 이면 `MarkDeleted` 건너뜀
+3. document.go empty no-op: 빈 activeIDs 배열은 `MarkDeleted`에서 no-op 처리
 
-**Consequences**: 인프라 복잡도 감소 (데몬 불필요). 비공식 동작으로 OpenAI 정책 변경 시 중단 가능. 프로덕션 전환 시 정식 API 키 권장.
-
----
-
-### ADR-011: Slack DM 비수집 (프라이버시 설계)
-
-**Context**: Slack DM은 개인 대화로, 수집 시 프라이버시 침해 우려.
-
-**Decision**: `users.conversations` API에 `types=public_channel,private_channel` 파라미터를 명시적으로 전달하여 IM(DM) 및 MPIM(그룹 DM) 채널을 열거 대상에서 제외 (`slack.go:183`). 봇이 member인 채널만 수집하므로 초대받지 않은 채널도 자동 제외.
-
-**Consequences**: 팀원 간 DM은 검색 불가. 팀 지식베이스는 공개/비공개 채널 대화만 포함. 명시적 제외가 코드로 문서화됨.
+**Consequences**: 의도치 않은 대량 삭제 방지. 오탐 시 운영자가 override 플래그(#147)로 수동 강제 삭제 가능.
 
 ---
 
-### ADR-012: Google Drive FS 스캔 (vs Drive API 전체)
+### ADR-007: collection_log staleness 모니터 (#137)
 
-**Context**: Google Drive 전체를 Drive API로 스캔하면 API 할당량 소모, 인증 복잡도 증가.
+**Context**: 수집기 오류가 조용히 누적되면 검색 결과 신선도가 저하된다.
 
-**Decision**: minikube mount로 Drive 폴더를 파일시스템으로 노출하고 `FilesystemCollector`가 로컬 파일처럼 스캔. Google Workspace stub 파일(`.gdoc` 등)은 ADC가 설정된 경우에만 `DriveExporter`를 통해 내용 export (`filesystem.go:389`). ADC 미설정 시 URL 메타데이터만 저장.
+**Decision**: `GET /api/v1/collect/status` 엔드포인트로 `last_success_at`, `stale_seconds`, `consecutive_failures` 노출. `FreshnessChecker`가 임계치 초과 시 Slack 웹훅 알림.
 
-**Consequences**: API 할당량 문제 없음. minikube mount가 실행 중이어야 함 (백그라운드 프로세스). Workspace 파일 내용은 ADC 설정 여부에 따라 선택적 색인.
+**Consequences**: 수집 오류 조기 감지. 운영자가 알림 없이 신선도 저하를 놓치는 상황 방지.
 
 ---
 
-## 13. 알려진 이슈
+### ADR-008: advisory lock 마이그레이션 (#155)
 
-GitHub 이슈로 추적 중. 전체 목록: https://github.com/baekenough/second-brain/issues
+**Context**: 멀티 인스턴스 동시 기동 시 마이그레이션이 중복 실행되어 충돌할 수 있다.
 
-### P0 버그 (즉시 수정 필요)
+**Decision**: `store/postgres.go`에서 `pg_try_advisory_lock`을 취득 후 마이그레이션 실행.
 
-| # | 제목 | 관련 파일 |
+**Consequences**: 복수 인스턴스 안전. 락 취득 실패 시 해당 인스턴스는 마이그레이션 건너뜀.
+
+---
+
+### ADR-009: eval 자기개선 루프 (#17-#20, #140, #142)
+
+**Context**: 검색 품질 회귀를 수동으로 감지하기 어렵다.
+
+**Decision**: nightly eval-runner가 NDCG/MRR을 측정하고 회귀·reindex 필요 시 웹훅 알림.
+
+**Consequences**: 자동화된 품질 모니터링. FP penalty로 eval set 오분류 최소화.
+
+---
+
+### ADR-010: `atomic.Bool` CAS scheduler 뮤텍스
+
+**Context**: cron 틱과 수동 트리거의 중복 실행 방지.
+
+**Decision**: `CompareAndSwap(false, true)` 논블로킹 skip. `sync.Mutex` 대신 CAS로 교착 상태 위험 제거.
+
+**Consequences**: 코드 단순, 교착 없음. 분산 환경(멀티 Pod)에서는 외부 잠금 필요.
+
+---
+
+## 14. 알려진 이슈
+
+GitHub 이슈로 추적: https://github.com/baekenough/second-brain/issues
+
+| 증상 | 원인 | 우회 방법 |
 |---|---|---|
-| [#1](https://github.com/baekenough/second-brain/issues/1) | Scheduler run() 동시 실행 방지 | `internal/scheduler/scheduler.go` |
-| [#2](https://github.com/baekenough/second-brain/issues/2) | PDF 다단계 fallback 체인 구현 | `internal/collector/*/pdf.go` |
-| [#3](https://github.com/baekenough/second-brain/issues/3) | 8KB 텍스트 절단 제거 및 chunks 기반 임베딩 전환 | `internal/scheduler/scheduler.go` |
-| [#4](https://github.com/baekenough/second-brain/issues/4) | OpenAI 임베딩 API 키 영구 전환 | 운영 |
-| [#5](https://github.com/baekenough/second-brain/issues/5) | Slack rate limit 지수 backoff + Retry-After 존중 | `internal/collector/slack.go` |
-| [#6](https://github.com/baekenough/second-brain/issues/6) | minikube hostPath Google Drive 호스트 종속 제거 | `deploy/k8s/*pv*.yaml` |
-| [#7](https://github.com/baekenough/second-brain/issues/7) | 9p mount 한글 긴 파일명 lstat 실패 대응 | `internal/collector/filesystem.go` |
-
-### P1 버그
-
-| # | 제목 |
-|---|---|
-| [#8](https://github.com/baekenough/second-brain/issues/8) | extraction_failures 추적 테이블 + 재시도 워커 |
-
-### 결정 대기
-
-| # | 제목 |
-|---|---|
-| [#25](https://github.com/baekenough/second-brain/issues/25) | PDF OCR 번들링 전략 결정 |
-| [#26](https://github.com/baekenough/second-brain/issues/26) | 요약용 LLM 모델/API/비용 예산 결정 |
-
-### Chore / 블로커
-
-| # | 제목 |
-|---|---|
-| [#21](https://github.com/baekenough/second-brain/issues/21) | CI/CD 구축 (.github/workflows/) |
-| [#22](https://github.com/baekenough/second-brain/issues/22) | GitHub 수집 연동 활성화 |
-| [#23](https://github.com/baekenough/second-brain/issues/23) | Notion 수집 연동 활성화 |
-| [#24](https://github.com/baekenough/second-brain/issues/24) | Google Workspace export 활성화 |
+| minikube mount에서 일부 파일 스킵 | 9p 마운트 한글 장파일명 255바이트 초과 | 파일명 단축 |
+| Slack/GitHub 수집기 ERROR 후 skip | 자격증명 미설정 | `*_TOKEN` / `*_ORG` 환경 변수 설정 |
+| gdrive 수집기 미동작 | `GDRIVE_CREDENTIALS_JSON` 미설정 | ADC 자격증명 설정 |
+| Ollama 첫 기동 느림 | gemma3:12b-it-qat CPU 추론 | 모델 pull 후 재사용 |
+| summary_embedding coverage < 80% | 백필 진행 중 | 백필 완료 전까지 summvec 레인 자동 비활성 |
 
 ---
 
-## 14. 로드맵
+## 15. 구현 완료 항목
 
-GitHub 이슈로 추적. 단계별 epic은 아래 이슈들로 구성됨.
+아래 항목들은 이전 로드맵에서 "예정"으로 기재되었으나 **이미 구현 완료** 상태다.
 
-### Phase 0: Baseline (현재 측정)
+### 검색 품질
 
-| # | 제목 |
+| 항목 | 파일 | 이슈 |
+|---|---|---|
+| BGE cross-encoder rerank | `internal/search/rerank.go` | #14 |
+| HyDE 쿼리 확장 | `internal/search/hyde.go` | #15 |
+| 하이브리드 검색 가중치 튜닝 | `internal/search/tune.go` | #16 |
+| 요약 임베딩 lane | `migrations/013_summary_vector.sql` | #13 |
+| 엔티티 RRF lane | `internal/store/document.go:entityCTE` | #139 |
+| bigm_similarity 정렬 (length→relevance) | `internal/store/document.go:bigm CTE` | #138 |
+| 청크 bigm FTS | `migrations/004_chunks.sql` | #146 |
+| rune 기반 청킹 | `internal/chunker/` | #145 |
+
+### 임베딩
+
+| 항목 | 파일 | 이슈 |
+|---|---|---|
+| per-chunk 임베딩 | `migrations/015_chunk_embeddings.sql` | #71 |
+| retry/backoff + 청크 백필 | `internal/worker/` | #141 |
+
+### 엔티티 추출
+
+| 항목 | 파일 | 이슈 |
+|---|---|---|
+| entities 테이블 | `migrations/017_entities.sql` | #77 |
+| entity_processed_at 컬럼 | `migrations/018_entity_processed_at.sql` | — |
+| EntityStore | `internal/store/entities.go` | — |
+
+### 데이터 가드 & 신선도
+
+| 항목 | 파일 | 이슈 |
+|---|---|---|
+| soft-delete 대량 삭제 가드 (3계층) | `internal/scheduler/scheduler_deletion_guard*.go` | #135, #147 |
+| CountActiveDocuments 인터페이스 | `internal/store/document.go`, `internal/scheduler/scheduler.go` | #148 |
+| collection_log staleness 모니터 | `internal/store/collection_status.go` | #137 |
+| GET /api/v1/collect/status | `internal/api/collect_status.go` | #137 |
+| 소스별 COLLECT_INTERVAL | `internal/config/config.go` | #143 |
+
+### eval 자기개선
+
+| 항목 | 파일 | 이슈 |
+|---|---|---|
+| nightly eval-runner Compose 서비스 | `docker-compose.local.yml` | — |
+| FP penalty | `cmd/eval/` | #140 |
+| reindex 추천 웹훅 | `cmd/eval/` | #142 |
+| eval_metrics latency | `migrations/016_eval_latency.sql` | #16 |
+
+### 데이터 무결성
+
+| 항목 | 파일 | 이슈 |
+|---|---|---|
+| SMS stable source_id | `migrations/019_sms_sourceid_rekey.sql` | #144 |
+| 마이그레이션 advisory lock | `internal/store/postgres.go` | #155 |
+
+### 운영 정리
+
+| 항목 | 이슈 |
 |---|---|
-| [#10](https://github.com/baekenough/second-brain/issues/10) | Baseline 지표 측정 |
-
-### Phase 1: RAG 기초 + 버그 수정
-
-| # | 제목 |
-|---|---|
-| [#9](https://github.com/baekenough/second-brain/issues/9) | chunks 테이블 마이그레이션 및 청크 단위 임베딩 |
-| [#1](https://github.com/baekenough/second-brain/issues/1)~[#8](https://github.com/baekenough/second-brain/issues/8) | P0/P1 버그 수정 (위 섹션 13 참조) |
-
-### Phase 2: 의미 강화
-
-| # | 제목 |
-|---|---|
-| [#11](https://github.com/baekenough/second-brain/issues/11) | 섹션/헤더 기반 의미 청킹 |
-| [#12](https://github.com/baekenough/second-brain/issues/12) | LLM 요약 컬럼 추가 (title_summary, bullet_summary) |
-| [#13](https://github.com/baekenough/second-brain/issues/13) | 요약 전용 임베딩 파이프라인 |
-
-### Phase 3: 검색 품질
-
-| # | 제목 |
-|---|---|
-| [#14](https://github.com/baekenough/second-brain/issues/14) | BGE-reranker cross-encoder 통합 |
-| [#15](https://github.com/baekenough/second-brain/issues/15) | HyDE 쿼리 확장 |
-| [#16](https://github.com/baekenough/second-brain/issues/16) | 하이브리드 검색 가중치 자동 튜닝 |
-
-### Phase 4: 자기진화 루프
-
-| # | 제목 |
-|---|---|
-| [#17](https://github.com/baekenough/second-brain/issues/17) | 사용자 피드백 테이블 + 수집 API |
-| [#18](https://github.com/baekenough/second-brain/issues/18) | eval set 자동 구축 — `GET /api/v1/eval/export` (JSONL, feedback 기반 query→relevant_doc_ids 쌍) |
-| [#19](https://github.com/baekenough/second-brain/issues/19) | nightly eval + 회귀 감지 파이프라인 |
-| [#20](https://github.com/baekenough/second-brain/issues/20) | 임계치 기반 자동 재인덱싱 |
+| secretary collector 제거 | #151 |
+| whisper 손상 오디오 격리 | #152 |
+| whisper 로컬 판별 수정 | #153 |
+| llm-memory sqlite 드라이버 복원 + graceful skip | #156 |
 
 ---
 
-*Last updated: 2026-04-15*
+*Last updated: 2026-06-13 (v0.20.4)*

@@ -26,13 +26,20 @@ LLM-curated private search engine. Collects and embeds knowledge from diverse so
 ## Features
 
 - **LLM Curation** — LLM re-ranks search results and generates lightweight summaries. Raw data is always included
-- **Korean Search** — pg_bigm 2-gram indexing + HyDE query expansion for morphology-independent Korean search
+- **Korean Search** — pg_bigm 2-gram indexing + bigm_similarity ordering + HyDE query expansion for morphology-independent Korean search
 - **Dual Binary** — API server and collector daemon run independently
-- **Hybrid Search** — Combines BM25 full-text search (`ts_rank_cd`) and pgvector cosine similarity via Reciprocal Rank Fusion (RRF) for high recall and precision
-- **Multi-source Collection** — Filesystem, Slack, GitHub, and Google Drive (Export) collectors with automatic scheduling and periodic refresh
-- **Rich Format Extraction** — Automatic text extraction from HTML, PDF, DOCX, XLSX, PPTX, and plain text
+- **5-lane Hybrid Search** — FTS (tsvector BM25) + pgvector cosine + pg_bigm + summary embedding + entity RRF for high recall and precision. Optional BGE cross-encoder rerank and HyDE query expansion
+- **Rune-based Chunking** — Equal information density for Korean and English text (issue #145). Heading-aware, paragraph/sentence boundary splitting with overlap
+- **Multi-source Collection** — Filesystem, Slack, GitHub, SMS/calls/recordings (Android), secretary SQLite, Gmail, Calendar, llm-memory, and more
+- **Rich Format Extraction** — Automatic text extraction from HTML, PDF, DOCX, XLSX, PPTX, HWPX
+- **Entity Extraction** — LLM-based knowledge graph entity (PERSON/ORG/CONCEPT/OTHER) extraction with integrated RRF search lane
+- **Data Guard** — 3-layer soft-delete mass-deletion protection: filesystem root stat / 50% deletion-ratio guard / document.go empty no-op
+- **Freshness Monitor** — collection_log staleness monitor + `GET /api/v1/collect/status` endpoint
+- **Eval Self-improvement Loop** — Nightly eval-runner (03:00 KST), NDCG/MRR regression detection, webhook alerts, reindex recommendations
 - **OpenAI-compatible Embeddings** — Accepts both a static API Key and ChatGPT Codex OAuth JWT (CliProxy) as Bearer tokens
+- **SMS Stable source_id** — `sms:{ms}:{addrHash}:{direction}` format guarantees idempotent upsert (issue #144)
 - **Soft Delete** — Removed documents are flagged rather than hard-deleted, preserving history
+- **Migration Advisory Lock** — Prevents duplicate migration execution when multiple instances start simultaneously
 - **Lightweight Images** — Server ~34.5 MB, Collector ~34.5 MB (alpine multi-stage)
 
 ---
@@ -61,41 +68,51 @@ flowchart LR
     classDef ext fill:#faf7f2,stroke:#57534e,color:#1c1917,stroke-width:1px,stroke-dasharray:4 3;
 
     Agent["AI Agent\n(MCP / HTTP)"]
-    Server["second-brain\nAPI Server\nGo 1.25\n:8080"]
-    Collector["second-brain\nCollector Daemon\nGo 1.25"]
+    Server["second-brain\nAPI Server\nGo\n:8080"]
+    MCP["MCP Server\n:8090"]
+    Collector["second-brain\nCollector Daemon\nGo"]
+    EvalRunner["eval-runner\nnightly 03:00 KST"]
     PG["PostgreSQL 16\n+ pgvector\n+ pg_bigm"]
-    LLM["LLM API\n(curation)"]
+    LLM["LLM / Ollama\n(curation + HyDE\n+ entity extract)"]
     OpenAI["OpenAI Embeddings\ntext-embedding-3-small\n1536 dim"]
-    FS["Filesystem\n(Google Drive mount)"]
-    Slack["Slack API"]
-    GH["GitHub API"]
-    GD["Google Drive\nExport"]
+    Whisper["Whisper\nASR :8000"]
+    Diarization["diarization\nspeaker sep :8001"]
+    Sources["Collection Sources\nFilesystem / Slack / GitHub\nSMS / Calls / Recordings\nGmail / Calendar / llm-memory"]
 
     Agent -->|REST /api/v1| Server
+    Agent -->|MCP streamable HTTP| MCP
     Server -->|SQL + pgvector| PG
-    Server -->|curated search| LLM
+    Server -->|curation| LLM
+    MCP -->|SQL + pgvector| PG
     Collector -->|SQL + pgvector| PG
     Collector -->|POST /embeddings| OpenAI
-    Collector -->|collect| FS
-    Collector -->|collect| Slack
-    Collector -->|collect| GH
-    Collector -->|collect| GD
+    Collector -->|collect| Sources
+    Collector -->|audio files| Whisper
+    Collector -->|diarize| Diarization
+    EvalRunner -->|eval query| PG
+    EvalRunner -->|regression webhook| LLM
 
     class Server,Collector focal;
     class PG data;
-    class LLM,OpenAI,Slack,GH,GD,FS ext;
-    class Agent muted;
+    class LLM,OpenAI,Whisper,Diarization,Sources ext;
+    class Agent,MCP,EvalRunner muted;
 ```
 
-The server (API) and collector are separate binaries. The collector runs on a configurable schedule (default: 1 hour). Collected text is truncated to a maximum of 8,000 characters before embedding, then stored in a `pgvector` column.
+The server (API) and collector are separate binaries. Each collector runs on a configurable per-source `COLLECT_INTERVAL`. Collected text is split by a rune-based chunker, then embedded and stored in a `pgvector` column. Production runs on **Mac mini docker-compose** (`docker-compose.local.yml`); `deploy/k8s/` is the future Kubernetes target.
 
 ### Components
 
-| Component | Image | Base | Size | UID |
-|-----------|-------|------|------|-----|
-| second-brain server (API) | `second-brain:dev` | golang:1.24-alpine → alpine:3.21 | ~34.5 MB | 10001 |
-| second-brain collector (daemon) | `second-brain-collector:dev` | golang:1.24-alpine → alpine:3.21 | ~34.5 MB | 10001 |
-| postgres | `pgvector/pgvector:pg16` | PostgreSQL 16 + pgvector + pg_bigm | — | — |
+| Component | Image | Base | UID |
+|-----------|-------|------|-----|
+| second-brain server (API) | `second-brain-server:local` | golang:alpine → alpine | 10001 |
+| second-brain collector (daemon) | `second-brain-collector:local` | golang:alpine → alpine | 10001 |
+| second-brain mcp (MCP server) | `second-brain-mcp:local` | golang:alpine → alpine | 10001 |
+| second-brain eval (nightly eval) | `second-brain-eval:local` | golang:alpine → alpine | — |
+| postgres | `second-brain-postgres:local` | pgvector/pgvector:pg16 + pg_bigm | — |
+| ollama | `ollama/ollama:latest` | — | — |
+| whisper | `fedirz/faster-whisper-server:latest-cpu` | faster-whisper (int8 CPU) | — |
+| diarization | `second-brain-diarization:local` | pyannote.audio | — |
+| web | `second-brain-web:local` | node:alpine (Next.js standalone) | 10001 |
 
 ---
 
@@ -106,22 +123,25 @@ The server (API) and collector are separate binaries. The collector runs on a co
 go run -tags setup ./cmd/collector/ setup
 
 # Or configure manually
-cp .env.example .env
-# Edit .env with required values (DATABASE_URL, EMBEDDING_API_KEY, etc.)
+cp .env.local.example .env.local
+# Edit .env.local with required values
 
 # 2. Start services
-docker compose up -d
+docker compose -f docker-compose.local.yml up -d --build
 
 # 3. Health check
-curl http://localhost:8080/health
+curl http://localhost:8081/health
 
 # 4. Test search
-curl -X POST http://localhost:8080/api/v1/search \
+curl -X POST http://localhost:8081/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{"query": "onboarding guide", "limit": 5}'
+
+# 5. Check collection freshness
+curl http://localhost:8081/api/v1/collect/status
 ```
 
-> **Note**: The wizard requires the `-tags setup` build tag. Production Docker images (built without the tag) do not include the wizard binary.
+> **Note**: The setup wizard requires the `-tags setup` build tag. Production Docker images do not include the wizard.
 
 ---
 
@@ -132,35 +152,59 @@ second-brain/
 ├── cmd/
 │   ├── server/
 │   │   └── main.go              # API server entry point (port 8080)
-│   └── collector/
-│       └── main.go              # Collector daemon entry point
+│   ├── collector/
+│   │   └── main.go              # Collector daemon entry point
+│   ├── mcp/
+│   │   └── main.go              # MCP streamable HTTP server (port 8090)
+│   └── eval/
+│       └── main.go              # Nightly eval binary
 ├── internal/
+│   ├── api/                     # HTTP handlers + router
+│   │   ├── collect_status.go    # GET /api/v1/collect/status + FreshnessChecker
+│   │   ├── reindex_check.go     # GET /api/v1/reindex/check
+│   │   └── search.go            # POST|GET /api/v1/search (HyDE, rerank options)
+│   ├── chunker/                 # Rune-based text chunking (#145)
+│   │   ├── chunker.go           # Options{TargetSize, MaxSize, Overlap, HeadingAware}
+│   │   └── adaptive.go          # SourceType-aware Options selection
 │   ├── collector/
 │   │   ├── extractor/           # File format extractors
-│   │   │   ├── extractor.go     # Interface + SanitizeText
-│   │   │   ├── html.go          # x/net/html tag stripping
-│   │   │   ├── pdf.go           # ledongthuc/pdf, 10s timeout
-│   │   │   ├── docx.go          # OOXML word/document.xml
-│   │   │   ├── xlsx.go          # excelize/v2 TSV, 200 KiB cap
-│   │   │   └── pptx.go          # OOXML ppt/slides
 │   │   ├── filesystem.go        # Local filesystem collector
 │   │   ├── slack.go             # Slack collector (public channels only)
 │   │   ├── github.go            # GitHub collector
-│   │   └── gdrive_export.go     # Google Drive Export collector
+│   │   ├── sms.go               # SMS + call-log collector (Android push)
+│   │   ├── recording.go         # Call recording collector (Whisper ASR)
+│   │   ├── secretary.go         # secretary SQLite collector
+│   │   ├── gmail.go             # Gmail collector
+│   │   ├── calendar.go          # Calendar collector
+│   │   └── llm_memory.go        # llm-memory SQLite collector
 │   ├── config/
 │   │   └── config.go            # Environment variable parsing
 │   ├── curation/                # LLM curation layer
-│   ├── db/                      # pgvector init, migrations
-│   ├── embedding/               # OpenAI-compatible embedding client
-│   ├── handler/                 # HTTP handlers (search, documents, sources)
-│   ├── model/                   # Document, SearchResult structs
-│   └── scheduler/               # Periodic collection scheduler (mutex dedup)
-├── migrations/                  # SQL migration files (auto-applied on startup)
+│   ├── llm/                     # LLM client (HyDE, entity extraction)
+│   ├── search/
+│   │   ├── search.go            # Service.Search() — HyDE, rerank, entity integration
+│   │   ├── embed.go             # EmbedClient (staticToken / cliProxyToken)
+│   │   ├── rerank.go            # HTTPReranker (BGE cross-encoder)
+│   │   ├── hyde.go              # HyDE query expansion
+│   │   └── tune.go              # Hybrid search weight tuning
+│   ├── store/
+│   │   ├── document.go          # DocumentStore — 5-lane hybridSearch CTE
+│   │   ├── collection_status.go # CollectionStatus + FreshnessChecker
+│   │   ├── entities.go          # EntityStore — upsert, link, fetch
+│   │   └── postgres.go          # pgx/v5 connection + advisory lock migrations
+│   ├── model/                   # Document, SearchQuery, Entity structs
+│   ├── scheduler/               # Periodic collection scheduler + deletion guard
+│   └── worker/                  # Async embedding backfill worker
+├── migrations/                  # SQL migrations 001–019 (auto-applied on startup)
 ├── deploy/
-│   └── k8s/                     # Kustomize manifests
-├── Dockerfile                   # Multi-target build (server + collector)
-├── docker-compose.yml           # Local development Compose
-└── go.mod                       # Go 1.25 module definition
+│   ├── k8s/                     # Kustomize manifests (future Kubernetes target)
+│   ├── postgres/                # Custom PostgreSQL image with pg_bigm
+│   └── diarization/             # pyannote.audio diarization server
+├── web/                         # Next.js frontend
+├── mobile/second-brain-push/    # Android collector app (SMS/calls/recordings)
+├── docker-compose.local.yml     # Production Compose (Mac mini)
+├── Dockerfile                   # Multi-target build (server/collector/mcp/eval)
+└── go.mod                       # Go module definition
 ```
 
 ---
@@ -180,61 +224,47 @@ All endpoints use the `/api/v1` prefix. The single exception is `/health`.
 | `GET` | `/api/v1/documents/{id}` | Single document detail |
 | `GET` | `/api/v1/documents/{id}/raw` | Raw file streaming (filesystem only, 50 MiB limit) |
 | `GET` | `/api/v1/sources` | Registered collector list |
-| `POST` | `/api/v1/ingest/messages` | Receive SMS + call-log JSON batch (Android app → server) |
-| `POST` | `/api/v1/ingest/recording` | Receive call recording `.m4a` multipart (Android app → server) |
+| `GET` | `/api/v1/stats/baseline` | Document count, chunk count, p50/p95 statistics |
+| `GET` | `/api/v1/collect/status` | Per-source collection freshness (last_success_at, stale_seconds) |
+| `POST` | `/api/v1/collect/trigger` | Manual collection trigger |
+| `POST` | `/api/v1/ingest/messages` | Receive SMS + call-log JSON batch (Android app) |
+| `POST` | `/api/v1/ingest/recording` | Receive call recording `.m4a` multipart (Android app) |
 
 ---
 
 ### GET /health
 
-Returns 200 when the server is running.
-
 ```bash
-curl http://localhost:8080/health
+curl http://localhost:8081/health
 ```
-
 ```json
 {"status":"ok"}
 ```
 
 ---
 
-### GET /api/v1/search
-
-Query parameter-based hybrid search.
-
-| Query Parameter | Type | Default | Description |
-|-----------------|------|---------|-------------|
-| `q` | string | required | Search query |
-| `source_type` | string | (all) | Filter by source: `filesystem` \| `slack` \| `github` |
-| `limit` | int | 10 | Maximum results to return |
-| `curated` | bool | `false` | Enable LLM curation (re-ranking + summary) |
-
-```bash
-curl "http://localhost:8080/api/v1/search?q=onboarding+guide&limit=5&curated=true"
-```
-
----
-
 ### POST /api/v1/search
 
-JSON body-based hybrid search combining BM25 full-text (`ts_rank_cd`) and pgvector cosine (`<=>`) scores via RRF.
+JSON body-based 5-lane hybrid search. Combines FTS (tsvector BM25) + pgvector cosine + pg_bigm + summary embedding + entity via RRF.
 
 **Request Body**
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `query` | string | required | Search query |
-| `source_type` | string | (all) | Filter by source: `filesystem` \| `slack` \| `github` |
-| `limit` | int | 10 | Maximum results to return |
+| `source_type` | string | (all) | Filter by source: `filesystem` \| `slack` \| `github` \| `sms` |
+| `exclude_source_types` | []string | — | Sources to exclude |
+| `limit` | int | 20 | Maximum results to return |
 | `sort` | string | `"relevance"` | `"relevance"` (RRF score desc) \| `"recent"` (collected_at desc) |
 | `include_deleted` | bool | `false` | Include soft-deleted documents |
 | `curated` | bool | `false` | Enable LLM curation (re-ranking + summary) |
+| `use_hyde` | bool | `false` | Enable HyDE query expansion (~1-3s additional latency) |
+| `use_rerank` | bool | `false` | Enable BGE cross-encoder reranking |
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/search \
+curl -X POST http://localhost:8081/api/v1/search \
   -H "Content-Type: application/json" \
-  -d '{"query": "onboarding guide", "limit": 5, "sort": "relevance", "curated": true}'
+  -d '{"query": "onboarding guide", "limit": 5, "use_rerank": true}'
 ```
 
 ```json
@@ -244,10 +274,11 @@ curl -X POST http://localhost:8080/api/v1/search \
       "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
       "title": "New Employee Onboarding Guide.docx",
       "content": "During your first week ...",
-      "source": "filesystem",
-      "source_url": "/data/drive/HR/New Employee Onboarding Guide.docx",
-      "collected_at": "2026-04-10T09:00:00Z",
-      "score": 0.0312
+      "source_type": "filesystem",
+      "source_id": "HR/New Employee Onboarding Guide.docx",
+      "match_type": "hybrid",
+      "score": 0.0312,
+      "collected_at": "2026-04-10T09:00:00Z"
     }
   ],
   "count": 1,
@@ -259,28 +290,24 @@ curl -X POST http://localhost:8080/api/v1/search \
 
 ---
 
-### GET /api/v1/documents
+### GET /api/v1/collect/status
 
-| Query Parameter | Type | Default | Description |
-|-----------------|------|---------|-------------|
-| `limit` | int | 20 | Max 100 |
-| `offset` | int | 0 | Pagination offset |
-| `source` | string | (all) | `filesystem` \| `slack` \| `github` |
+Returns per-source collection freshness derived from the collection_log table.
 
 ```bash
-curl "http://localhost:8080/api/v1/documents?limit=5&offset=0&source=filesystem"
+curl http://localhost:8081/api/v1/collect/status
 ```
 
 ```json
 {
-  "documents": [
+  "sources": [
     {
-      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-      "title": "README.md",
-      "source": "filesystem",
-      "source_url": "/data/drive/README.md",
-      "collected_at": "2026-04-10T09:00:00Z",
-      "updated_at": "2026-04-12T15:30:00Z"
+      "source_type": "filesystem",
+      "last_success_at": "2026-06-13T03:00:00Z",
+      "last_attempt_at": "2026-06-13T03:00:01Z",
+      "consecutive_failures": 0,
+      "total_runs": 1240,
+      "stale_seconds": 3600.5
     }
   ]
 }
@@ -288,45 +315,27 @@ curl "http://localhost:8080/api/v1/documents?limit=5&offset=0&source=filesystem"
 
 ---
 
-### GET /api/v1/documents/{id}
+### GET /api/v1/documents
 
-Returns the full metadata and content of a single document as JSON.
-
-```bash
-curl http://localhost:8080/api/v1/documents/a1b2c3d4-e5f6-7890-abcd-ef1234567890
-```
-
----
-
-### GET /api/v1/documents/{id}/raw
-
-Streams the raw file bytes. Available for filesystem sources only. `Content-Type` is set automatically based on the file extension. Files exceeding 50 MiB return 413.
-
-```bash
-# Download file
-curl -O -J http://localhost:8080/api/v1/documents/a1b2c3d4-e5f6-7890-abcd-ef1234567890/raw
-
-# Open inline in browser (images, PDFs, etc.)
-open "http://localhost:8080/api/v1/documents/a1b2c3d4-e5f6-7890-abcd-ef1234567890/raw"
-```
+| Query Parameter | Type | Default | Description |
+|-----------------|------|---------|-------------|
+| `limit` | int | 20 | Max 100 |
+| `offset` | int | 0 | Pagination offset |
+| `source` | string | (all) | `filesystem` \| `slack` \| `github` etc. |
 
 ---
 
-### GET /api/v1/sources
+### POST /api/v1/ingest/messages
 
-Returns the list of registered collectors and their status.
-
-```bash
-curl http://localhost:8080/api/v1/sources
-```
+The Android second-brain-push app sends SMS and call logs as a JSON batch. Source ID format: `sms:{dateMs}:{addrHash}:{direction}`.
 
 ---
 
 ## Environment Variables
 
-Full list based on `internal/config/config.go`.
+Key environment variables based on `internal/config/config.go`.
 
-### Server Environment Variables
+### Server
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -335,33 +344,34 @@ Full list based on `internal/config/config.go`.
 | `EMBEDDING_API_URL` | `https://api.openai.com/v1` | OpenAI-compatible embeddings endpoint |
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model (1536 dimensions) |
 | `EMBEDDING_API_KEY` | — | Static Bearer token. Mutually exclusive with `CLIPROXY_AUTH_FILE` |
-| `CLIPROXY_AUTH_FILE` | — | Path to CliProxy OAuth JSON. Reads `access_token` with 5-minute TTL auto-refresh |
-| `LLM_API_URL` | — | LLM curation chat completions endpoint |
+| `CLIPROXY_AUTH_FILE` | — | CliProxy OAuth JSON path. Auto-refreshes with 5-minute TTL |
+| `LLM_API_URL` | — | LLM endpoint for curation, HyDE, and entity extraction |
 | `LLM_API_KEY` | — | LLM API key |
 | `LLM_MODEL` | — | LLM model identifier |
-| `MIGRATIONS_DIR` | runtime.Caller fallback | In Docker images: `/app/migrations` |
 | `API_KEY` | — | API authentication Bearer token |
+| `ALERT_WEBHOOK_URL` | — | Slack webhook URL for collection freshness alerts |
+| `RERANK_API_URL` | — | BGE cross-encoder reranking endpoint |
+| `ENTITY_EXTRACTION_ENABLED` | `false` | Enable entity extraction + search lane |
 
-### Collector Environment Variables
+### Collector
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `DATABASE_URL` | (same as above) | PostgreSQL connection string |
-| `COLLECT_INTERVAL` | `1h` | Collector schedule interval (Go duration format) |
-| `MAX_EMBED_CHARS` | `8000` | Maximum characters sent to the embedding API. Excess is truncated with a WARN log |
-| `EMBEDDING_API_URL` | `https://api.openai.com/v1` | OpenAI-compatible embeddings endpoint |
-| `EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model |
-| `EMBEDDING_API_KEY` | — | Static Bearer token |
-| `CLIPROXY_AUTH_FILE` | — | Path to CliProxy OAuth JSON |
-| `FILESYSTEM_PATH` | — | Root directory to collect from. In-cluster path: `/data/drive` |
-| `FILESYSTEM_ENABLED` | `false` | Set to `true` to register the filesystem collector |
+| `COLLECT_INTERVAL` | `1h` | Default collection interval (overridable per source) |
+| `MAX_EMBED_CHARS` | `8000` | Maximum characters for embedding input |
+| `FILESYSTEM_PATH` | — | Root directory to collect from |
+| `FILESYSTEM_ENABLED` | `false` | Set to `true` to activate the filesystem collector |
 | `SLACK_BOT_TOKEN` | — | Slack Bot OAuth Token (`xoxb-...`) |
 | `SLACK_TEAM_ID` | — | Slack Workspace ID |
 | `GITHUB_TOKEN` | — | GitHub Personal Access Token |
 | `GITHUB_ORG` | — | GitHub organization name |
-| `GDRIVE_CREDENTIALS_JSON` | — | Google ADC JSON path. If unset, the gdrive collector is disabled |
+| `GDRIVE_CREDENTIALS_JSON` | — | Google ADC JSON path |
+| `DIARIZATION_API_URL` | — | pyannote.audio speaker diarization server URL |
+| `DIARIZATION_ENABLED` | `false` | Enable speaker diarization |
+| `ENTITY_EXTRACTION_ENABLED` | `false` | Enable entity extraction |
 
-> When both `EMBEDDING_API_KEY` and `CLIPROXY_AUTH_FILE` are set, `CLIPROXY_AUTH_FILE` takes precedence. Set only one.
+> When both `EMBEDDING_API_KEY` and `CLIPROXY_AUTH_FILE` are set, `CLIPROXY_AUTH_FILE` takes precedence.
 
 ---
 
@@ -369,22 +379,28 @@ Full list based on `internal/config/config.go`.
 
 | Source | Active When | Implementation | Notes |
 |--------|-------------|----------------|-------|
-| filesystem | `FILESYSTEM_PATH` set + `FILESYSTEM_ENABLED=true` | Fully operational | 4,150+ documents verified |
-| slack | `SLACK_BOT_TOKEN` set | Complete | Public channels only; DMs automatically excluded. ERROR then skip if unset |
-| github | `GITHUB_TOKEN` + `GITHUB_ORG` set | Complete | ERROR then skip if unset |
+| filesystem | `FILESYSTEM_PATH` + `FILESYSTEM_ENABLED=true` | Fully operational | 4,150+ documents verified |
+| slack | `SLACK_BOT_TOKEN` set | Complete | Public channels only; DMs automatically excluded |
+| github | `GITHUB_TOKEN` + `GITHUB_ORG` set | Complete | Issues + PRs |
+| sms / call | Android app + server URL/token configured | Fully operational | Galaxy Z Flip6 live-tested. App: [`mobile/second-brain-push/`](mobile/second-brain-push/README.md) |
+| recording | Same as above + Whisper server | Fully operational | Whisper ASR → text transcription |
+| secretary | `SECRETARY_DB_HOST_PATH` mounted | Fully operational | secretary SQLite read-only mount |
+| gmail | `/data/gmail` mounted | Fully operational | Gmail export via secretary |
+| calendar | `/data/calendar` mounted | Fully operational | Calendar export via secretary |
+| llm-memory | `LLM_MEMORY_DB_HOST_PATH` mounted | Fully operational | llm-memory SQLite read-only mount |
 | gdrive (export) | `GDRIVE_CREDENTIALS_JSON` set | Scaffold only | Requires ADC; disabled by default |
 | notion | — | Removed | Deregistered from main.go |
-| mobile-push (SMS / calls / recordings) | Android app installed + server URL/token configured | Fully operational | Galaxy Z Flip6 live-tested. App: [`mobile/second-brain-push/`](mobile/second-brain-push/README.md) |
 
 ### File Extractors (`internal/collector/extractor/`)
 
 | Format | Library | Notes |
 |--------|---------|-------|
-| HTML | `golang.org/x/net/html` | HTML tag stripping |
+| HTML | `golang.org/x/net/html` | Tag stripping |
 | PDF | `ledongthuc/pdf` | 10-second timeout; NUL byte sanitization |
 | DOCX | OOXML unzip | Parses `word/document.xml` |
-| XLSX | `github.com/xuri/excelize/v2` | TSV output; `##SHEET {name}` header + tab-separated rows; 200 KiB cap |
+| XLSX | `github.com/xuri/excelize/v2` | TSV output; `##SHEET {name}` headers; 200 KiB cap |
 | PPTX | OOXML unzip | Parses `ppt/slides/*.xml` |
+| HWPX | OWPML unzip | Parses `Contents/section*.xml` `<hp:t>` nodes |
 | All | `SanitizeText` | 0x00 removal + UTF-8 validation + whitespace compression |
 
 ---
@@ -394,44 +410,55 @@ Full list based on `internal/config/config.go`.
 ### Service Status
 
 ```bash
-docker compose ps
-docker compose logs server --tail=100 -f
-docker compose logs collector --tail=100 -f
+docker compose -f docker-compose.local.yml ps
+docker compose -f docker-compose.local.yml logs server --tail=100 -f
+docker compose -f docker-compose.local.yml logs collector --tail=100 -f
+```
+
+### Check Collection Freshness
+
+```bash
+curl http://localhost:8081/api/v1/collect/status | jq '.sources[] | {source_type, consecutive_failures, stale_seconds}'
 ```
 
 ### Direct Database Access
 
 ```bash
-docker compose exec postgres psql -U brain -d second_brain
+docker compose -f docker-compose.local.yml exec postgres psql -U brain -d second_brain
 ```
 
 ```sql
 -- Document count by source
-SELECT source, COUNT(*) FROM documents GROUP BY source;
+SELECT source_type, COUNT(*) FROM documents GROUP BY source_type;
 
 -- 10 most recently collected documents
-SELECT title, source, collected_at FROM documents ORDER BY collected_at DESC LIMIT 10;
+SELECT title, source_type, collected_at FROM documents ORDER BY collected_at DESC LIMIT 10;
 
--- Documents missing embeddings (excluded from vector search)
-SELECT COUNT(*) FROM documents WHERE embedding IS NULL;
+-- Active documents missing embeddings
+SELECT COUNT(*) FROM documents WHERE embedding IS NULL AND status = 'active';
+
+-- Recent collection log entries
+SELECT source_type, started_at, documents_count, error FROM collection_log ORDER BY started_at DESC LIMIT 20;
 ```
 
 ### Rebuild Images
 
 ```bash
-docker compose build --no-cache
-docker compose up -d
+docker compose -f docker-compose.local.yml build --no-cache
+docker compose -f docker-compose.local.yml up -d
 ```
 
-### Rotate CliProxy OAuth Secret
+### Initial Ollama Model Download
 
-When the token expires or `auth.json` is replaced, restart the Collector.
+```bash
+docker exec second-brain-ollama ollama pull gemma3:12b-it-qat
+```
 
 ---
 
 ## Contributor Setup
 
-If you have push access to this repository, run once per clone:
+Run once per clone if you have push access:
 
 ```bash
 make install-hooks
@@ -439,12 +466,10 @@ make install-hooks
 
 This tells git to use the pre-push hook in `.githooks/`. On every push, the following run automatically:
 
-- `scripts/ci-checks.sh` (kustomization secret guard, discord placeholder check, sync-env destructive-command guard, secret-leak detection, .env tracking detection)
-- `go vet` / `go build` / `go test` (race detector runs in CI)
+- `scripts/ci-checks.sh` (secret guard, discord placeholder, .env tracking detection, etc.)
+- `go vet` / `go build` / `go test`
 
-Emergency bypass: `git push --no-verify` (the person who bypasses owns the consequences).
-
-To run the same hygiene checks locally without pushing:
+To run the same checks locally without pushing:
 
 ```bash
 make check
@@ -486,52 +511,25 @@ gofmt -w .
 
 ### Migrations
 
-Migration files live in `migrations/` and are applied automatically in order when the server starts. Already-applied migrations are not re-run.
+Migration files live in `migrations/` (001–019) and are applied in order under an advisory lock when the server starts. Already-applied migrations are not re-run.
 
 ---
 
 ## Known Issues
 
-| ID | Symptom | Cause | Workaround |
-|----|---------|-------|------------|
-| BUG-007 | Some files skipped during minikube mount collection | 9p mount raises `lstat: file name too long` for Korean filenames exceeding 255 bytes | Shorten filenames to under 255 bytes |
-| — | Embedding failures when `cliproxy-auth-secret` is missing | Out-of-band Secret excluded from git | Run `kubectl create secret --from-file=auth.json=~/.cli-proxy-api/codex-*.json` manually on each deployment |
-| — | Slack/GitHub collectors log ERROR then skip | Credential environment variables not set | Set the relevant `*_TOKEN` / `*_ORG` variables. Other collectors continue to run normally |
-| — | Documents longer than 8,000 characters are embedding-truncated | `MAX_EMBED_CHARS` default of 8,000 | Increase `MAX_EMBED_CHARS`. Intended as a temporary measure until the Phase 1 chunks table is introduced |
-| — | gdrive collector not active | `GDRIVE_CREDENTIALS_JSON` unset disables it by default | Provide ADC credentials to enable (currently scaffold-stage implementation) |
-
----
-
-## Interactive Diagrams
-
-Each diagram mirrors the corresponding section in ARCHITECTURE.en.md and can be edited interactively on [eraser.io](https://app.eraser.io).
-
-### 1. System Runtime Topology
-![System Runtime Topology](docs/diagrams/01-system-runtime-topology.png)
-([Open in eraser.io](https://app.eraser.io/workspace/PyHgjPmM97MYtJNoVD5H?diagram=CSpF8N1BRvdpM3l5TW2nd))
-
-### 2. Service Layer Map
-![Service Layer Map](docs/diagrams/02-service-layer-map.png)
-([Open in eraser.io](https://app.eraser.io/workspace/Z8JviN6EySSKzjgtXNp4?diagram=o4bbcT5wpMrwh3nMRPRLm))
-
-### 3. Data Model ERD
-![Data Model ERD](docs/diagrams/03-data-model-erd.png)
-([Open in eraser.io](https://app.eraser.io/workspace/O901Iet3HpcIaldLfQ1e?diagram=fo1U7OVZh_I9mVe6OaLfV))
-
-### 4. Collection Pipeline Sequence
-![Collection Pipeline Sequence](docs/diagrams/04-collection-pipeline-sequence.png)
-([Open in eraser.io](https://app.eraser.io/workspace/2NzpSSDbSx4Oh3gCs6DV?diagram=UT0aD63tuIkrRiqLEUgKr))
-
-### 5. Hybrid Search Pipeline RRF
-![Hybrid Search Pipeline RRF](docs/diagrams/05-hybrid-search-rrf.png)
-([Open in eraser.io](https://app.eraser.io/workspace/K10FmwBysYGTBVp8E9Wb?diagram=xJgZnmmbfRJL2Ox_bMd_i))
+| Symptom | Cause | Workaround |
+|---------|-------|------------|
+| Some files skipped during minikube mount collection | 9p mount raises `lstat: file name too long` for Korean filenames exceeding 255 bytes | Shorten filenames to under 255 bytes |
+| Slack/GitHub collectors log ERROR then skip | Credential environment variables not set | Set the relevant `*_TOKEN` / `*_ORG` variables |
+| gdrive collector not active | `GDRIVE_CREDENTIALS_JSON` unset disables it | Provide ADC credentials to enable |
+| Ollama slow on first start | gemma3:12b-it-qat CPU inference on macOS arm64 | Pull model once; subsequent runs reuse cached weights |
 
 ---
 
 ## Related Documentation
 
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — Detailed architecture reference
-- [`EXPANSION.md`](EXPANSION.md) — Expansion plans
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — Detailed architecture reference (Korean)
+- [`ARCHITECTURE.en.md`](ARCHITECTURE.en.md) — Detailed architecture reference (English)
 - [`docs/runbook-deploy.md`](docs/runbook-deploy.md) — Deployment runbook
 - [`guides/`](guides/) — Operations and development guides
 
@@ -539,8 +537,8 @@ Each diagram mirrors the corresponding section in ARCHITECTURE.en.md and can be 
 
 ## License
 
-No license file is present in this repository. Contact the project maintainer before using or distributing this code.
+This project is distributed under the [MIT License](LICENSE). See [CONTRIBUTE.md](CONTRIBUTE.md) for contribution guidelines.
 
 ---
 
-Last updated: 2026-04-15
+Last updated: 2026-06-13 (v0.20.4)
