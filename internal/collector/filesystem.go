@@ -361,11 +361,30 @@ func (c *FilesystemCollector) CollectStream(ctx context.Context, since time.Time
 // ListActiveSourceIDs walks the entire root directory and returns the relative
 // path of every indexable file, regardless of modification time. This allows
 // the scheduler to detect files that were removed since the last collection run.
+//
+// If the root directory does not exist or cannot be accessed (e.g. the volume
+// is unmounted), an error is returned immediately. This distinguishes a broken
+// root from a legitimately empty source directory, preventing the scheduler
+// from misinterpreting the error as "all files deleted" and bulk-deleting
+// active documents in the database.
 func (c *FilesystemCollector) ListActiveSourceIDs(_ context.Context) ([]string, error) {
+	// Guard: verify the root is accessible before walking. If stat fails the
+	// root is missing or unmounted — return an error rather than an empty slice.
+	if _, err := os.Stat(c.rootPath); err != nil {
+		return nil, fmt.Errorf("filesystem: root not accessible %q: %w", c.rootPath, err)
+	}
+
 	var ids []string
 
 	err := filepath.WalkDir(c.rootPath, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
+			// If this is the root-level entry itself the directory became
+			// inaccessible after our stat above (e.g. a TOCTOU race or
+			// permission change). Propagate as an error instead of silently
+			// producing an empty slice.
+			if path == c.rootPath {
+				return fmt.Errorf("filesystem: root walk error %q: %w", c.rootPath, walkErr)
+			}
 			slog.Warn("filesystem: walk error during ID listing, skipping", "path", path, "error", walkErr)
 			return nil
 		}

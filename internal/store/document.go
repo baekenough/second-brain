@@ -562,9 +562,30 @@ func (s *DocumentStore) UpdateCollectorState(ctx context.Context, instanceID str
 	return nil
 }
 
+// markDeletedEmptyGuardComment documents the belt-and-suspenders empty-slice
+// guard added to MarkDeleted. An empty activeIDs slice passed to the Postgres
+// query `source_id != ALL('{}')` evaluates as vacuously TRUE, which would
+// soft-delete every active document for the source type — a silent data-loss
+// path (see GitHub issue #135). The early-return no-op below prevents this.
+// Callers (scheduler Layer 2) also guard against this via error propagation and
+// deletion-ratio sanity checks; this guard is an additional safety net.
+const markDeletedEmptyGuardComment = "empty activeIDs early-return no-op guard"
+
 // MarkDeleted marks documents as deleted for source IDs not present in activeIDs.
 // Only documents with status 'active' are updated. Returns the number of rows updated.
+//
+// Belt-and-suspenders: if activeIDs is empty, this function returns (0, nil)
+// immediately without touching the database. An empty slice fed to the Postgres
+// expression `source_id != ALL('{}')` is vacuously TRUE — it would delete every
+// active document for the source type. The legitimate callers that intend a full
+// wipe (if any ever exist) must use a dedicated, explicitly-named method rather
+// than relying on an empty-slice side-effect.
 func (s *DocumentStore) MarkDeleted(ctx context.Context, sourceType model.SourceType, activeIDs []string) (int, error) {
+	if len(activeIDs) == 0 {
+		// Empty slice guard: do NOT execute the query. See markDeletedEmptyGuardComment.
+		return 0, nil
+	}
+
 	tag, err := s.pg.pool.Exec(ctx, `
 		UPDATE documents
 		SET status = 'deleted', deleted_at = now()
@@ -577,6 +598,24 @@ func (s *DocumentStore) MarkDeleted(ctx context.Context, sourceType model.Source
 		return 0, fmt.Errorf("mark deleted for %s: %w", sourceType, err)
 	}
 	return int(tag.RowsAffected()), nil
+}
+
+// CountActiveDocuments returns the total number of active (non-deleted) documents
+// for the given source type. It is used by the scheduler's deletion-ratio sanity
+// check (issue #135) to detect a suspicious bulk-deletion before calling MarkDeleted.
+// Implements scheduler.ActiveDocumentCounter.
+func (s *DocumentStore) CountActiveDocuments(ctx context.Context, sourceType model.SourceType) (int, error) {
+	var n int
+	err := s.pg.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM documents
+		WHERE source_type = $1 AND status = 'active'`,
+		sourceType,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count active documents for %s: %w", sourceType, err)
+	}
+	return n, nil
 }
 
 // CountBySource returns the number of active documents grouped by logical source.

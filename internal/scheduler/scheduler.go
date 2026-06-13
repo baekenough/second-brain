@@ -35,8 +35,44 @@ type DocumentUpserter interface {
 	UpdateEmbedding(ctx context.Context, doc *model.Document) error
 	// ActiveSourceIDSet returns the set of source_ids currently active in the
 	// store for the given source type. Used by the filesystem collector to detect
-	// files that have never been indexed regardless of their mtime.
+	// files that are new (not yet indexed) regardless of their mtime.
 	ActiveSourceIDSet(ctx context.Context, sourceType model.SourceType) (map[string]struct{}, error)
+}
+
+// ActiveDocumentCounter is an optional extension of DocumentUpserter. When the
+// store implements it, the scheduler uses it to perform a deletion-ratio
+// sanity check before calling MarkDeleted. If the ratio of documents that
+// would be deleted exceeds deletionRatioThreshold the deletion is skipped and
+// a warning is logged — this guards against bulk data-loss caused by a
+// partially unmounted or glitching filesystem.
+type ActiveDocumentCounter interface {
+	CountActiveDocuments(ctx context.Context, sourceType model.SourceType) (int, error)
+}
+
+// deletionRatioThreshold is the maximum fraction of currently active documents
+// that may be deleted in a single MarkDeleted pass. Deletions exceeding this
+// fraction are considered suspicious (e.g. partial unmount) and are skipped
+// with a warning log. The value 0.50 means "block if more than 50% would be
+// deleted". Tests and callers must not hardcode this constant.
+const deletionRatioThreshold = 0.50
+
+// deletionRatioWouldExceed reports whether deleting all DB-active documents
+// that are absent from the filesystem walk (activeInDB - activeOnFS) would
+// exceed deletionRatioThreshold.
+//
+// When activeInDB is zero (fresh source, no prior documents), the ratio is
+// zero by definition and the function always returns false so that the very
+// first sync can proceed normally.
+func deletionRatioWouldExceed(activeInDB, activeOnFS int) bool {
+	if activeInDB <= 0 {
+		return false
+	}
+	wouldDelete := activeInDB - activeOnFS
+	if wouldDelete <= 0 {
+		return false
+	}
+	ratio := float64(wouldDelete) / float64(activeInDB)
+	return ratio > deletionRatioThreshold
 }
 
 // EntityExtractor is the subset of the entity store used by the scheduler to
@@ -405,13 +441,44 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 
 	// Soft-delete detection: if the collector can enumerate all current source IDs,
 	// mark any DB-active documents whose source IDs are no longer present.
+	//
+	// Three-layer defence (issue #135):
+	//   Layer 1 — collector.ListActiveSourceIDs returns error on missing/unmounted root.
+	//   Layer 2 — scheduler skips MarkDeleted on error OR when deletion ratio exceeds threshold.
+	//   Layer 3 — store.MarkDeleted no-ops on empty slice (belt-and-suspenders).
 	if dd, ok := col.(collector.DeletionDetector); ok {
 		allIDs, err := dd.ListActiveSourceIDs(ctx)
 		if err != nil {
-			slog.Warn("scheduler: deletion detection ID listing failed",
+			// Layer 2a: error from collector (e.g. root not accessible / unmounted).
+			// Do NOT call MarkDeleted — an empty/error result must never be treated
+			// as "all files deleted".
+			slog.Warn("scheduler: deletion detection skipped — ID listing failed (root may be unmounted)",
 				"collector", col.Name(), "error", err)
 			return
 		}
+
+		// Layer 2b: deletion-ratio sanity check.
+		// If the store supports CountActiveDocuments, verify that the fraction of
+		// documents that would be deleted is within the safe threshold.
+		if counter, ok := s.store.(ActiveDocumentCounter); ok {
+			activeInDB, countErr := counter.CountActiveDocuments(ctx, col.Source())
+			if countErr != nil {
+				slog.Warn("scheduler: deletion detection skipped — could not count active documents",
+					"collector", col.Name(), "error", countErr)
+				return
+			}
+			if deletionRatioWouldExceed(activeInDB, len(allIDs)) {
+				wouldDelete := activeInDB - len(allIDs)
+				slog.Warn("scheduler: deletion detection skipped — ratio exceeds safety threshold",
+					"collector", col.Name(),
+					"active_in_db", activeInDB,
+					"active_on_source", len(allIDs),
+					"would_delete", wouldDelete,
+					"threshold_pct", int(deletionRatioThreshold*100))
+				return
+			}
+		}
+
 		deleted, err := s.store.MarkDeleted(ctx, col.Source(), allIDs)
 		if err != nil {
 			slog.Warn("scheduler: deletion detection failed",
