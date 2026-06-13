@@ -149,6 +149,46 @@ services:
       - default
 
   # ---------------------------------------------------------------------------
+  # eval-runner — nightly eval 스케줄러 (포트 없음).
+  #   매일 03:00 KST (TZ=Asia/Seoul) 에 /app/eval --check-reindex 를 실행한다.
+  #   Exit-code 계약 (k8s eval-cronjob.yaml 과 동일):
+  #     0 — eval 통과 (회귀 없음, reindex 불필요)
+  #     1 — 회귀 감지 → 로그 기록 후 다음 사이클 대기 (컨테이너 종료 안 함)
+  #     2 — reindex 권장 (eval 바이너리가 이미 웹훅 알림 발송) → 무시하고 계속
+  #   supercronic 등 외부 의존성 없이 셸 루프로 self-contained 스케줄링.
+  # ---------------------------------------------------------------------------
+  eval-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: eval
+    image: second-brain-eval:local
+    env_file:
+      - .env.local
+    environment:
+      TZ: Asia/Seoul
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    command:
+      - sh
+      - -c
+      - |
+        while true; do
+          now=$$(date +%s)
+          target=$$(date -d "today 03:00" +%s 2>/dev/null)
+          [ "$$target" -le "$$now" ] && target=$$(($$target + 86400))
+          sleep_sec=$$(($$target - $$now))
+          echo "[eval-runner] next run at $$(date -d "@$${target}" '+%Y-%m-%d %H:%M:%S %Z'), sleeping $${sleep_sec}s"
+          sleep "$$sleep_sec"
+          echo "[eval-runner] starting /app/eval --check-reindex at $$(date '+%Y-%m-%d %H:%M:%S %Z')"
+          /app/eval --check-reindex
+          code=$$?
+          echo "[eval-runner] exited $$code"
+        done
+
+  # ---------------------------------------------------------------------------
   # mcp — MCP streamable HTTP 서버 (포트 8090).
   #   마이그레이션은 server 가 적용하므로, server 가 기동된 뒤 시작한다.
   #   (server 는 depends_on postgres healthy 로 마이그레이션 완료를 보장)
