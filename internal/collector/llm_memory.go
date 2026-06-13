@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/baekenough/second-brain/internal/model"
+	_ "modernc.org/sqlite" // register CGO-free SQLite driver for sql.Open("sqlite", ...) — restored after #151 removed secretary.go which had been the sole registration point
 )
 
 // LLMMemoryCollector reads records from an llm-memory SQLite database and

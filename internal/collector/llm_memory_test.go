@@ -2,6 +2,9 @@ package collector
 
 import (
 	"context"
+	"database/sql"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -83,5 +86,43 @@ func TestLLMMemoryCollector_Name(t *testing.T) {
 	c := NewLLMMemoryCollector("/some/path")
 	if c.Name() != "llm-memory" {
 		t.Errorf("Name()=%q, want %q", c.Name(), "llm-memory")
+	}
+}
+
+// TestSQLiteDriverRegistered verifies that the modernc.org/sqlite driver is
+// registered and usable via sql.Open("sqlite", ...). This is a regression test
+// for the #151 regression where secretary.go (the sole registration point) was
+// removed without preserving the blank import, causing "sql: unknown driver
+// sqlite" panics in production.
+//
+// The test creates a real in-process SQLite database, which is safe to run in
+// CI because modernc.org/sqlite is a CGO-free pure-Go implementation.
+func TestSQLiteDriverRegistered(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "driver_test.sqlite")
+
+	// sql.Open itself does not fail for unknown drivers — the error surfaces on
+	// the first database operation (Ping or Query). Use a writable URI here
+	// (no mode=ro) so that the driver can create the file.
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open(\"sqlite\", ...): %v — driver may not be registered", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		t.Fatalf("db.Ping() failed: %v — driver may not be registered (regression: #151)", err)
+	}
+
+	// Verify a round-trip to confirm the driver is fully functional.
+	if _, err := db.Exec("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatalf("CREATE TABLE failed: %v", err)
+	}
+
+	// Verify the db file was created by the CGO-free driver.
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("db file not found after Ping: %v", err)
 	}
 }
