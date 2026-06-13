@@ -122,6 +122,9 @@ NO EXCEPTIONS. NO EXCUSES.
 | `/omcustom:lists` | Show all available commands |
 | `/omcustom:status` | Show system status |
 | `/omcustom:help` | Show help information |
+| `/omcustom:fsd` | Full Self Driving — autonomous release loop (pipeline auto-dev → homework until issues exhausted) |
+| `/omcustom:goal` | Disciplined goal-to-execution workflow (parse → plan → execute → verify) |
+| `/idea` | Analyze NL idea against codebase into issue specs |
 
 ## Project Structure
 
@@ -130,7 +133,7 @@ project/
 +-- CLAUDE.md                    # Entry point
 +-- .claude/
 |   +-- agents/                  # Subagent definitions (48 files)
-|   +-- skills/                  # Skills (106 directories)
+|   +-- skills/                  # Skills (109 directories)
 |   +-- rules/                   # Global rules (R000-R020)
 |   +-- hooks/                   # Hook scripts (security, validation, HUD)
 |   +-- contexts/                # Context files (ecomode)
@@ -380,6 +383,9 @@ NO EXCEPTIONS. NO EXCUSES.
 | `/omcustom:lists` | Show all available commands |
 | `/omcustom:status` | Show system status |
 | `/omcustom:help` | Show help information |
+| `/omcustom:fsd` | Full Self Driving — autonomous release loop (pipeline auto-dev → homework until issues exhausted) |
+| `/omcustom:goal` | Disciplined goal-to-execution workflow (parse → plan → execute → verify) |
+| `/idea` | Analyze NL idea against codebase into issue specs |
 
 ## Project Structure
 
@@ -388,7 +394,7 @@ project/
 +-- CLAUDE.md                    # Entry point
 +-- .claude/
 |   +-- agents/                  # Subagent definitions (48 files)
-|   +-- skills/                  # Skills (106 directories)
+|   +-- skills/                  # Skills (109 directories)
 |   +-- rules/                   # Global rules (R000-R020)
 |   +-- hooks/                   # Hook scripts (security, validation, HUD)
 |   +-- contexts/                # Context files (ecomode)

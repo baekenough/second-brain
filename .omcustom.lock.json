@@ -984,6 +984,21 @@
       "size": 3106,
       "component": "skills"
     },
+    ".claude/skills/fsd/SKILL.md": {
+      "templateHash": "56cfd6e36baab020a4a3fe6c06a91035d85d74fb7dcc3398b475185df001829e",
+      "size": 6874,
+      "component": "skills"
+    },
+    ".claude/skills/goal/SKILL.md": {
+      "templateHash": "f13ed958a26f112aad154c801de3d4932047e02556e654ec65501a5174434acd",
+      "size": 3986,
+      "component": "skills"
+    },
+    ".claude/skills/idea/SKILL.md": {
+      "templateHash": "80110806cf1af053c55132c19150ac6adfa13a0958ddc5dce7b3903583ba7c2b",
+      "size": 2167,
+      "component": "skills"
+    },
     ".claude/hooks/skill-count-reminder.sh": {
       "templateHash": "3d2f3908c497d26cb1c0bf408f17a8302fa2b724cdc455797f16016e44f95c03",
       "size": 1461,
