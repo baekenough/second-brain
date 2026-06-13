@@ -202,15 +202,15 @@ steps:
     prompt: |
       Deploy the tagged release to the home server via SSH.
 
-      Target: host24_home_server-ext (SSH alias → 125.133.87.236:9416, user baekenough)
-      Host: <deploy-host> (Ubuntu 24, kernel 6.8)
+      Target: <SSH_ALIAS> (SSH alias → <HOME_SERVER_IP>:<SSH_PORT>, user <SSH_USER>)
+      Host: <HOSTNAME> (Ubuntu 24, kernel 6.8)
       Environment: minikube on docker driver (running node container)
       Fresh deployment: server has no existing ~/second-brain dir, no collected data yet.
 
       Pre-flight checks (halt on any failure):
-      1. SSH reachable: `ssh host24_home_server-ext hostname` (expect: <deploy-host>)
-      2. minikube running: `ssh host24_home_server-ext 'minikube status'`
-         - If "Stopped": `ssh host24_home_server-ext 'minikube start'`
+      1. SSH reachable: `ssh <SSH_ALIAS> hostname` (expect: <HOSTNAME>)
+      2. minikube running: `ssh <SSH_ALIAS> 'minikube status'`
+         - If "Stopped": `ssh <SSH_ALIAS> 'minikube start'`
       3. Git remote HTTPS accessible from server (public repo, no auth needed)
 
       Known blocker (issue #6):
@@ -225,7 +225,7 @@ steps:
       Deployment steps (delegate SSH to infra-docker-expert):
 
       Step 1 — Clone project (first deploy):
-        ssh host24_home_server-ext bash <<'EOF'
+        ssh <SSH_ALIAS> bash <<'EOF'
           set -e
           if [ ! -d ~/second-brain ]; then
             git clone https://github.com/baekenough/second-brain.git ~/second-brain
@@ -236,12 +236,12 @@ steps:
         EOF
 
       Step 2 — Secrets file check:
-        ssh host24_home_server-ext 'test -f ~/second-brain/.env'
+        ssh <SSH_ALIAS> 'test -f ~/second-brain/.env'
         - If missing: HALT with instructions — "Create ~/second-brain/.env on server with production secrets (EMBEDDING_API_KEY, API_KEY, SLACK_TOKEN, etc.)"
         - Do NOT scp .env from local (local .env may contain dev-only values)
 
       Step 3 — Build image inside minikube docker:
-        ssh host24_home_server-ext bash <<'EOF'
+        ssh <SSH_ALIAS> bash <<'EOF'
           set -e
           cd ~/second-brain
           eval $(minikube docker-env)
@@ -250,7 +250,7 @@ steps:
         EOF
 
       Step 4 — Apply k8s manifests:
-        ssh host24_home_server-ext bash <<'EOF'
+        ssh <SSH_ALIAS> bash <<'EOF'
           set -e
           cd ~/second-brain
           kubectl apply -k deploy/k8s/ 2>/dev/null || kubectl apply -f deploy/k8s/
@@ -258,7 +258,7 @@ steps:
         EOF
 
       Step 5 — Post-deploy verification:
-        ssh host24_home_server-ext bash <<'EOF'
+        ssh <SSH_ALIAS> bash <<'EOF'
           set -e
           kubectl -n second-brain get pods -o wide
           kubectl -n second-brain logs deployment/second-brain --tail=50
@@ -266,7 +266,7 @@ steps:
         EOF
 
       Step 6 — Health endpoint smoke test:
-        ssh host24_home_server-ext bash <<'EOF'
+        ssh <SSH_ALIAS> bash <<'EOF'
           kubectl -n second-brain port-forward svc/second-brain 9200:9200 &
           PF_PID=$!
           sleep 3
@@ -274,10 +274,10 @@ steps:
           kill $PF_PID 2>/dev/null || true
         EOF
 
-      On success: comment on the GitHub Release with "Deployed to <deploy-host> at {timestamp}".
+      On success: comment on the GitHub Release with "Deployed to <HOSTNAME> at {timestamp}".
       On failure: collect logs, report, and advise rollback via `kubectl rollout undo`.
 
       **Rollback plan**: if health check fails, execute
-        ssh host24_home_server-ext 'kubectl -n second-brain rollout undo deployment/second-brain'
-    description: "SSH deploy to host24_home_server-ext via minikube + k8s rollout (fresh first deploy)"
+        ssh <SSH_ALIAS> 'kubectl -n second-brain rollout undo deployment/second-brain'
+    description: "SSH deploy to <SSH_ALIAS> via minikube + k8s rollout (fresh first deploy)"
     depends_on: post-release-followup

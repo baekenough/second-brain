@@ -50,7 +50,7 @@ type: project
 
 ### cloudflared tunnel
 - **상태**: Quick Tunnel 활성 (재기동 시 URL 변경됨)
-- **현재 URL**: `https://influenced-computational-smaller-sharp.trycloudflare.com` → `localhost:9200`
+- **현재 URL**: `<redacted-tunnel-url>` → `localhost:9200`
 
 ### 주요 API 엔드포인트
 - `POST /api/v1/collect/trigger` — 수동 수집 트리거

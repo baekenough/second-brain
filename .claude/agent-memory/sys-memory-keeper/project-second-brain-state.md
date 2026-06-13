@@ -33,8 +33,8 @@ second-brain 프로젝트 2026-04-15 세션 종료 시점 상태.
 - 오픈 이슈: #2 #6 #12~20 #22~26 #34 #42 등 (decision-needed, phase 2-4 로드맵, 외부 토큰 필요)
 - 로컬: `.claude/skills/pipeline/SKILL.md` M 상태 (upstream 업데이트, 의도적 미커밋)
 - **서버 배포 없음**: k8s/Docker/cloudflared/cli-proxy-api 전부 제거됨
-- <deploy-host> 서버에는 Airflow·Kafka 등 다른 서비스만 잔존
-- Cloudflare DNS `your-domain.example` 레코드 사용자 수동 제거 필요
+- <redacted-hostname> 서버에는 Airflow·Kafka 등 다른 서비스만 잔존
+- Cloudflare DNS `<redacted-domain>` 레코드 사용자 수동 제거 필요
 
 ## 재배포 시 주요 참고사항
 

@@ -791,7 +791,7 @@ The `eval-runner` service in `docker-compose.local.yml` uses a shell loop to run
 
 ### Current: Mac mini docker-compose (Production)
 
-Production runs on `docker-compose.local.yml`. External access is handled via the `your-domain.example` tunnel.
+Production runs on `docker-compose.local.yml`. External access is handled via a private reverse tunnel (endpoint not published).
 
 ```bash
 # Deploy / update

@@ -55,29 +55,29 @@ spec:
       volumes:
         - name: host-workspace
           hostPath:
-            path: /home/baekenough/workspace
+            path: /home/<user>/workspace
             type: DirectoryOrCreate
         - name: host-claude-skills
           hostPath:
-            path: /home/baekenough/.claude/skills
+            path: /home/<user>/.claude/skills
             type: DirectoryOrCreate
         - name: host-codex-sessions
           hostPath:
-            path: /home/baekenough/.codex/sessions
+            path: /home/<user>/.codex/sessions
             type: DirectoryOrCreate
         - name: host-codex-memories
           hostPath:
-            path: /home/baekenough/.codex/memories
+            path: /home/<user>/.codex/memories
             type: DirectoryOrCreate
         - name: host-codex-skills
           hostPath:
-            path: /home/baekenough/.codex/skills
+            path: /home/<user>/.codex/skills
             type: DirectoryOrCreate
         - name: host-codex-plugins
           hostPath:
-            path: /home/baekenough/.codex/plugins
+            path: /home/<user>/.codex/plugins
             type: DirectoryOrCreate
         - name: host-gemini-history
           hostPath:
-            path: /home/baekenough/.gemini/history
+            path: /home/<user>/.gemini/history
             type: DirectoryOrCreate

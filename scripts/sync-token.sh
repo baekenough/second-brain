@@ -4,10 +4,10 @@
 set -e
 
 LOCAL_DIR="$HOME/.cli-proxy-api"
-REMOTE="host24_home_server-ext"
-AUTH_FILE="codex-baekenough@gmail.com-pro.json"
+REMOTE="<SSH_ALIAS>"
+AUTH_FILE="codex-<user>@example.com-pro.json"
 
 mkdir -p "$LOCAL_DIR"
-scp "$REMOTE:/home/baekenough/.cli-proxy-api/$AUTH_FILE" "$LOCAL_DIR/$AUTH_FILE"
+scp "$REMOTE:/home/<user>/.cli-proxy-api/$AUTH_FILE" "$LOCAL_DIR/$AUTH_FILE"
 echo "Token synced to $LOCAL_DIR/$AUTH_FILE"
 echo "Expires: $(python3 -c "import json; print(json.load(open('$LOCAL_DIR/$AUTH_FILE'))['expired'])")"

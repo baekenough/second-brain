@@ -14,7 +14,7 @@ To enable later:
    ```bash
    ssh host1 'sudo microk8s kubectl -n second-brain rollout restart deployment/second-brain deployment/second-brain-collector'
    ```
-4. Also set the same key on laptop (`docker-compose.laptop-collector.yml`) and host2 (`/home/baekenough/second-brain-collector/docker-compose.yml`) EMBEDDING_API_KEY env.
+4. Also set the same key on laptop (`docker-compose.laptop-collector.yml`) and host2 (`/home/<user>/second-brain-collector/docker-compose.yml`) EMBEDDING_API_KEY env.
 5. Restart those compose stacks.
 6. Trigger a full re-embed: reset collected_at on all filesystem docs so the next scheduler tick re-processes them:
    ```bash

@@ -239,8 +239,8 @@ services:
     environment:
       BRAIN_API_URL: "http://server:8080"
       AUTH_TRUST_HOST: "true"
-      AUTH_URL: "https://your-domain.example"
-      NEXT_PUBLIC_APP_URL: "https://your-domain.example"
+      AUTH_URL: "${AUTH_URL}"
+      NEXT_PUBLIC_APP_URL: "${NEXT_PUBLIC_APP_URL}"
       NODE_ENV: "production"
       PORT: "3000"
       HOSTNAME: "0.0.0.0"

@@ -16,7 +16,7 @@ type: project
 - **GitHub remote 변경**: `git@github.com:<maintainer>/<old-repo>.git` → `git@github.com:<org>/<old-repo>.git`
 - **gh CLI 활성 계정**: `<maintainer>` (baekenough → <maintainer> 전환)
 - **minikube VM 메모리**: 7 GB → 8 GB (`docker update --memory 8g` in-place 적용)
-- **cloudflared Quick Tunnel**: `https://influenced-computational-smaller-sharp.trycloudflare.com` → `localhost:9200` (재기동 시 URL 변경됨)
+- **cloudflared Quick Tunnel**: `<redacted-tunnel-url>` → `localhost:9200` (재기동 시 URL 변경됨)
 
 ### 코드 변경 (커밋 4개)
 

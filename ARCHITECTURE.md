@@ -809,7 +809,7 @@ flowchart LR
 
 ### 현행: Mac mini docker-compose (프로덕션)
 
-프로덕션 환경은 `docker-compose.local.yml`로 운영한다. 외부 접근은 `your-domain.example` 터널을 통해 처리.
+프로덕션 환경은 `docker-compose.local.yml`로 운영한다. 외부 접근은 비공개 리버스 터널을 통해 처리(엔드포인트 미공개).
 
 ```bash
 # 배포 / 업데이트

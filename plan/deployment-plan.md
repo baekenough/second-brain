@@ -25,7 +25,7 @@ Phase 0-1은 현재 MacBook에서, Phase 2-7은 Mac mini 수령 후 진행한다
   brew install cloudflared
   cloudflared tunnel --url http://localhost:9200
   ```
-  - 발급된 `https://*.trycloudflare.com` URL 기록 (팀 공유용)
+  - 발급된 `https://<your-tunnel>.example` URL 기록 (팀 공유용)
   - Quick Tunnel은 재시작 시 URL이 바뀌므로 영구 사용 시 Named Tunnel 전환 필요
 - [ ] API 토큰 인증 미들웨어 확인
   - Bearer 토큰 방식 (`API_KEY` 환경변수)

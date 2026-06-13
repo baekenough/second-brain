@@ -13,7 +13,7 @@ type: project
 ## 타임라인
 
 - **초반**: <old-repo> → second-brain rename, 권한 복구(chown), 프로젝트·문서·ARCHITECTURE 보강
-- **1차 배포**: git reinit → GitHub baekenough 퍼블리시 → v0.1.0 태그 → <deploy-host> 서버 배포 (minikube + cloudflared named tunnel)
+- **1차 배포**: git reinit → GitHub baekenough 퍼블리시 → v0.1.0 태그 → <redacted-hostname> 서버 배포 (minikube + cloudflared named tunnel)
 - **Discord 통합**: 봇 토큰 받아 collector/RAG gateway 구현, cliproxy via gpt-codex-5.3 연동
 - **자율주행 릴리즈**: v0.1.6(CI 파운데이션) → v0.1.7(P0 버그) → v0.1.8(docs+secret+첨부) → v0.1.9(chunks) → v0.1.10(heading+realtime) → v0.1.11(feedback+HyDE+reactions) → v0.1.12(eval+metrics) → v0.1.13(UUID hotfix) → v0.1.14(Intent hotfix)
 
