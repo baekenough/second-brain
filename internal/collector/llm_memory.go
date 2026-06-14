@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/google/uuid"
 	_ "modernc.org/sqlite" // register CGO-free SQLite driver for sql.Open("sqlite", ...) — restored after #151 removed secretary.go which had been the sole registration point
 )
 
@@ -31,6 +31,14 @@ import (
 //
 // The kind value (e.g. "session", "note", "fact") is preserved verbatim as
 // metadata["kind"]. source_type is always "llm-memory".
+//
+// Enabled: the collector is only registered when dbPath points to a readable
+// regular file. A missing file or a directory at that path (e.g. when the
+// volume mount creates an empty directory instead of a file — issue #161)
+// causes Enabled() to return false so the scheduler never runs this collector
+// and never calls MarkDeleted for the source. This prevents the deletion-sync
+// path from being entered with an empty active-ID set, which would attempt to
+// soft-delete all preserved secretary documents.
 //
 // Graceful skip: when the SQLite database file does not exist at the
 // configured path, Collect logs a single info-level message and returns an
@@ -53,7 +61,36 @@ func NewLLMMemoryCollector(dbPath string) *LLMMemoryCollector {
 
 func (c *LLMMemoryCollector) Name() string             { return "llm-memory" }
 func (c *LLMMemoryCollector) Source() model.SourceType { return model.SourceLLMMemory }
-func (c *LLMMemoryCollector) Enabled() bool            { return c.dbPath != "" }
+
+// Enabled returns true only when dbPath is non-empty AND the path refers to a
+// readable regular file. A directory at that path (e.g. an empty Docker volume
+// mount when the host file is absent) or a non-existent path returns false so
+// that the scheduler skips registration entirely — preventing the
+// deletion-sync path from running with an empty active-ID set (#161).
+func (c *LLMMemoryCollector) Enabled() bool {
+	if c.dbPath == "" {
+		return false
+	}
+	fi, err := os.Stat(c.dbPath)
+	if err != nil {
+		// File absent or inaccessible: log once and report disabled.
+		if c.missingLogged.CompareAndSwap(0, 1) {
+			slog.Info("llm-memory collector disabled: source db absent or inaccessible (#161)",
+				"path", c.dbPath)
+		}
+		return false
+	}
+	if !fi.Mode().IsRegular() {
+		// Path exists but is a directory (Docker mounted an empty dir instead of
+		// the host file). Treat as absent and prevent scheduler registration.
+		if c.missingLogged.CompareAndSwap(0, 1) {
+			slog.Info("llm-memory collector disabled: source db path is not a regular file (#161)",
+				"path", c.dbPath, "mode", fi.Mode())
+		}
+		return false
+	}
+	return true
+}
 
 // Collect fetches all llm-memory records whose updated_at is after since.
 // Records with empty content (after joining summary + content) are silently skipped.

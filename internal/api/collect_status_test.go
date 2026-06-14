@@ -254,6 +254,108 @@ func TestWithDocumentFreshness_ChainReturnsSelf(t *testing.T) {
 	}
 }
 
+// --- TestFreshnessChecker_RetiredSources (#161) ---
+
+// TestRetiredSources_SuppressesAlert verifies that a source registered via
+// WithRetiredSources is silently skipped during the collection_log freshness
+// check, even when its last_success timestamp is far beyond the stale threshold.
+//
+// This is the primary regression test for issue #161: the secretary source has
+// 3 699 historical rows in collection_log with last_success frozen at
+// 2026-05-30 (the collector was decommissioned in #101). Without WithRetiredSources
+// it would fire a stale alert on every FreshnessChecker tick.
+func TestRetiredSources_SuppressesAlert(t *testing.T) {
+	t.Parallel()
+
+	var webhookCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		webhookCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// Secretary: last success frozen 15 days ago — well beyond the 2h threshold.
+	secretarySuccess := time.Now().Add(-15 * 24 * time.Hour)
+	colStatus := &stubCollectionStatusProvider{
+		statuses: []store.CollectionSourceStatus{
+			{
+				SourceType:          model.SourceSecretary,
+				LastSuccessAt:       &secretarySuccess,
+				ConsecutiveFailures: 0,
+			},
+		},
+	}
+
+	checker := NewFreshnessChecker(colStatus, srv.URL, 2*time.Hour, 3).
+		WithRetiredSources("secretary")
+
+	if err := checker.Check(context.Background()); err != nil {
+		t.Fatalf("Check returned unexpected error: %v", err)
+	}
+
+	// Retired source must not generate any webhook call.
+	if n := webhookCalls.Load(); n != 0 {
+		t.Errorf("webhook calls = %d, want 0 — retired source must not alert (#161)", n)
+	}
+}
+
+// TestRetiredSources_NonRetiredSourceStillAlerts verifies that a source NOT in
+// the retired set continues to generate alerts normally. WithRetiredSources must
+// not suppress alerts for active sources.
+func TestRetiredSources_NonRetiredSourceStillAlerts(t *testing.T) {
+	t.Parallel()
+
+	var webhookCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		webhookCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// Secretary is retired (frozen last_success), github is stale but still active.
+	secretarySuccess := time.Now().Add(-15 * 24 * time.Hour)
+	githubSuccess := time.Now().Add(-5 * time.Hour) // 5 h ago, threshold 2 h → stale
+	colStatus := &stubCollectionStatusProvider{
+		statuses: []store.CollectionSourceStatus{
+			{
+				SourceType:          model.SourceSecretary,
+				LastSuccessAt:       &secretarySuccess,
+				ConsecutiveFailures: 0,
+			},
+			{
+				SourceType:          model.SourceGitHub,
+				LastSuccessAt:       &githubSuccess,
+				ConsecutiveFailures: 0,
+			},
+		},
+	}
+
+	checker := NewFreshnessChecker(colStatus, srv.URL, 2*time.Hour, 3).
+		WithRetiredSources("secretary") // only secretary is retired
+
+	if err := checker.Check(context.Background()); err != nil {
+		t.Fatalf("Check returned unexpected error: %v", err)
+	}
+
+	// github is stale → 1 alert. secretary is retired → 0 alert. Total = 1.
+	if n := webhookCalls.Load(); n != 1 {
+		t.Errorf("webhook calls = %d, want 1 (github stale, secretary retired → only github alerts)", n)
+	}
+}
+
+// TestRetiredSources_WithRetiredSources_ChainReturnsSelf verifies that
+// WithRetiredSources returns the same *FreshnessChecker receiver for chaining.
+func TestRetiredSources_ChainReturnsSelf(t *testing.T) {
+	t.Parallel()
+
+	colStatus := &stubCollectionStatusProvider{}
+	checker := NewFreshnessChecker(colStatus, "", 2*time.Hour, 3)
+	returned := checker.WithRetiredSources("secretary")
+	if returned != checker {
+		t.Error("WithRetiredSources should return the same *FreshnessChecker receiver")
+	}
+}
+
 // --- TestFreshnessChecker_CollectionLog_Unchanged ---
 
 // TestCollectionLog_Unchanged verifies that the existing collection_log

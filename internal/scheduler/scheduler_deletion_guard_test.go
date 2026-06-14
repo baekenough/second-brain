@@ -22,7 +22,7 @@ import (
 type trackingStore struct {
 	mockStore
 
-	mu           sync.Mutex
+	mu               sync.Mutex
 	markDeletedCalls []markDeletedCall
 }
 
@@ -253,10 +253,10 @@ func TestDeletionRatioWouldExceed(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name        string
-		activeInDB  int
-		activeOnFS  int
-		wantExceed  bool
+		name       string
+		activeInDB int
+		activeOnFS int
+		wantExceed bool
 	}{
 		// Clearly dangerous: 0 files visible, 10 in DB → 100% deletion
 		{"all_deleted", 10, 0, true},
@@ -289,7 +289,62 @@ func TestDeletionRatioWouldExceed(t *testing.T) {
 	}
 }
 
-// TestDeletedAt_SchedulerRuntime sanity: confirm run() does not panic when the
+// ---------------------------------------------------------------------------
+// #161: data-safety regression — disabled collector must not enter deletion-sync
+// ---------------------------------------------------------------------------
+
+// TestScheduler_DisabledCollector_NoMarkDeleted is the data-safety regression
+// test for issue #161.
+//
+// Background: when SECRETARY_DB_HOST_PATH points to a missing host file, Docker
+// mounts an empty *directory* at /data/secretary.db (or /data/llm-memory.sqlite).
+// Before the #161 fix, LLMMemoryCollector.Enabled() returned true for any
+// non-empty dbPath — including a directory. The scheduler would register the
+// collector, call Collect() (which fails because the db is a directory), and
+// the failure path skips MarkDeleted — but at high noise cost.
+//
+// The #161 fix makes Enabled() return false when the path is a directory. This
+// test proves that a collector with Enabled()==false:
+//  1. Is NOT called by TriggerAll (Collect() call count == 0).
+//  2. Does NOT cause MarkDeleted to be called for the source — the 18 328
+//     preserved secretary documents are safe from accidental soft-deletion.
+//
+// Note: Register() already skips disabled collectors (they are not added to the
+// cron schedule). TriggerAll() also skips them. The critical invariant is that
+// the disabled-collector path never calls Collect() or enters deletion-sync.
+func TestScheduler_DisabledCollector_NoMarkDeleted(t *testing.T) {
+	t.Parallel()
+
+	// Simulate the disabled collector: Enabled()==false.
+	// The scheduler must not run it via TriggerAll or the regular cron schedule.
+	col := newCountingCollector("secretary-disabled", false)
+	st := &trackingStore{}
+	sched := New(st, disabledEmbed(), col)
+
+	if err := sched.Register(time.Minute, nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// TriggerAll respects Enabled() and skips disabled collectors.
+	sched.TriggerAll(context.Background())
+	// TriggerAll spawns goroutines; give them a moment to complete if any ran.
+	time.Sleep(50 * time.Millisecond)
+
+	// Collect must never have been called — disabled collector is excluded.
+	if n := col.callCount(); n != 0 {
+		t.Errorf("Collect called %d times for disabled collector; want 0", n)
+	}
+
+	// MarkDeleted must never have been called — the 18 328 secretary/llm-memory
+	// documents preserved in the DB are not at risk of accidental soft-deletion
+	// through the deletion-sync path (#161).
+	if n := st.markDeletedCallCount(); n != 0 {
+		t.Errorf("MarkDeleted called %d times for disabled collector; want 0 — "+
+			"this would attempt to soft-delete preserved secretary documents (#161)", n)
+	}
+}
+
+// TestScheduler_EndToEnd_NoPanic sanity: confirm run() does not panic when the
 // entire pipeline (collect → list IDs → mark deleted) succeeds end-to-end with
 // a real filesystem and a permissive mock store.
 func TestScheduler_EndToEnd_NoPanic(t *testing.T) {

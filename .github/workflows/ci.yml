@@ -30,7 +30,7 @@ jobs:
         run: go test -race -count=1 ./...
 
   yaml-lint:
-    name: k8s YAML + hygiene gates (single source-of-truth)
+    name: k8s YAML + hygiene gates [1-6/6] (single source-of-truth)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -40,6 +40,37 @@ jobs:
           sudo chmod +x /usr/local/bin/yq
       - name: Run scripts/ci-checks.sh
         run: bash scripts/ci-checks.sh
+
+  compose-deploy-readiness:
+    name: Compose deploy-readiness lint (#162)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Bare absolute host path guard (ci-checks.sh [6/6])
+        run: bash scripts/ci-checks.sh
+      - name: docker compose config validation
+        run: |
+          # Validate compose interpolation / syntax without requiring .env.local.
+          # Strategy: capture stderr, strip expected "variable is not set" warnings,
+          # then fail if any unexpected error output remains.
+          # NOTE: --quiet suppresses the rendered YAML on stdout; we only care about
+          # stderr (warnings/errors). Exit code of `docker compose config` itself is
+          # the primary failure signal for true syntax/interpolation errors.
+          set +e
+          ERR_OUTPUT=$(docker compose -f docker-compose.local.yml config --quiet 2>&1 >/dev/null)
+          CONFIG_EXIT=$?
+          set -e
+          # Filter out known acceptable warnings (unset optional vars like AUTH_URL)
+          REAL_ERRORS=$(printf '%s\n' "$ERR_OUTPUT" \
+            | grep -v "variable is not set" \
+            | grep -v "The .* variable is not set" \
+            | grep -v "^$" || true)
+          if [ $CONFIG_EXIT -ne 0 ] || [ -n "$REAL_ERRORS" ]; then
+            echo "::error::docker compose config failed or produced unexpected errors"
+            printf '%s\n' "$ERR_OUTPUT"
+            exit 1
+          fi
+          echo "OK: docker compose config clean"
 
   docker-build-multiarch:
     name: Docker multi-arch build (no-cache)

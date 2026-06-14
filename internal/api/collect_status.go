@@ -75,6 +75,11 @@ func (s *Server) collectStatusHandler(w http.ResponseWriter, r *http.Request) {
 // (e.g. SMS via Android app) that do not write collection_log rows (#159).
 // Use WithDocumentFreshness to register sources and their alert thresholds.
 //
+// Retired sources (decommissioned collectors that still have historical rows in
+// collection_log) can be excluded from freshness checks via WithRetiredSources
+// (#161). This prevents permanent stale-alert noise from sources that are
+// intentionally no longer active.
+//
 // It follows the same alerting pattern as the eval regression webhook in
 // cmd/eval/main.go: POST a Slack-compatible JSON payload to the configured
 // ALERT_WEBHOOK_URL.
@@ -90,6 +95,12 @@ type FreshnessChecker struct {
 	// processStart is used to compute staleness for sources that have never
 	// succeeded (first-run grace period).
 	processStart time.Time
+
+	// retiredSources is the set of source type strings that are intentionally
+	// decommissioned. These sources are skipped entirely in the collection_log
+	// freshness check so that stale historical rows do not generate perpetual
+	// alerts (#161). Document-level freshness checks are unaffected.
+	retiredSources map[string]bool
 
 	// docFreshnessProvider is optional. When non-nil, document-level freshness
 	// is checked for sources listed in docFreshnessMaxAge.
@@ -120,6 +131,29 @@ func NewFreshnessChecker(store CollectionStatusProvider, webhook string, maxAge 
 		maxConsecFail: maxConsecFail,
 		processStart:  time.Now(),
 	}
+}
+
+// WithRetiredSources registers source type strings that are intentionally
+// decommissioned (i.e. the collector has been removed but historical rows
+// remain in collection_log). Retired sources are silently skipped in the
+// collection_log freshness check — they will never produce stale-alert noise
+// even though their last_success timestamp is frozen in the past (#161).
+//
+// Document-level freshness checks (WithDocumentFreshness) are unaffected.
+//
+// This method returns the receiver for method chaining:
+//
+//	checker := api.NewFreshnessChecker(store, webhookURL, 2*time.Hour, 3).
+//	    WithRetiredSources("secretary").
+//	    WithDocumentFreshness(...)
+func (f *FreshnessChecker) WithRetiredSources(sources ...string) *FreshnessChecker {
+	if f.retiredSources == nil {
+		f.retiredSources = make(map[string]bool, len(sources))
+	}
+	for _, s := range sources {
+		f.retiredSources[s] = true
+	}
+	return f
 }
 
 // WithDocumentFreshness configures document-level freshness monitoring for
@@ -155,6 +189,13 @@ func (f *FreshnessChecker) Check(ctx context.Context) error {
 
 	now := time.Now()
 	for _, st := range statuses {
+		// Skip retired sources: their collection_log rows are frozen historical
+		// data from a decommissioned collector — stale-age alerts are meaningless
+		// and produce permanent noise (#161).
+		if f.retiredSources[string(st.SourceType)] {
+			continue
+		}
+
 		reasons := f.staleness(st, now)
 		if len(reasons) == 0 {
 			continue

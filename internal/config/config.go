@@ -229,6 +229,15 @@ type Config struct {
 	// Invalid values are ignored and the default is used.
 	FreshnessCheckInterval time.Duration // FRESHNESS_CHECK_INTERVAL
 
+	// RetiredSources is the list of source type strings to exclude from
+	// collection_log freshness alerts. Use this for decommissioned collectors
+	// whose historical rows remain in collection_log but whose last_success
+	// timestamp is permanently frozen (#161).
+	//
+	// RETIRED_SOURCES: comma-separated source type strings (default: "secretary").
+	// Example: RETIRED_SOURCES=secretary,old-source
+	RetiredSources []string // RETIRED_SOURCES
+
 	// Scheduler
 	CollectInterval time.Duration
 	// CollectIntervalPerSource holds per-source overrides for the global
@@ -465,6 +474,7 @@ func Load() (*Config, error) {
 
 		SMSFreshnessMaxAge:     smsFreshnessMaxAge(),
 		FreshnessCheckInterval: freshnessCheckInterval(),
+		RetiredSources:         retiredSources(),
 
 		CollectInterval:          interval,
 		CollectIntervalPerSource: collectIntervalPerSource(),
@@ -773,6 +783,18 @@ func freshnessCheckInterval() time.Duration {
 		return defaultInterval
 	}
 	return d
+}
+
+// retiredSources returns the list of source type strings to exclude from
+// collection_log freshness alerts. Parsed from RETIRED_SOURCES (comma-separated).
+// Defaults to ["secretary"] — the decommissioned collector whose historical
+// rows remain in collection_log after #101/#151 (#161).
+func retiredSources() []string {
+	raw := os.Getenv("RETIRED_SOURCES")
+	if raw == "" {
+		return []string{"secretary"}
+	}
+	return splitCSV(raw)
 }
 
 // normalizeExts ensures every extension starts with a leading dot and is lowercase.

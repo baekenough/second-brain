@@ -9,18 +9,34 @@ import (
 	"time"
 )
 
-// TestLLMMemoryCollector_Enabled verifies that Enabled() returns true when a
-// non-empty dbPath is configured and false when it is empty.
+// TestLLMMemoryCollector_Enabled verifies that Enabled() returns true only for
+// a valid, readable regular file — and false for empty path, non-existent path,
+// or a directory (issue #161: prevent deletion-sync from being entered with an
+// empty active-ID set when the Docker mount creates a directory instead of a
+// file).
 func TestLLMMemoryCollector_Enabled(t *testing.T) {
 	t.Parallel()
+
+	// (c) valid regular file — create a real temp file for the "true" case.
+	dir := t.TempDir()
+	realFile := filepath.Join(dir, "memory.sqlite")
+	if err := os.WriteFile(realFile, []byte("fake"), 0o644); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
 
 	cases := []struct {
 		name    string
 		dbPath  string
 		enabled bool
 	}{
-		{"non-empty path", "/data/llm-memory.sqlite", true},
+		// (a) empty path — always disabled
 		{"empty path", "", false},
+		// (b) non-existent path — disabled (file not found)
+		{"non-existent path", filepath.Join(dir, "does-not-exist.sqlite"), false},
+		// (b2) directory path — disabled (Docker mounts empty dir when host file absent)
+		{"directory path", dir, false},
+		// (c) valid regular file — enabled
+		{"valid regular file", realFile, true},
 	}
 
 	for _, tc := range cases {
@@ -32,6 +48,25 @@ func TestLLMMemoryCollector_Enabled(t *testing.T) {
 				t.Errorf("Enabled()=%v, want %v (dbPath=%q)", c.Enabled(), tc.enabled, tc.dbPath)
 			}
 		})
+	}
+}
+
+// TestLLMMemoryCollector_Enabled_DirectoryDisabled is a focused regression test
+// for the #161 scenario: when Docker mounts an empty directory at the db path
+// (because the host file does not exist), Enabled() must return false so that
+// the scheduler never registers this collector and never calls
+// MarkDeleted(llm-memory, []) — which would attempt to soft-delete all
+// previously collected secretary/llm-memory documents.
+func TestLLMMemoryCollector_Enabled_DirectoryDisabled(t *testing.T) {
+	t.Parallel()
+
+	// Simulate the Docker mount: an empty directory at the configured path.
+	emptyDir := t.TempDir()
+
+	c := NewLLMMemoryCollector(emptyDir)
+	if c.Enabled() {
+		t.Errorf("Enabled()=true for directory path %q; want false — "+
+			"a directory must never be treated as a valid SQLite db (#161)", emptyDir)
 	}
 }
 

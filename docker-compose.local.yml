@@ -84,7 +84,6 @@ services:
       diarization:
         condition: service_started
     volumes:
-      - ${SECRETARY_DB_HOST_PATH:-/Users/user/workspace/private/secretary/assistant/secretary.db}:/data/secretary.db:ro
       - ${LLM_MEMORY_DB_HOST_PATH:-/Users/user/workspace/llm-memory/data/memory.sqlite}:/data/llm-memory.sqlite:ro
       - ${GMAIL_HOST_PATH:-/Users/user/workspace/private/secretary/gmail}:/data/gmail:ro
       - ${CALENDAR_HOST_PATH:-/Users/user/workspace/private/secretary/calendar}:/data/calendar:ro

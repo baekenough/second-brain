@@ -279,6 +279,7 @@ func run() error {
 	// Errors from the store are logged but never crash the scheduler — the collector
 	// continues even if the freshness check cannot reach the database momentarily.
 	freshnessChecker := api.NewFreshnessChecker(docStore, cfg.AlertWebhookURL, 2*time.Hour, 3).
+		WithRetiredSources(cfg.RetiredSources...).
 		WithDocumentFreshness(docStore, map[string]time.Duration{
 			"sms": cfg.SMSFreshnessMaxAge,
 		})
