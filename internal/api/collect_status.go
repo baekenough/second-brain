@@ -18,6 +18,13 @@ type CollectionStatusProvider interface {
 	CollectionStatus(ctx context.Context) ([]store.CollectionSourceStatus, error)
 }
 
+// DocumentFreshnessProvider is the interface required for document-level
+// freshness checks (issue #159). Implemented by store.DocumentStore.
+// Kept separate from CollectionStatusProvider so each can be mocked independently.
+type DocumentFreshnessProvider interface {
+	DocumentFreshness(ctx context.Context) ([]store.SourceDocumentFreshness, error)
+}
+
 // WithCollectStatus attaches a CollectionStatusProvider to the server so that
 // the GET /api/v1/collect/status route is registered.
 // Must be called before the first call to Handler().
@@ -64,21 +71,33 @@ func (s *Server) collectStatusHandler(w http.ResponseWriter, r *http.Request) {
 // to webhookURL when a source exceeds its expected interval or has too many
 // consecutive failures (#137).
 //
+// It also optionally monitors document-level freshness for push-ingested sources
+// (e.g. SMS via Android app) that do not write collection_log rows (#159).
+// Use WithDocumentFreshness to register sources and their alert thresholds.
+//
 // It follows the same alerting pattern as the eval regression webhook in
 // cmd/eval/main.go: POST a Slack-compatible JSON payload to the configured
 // ALERT_WEBHOOK_URL.
 type FreshnessChecker struct {
-	store      CollectionStatusProvider
-	webhook    string
+	store   CollectionStatusProvider
+	webhook string
 	// maxAge is the maximum time since last successful collection before an
 	// alert is sent. Default 2 h. Sources that have never succeeded are
 	// flagged after maxAge since the process started.
-	maxAge     time.Duration
+	maxAge time.Duration
 	// maxConsecFail is the number of consecutive failures that triggers an alert.
 	maxConsecFail int
 	// processStart is used to compute staleness for sources that have never
 	// succeeded (first-run grace period).
 	processStart time.Time
+
+	// docFreshnessProvider is optional. When non-nil, document-level freshness
+	// is checked for sources listed in docFreshnessMaxAge.
+	docFreshnessProvider DocumentFreshnessProvider
+	// docFreshnessMaxAge maps source type string → alert threshold.
+	// Sources not in this map are not subject to document-level freshness checks.
+	// Example: map[string]time.Duration{"sms": 24*time.Hour}
+	docFreshnessMaxAge map[string]time.Duration
 }
 
 // NewFreshnessChecker creates a FreshnessChecker.
@@ -103,9 +122,28 @@ func NewFreshnessChecker(store CollectionStatusProvider, webhook string, maxAge 
 	}
 }
 
+// WithDocumentFreshness configures document-level freshness monitoring for
+// push-ingested sources (e.g. SMS via Android push app) that bypass the
+// collection_log path. Each entry in maxAgeBySource maps a source type string
+// to its alert threshold: if the most recent active document for that source was
+// created more than the threshold ago (or no active document exists), an alert fires.
+//
+// This method returns the receiver to enable method chaining:
+//
+//	checker := api.NewFreshnessChecker(store, webhookURL, 2*time.Hour, 3).
+//	    WithDocumentFreshness(map[string]time.Duration{"sms": 24*time.Hour})
+func (f *FreshnessChecker) WithDocumentFreshness(provider DocumentFreshnessProvider, maxAgeBySource map[string]time.Duration) *FreshnessChecker {
+	f.docFreshnessProvider = provider
+	f.docFreshnessMaxAge = maxAgeBySource
+	return f
+}
+
 // Check queries collection_log and sends a webhook alert for any stale or
 // repeatedly-failing source. It is intended to be called on a regular tick
 // (e.g. from a cron job or the scheduler).
+//
+// When WithDocumentFreshness has been called, it also queries the documents
+// table and alerts when a monitored source has no recent active documents.
 //
 // Errors contacting the store are returned. Webhook errors are logged but not
 // returned so that a transient network failure does not block the scheduler.
@@ -130,7 +168,74 @@ func (f *FreshnessChecker) Check(ctx context.Context) error {
 		)
 
 		if f.webhook != "" {
-			f.sendAlert(st, reasons)
+			f.sendAlert(string(st.SourceType), reasons)
+		}
+	}
+
+	// --- document-level freshness check (issue #159) ---
+	if f.docFreshnessProvider != nil && len(f.docFreshnessMaxAge) > 0 {
+		if err := f.checkDocumentFreshness(ctx, now); err != nil {
+			// Store errors are returned so the caller can log/retry; they do not
+			// block the collection_log freshness path which already ran above.
+			return fmt.Errorf("document freshness check: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// checkDocumentFreshness queries the documents table and fires alerts for
+// monitored sources whose most recent active document is older than the
+// configured threshold (or where no active document exists at all).
+func (f *FreshnessChecker) checkDocumentFreshness(ctx context.Context, now time.Time) error {
+	freshnesses, err := f.docFreshnessProvider.DocumentFreshness(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Build a lookup from the query results so we can check configured sources
+	// even when a source has zero documents (won't appear in the query results).
+	bySource := make(map[string]store.SourceDocumentFreshness, len(freshnesses))
+	for _, row := range freshnesses {
+		bySource[string(row.SourceType)] = row
+	}
+
+	for src, maxAge := range f.docFreshnessMaxAge {
+		row, found := bySource[src]
+
+		var reasons []string
+		if !found || row.LastCreated == nil {
+			// No active documents exist for this source at all.
+			// We always alert (no grace period) because a push-ingest source that
+			// has never delivered a document on a running server is suspicious.
+			// Operators can suppress this by setting a longer SMS_FRESHNESS_MAX_AGE
+			// during initial rollout.
+			reasons = append(reasons, fmt.Sprintf(
+				"no active %s documents found in the database — push-app ingest may never have run", src))
+		} else if elapsed := now.Sub(*row.LastCreated); elapsed > maxAge {
+			reasons = append(reasons, fmt.Sprintf(
+				"last %s document created %.1f h ago (threshold: %.0f h) — push-app ingest may be down",
+				src, elapsed.Hours(), maxAge.Hours()))
+		}
+
+		if len(reasons) == 0 {
+			continue
+		}
+
+		slog.Warn("scheduler: document freshness alert",
+			"source", src,
+			"reasons", reasons,
+			"last_created", func() *time.Time {
+				if row.LastCreated != nil {
+					return row.LastCreated
+				}
+				return nil
+			}(),
+			"active_count", row.ActiveCount,
+		)
+
+		if f.webhook != "" {
+			f.sendAlert(src, reasons)
 		}
 	}
 	return nil
@@ -161,10 +266,12 @@ func (f *FreshnessChecker) staleness(st store.CollectionSourceStatus, now time.T
 	return reasons
 }
 
-// sendAlert POSTs a Slack-compatible webhook alert. Failures are logged but
-// never propagated — alerting failures must not block the scheduler.
-func (f *FreshnessChecker) sendAlert(st store.CollectionSourceStatus, reasons []string) {
-	text := fmt.Sprintf(":warning: *Collector freshness alert: %s*\n", st.SourceType)
+// sendAlert POSTs a Slack-compatible webhook alert for a source. Failures are
+// logged but never propagated — alerting failures must not block the scheduler.
+//
+// source is a human-readable identifier (e.g. "sms", "github").
+func (f *FreshnessChecker) sendAlert(source string, reasons []string) {
+	text := fmt.Sprintf(":warning: *Collector freshness alert: %s*\n", source)
 	for _, r := range reasons {
 		text += "• " + r + "\n"
 	}
@@ -176,7 +283,7 @@ func (f *FreshnessChecker) sendAlert(st store.CollectionSourceStatus, reasons []
 	body, err := json.Marshal(payload)
 	if err != nil {
 		slog.Warn("freshness checker: failed to marshal alert payload",
-			"source", st.SourceType, "error", err)
+			"source", source, "error", err)
 		return
 	}
 
@@ -184,13 +291,13 @@ func (f *FreshnessChecker) sendAlert(st store.CollectionSourceStatus, reasons []
 	resp, err := client.Post(f.webhook, "application/json", bytes.NewReader(body))
 	if err != nil {
 		slog.Warn("freshness checker: failed to send alert",
-			"source", st.SourceType, "error", err)
+			"source", source, "error", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		slog.Warn("freshness checker: alert webhook returned non-2xx status",
-			"source", st.SourceType, "status", resp.StatusCode)
+			"source", source, "status", resp.StatusCode)
 	}
 }

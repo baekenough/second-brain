@@ -8,15 +8,32 @@ import (
 	"github.com/baekenough/second-brain/internal/model"
 )
 
+// SourceDocumentFreshness holds the per-source-type document freshness snapshot
+// derived from the documents table (not the collection_log). This is used by the
+// FreshnessChecker to detect silent push-ingest failures where no collection_log
+// row is written (e.g. SMS documents from the Android push app via /ingest).
+type SourceDocumentFreshness struct {
+	SourceType  model.SourceType `json:"source_type"`
+	LastCreated *time.Time       `json:"last_created"` // MAX(created_at); nil when no active docs exist
+	ActiveCount int              `json:"active_count"`
+}
+
+// DocumentFreshnessProvider is the interface implemented by DocumentStore to
+// expose per-source document freshness data. Defined separately from
+// CollectionStatusReader so the FreshnessChecker can be tested with a minimal mock.
+type DocumentFreshnessProvider interface {
+	DocumentFreshness(ctx context.Context) ([]SourceDocumentFreshness, error)
+}
+
 // CollectionSourceStatus describes the freshness state of a single collector
 // source computed from the collection_log table.
 type CollectionSourceStatus struct {
-	SourceType         model.SourceType `json:"source_type"`
-	LastSuccessAt      *time.Time       `json:"last_success_at"`       // nil if never succeeded
-	LastAttemptAt      *time.Time       `json:"last_attempt_at"`       // nil if never attempted
-	ConsecutiveFailures int             `json:"consecutive_failures"`  // failures since last success
-	TotalRuns          int              `json:"total_runs"`
-	StaleSeconds       *float64         `json:"stale_seconds,omitempty"` // seconds since last success; nil when never succeeded
+	SourceType          model.SourceType `json:"source_type"`
+	LastSuccessAt       *time.Time       `json:"last_success_at"`      // nil if never succeeded
+	LastAttemptAt       *time.Time       `json:"last_attempt_at"`      // nil if never attempted
+	ConsecutiveFailures int              `json:"consecutive_failures"` // failures since last success
+	TotalRuns           int              `json:"total_runs"`
+	StaleSeconds        *float64         `json:"stale_seconds,omitempty"` // seconds since last success; nil when never succeeded
 }
 
 // CollectionStatusReader is the interface implemented by DocumentStore to
@@ -113,4 +130,43 @@ func (s *DocumentStore) CollectionStatus(ctx context.Context) ([]CollectionSourc
 	}
 
 	return statuses, nil
+}
+
+// DocumentFreshness returns per-source-type MAX(created_at) and active document
+// count from the documents table. Only active (non-deleted) documents are
+// considered, using the same status='active' filter as CountActiveDocuments.
+//
+// Results are ordered by source_type ASC. Sources with zero active documents
+// are not included (they have no rows to aggregate).
+//
+// This is used by FreshnessChecker to detect silent push-ingest failures that
+// do not write collection_log rows (e.g. SMS via Android push app / /ingest).
+func (s *DocumentStore) DocumentFreshness(ctx context.Context) ([]SourceDocumentFreshness, error) {
+	rows, err := s.pg.pool.Query(ctx, `
+		SELECT
+			source_type,
+			MAX(created_at) AS last_created,
+			COUNT(*)        AS active_count
+		FROM documents
+		WHERE status = 'active'
+		GROUP BY source_type
+		ORDER BY source_type
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("query document_freshness: %w", err)
+	}
+	defer rows.Close()
+
+	var result []SourceDocumentFreshness
+	for rows.Next() {
+		var f SourceDocumentFreshness
+		if err := rows.Scan(&f.SourceType, &f.LastCreated, &f.ActiveCount); err != nil {
+			return nil, fmt.Errorf("scan document_freshness row: %w", err)
+		}
+		result = append(result, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate document_freshness rows: %w", err)
+	}
+	return result, nil
 }

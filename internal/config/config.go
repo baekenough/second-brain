@@ -31,7 +31,7 @@ type Config struct {
 	// Default EMBEDDING_API_URL: https://api.openai.com/v1
 	// Default EMBEDDING_MODEL:   text-embedding-3-small
 	// Default EMBEDDING_DIM:     1536 (matches text-embedding-3-small output)
-	EmbeddingAPIURL  string
+	EmbeddingAPIURL string
 	// EmbeddingAPIKey is a dedicated OpenAI API key (EMBEDDING_API_KEY env var).
 	// Use a separate key from any chat/LLM key so embedding costs are tracked
 	// independently and the key can be rotated without affecting chat traffic.
@@ -60,13 +60,13 @@ type Config struct {
 	// LLMTimeoutSeconds: LLM_TIMEOUT_SECONDS env var; per-request HTTP timeout for LLM calls.
 	//   Default 120 s (generous for local CPU inference). Set higher for slow models
 	//   (e.g. gemma3:4b on Mac mini CPU). Setting 0 falls back to the default.
-	LLMAPIURL          string
-	LLMAPIKey          string
-	LLMAuthFile        string // path to CliProxyAPI OAuth JSON for LLM requests
-	LLMModel           string
-	LLMMaxTokens       int
-	LLMTemperature     float64
-	LLMTimeoutSeconds  int    // LLM_TIMEOUT_SECONDS — HTTP client timeout; default 120
+	LLMAPIURL         string
+	LLMAPIKey         string
+	LLMAuthFile       string // path to CliProxyAPI OAuth JSON for LLM requests
+	LLMModel          string
+	LLMMaxTokens      int
+	LLMTemperature    float64
+	LLMTimeoutSeconds int // LLM_TIMEOUT_SECONDS — HTTP client timeout; default 120
 
 	// Slack (optional)
 	SlackBotToken string
@@ -105,10 +105,10 @@ type Config struct {
 	APIKey string // API_KEY — Bearer token required for /api/v1/* routes
 
 	// Filesystem (optional)
-	FilesystemPath         string   // FILESYSTEM_PATH — directory to scan
-	FilesystemEnabled      bool     // FILESYSTEM_ENABLED — default false
-	FilesystemExcludeDirs  []string // FILESYSTEM_EXCLUDE_DIRS — comma-separated dir names to skip (merged with built-in defaults)
-	FilesystemExcludeExts  []string // FILESYSTEM_EXCLUDE_EXTS — comma-separated file extensions to skip (merged with built-in defaults)
+	FilesystemPath        string   // FILESYSTEM_PATH — directory to scan
+	FilesystemEnabled     bool     // FILESYSTEM_ENABLED — default false
+	FilesystemExcludeDirs []string // FILESYSTEM_EXCLUDE_DIRS — comma-separated dir names to skip (merged with built-in defaults)
+	FilesystemExcludeExts []string // FILESYSTEM_EXCLUDE_EXTS — comma-separated file extensions to skip (merged with built-in defaults)
 
 	// Secretary SQLite (optional — disabled when empty)
 	SecretaryDBPath string // SECRETARY_DB_PATH — path to secretary.db (e.g. /data/secretary.db)
@@ -144,8 +144,8 @@ type Config struct {
 	// (sms-*.xml and calls-*.xml; latest mtime per prefix is used)
 	// SMS_MAX_FILE_BYTES: per-file size cap for OOM guard (bytes, int64).
 	// Default 1 GiB. Set 0 to disable the cap entirely (no limit).
-	SMSSourceDir     string
-	SMSMaxFileBytes  int64
+	SMSSourceDir    string
+	SMSMaxFileBytes int64
 
 	// Whisper transcription (optional — disabled when WhisperAPIKey is empty)
 	// WHISPER_API_KEY: OpenAI (or compatible) API key
@@ -210,6 +210,24 @@ type Config struct {
 	// Default true. Set SUMMARIZER_BACKFILL_ENABLED=false when running a slow
 	// local LLM to avoid a flood of LLM calls for the pre-existing backlog.
 	SummarizerBackfillEnabled bool // SUMMARIZER_BACKFILL_ENABLED
+
+	// Freshness monitoring (issue #159)
+	//
+	// SMSFreshnessMaxAge is the maximum time since the most recent active SMS
+	// document was created before an alert fires. SMS documents arrive via the
+	// Android push app and are NOT tracked in collection_log, so a document-level
+	// freshness check is the only reliable way to detect silent push failures.
+	//
+	// SMS_FRESHNESS_MAX_AGE: Go duration string (default: "24h").
+	// Invalid values are ignored and the default is used.
+	SMSFreshnessMaxAge time.Duration // SMS_FRESHNESS_MAX_AGE
+
+	// FreshnessCheckInterval controls how often FreshnessChecker.Check() runs in
+	// the collector daemon.
+	//
+	// FRESHNESS_CHECK_INTERVAL: Go duration string (default: "1h").
+	// Invalid values are ignored and the default is used.
+	FreshnessCheckInterval time.Duration // FRESHNESS_CHECK_INTERVAL
 
 	// Scheduler
 	CollectInterval time.Duration
@@ -370,13 +388,13 @@ func Load() (*Config, error) {
 		LocalEmbeddingModel:    getenv("LOCAL_EMBEDDING_MODEL", "bge-m3"),
 		LocalEmbeddingEndpoint: os.Getenv("LOCAL_EMBEDDING_ENDPOINT"),
 
-		LLMAPIURL:          llmAPIURL,
-		LLMAPIKey:          llmAPIKey,
-		LLMAuthFile:        llmAuthFile,
-		LLMModel:           getenv("LLM_MODEL", "gpt-4o-mini"),
-		LLMMaxTokens:       llmMaxTokens,
-		LLMTemperature:     llmTemperature,
-		LLMTimeoutSeconds:  llmTimeoutSeconds,
+		LLMAPIURL:         llmAPIURL,
+		LLMAPIKey:         llmAPIKey,
+		LLMAuthFile:       llmAuthFile,
+		LLMModel:          getenv("LLM_MODEL", "gpt-4o-mini"),
+		LLMMaxTokens:      llmMaxTokens,
+		LLMTemperature:    llmTemperature,
+		LLMTimeoutSeconds: llmTimeoutSeconds,
 
 		SlackBotToken: os.Getenv("SLACK_BOT_TOKEN"),
 		SlackTeamID:   os.Getenv("SLACK_TEAM_ID"),
@@ -444,6 +462,9 @@ func Load() (*Config, error) {
 		IngestMaxBatchMessages: ingestMaxBatchMessages(),
 
 		SummarizerBackfillEnabled: summarizerBackfill,
+
+		SMSFreshnessMaxAge:     smsFreshnessMaxAge(),
+		FreshnessCheckInterval: freshnessCheckInterval(),
 
 		CollectInterval:          interval,
 		CollectIntervalPerSource: collectIntervalPerSource(),
@@ -714,6 +735,44 @@ func collectIntervalPerSource() map[string]time.Duration {
 		result[name] = d
 	}
 	return result
+}
+
+// smsFreshnessMaxAge parses SMS_FRESHNESS_MAX_AGE from the environment.
+// Default is 24h. Invalid values are ignored and the default is used.
+func smsFreshnessMaxAge() time.Duration {
+	const defaultAge = 24 * time.Hour
+	v := os.Getenv("SMS_FRESHNESS_MAX_AGE")
+	if v == "" {
+		return defaultAge
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		slog.Warn("config: SMS_FRESHNESS_MAX_AGE is invalid; using default 24h",
+			"value", v,
+			"error", err,
+		)
+		return defaultAge
+	}
+	return d
+}
+
+// freshnessCheckInterval parses FRESHNESS_CHECK_INTERVAL from the environment.
+// Default is 1h. Invalid values are ignored and the default is used.
+func freshnessCheckInterval() time.Duration {
+	const defaultInterval = time.Hour
+	v := os.Getenv("FRESHNESS_CHECK_INTERVAL")
+	if v == "" {
+		return defaultInterval
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		slog.Warn("config: FRESHNESS_CHECK_INTERVAL is invalid; using default 1h",
+			"value", v,
+			"error", err,
+		)
+		return defaultInterval
+	}
+	return d
 }
 
 // normalizeExts ensures every extension starts with a leading dot and is lowercase.

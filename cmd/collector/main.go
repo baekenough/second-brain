@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/joho/godotenv"
+	"github.com/baekenough/second-brain/internal/api"
 	"github.com/baekenough/second-brain/internal/collector"
 	"github.com/baekenough/second-brain/internal/collector/extractor"
 	"github.com/baekenough/second-brain/internal/config"
@@ -22,6 +22,7 @@ import (
 	"github.com/baekenough/second-brain/internal/setup"
 	"github.com/baekenough/second-brain/internal/store"
 	"github.com/baekenough/second-brain/internal/worker"
+	"github.com/joho/godotenv"
 )
 
 func main() {
@@ -265,7 +266,45 @@ func run() error {
 		go watcher.Run(ctx)
 	}
 
-	slog.Info("collector daemon started")
+	// --- Freshness checker (#137 + #159) ---
+	//
+	// Monitors two layers of health:
+	//   1. collection_log freshness — catches failures in pull-based collectors
+	//      that write a log entry on every run.
+	//   2. document-level freshness — catches silent push-ingest failures (e.g.
+	//      SMS via Android push app) that bypass collection_log entirely. This
+	//      was the dead-code gap from #137 now wired here as part of #159.
+	//
+	// Runs immediately after start, then on every FreshnessCheckInterval tick.
+	// Errors from the store are logged but never crash the scheduler — the collector
+	// continues even if the freshness check cannot reach the database momentarily.
+	freshnessChecker := api.NewFreshnessChecker(docStore, cfg.AlertWebhookURL, 2*time.Hour, 3).
+		WithDocumentFreshness(docStore, map[string]time.Duration{
+			"sms": cfg.SMSFreshnessMaxAge,
+		})
+	go func() {
+		// Run once immediately so operators get fast feedback on startup.
+		if err := freshnessChecker.Check(ctx); err != nil {
+			slog.Warn("freshness checker: initial check failed", "error", err)
+		}
+		ticker := time.NewTicker(cfg.FreshnessCheckInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := freshnessChecker.Check(ctx); err != nil {
+					slog.Warn("freshness checker: periodic check failed", "error", err)
+				}
+			}
+		}
+	}()
+
+	slog.Info("collector daemon started",
+		"freshness_check_interval", cfg.FreshnessCheckInterval,
+		"sms_freshness_max_age", cfg.SMSFreshnessMaxAge,
+	)
 	<-ctx.Done()
 
 	// Bounded drain: give in-flight goroutines (summarizer, retry worker) time
