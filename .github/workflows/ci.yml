@@ -51,11 +51,10 @@ jobs:
       - name: docker compose config validation
         run: |
           # Validate compose interpolation / syntax without requiring .env.local.
-          # Strategy: capture stderr, strip expected "variable is not set" warnings,
-          # then fail if any unexpected error output remains.
-          # NOTE: --quiet suppresses the rendered YAML on stdout; we only care about
-          # stderr (warnings/errors). Exit code of `docker compose config` itself is
-          # the primary failure signal for true syntax/interpolation errors.
+          # Create stub env files so docker compose config can parse the file
+          # without failing on missing env_file references. Real secrets are not
+          # needed — only the YAML structure and variable interpolation are checked.
+          touch .env.local web/.env.local
           set +e
           ERR_OUTPUT=$(docker compose -f docker-compose.local.yml config --quiet 2>&1 >/dev/null)
           CONFIG_EXIT=$?
