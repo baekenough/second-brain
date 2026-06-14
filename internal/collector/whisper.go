@@ -18,10 +18,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/baekenough/second-brain/internal/audiovalidate"
 	"github.com/baekenough/second-brain/internal/config"
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/google/uuid"
 )
 
 // whisperDefaultHTTPTimeout is the fallback per-request timeout used when the
@@ -334,6 +334,25 @@ type WhisperCollector struct {
 	// names fall back to mtime for the comparison.
 	// Zero = floor disabled (no behaviour change).
 	cutover time.Time
+
+	// failedQuarantine is an in-memory skip-set of absolute file paths whose
+	// quarantine move failed (e.g. because the audio directory is on a
+	// read-only mount — EROFS). Paths recorded here are silently bypassed on
+	// subsequent WalkDir passes within the same process lifetime, preventing
+	// the infinite-retry loop that occurs when physical isolation is impossible
+	// (#158).
+	//
+	// Physical quarantine to a separate rw volume (A-plan) would persist across
+	// restarts but is excluded from this change: the marginal benefit (one
+	// extra warning on restart) is outweighed by the operational complexity of
+	// adding a second mount. The skip-set fully eliminates the loop for the
+	// current process lifetime.
+	//
+	// Access pattern: Collect() calls WalkDir which is single-goroutine, so
+	// no mutex is required as long as the scheduler does not call Collect()
+	// concurrently on the same collector instance (confirmed by scheduler
+	// design). Initialised in NewWhisperCollector.
+	failedQuarantine map[string]struct{}
 }
 
 // NewWhisperCollector returns a WhisperCollector configured from cfg.
@@ -355,8 +374,9 @@ func NewWhisperCollector(cfg *config.Config) *WhisperCollector {
 		httpClient: &http.Client{
 			Timeout: httpTimeout,
 		},
-		baseURL:      cfg.WhisperAPIURL,
-		maxFileBytes: cfg.WhisperMaxFileBytes,
+		baseURL:          cfg.WhisperAPIURL,
+		maxFileBytes:     cfg.WhisperMaxFileBytes,
+		failedQuarantine: make(map[string]struct{}),
 	}
 }
 
@@ -586,11 +606,29 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 		// The ingest handler (layer 1) prevents new corrupt files from reaching
 		// disk; this guard protects against files already on disk before the fix.
 		//
-		// On failure the file is quarantined (moved to <audioDir>/.quarantine/)
-		// and logged once. Subsequent walks skip it because it is no longer in the
-		// audio directory tree — breaking the infinite-retry loop (#152).
+		// On a writable mount: the file is quarantined (moved to
+		// <audioDir>/.quarantine/) and logged once. Subsequent walks skip it
+		// because it is no longer in the audio directory tree (#152).
+		//
+		// On a read-only mount (e.g. /data/call:ro): physical quarantine is
+		// impossible. quarantineCorruptAudio returns false, and the path is
+		// recorded in the in-memory failedQuarantine skip-set so that subsequent
+		// WalkDir passes within the same process lifetime bypass this file
+		// silently — eliminating the infinite-retry loop (#158).
+
+		// Skip-set check: if a prior Collect already failed to quarantine this
+		// file (ro mount), bypass it silently without re-running the header check.
+		if _, skip := c.failedQuarantine[path]; skip {
+			return nil
+		}
+
 		if err := checkAudioFileHeader(path, ext); err != nil {
-			quarantineCorruptAudio(path, c.cfg.WhisperAudioDir, info.Size(), err)
+			if !quarantineCorruptAudio(path, c.cfg.WhisperAudioDir, info.Size(), err) {
+				// Physical quarantine failed (e.g. read-only mount). Record the
+				// path in the in-memory skip-set so this file is not re-visited
+				// on subsequent collection cycles within this process (#158).
+				c.failedQuarantine[path] = struct{}{}
+			}
 			return nil
 		}
 
@@ -956,39 +994,48 @@ const whisperQuarantineDir = ".quarantine"
 
 // quarantineCorruptAudio moves a corrupt or unreadable audio file to the
 // quarantine subdirectory (<audioDir>/.quarantine/) and logs a single
-// diagnostic message. After the move the file is no longer in the audio tree
-// so subsequent walks will not revisit it, breaking the infinite-retry loop
-// caused by permanently-corrupt files (#152).
+// diagnostic message. After a successful move the file is no longer in the
+// audio tree so subsequent walks will not revisit it, breaking the
+// infinite-retry loop caused by permanently-corrupt files (#152).
+//
+// On read-only mounts (e.g. /data/call:ro) os.MkdirAll and os.Rename both
+// fail with EROFS. In that case the function returns false and the caller
+// records the path in an in-memory skip-set (failedQuarantine) to prevent
+// re-visiting within the current process lifetime (#158).
+//
+// Physical quarantine to a separate rw volume would persist the block across
+// restarts, but the marginal benefit (one extra warning on restart) does not
+// justify the operational complexity of adding a second mount. The skip-set
+// fully eliminates the loop for the current process lifetime.
+//
+// Returns true when the file was successfully moved to quarantine,
+// false when mkdir or rename failed (caller must use skip-set).
 //
 // Sidecar files (<path>.meta.json) are moved alongside the audio file when
 // present, so that provenance information is preserved for manual inspection.
-//
-// If the quarantine directory cannot be created, or the rename fails (e.g.
-// cross-device move), the function falls back to a warn-and-skip so that the
-// collector still processes the remaining files.
-func quarantineCorruptAudio(path, audioDir string, sizeBytes int64, reason error) {
+func quarantineCorruptAudio(path, audioDir string, sizeBytes int64, reason error) bool {
 	qDir := filepath.Join(audioDir, whisperQuarantineDir)
 	if err := os.MkdirAll(qDir, 0o755); err != nil {
-		slog.Warn("whisper: cannot create quarantine dir — skipping corrupt file without quarantine",
+		slog.Warn("whisper: cannot create quarantine dir — corrupt file added to in-memory skip-set (#158)",
 			"path", path,
 			"quarantine_dir", qDir,
 			"size_bytes", sizeBytes,
 			"reason", reason,
 			"mkdir_error", err,
 		)
-		return
+		return false
 	}
 
 	dest := filepath.Join(qDir, filepath.Base(path))
 	if err := os.Rename(path, dest); err != nil {
-		slog.Warn("whisper: skipping unreadable or corrupt audio file (quarantine move failed)",
+		slog.Warn("whisper: quarantine move failed — corrupt file added to in-memory skip-set (#158)",
 			"path", path,
 			"dest", dest,
 			"size_bytes", sizeBytes,
 			"reason", reason,
 			"move_error", err,
 		)
-		return
+		return false
 	}
 
 	slog.Warn("whisper: corrupt audio file quarantined — will not be retried",
@@ -1010,4 +1057,5 @@ func quarantineCorruptAudio(path, audioDir string, sizeBytes int64, reason error
 			)
 		}
 	}
+	return true
 }
