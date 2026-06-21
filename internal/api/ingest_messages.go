@@ -18,12 +18,25 @@ import (
 const defaultIngestMaxBatchMessages = 5000
 
 // IngestMessagesUpserter is the document persistence interface required by the
-// ingest-messages handler. *store.DocumentStore satisfies this interface.
+// ingest-messages handler. *store.DocumentStore satisfies this interface via
+// UpsertTracked, which returns change-detection metadata alongside the normal
+// upsert semantics.
 //
-// Note: this is intentionally identical to IngestFileUpserter so a single
-// concrete store implementation can satisfy both without wrapping.
+// The contentChanged return value allows the handler to skip chunk replacement
+// and re-embedding when a record arrives unchanged — the dominant cost in the
+// 224-record duplicate-batch scenario where 216 records were identical
+// re-sends: each was triggering a full embed API call (~300 ms) for a total of
+// ~70 s per request. With the skip, unchanged records complete in a single DB
+// round-trip (~1 ms).
 type IngestMessagesUpserter interface {
-	Upsert(ctx context.Context, doc *model.Document) error
+	// UpsertTracked upserts the document and reports (contentChanged, error).
+	// contentChanged is true when the document was newly inserted OR when an
+	// existing row's content was modified. false means the stored content is
+	// byte-for-byte identical to the incoming doc: chunk/embed work can be
+	// skipped safely.
+	// Implementations must be idempotent: re-sending the same document must not
+	// corrupt stored state.
+	UpsertTracked(ctx context.Context, doc *model.Document) (contentChanged bool, err error)
 }
 
 // WithIngestMessages attaches the dependencies required by
@@ -195,12 +208,34 @@ func (s *Server) ingestMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// upsertAndEmbedMessage persists doc and triggers chunking + embedding.
-// It mirrors the logic in ingestFileHandler / add_note.
-// Embedding failures are non-fatal: the document is stored and FTS-searchable.
+// upsertAndEmbedMessage persists doc and, when the content actually changed,
+// replaces its chunks and triggers re-embedding.
+//
+// Content-change skip (performance fix): UpsertTracked returns ContentChanged=false
+// when an identical document was already stored. In that case ReplaceDocument
+// and ingestEmbedChunks are skipped entirely — the dominant cost in a 224-record
+// duplicate batch was 224 sequential embed API calls even when only 8 records
+// were new. With this guard, unchanged records complete in a single DB round-trip
+// instead of a round-trip + embed latency.
+//
+// Guarantees preserved:
+//   - New documents: always chunked + embedded.
+//   - Changed documents: always re-chunked + re-embedded.
+//   - Unchanged documents: DB row refreshed (status reset to 'active', collected_at
+//     updated), chunks/embeddings left intact — no data loss.
+//   - Embedding failures remain non-fatal: document is stored and FTS-searchable.
 func (s *Server) upsertAndEmbedMessage(ctx context.Context, doc *model.Document) error {
-	if err := s.messagesUpserter.Upsert(ctx, doc); err != nil {
+	contentChanged, err := s.messagesUpserter.UpsertTracked(ctx, doc)
+	if err != nil {
 		return err
+	}
+
+	// Skip chunk/embed work when content is unchanged.
+	// The document row has already been refreshed in DB (collected_at, status).
+	if !contentChanged {
+		slog.Debug("ingest_messages: content unchanged, skipping chunk/embed",
+			"doc_id", doc.ID, "source_id", doc.SourceID)
+		return nil
 	}
 
 	// Chunk + embed (mirrors ingest_file.go inline path).

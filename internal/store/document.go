@@ -57,6 +57,117 @@ const callTranscriptDupCheckQuery = `
 	  AND source_id  <> $2
 	LIMIT 1`
 
+// UpsertTracked is identical to Upsert but additionally returns a bool that
+// indicates whether the document's content actually changed. Callers that
+// perform post-upsert work (chunking, embedding) can use this to skip
+// expensive operations when a document arrives unchanged.
+//
+// Change detection uses a WITH CTE that captures the pre-update content in the
+// same MVCC snapshot as the INSERT … ON CONFLICT statement, then compares it
+// against the incoming value in RETURNING. This avoids two PostgreSQL pitfalls:
+//   1. EXCLUDED cannot be referenced in the RETURNING clause (only valid inside
+//      ON CONFLICT DO UPDATE SET/WHERE).
+//   2. `documents.col` in RETURNING reflects the post-update value, so a naive
+//      `documents.content IS DISTINCT FROM EXCLUDED.content` would always be
+//      false after the UPDATE overwrites the column.
+//
+// *DocumentStore satisfies the api.IngestMessagesUpserter interface via this method.
+func (s *DocumentStore) UpsertTracked(ctx context.Context, doc *model.Document) (contentChanged bool, err error) {
+	// Duplicate guard: call-transcript content dedup (issue #134).
+	if doc.SourceType == model.SourceCallTranscript {
+		var exists int
+		qErr := s.pg.pool.QueryRow(ctx, callTranscriptDupCheckQuery,
+			doc.Content,
+			doc.SourceID,
+		).Scan(&exists)
+		switch {
+		case qErr == nil:
+			slog.Info("store: skipping duplicate call-transcript",
+				"source_id", doc.SourceID,
+				"content_len", len(doc.Content),
+			)
+			return false, ErrDuplicateTranscript
+		case isNoRows(qErr):
+			// No duplicate — proceed with the normal upsert.
+		default:
+			return false, fmt.Errorf("call-transcript dup check: %w", qErr)
+		}
+	}
+
+	meta, err := json.Marshal(doc.Metadata)
+	if err != nil {
+		return false, fmt.Errorf("marshal metadata: %w", err)
+	}
+
+	var embeddingArg interface{}
+	if len(doc.Embedding) > 0 {
+		embeddingArg = pgvector.NewVector(doc.Embedding)
+	}
+
+	// Change detection via CTE pre-update snapshot.
+	//
+	// Why CTE and not RETURNING + EXCLUDED:
+	//   PostgreSQL does not allow EXCLUDED references in the RETURNING clause
+	//   (only valid inside ON CONFLICT DO UPDATE SET/WHERE). Additionally,
+	//   RETURNING evaluates after the UPDATE is applied, so `documents.content`
+	//   in RETURNING would already hold the new (post-update) value — making an
+	//   IS DISTINCT FROM comparison there always false.
+	//
+	// Solution: the `prev` CTE runs a SELECT in the same statement snapshot
+	// (PostgreSQL CTE semantics: all CTEs and the main DML share one MVCC
+	// snapshot), capturing the pre-update content before the INSERT/UPDATE
+	// fires. On INSERT the `prev` row is empty → COALESCE(old_content, '') →
+	// compared against incoming $4, which will differ → content_changed=true.
+	// On UPDATE with identical content: old=new → content_changed=false.
+	// On UPDATE with changed content: old≠new → content_changed=true.
+	// xmax::text::bigint=0 signals a fresh INSERT (belt-and-suspenders: a new
+	// row cannot have unchanged content anyway).
+	const q = `
+		WITH prev AS (
+			SELECT content AS old_content
+			FROM documents
+			WHERE source_type = $1 AND source_id = $2
+		)
+		INSERT INTO documents
+			(source_type, source_id, title, content, metadata, embedding, occurred_at, collected_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (source_type, source_id) DO UPDATE SET
+			title        = EXCLUDED.title,
+			content      = EXCLUDED.content,
+			metadata     = EXCLUDED.metadata,
+			embedding    = COALESCE(EXCLUDED.embedding, documents.embedding),
+			occurred_at  = COALESCE(EXCLUDED.occurred_at, documents.occurred_at),
+			collected_at = EXCLUDED.collected_at,
+			status       = 'active',
+			deleted_at   = NULL,
+			updated_at   = now()
+		RETURNING id, created_at, updated_at,
+		          (xmax::text::bigint = 0) AS was_insert,
+		          COALESCE((SELECT old_content FROM prev), '') IS DISTINCT FROM $4 AS content_changed`
+
+	var wasInsert bool
+	row := s.pg.pool.QueryRow(ctx, q,
+		doc.SourceType,
+		doc.SourceID,
+		doc.Title,
+		doc.Content,
+		meta,
+		embeddingArg,
+		doc.OccurredAt,
+		doc.CollectedAt,
+	)
+	if err := row.Scan(&doc.ID, &doc.CreatedAt, &doc.UpdatedAt, &wasInsert, &contentChanged); err != nil {
+		return false, err
+	}
+	// Fresh INSERT: content is always new. The CTE comparison also yields true
+	// in this case (prev is empty → COALESCE '' IS DISTINCT FROM $4), but we
+	// guard explicitly so any empty-string edge case cannot produce a false skip.
+	if wasInsert {
+		contentChanged = true
+	}
+	return contentChanged, nil
+}
+
 // Upsert inserts a document or updates it when (source_type, source_id) already exists.
 // On conflict the status is reset to 'active' (handles re-appearance of previously deleted files).
 //

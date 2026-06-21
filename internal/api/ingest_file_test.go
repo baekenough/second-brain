@@ -21,6 +21,12 @@ import (
 type stubIngestUpserter struct {
 	upserted []*model.Document
 	err      error
+	// contentChangedSequence controls the contentChanged value returned by
+	// UpsertTracked for each successive call. When the slice is exhausted every
+	// further call returns true (new document). Use this to simulate a duplicate
+	// batch where some records are unchanged.
+	contentChangedSequence []bool
+	callCount              int
 }
 
 func (s *stubIngestUpserter) Upsert(_ context.Context, doc *model.Document) error {
@@ -33,6 +39,27 @@ func (s *stubIngestUpserter) Upsert(_ context.Context, doc *model.Document) erro
 	}
 	s.upserted = append(s.upserted, doc)
 	return nil
+}
+
+// UpsertTracked satisfies IngestMessagesUpserter. It behaves identically to
+// Upsert for document persistence. The contentChanged return value is driven by
+// contentChangedSequence: if the slice has an entry for this call index it is
+// used; otherwise true is returned (default: treat as new/changed document).
+func (s *stubIngestUpserter) UpsertTracked(_ context.Context, doc *model.Document) (contentChanged bool, err error) {
+	if s.err != nil {
+		return false, s.err
+	}
+	if doc.ID == uuid.Nil {
+		doc.ID = uuid.New()
+	}
+	s.upserted = append(s.upserted, doc)
+
+	idx := s.callCount
+	s.callCount++
+	if idx < len(s.contentChangedSequence) {
+		return s.contentChangedSequence[idx], nil
+	}
+	return true, nil // default: content is new/changed
 }
 
 type stubIngestChunkWriter struct {

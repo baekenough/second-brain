@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -398,6 +399,78 @@ func TestIngestMessages_MissingAddress(t *testing.T) {
 	if len(resp.Errors) == 0 {
 		t.Error("expected at least one error entry")
 	}
+}
+
+// TestIngestMessages_DuplicateBatchSkipsEmbed verifies the core performance fix:
+// when a batch of records is re-sent and none of them have changed content,
+// chunk replacement and embedding are skipped for every unchanged record.
+//
+// This mirrors the prod scenario: 224 records retried, 216 unchanged → only
+// the 8 new/changed records should trigger embed work. Here we test the skip
+// with a tracking embedder so we can assert embed call count.
+func TestIngestMessages_DuplicateBatchSkipsEmbed(t *testing.T) {
+	t.Parallel()
+
+	// funcEmbedder counts EmbedBatch invocations so we can assert that
+	// unchanged records never trigger an embed call.
+	var embedCallCount int
+	embedder := &funcEmbedder{
+		enabled: true,
+		embedBatch: func(_ context.Context, texts []string) ([][]float32, error) {
+			embedCallCount++
+			vecs := make([][]float32, len(texts))
+			for i := range vecs {
+				vecs[i] = []float32{0.1, 0.2, 0.3}
+			}
+			return vecs, nil
+		},
+	}
+
+	// Sequence: first two records return contentChanged=false (duplicates),
+	// third record returns contentChanged=true (new).
+	upserter := &stubIngestUpserter{
+		contentChangedSequence: []bool{false, false, true},
+	}
+
+	srv := newMessagesTestServer(upserter, &stubIngestChunkWriter{}, embedder, 0, time.Time{})
+
+	payload := map[string]any{
+		"sms": []any{
+			map[string]any{"address": "010-0000-0001", "body": "dup msg 1", "date_ms": time.Now().Add(-3 * time.Hour).UnixMilli(), "type": 1},
+			map[string]any{"address": "010-0000-0002", "body": "dup msg 2", "date_ms": time.Now().Add(-2 * time.Hour).UnixMilli(), "type": 1},
+			map[string]any{"address": "010-0000-0003", "body": "new msg", "date_ms": time.Now().Add(-1 * time.Hour).UnixMilli(), "type": 1},
+		},
+	}
+	rr := doMessagesPost(t, srv, payload, "Bearer test-key")
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", rr.Code, rr.Body.String())
+	}
+	var resp IngestMessagesResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Accepted != 3 {
+		t.Errorf("accepted=%d, want 3", resp.Accepted)
+	}
+
+	// EmbedBatch must be called exactly once: only for the 1 changed record.
+	// The 2 duplicate records must not trigger any embed call.
+	if embedCallCount != 1 {
+		t.Errorf("EmbedBatch called %d times, want 1 (only new/changed records should embed)", embedCallCount)
+	}
+}
+
+// funcEmbedder is an IngestFileEmbedder that delegates to a function, allowing
+// tests to count or control EmbedBatch invocations without a full mock library.
+type funcEmbedder struct {
+	enabled    bool
+	embedBatch func(ctx context.Context, texts []string) ([][]float32, error)
+}
+
+func (f *funcEmbedder) Enabled() bool { return f.enabled }
+func (f *funcEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	return f.embedBatch(ctx, texts)
 }
 
 // TestIngestMessages_AuthLikeRedacted verifies that OTP digits in auth-like
