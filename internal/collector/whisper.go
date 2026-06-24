@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/baekenough/second-brain/internal/audiovalidate"
@@ -323,6 +324,12 @@ type WhisperCollector struct {
 	// Sourced from cfg.WhisperMaxFileBytes; stored here so tests can override easily.
 	maxFileBytes int64
 
+	// workerCount is the number of files transcribed in parallel after the walk.
+	// Sourced from cfg.WhisperConcurrency (clamped to >= 1 by concurrency()).
+	// Stored here so tests can override without rebuilding the Config. A value of
+	// 1 (the default) reproduces the original sequential behaviour exactly.
+	workerCount int
+
 	// indexedIDs is an optional set of source_ids already active in the store.
 	// When non-nil, Collect emits files whose SourceID is absent from the set
 	// even when their mtime predates the since watermark (IndexAwareCollector).
@@ -376,8 +383,19 @@ func NewWhisperCollector(cfg *config.Config) *WhisperCollector {
 		},
 		baseURL:          cfg.WhisperAPIURL,
 		maxFileBytes:     cfg.WhisperMaxFileBytes,
+		workerCount:      cfg.WhisperConcurrency,
 		failedQuarantine: make(map[string]struct{}),
 	}
+}
+
+// concurrency returns the effective worker-pool size for transcription, clamped
+// to at least 1. A zero or negative workerCount (e.g. a zero-value Config in
+// tests) yields 1, preserving the original sequential behaviour.
+func (c *WhisperCollector) concurrency() int {
+	if c.workerCount < 1 {
+		return 1
+	}
+	return c.workerCount
 }
 
 func (c *WhisperCollector) Name() string             { return "whisper" }
@@ -415,6 +433,12 @@ var whisperPrivateCIDRs = func() []*net.IPNet {
 		"10.0.0.0/8",     // RFC-1918 class A
 		"172.16.0.0/12",  // RFC-1918 class B
 		"192.168.0.0/16", // RFC-1918 class C
+		// Tailscale CGNAT shared address space (RFC 6598). Tailscale assigns mesh
+		// nodes 100.64.0.0/10 addresses (e.g. 100.64.0.1), so pointing the
+		// whisper endpoint at a Tailscale IP must count as local — otherwise a
+		// false "endpoint not local" WARN fires every cycle. Keeps issue #100
+		// (call data stays local) satisfied for the Tailscale mesh.
+		"100.64.0.0/10",
 	}
 	nets := make([]*net.IPNet, 0, len(cidrs))
 	for _, cidr := range cidrs {
@@ -496,8 +520,30 @@ func isLocalWhisperEndpoint(rawURL string) bool {
 	return true
 }
 
-// Collect walks WhisperAudioDir recursively, transcribes audio files modified
-// after since, and returns a Document per successful transcription.
+// whisperStreamBatchSize is the number of completed transcription documents
+// accumulated by the drain goroutine before each onBatch (emit) call in
+// CollectStream. It is intentionally small (4–8 range) so that the scheduler
+// records each batch in the transcription ledger and upserts the documents
+// incrementally during a long initial drain (hundreds of files / multiple
+// hours). This means:
+//   - The ledger fills live, so progress survives a mid-drain restart (already
+//     transcribed source_ids are skipped on the next run) instead of starting
+//     over from zero.
+//   - The ledger's correctness can be observed during the drain rather than only
+//     after the entire backlog completes.
+//
+// 5 balances ledger-write overhead (one batched round-trip per 5 files) against
+// the recovery granularity above.
+const whisperStreamBatchSize = 5
+
+// Collect walks WhisperAudioDir recursively, transcribes audio files, and
+// returns a Document per successful transcription.
+//
+// Collect is retained for backward compatibility and is implemented as a thin
+// accumulator around CollectStream: it appends every emitted batch into a single
+// slice and returns it. Callers processing a large backlog should prefer
+// CollectStream directly so that transcripts are flushed incrementally (the
+// scheduler does this — see CollectStream).
 //
 // Incremental strategy (primary): only files with mtime > since are submitted.
 // The scheduler watermark ensures that on subsequent runs only new or changed
@@ -515,6 +561,51 @@ func isLocalWhisperEndpoint(rawURL string) bool {
 // the walk continues. The final error is nil as long as the directory walk
 // itself succeeds.
 func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]model.Document, error) {
+	var docs []model.Document
+	err := c.CollectStream(ctx, since, func(batch []model.Document) error {
+		docs = append(docs, batch...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return docs, nil
+}
+
+// CollectStream walks WhisperAudioDir recursively, transcribes audio files, and
+// emits successfully-transcribed documents in bounded batches via onBatch.
+// It implements StreamingCollector so the scheduler records each batch in the
+// transcription ledger and upserts it incrementally rather than waiting for the
+// entire (potentially multi-hour) backlog to finish.
+//
+// Pipeline:
+//   - Phase 1 (SEQUENTIAL walk): every filter (ext, cutover, authoritative
+//     index-skip, size cap, failedQuarantine skip-set, header check +
+//     quarantine) runs single-goroutine inside WalkDir, preserving the
+//     single-writer safety of the failedQuarantine map (no mutex). Files that
+//     pass become `pending`.
+//   - Phase 2 (CONCURRENT transcription): a worker pool of c.concurrency()
+//     workers transcribes pending files and sends each completed document to a
+//     results channel. A SINGLE drain goroutine receives from that channel,
+//     buffers documents, and calls onBatch once per whisperStreamBatchSize
+//     (and once more for the final partial batch). Concentrating every onBatch
+//     call in one goroutine is REQUIRED: the scheduler's processBatch (ledger
+//     record + embedding + upsert) is not safe for concurrent invocation.
+//
+// Cancellation: ctx is honoured by both the workers (between files) and the
+// drain goroutine (between batches). If onBatch returns an error the stream
+// stops and that error is propagated (wrapped so it is distinguishable from an
+// internal error). Individual transcription failures are logged and skipped
+// (partial success), matching Collect's contract.
+//
+// Goroutine safety: the results channel is closed exactly once (after the worker
+// WaitGroup drains) and the drain goroutine exits on channel close, so there is
+// no goroutine leak.
+func (c *WhisperCollector) CollectStream(ctx context.Context, since time.Time, onBatch func([]model.Document) error) error {
+	if onBatch == nil {
+		return fmt.Errorf("whisper: CollectStream requires non-nil onBatch")
+	}
+
 	// LOW: cloud-endpoint guard (issue #100).
 	if !isLocalWhisperEndpoint(c.baseURL) {
 		slog.Warn("whisper: endpoint does not appear to be local — call transcription data may be sent to a cloud API; set WhisperAPIURL to a localhost or private-network address",
@@ -522,8 +613,16 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 		)
 	}
 
-	var docs []model.Document
 	now := time.Now().UTC()
+
+	// Phase 1 — SEQUENTIAL walk + filtering.
+	//
+	// All filtering (ext, cutover, authoritative index-skip, size cap,
+	// failedQuarantine skip-set, header check + quarantine) runs single-goroutine
+	// inside WalkDir. This preserves the single-writer safety of the
+	// failedQuarantine map (no mutex needed). Files that pass every filter are
+	// collected into `pending`; the expensive transcription happens in Phase 2.
+	var pending []pendingTranscription
 
 	err := filepath.WalkDir(c.cfg.WhisperAudioDir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -573,17 +672,40 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 		// have recent mtimes (copy time), so the mtime-based check wrongly
 		// admits historical recordings. Filename-parsed time is used when
 		// available; files with unparseable names fall back to mtime.
+		//
+		// Kept BEFORE the index-skip block (unchanged).
 		if !c.cutover.IsZero() && recordingTime(d.Name(), info.ModTime()).Before(c.cutover) {
 			return nil
 		}
 
-		// Incremental + IndexAware filter (HIGH#1 fix):
-		// Emit when mtime > since  OR  SourceID not in indexed set.
-		mtimeNew := since.IsZero() || info.ModTime().After(since)
-		_, alreadyIndexed := c.indexedIDs[sourceID]
-		notIndexed := c.indexedIDs != nil && !alreadyIndexed
-		if !mtimeNew && !notIndexed {
-			return nil
+		// Authoritative index skip (infinite re-transcription loop fix).
+		//
+		// Audio files are IMMUTABLE: once a source_id has been transcribed it must
+		// NEVER be transcribed again. When the index set is available
+		// (c.indexedIDs != nil it is supplied by the scheduler as the UNION of the
+		// active document index and the transcription ledger) it is AUTHORITATIVE:
+		//   - source_id present  → skip (already transcribed; do not re-submit).
+		//   - source_id absent   → transcribe, regardless of mtime. This preserves
+		//     IndexAware recovery of late-arriving files (OneDrive FUSE) whose
+		//     mtime predates the watermark.
+		// The previous "mtimeNew || notIndexed" logic could only ADD files to the
+		// set and never SUPPRESS an already-processed one, so a duplicate-rejected
+		// or transcription-failed file (never in the active index) was re-submitted
+		// every ~60s cycle forever.
+		//
+		// When the index set is unavailable (c.indexedIDs == nil — the scheduler's
+		// store query failed) fall back to the mtime watermark: transcribe only
+		// files modified after `since` (since.IsZero() ⇒ first run ⇒ all files).
+		if c.indexedIDs != nil {
+			if _, known := c.indexedIDs[sourceID]; known {
+				return nil // authoritative: already transcribed, skip
+			}
+			// absent → transcribe (fall through), regardless of mtime
+		} else {
+			mtimeNew := since.IsZero() || info.ModTime().After(since)
+			if !mtimeNew {
+				return nil
+			}
 		}
 
 		// Per-file size cap: skip files that exceed the configured limit.
@@ -615,6 +737,9 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 		// recorded in the in-memory failedQuarantine skip-set so that subsequent
 		// WalkDir passes within the same process lifetime bypass this file
 		// silently — eliminating the infinite-retry loop (#158).
+		//
+		// This whole block stays in the SEQUENTIAL walk so writes to
+		// failedQuarantine remain single-goroutine (no mutex required).
 
 		// Skip-set check: if a prior Collect already failed to quarantine this
 		// file (ro mount), bypass it silently without re-running the header check.
@@ -632,83 +757,267 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 			return nil
 		}
 
-		txResult, err := c.transcribeFile(ctx, path)
-		if err != nil {
-			slog.Warn("whisper: transcription failed", "path", path, "error", err)
-			return nil // partial success — continue
-		}
-
-		// Title is the filename without extension.
-		title := strings.TrimSuffix(d.Name(), filepath.Ext(d.Name()))
-
-		mtime := info.ModTime().UTC()
-		meta := map[string]any{
-			"relative_path": relPath,
-			"language":      c.cfg.WhisperLanguage,
-			"audio_size":    info.Size(),
-			"model":         c.cfg.WhisperModel,
-		}
-
-		// Merge sidecar metadata when present (written by the ingest-recording
-		// handler alongside the audio file). Missing sidecar = historical file or
-		// OneDrive-staged file — silently skip, no error.
-		if sidecarMeta, ok := readRecordingSidecar(path); ok {
-			for k, v := range sidecarMeta {
-				meta[k] = v
-			}
-		}
-
-		// Use the plain transcript as the default content.
-		content := txResult.text
-
-		// Diarization post-processing (feature-flagged OFF by default).
-		// Only attempted when:
-		//   1. DiarizationEnabled=true AND DiarizationAPIURL is set
-		//   2. Whisper returned at least one segment (verbose_json)
-		// On any error the warning is logged and the plain transcript is used.
-		if c.cfg.DiarizationEnabled && c.cfg.DiarizationAPIURL != "" && len(txResult.segments) > 0 {
-			audioBytes, readErr := os.ReadFile(path)
-			if readErr != nil {
-				slog.Warn("whisper: diarization skipped — cannot re-read audio file",
-					"path", path, "error", readErr)
-			} else {
-				isCall := isTPhoneCallPath(path)
-				diarSegs, diarErr := c.diarizeAudio(ctx, path, audioBytes, isCall)
-				if diarErr != nil {
-					slog.Warn("whisper: diarization failed — using plain transcript",
-						"path", path, "error", diarErr)
-				} else {
-					labelled, nSpeakers := labelTranscript(txResult.segments, diarSegs)
-					if labelled != "" {
-						content = labelled
-						meta["speaker_count"] = nSpeakers
-					} else {
-						slog.Warn("whisper: labelTranscript produced empty output — using plain transcript",
-							"path", path)
-					}
-				}
-			}
-		}
-
-		docs = append(docs, model.Document{
-			ID:          uuid.New(),
-			SourceType:  model.SourceCallTranscript,
-			SourceID:    sourceID,
-			Title:       title,
-			Content:     content,
-			Metadata:    meta,
-			OccurredAt:  &mtime,
-			CollectedAt: now,
+		// Passed all filters — defer transcription to the Phase 2 worker pool.
+		pending = append(pending, pendingTranscription{
+			path:     path,
+			info:     info,
+			relPath:  relPath,
+			sourceID: sourceID,
+			title:    strings.TrimSuffix(d.Name(), filepath.Ext(d.Name())),
 		})
-
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("whisper: walk %q: %w", c.cfg.WhisperAudioDir, err)
+		return fmt.Errorf("whisper: walk %q: %w", c.cfg.WhisperAudioDir, err)
 	}
 
-	slog.Info("whisper: collected transcripts", "count", len(docs), "audio_dir", c.cfg.WhisperAudioDir)
-	return docs, nil
+	// Phase 2 — CONCURRENT transcription + INCREMENTAL emit.
+	//
+	// Up to c.concurrency() files are transcribed in parallel (a load balancer can
+	// fan requests across multiple whisper backends). Completed documents flow
+	// through a results channel to a single drain goroutine that emits them in
+	// batches of whisperStreamBatchSize via onBatch. When concurrency == 1 the
+	// transcription order is sequential, identical to the original behaviour.
+	//
+	// transcribeFile / diarizeAudio internals are unchanged; only the dispatch is
+	// parallelised and the emit is incremental.
+	emitted, streamErr := c.streamPending(ctx, pending, now, onBatch)
+
+	slog.Info("whisper: collected transcripts", "count", emitted, "audio_dir", c.cfg.WhisperAudioDir)
+	return streamErr
+}
+
+// pendingTranscription is one audio file that passed every sequential filter in
+// the walk and is awaiting transcription by the Phase 2 worker pool.
+type pendingTranscription struct {
+	path     string
+	info     fs.FileInfo
+	relPath  string
+	sourceID string
+	title    string
+}
+
+// streamPending transcribes the pending items using a worker pool of size
+// c.concurrency() and emits the resulting documents incrementally via onBatch in
+// batches of whisperStreamBatchSize. It returns the total number of documents
+// emitted and an error (the caller's onBatch error if emit failed, a context
+// error on cancellation, or nil).
+//
+// Concurrency model:
+//   - A feeder goroutine dispatches pending items on the `jobs` channel.
+//   - c.concurrency() worker goroutines transcribe files in parallel and send
+//     each completed document on the unbuffered `results` channel.
+//   - A closer goroutine waits for the worker WaitGroup and closes `results`.
+//   - THIS goroutine is the single drain/emitter: it receives from `results`,
+//     buffers documents, and calls onBatch once per whisperStreamBatchSize
+//     (plus a final partial flush). Funnelling every onBatch call through ONE
+//     goroutine is REQUIRED because the scheduler's processBatch (ledger record
+//     + embed + upsert) is not concurrency-safe.
+//
+// Each completed document is sent exactly once and received by exactly one drain
+// iteration, so every file appears in exactly one batch (no duplicates, no
+// omissions) regardless of concurrency.
+//
+// Leak safety: streamPending derives a cancellable streamCtx and defers its
+// cancel. Workers and the feeder select on streamCtx.Done() for both their job
+// dequeue and their `results <- doc` send, so when the drain loop returns early
+// (onBatch error or parent ctx cancellation) the deferred cancel unblocks every
+// worker. The closer goroutine then observes the WaitGroup drain and closes
+// `results`. No goroutine is left blocked.
+//
+// When concurrency == 1 a single worker processes the channel, reproducing the
+// original sequential transcription order.
+func (c *WhisperCollector) streamPending(ctx context.Context, pending []pendingTranscription, now time.Time, onBatch func([]model.Document) error) (int, error) {
+	if len(pending) == 0 {
+		return 0, nil
+	}
+
+	workers := c.concurrency()
+	if workers > len(pending) {
+		workers = len(pending)
+	}
+
+	// streamCtx is cancelled when this function returns (deferred cancel) so that
+	// any worker still blocked on a `results <- doc` send — because the drain loop
+	// has already returned and stopped receiving — is unblocked and exits. This
+	// guarantees the worker WaitGroup eventually drains and the closer goroutine
+	// closes `results`, leaving no leaked goroutine.
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobs := make(chan pendingTranscription)
+	results := make(chan model.Document)
+
+	var wg sync.WaitGroup
+
+	worker := func() {
+		defer wg.Done()
+		for item := range jobs {
+			// Respect cancellation inside the worker so an aborted collection
+			// stops issuing expensive transcription calls promptly.
+			if streamCtx.Err() != nil {
+				return
+			}
+			doc, ok := c.buildDocument(streamCtx, item, now)
+			if !ok {
+				continue // failure already logged; partial success
+			}
+			// Send the completed document to the single drain goroutine. Select on
+			// streamCtx.Done() so a cancelled or early-returning collection does
+			// not block this worker forever when no receiver remains.
+			select {
+			case results <- doc:
+			case <-streamCtx.Done():
+				return
+			}
+		}
+	}
+
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go worker()
+	}
+
+	// Feeder goroutine: dispatch pending items to the worker pool, then close
+	// jobs so the workers exit their range loop. Running this concurrently with
+	// the drain loop lets emit happen while transcription is still in flight.
+	go func() {
+		defer close(jobs)
+		for _, item := range pending {
+			select {
+			case jobs <- item:
+			case <-streamCtx.Done():
+				return
+			}
+		}
+	}()
+
+	// Closer goroutine: once all workers have finished, close results so the
+	// drain loop terminates. This is the ONLY place results is closed.
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Drain loop (THIS goroutine — the single emitter). Buffers up to
+	// whisperStreamBatchSize documents and calls onBatch. onBatch is invoked only
+	// here, so it is never called concurrently.
+	batch := make([]model.Document, 0, whisperStreamBatchSize)
+	emitted := 0
+
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := onBatch(batch); err != nil {
+			return err
+		}
+		emitted += len(batch)
+		batch = batch[:0] // reuse backing array for the next batch
+		return nil
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Parent cancellation: emit what is buffered (best-effort) then report
+			// the cancellation. The deferred cancel() unblocks the workers.
+			_ = flush()
+			return emitted, ctx.Err()
+		case doc, ok := <-results:
+			if !ok {
+				// All workers finished and results is closed: emit the final
+				// partial batch and return.
+				if err := flush(); err != nil {
+					return emitted, err
+				}
+				return emitted, nil
+			}
+			batch = append(batch, doc)
+			if len(batch) >= whisperStreamBatchSize {
+				if err := flush(); err != nil {
+					// onBatch failed: abort. The deferred cancel() unblocks every
+					// worker still attempting to send, so no goroutine leaks.
+					return emitted, err
+				}
+			}
+		}
+	}
+}
+
+// buildDocument transcribes a single pending file and assembles the
+// model.Document (sidecar merge + optional diarization). It returns (doc, true)
+// on success and (zero, false) when transcription failed — the caller skips
+// failures (partial success). This is the per-file body that previously lived
+// inline in the walk; it is unchanged except for being extracted so the worker
+// pool can call it concurrently. transcribeFile / diarizeAudio internals are
+// untouched.
+func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTranscription, now time.Time) (model.Document, bool) {
+	txResult, err := c.transcribeFile(ctx, item.path)
+	if err != nil {
+		slog.Warn("whisper: transcription failed", "path", item.path, "error", err)
+		return model.Document{}, false // partial success — skip
+	}
+
+	mtime := item.info.ModTime().UTC()
+	meta := map[string]any{
+		"relative_path": item.relPath,
+		"language":      c.cfg.WhisperLanguage,
+		"audio_size":    item.info.Size(),
+		"model":         c.cfg.WhisperModel,
+	}
+
+	// Merge sidecar metadata when present (written by the ingest-recording
+	// handler alongside the audio file). Missing sidecar = historical file or
+	// OneDrive-staged file — silently skip, no error.
+	if sidecarMeta, ok := readRecordingSidecar(item.path); ok {
+		for k, v := range sidecarMeta {
+			meta[k] = v
+		}
+	}
+
+	// Use the plain transcript as the default content.
+	content := txResult.text
+
+	// Diarization post-processing (feature-flagged OFF by default).
+	// Only attempted when:
+	//   1. DiarizationEnabled=true AND DiarizationAPIURL is set
+	//   2. Whisper returned at least one segment (verbose_json)
+	// On any error the warning is logged and the plain transcript is used.
+	if c.cfg.DiarizationEnabled && c.cfg.DiarizationAPIURL != "" && len(txResult.segments) > 0 {
+		audioBytes, readErr := os.ReadFile(item.path)
+		if readErr != nil {
+			slog.Warn("whisper: diarization skipped — cannot re-read audio file",
+				"path", item.path, "error", readErr)
+		} else {
+			isCall := isTPhoneCallPath(item.path)
+			diarSegs, diarErr := c.diarizeAudio(ctx, item.path, audioBytes, isCall)
+			if diarErr != nil {
+				slog.Warn("whisper: diarization failed — using plain transcript",
+					"path", item.path, "error", diarErr)
+			} else {
+				labelled, nSpeakers := labelTranscript(txResult.segments, diarSegs)
+				if labelled != "" {
+					content = labelled
+					meta["speaker_count"] = nSpeakers
+				} else {
+					slog.Warn("whisper: labelTranscript produced empty output — using plain transcript",
+						"path", item.path)
+				}
+			}
+		}
+	}
+
+	return model.Document{
+		ID:          uuid.New(),
+		SourceType:  model.SourceCallTranscript,
+		SourceID:    item.sourceID,
+		Title:       item.title,
+		Content:     content,
+		Metadata:    meta,
+		OccurredAt:  &mtime,
+		CollectedAt: now,
+	}, true
 }
 
 // readRecordingSidecar attempts to read and parse the sidecar metadata file

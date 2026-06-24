@@ -1,0 +1,29 @@
+# ubuntu2 — faster-whisper backend only (secondary node)
+# Tailscale IP: ${NODE2_TAILSCALE_IP} (set per-host; see deploy/whisper-lb/README.md)
+#
+# Deploy:
+#   scp deploy/whisper-lb/ubuntu2/docker-compose.yml ubuntu2:~/second-brain-whisper/docker-compose.yml
+#   ssh ubuntu2 'cd ~/second-brain-whisper && docker compose up -d'
+#
+# Port binding scoped to Tailscale IP (issue #100: call data must stay private).
+
+services:
+  whisper:
+    image: fedirz/faster-whisper-server:latest-cpu
+    container_name: second-brain-whisper
+    restart: unless-stopped
+    environment:
+      WHISPER__MODEL: Systran/faster-whisper-medium
+      WHISPER__INFERENCE_DEVICE: cpu
+      WHISPER__COMPUTE_TYPE: int8
+      UVICORN_HOST: 0.0.0.0
+      UVICORN_PORT: "8000"
+    volumes:
+      # HuggingFace model cache — prevents re-download on container restart.
+      - hf-cache:/root/.cache/huggingface
+    ports:
+      # Tailscale IP only — LAN/public not exposed.
+      - "${NODE2_TAILSCALE_IP}:8771:8000"
+
+volumes:
+  hf-cache:

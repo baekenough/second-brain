@@ -43,6 +43,17 @@ type DocumentUpserter interface {
 	// store for the given source type. Used by the filesystem collector to detect
 	// files that are new (not yet indexed) regardless of their mtime.
 	ActiveSourceIDSet(ctx context.Context, sourceType model.SourceType) (map[string]struct{}, error)
+	// TranscribedSourceIDSet returns the set of source_ids the whisper pipeline
+	// has already transcribed (transcription_ledger), regardless of whether the
+	// resulting document was stored or rejected as a duplicate. Unioned with
+	// ActiveSourceIDSet to build the authoritative "do NOT re-transcribe" set —
+	// this fixes the infinite re-transcription loop for immutable audio.
+	TranscribedSourceIDSet(ctx context.Context, sourceType model.SourceType) (map[string]struct{}, error)
+	// RecordTranscribed durably records that the given source_ids were
+	// transcribed for the source type. Idempotent (ON CONFLICT DO NOTHING),
+	// no-op on empty input. Called per batch so duplicate-rejected files are
+	// ledgered and never re-transcribed.
+	RecordTranscribed(ctx context.Context, sourceType model.SourceType, sourceIDs []string) error
 }
 
 // ActiveDocumentCounter is retained for backward compatibility and for use by
@@ -404,19 +415,46 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 	//
 	// We load the set once per run (not per-record) so the per-record cost is an
 	// O(1) map lookup rather than a round-trip to the database.
-	if iac, ok := col.(collector.IndexAwareCollector); ok && !since.IsZero() {
-		indexedIDs, err := s.store.ActiveSourceIDSet(ctx, col.Source())
-		if err != nil {
+	//
+	// The "&& !since.IsZero()" guard was REMOVED (infinite re-transcription loop
+	// fix): when the watermark was zero (first run / after any reset) the index
+	// set was not loaded at all, which fully disabled whisper dedup and made every
+	// audio file look new every cycle. The set must always load.
+	//
+	// For whisper, the authoritative "do NOT re-transcribe" set is the UNION of
+	//   active = ActiveSourceIDSet     (source_ids active in the search index)
+	//   ledger = TranscribedSourceIDSet (source_ids already transcribed, including
+	//            those rejected as duplicates or whose document was never stored)
+	// Audio is immutable, so a source_id in this union must never be transcribed
+	// again. If EITHER query errors we fall back to WithIndexedIDs(nil)
+	// (mtime-only) so the collector never carries stale data and never blocks.
+	if iac, ok := col.(collector.IndexAwareCollector); ok {
+		active, activeErr := s.store.ActiveSourceIDSet(ctx, col.Source())
+		ledger, ledgerErr := s.store.TranscribedSourceIDSet(ctx, col.Source())
+		if activeErr != nil || ledgerErr != nil {
 			// Non-fatal: fall back to event-time-only behaviour for this run.
 			// Explicitly clear any stale set so the collector does not silently
 			// carry over stale data from a previous successful run.
 			iac.WithIndexedIDs(nil)
-			slog.Warn("scheduler: could not load indexed source IDs, falling back to event-time-only",
-				"collector", col.Name(), "error", err)
+			slog.Warn("scheduler: could not load indexed/ledger source IDs, falling back to event-time-only",
+				"collector", col.Name(),
+				"active_error", activeErr,
+				"ledger_error", ledgerErr)
 		} else {
-			iac.WithIndexedIDs(indexedIDs)
+			// Union active ∪ ledger into a single set.
+			union := make(map[string]struct{}, len(active)+len(ledger))
+			for id := range active {
+				union[id] = struct{}{}
+			}
+			for id := range ledger {
+				union[id] = struct{}{}
+			}
+			iac.WithIndexedIDs(union)
 			slog.Debug("scheduler: loaded indexed source IDs",
-				"collector", col.Name(), "count", len(indexedIDs))
+				"collector", col.Name(),
+				"active", len(active),
+				"ledger", len(ledger),
+				"union", len(union))
 		}
 	}
 
@@ -437,6 +475,28 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 			return err
 		}
 		totalSeen += len(batch)
+
+		// Transcription ledger (infinite re-transcription loop fix):
+		// The collector only returns SUCCESSFULLY-transcribed documents, so every
+		// source_id in this batch has already been transcribed. Record them in the
+		// ledger BEFORE the upsert loop so that even documents rejected as
+		// duplicates (ErrDuplicateTranscript) — whose source_id never enters the
+		// active index — are durably marked as "already transcribed" and are never
+		// re-submitted to the (expensive) whisper API on a later cycle.
+		//
+		// This is a single batched round-trip and is best-effort: a failure is
+		// logged but never blocks ingestion (worst case is a redundant
+		// re-transcription, which the active-index union still mostly prevents).
+		if col.Source() == model.SourceCallTranscript && len(batch) > 0 {
+			ids := make([]string, len(batch))
+			for i := range batch {
+				ids[i] = batch[i].SourceID
+			}
+			if err := s.store.RecordTranscribed(ctx, col.Source(), ids); err != nil {
+				slog.Warn("scheduler: record transcribed ledger failed (non-fatal)",
+					"collector", col.Name(), "count", len(ids), "error", err)
+			}
+		}
 
 		// Optionally enrich documents with embeddings before upserting.
 		if s.embed.Enabled() && len(batch) > 0 {

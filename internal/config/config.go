@@ -167,6 +167,12 @@ type Config struct {
 	WhisperLanguage     string
 	WhisperMaxFileBytes int64
 	WhisperHTTPTimeout  time.Duration
+	// WhisperConcurrency is the number of audio files transcribed in parallel by
+	// the whisper collector. Sourced from WHISPER_CONCURRENCY (default 1, clamped
+	// to >= 1). Values >1 enable 2-node load balancing across whisper backends
+	// (e.g. via a load balancer in front of two whisper containers). Default 1
+	// keeps single-node deployments unchanged (sequential behaviour).
+	WhisperConcurrency int
 
 	// Speaker diarization (optional — feature-flagged OFF by default).
 	//
@@ -461,6 +467,7 @@ func Load() (*Config, error) {
 		WhisperLanguage:     getenv("WHISPER_LANGUAGE", "ko"),
 		WhisperMaxFileBytes: whisperMaxFileBytes(),
 		WhisperHTTPTimeout:  whisperHTTPTimeout(),
+		WhisperConcurrency:  whisperConcurrency(),
 
 		DiarizationEnabled: os.Getenv("DIARIZATION_ENABLED") == "true",
 		DiarizationAPIURL:  os.Getenv("DIARIZATION_API_URL"),
@@ -588,6 +595,27 @@ func whisperHTTPTimeout() time.Duration {
 		return defaultTimeout
 	}
 	return d
+}
+
+// whisperConcurrency parses WHISPER_CONCURRENCY from the environment.
+// Default is 1 (sequential — single-node deployments unchanged).
+// The value is clamped to >= 1: zero, negative, or invalid values fall back to 1
+// so the collector always has at least one worker.
+func whisperConcurrency() int {
+	const defaultConcurrency = 1
+	v := os.Getenv("WHISPER_CONCURRENCY")
+	if v == "" {
+		return defaultConcurrency
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		slog.Warn("config: WHISPER_CONCURRENCY is invalid; using default 1",
+			"value", v,
+			"error", err,
+		)
+		return defaultConcurrency
+	}
+	return n
 }
 
 // ingestMaxFileBytes parses INGEST_MAX_FILE_BYTES from the environment.

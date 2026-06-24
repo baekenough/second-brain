@@ -51,8 +51,9 @@ func (c *countingCollector) callCount() int {
 
 // mockStore implements DocumentUpserter for tests.
 type mockStore struct {
-	mu      sync.Mutex
-	upserts int
+	mu       sync.Mutex
+	upserts  int
+	recorded []string // source_ids passed to RecordTranscribed
 }
 
 func (m *mockStore) Upsert(_ context.Context, _ *model.Document) error {
@@ -88,6 +89,31 @@ func (m *mockStore) UpdateEmbedding(_ context.Context, _ *model.Document) error 
 
 func (m *mockStore) ActiveSourceIDSet(_ context.Context, _ model.SourceType) (map[string]struct{}, error) {
 	return map[string]struct{}{}, nil
+}
+
+// TranscribedSourceIDSet satisfies DocumentUpserter (transcription ledger).
+// Returns an empty set by default so dedup never suppresses in pure-mock tests.
+func (m *mockStore) TranscribedSourceIDSet(_ context.Context, _ model.SourceType) (map[string]struct{}, error) {
+	return map[string]struct{}{}, nil
+}
+
+// RecordTranscribed satisfies DocumentUpserter (transcription ledger).
+// Records the ledgered source_ids so tests can assert duplicate-rejected files
+// are still ledgered.
+func (m *mockStore) RecordTranscribed(_ context.Context, _ model.SourceType, sourceIDs []string) error {
+	m.mu.Lock()
+	m.recorded = append(m.recorded, sourceIDs...)
+	m.mu.Unlock()
+	return nil
+}
+
+// recordedIDs returns a copy of the source_ids passed to RecordTranscribed.
+func (m *mockStore) recordedIDs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, len(m.recorded))
+	copy(out, m.recorded)
+	return out
 }
 
 // CountActiveDocuments satisfies DocumentUpserter (#148: promoted from optional

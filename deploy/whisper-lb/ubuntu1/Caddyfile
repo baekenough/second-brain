@@ -1,0 +1,40 @@
+# Caddy round-robin load balancer for faster-whisper backends (3-node).
+#
+# Listens on ubuntu1 Tailscale IP:8770 (private — not exposed to LAN/public).
+#
+# Backend routing (3-way round_robin):
+#   whisper:8000        — ubuntu1 local backend via compose network (NAT hairpin
+#                         avoidance: containers cannot reach the host's own
+#                         Tailscale IP <node1-tailscale-ip>:8771 from inside)
+#   <node2-tailscale-ip>:8771   — node2 backend via Tailscale
+#   <node3-tailscale-ip>:8771   — node3 (Mac) backend via Tailscale
+#                         (docker-compose.local.yml whisper service, published on
+#                          node3 Tailscale IP; see docker-compose.local.yml whisper ports)
+#
+# Transcription requests can take tens of minutes up to ~2 hours.
+# read_timeout / write_timeout are set to 3h, flush_interval -1 to prevent
+# Caddy from cutting long-running connections.
+
+http://<node1-tailscale-ip>:8770 {
+	reverse_proxy whisper:8000 <node2-tailscale-ip>:8771 <node3-tailscale-ip>:8771 {
+		lb_policy round_robin
+
+		# Active health checks against the OpenAI-compatible models endpoint.
+		health_uri      /v1/models
+		health_interval 30s
+		health_timeout  20s
+
+		# Passive failover: remove a backend from rotation on repeated errors.
+		fail_duration 30s
+		max_fails     2
+
+		# Disable response buffering — required for streaming/long-running transfers.
+		flush_interval -1
+
+		transport http {
+			read_timeout  3h
+			write_timeout 3h
+			dial_timeout  30s
+		}
+	}
+}

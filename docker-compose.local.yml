@@ -151,6 +151,12 @@ services:
       WHISPER__COMPUTE_TYPE: int8
       UVICORN_HOST: "0.0.0.0"
       UVICORN_PORT: "8000"
+    # In distributed mode, set WHISPER_HOST_BIND in .env.local to this host's
+    # Tailscale IP so the ubuntu1 Caddy LB can include this Mac node as a backend.
+    # Default is localhost (local-only mode); the port is then unused but harmless.
+    # Tailscale IPs are stable per-device and private — never exposed on LAN/public.
+    ports:
+      - "${WHISPER_HOST_BIND:-127.0.0.1}:8771:8000"
     restart: unless-stopped
     networks:
       - default
