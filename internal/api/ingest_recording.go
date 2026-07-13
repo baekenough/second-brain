@@ -244,6 +244,10 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 
 	var audioFilename string
 	var sourceID string
+	// numHash is the ShortHash of the counterpart phone number, computed only
+	// for kind=call. It is reused below when writing the sidecar so the raw
+	// phone number is never persisted to disk in plaintext (issue #164).
+	var numHash string
 
 	switch kind {
 	case "voice-memo":
@@ -282,16 +286,34 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 			audioFilename = fmt.Sprintf("voice-memo_%s%s", timestampStr, ext)
 		}
 	default: // "call"
-		// Format: {sanitized-number}_{YYYYMMDDHHMMSS}{ext}
+		// Mirrors smsmap.MapCall SourceID format. Computed BEFORE audioFilename
+		// so the filename can reuse the same one-way hash (issue #164/#165
+		// follow-up) — see the audioFilename comment below. This does not
+		// change the SourceID itself, so already-ingested call-log documents
+		// keep an identical SourceID after this change (dedup/upsert identity
+		// is unaffected).
+		numHash = smsmap.ShortHash(number)
+		durHash := smsmap.BodyShortHash(fmt.Sprintf("%d", durationSec))
+		sourceID = fmt.Sprintf("call-log:%d:%s:%s", dateMs, numHash, durHash)
+
+		// Format: {numHash}_{YYYYMMDDHHMMSS}{ext}
+		//
+		// Security: previously this embedded sanitizePhoneNumber(number) — the
+		// raw phone number with only punctuation stripped — directly in the
+		// on-disk filename, leaking PII into filesystem paths, logs, backups,
+		// and any sync tooling that mirrors the recording directory. numHash
+		// is already computed above for the SourceID, so reusing it here for
+		// the filename is free and keeps the two identifiers consistent.
+		//
+		// WhisperCollector.recordingTime() (reTPhone) only parses the trailing
+		// "_YYYYMMDDHHMMSS[-N]" timestamp suffix and does not care what
+		// precedes it, so this rename is fully transparent to the cutover /
+		// watermark logic and to isTPhoneCallPath's diarization heuristic.
 		audioFilename = fmt.Sprintf("%s_%s%s",
-			sanitizePhoneNumber(number),
+			numHash,
 			timestampStr,
 			ext,
 		)
-		// Mirrors smsmap.MapCall SourceID format.
-		numHash := smsmap.ShortHash(number)
-		durHash := smsmap.BodyShortHash(fmt.Sprintf("%d", durationSec))
-		sourceID = fmt.Sprintf("call-log:%d:%s:%s", dateMs, numHash, durHash)
 	}
 
 	// --- Ensure the recording directory exists ---
@@ -305,7 +327,12 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 	// audioBytes was validated above; write from memory to disk.
 	destPath := filepath.Join(s.recordingDir, audioFilename)
 	if err := os.WriteFile(destPath, audioBytes, 0o644); err != nil {
-		slog.Error("ingest_recording: write audio file", "path", destPath, "error", err)
+		// Security: log only the basename, never the full destPath. audioFilename
+		// is hash-based for kind=call as of this change (see numHash above), but
+		// logging the basename rather than the directory-qualified path is kept
+		// as defence-in-depth against any future/legacy naming path that still
+		// embeds raw PII.
+		slog.Error("ingest_recording: write audio file", "filename", filepath.Base(destPath), "error", err)
 		writeError(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
@@ -321,13 +348,18 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 	// On write failure: log a warning and continue — the audio file and call-log
 	// doc already succeeded, and missing sidecars are handled gracefully by
 	// WhisperCollector (historical files have no sidecar).
+	//
+	// Security (issue #164): the counterpart phone number is never written to
+	// the sidecar in plaintext. Only its ShortHash (numHash, already computed
+	// above for the SourceID) is stored, under the number_hash key. This is a
+	// one-way hash — the sidecar cannot be used to recover the raw number.
 	sidecarDirection := ""
 	if kind == "call" {
 		sidecarDirection = "incoming"
 	}
 	sidecar := recordingSidecar{
 		ContactName:     contactName,
-		Number:          number,
+		NumberHash:      numHash,
 		Direction:       sidecarDirection,
 		RecordingType:   kind,
 		DurationSeconds: durationSec,
@@ -335,9 +367,10 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 		Kind:            kind,
 	}
 	if sidecarData, marshalErr := json.Marshal(sidecar); marshalErr != nil {
-		slog.Warn("ingest_recording: marshal sidecar", "path", destPath, "error", marshalErr)
+		// Security: basename only — see the write-audio-file log above.
+		slog.Warn("ingest_recording: marshal sidecar", "filename", filepath.Base(destPath), "error", marshalErr)
 	} else if writeErr := os.WriteFile(destPath+".meta.json", sidecarData, 0o644); writeErr != nil {
-		slog.Warn("ingest_recording: write sidecar", "path", destPath+".meta.json", "error", writeErr)
+		slog.Warn("ingest_recording: write sidecar", "filename", filepath.Base(destPath)+".meta.json", "error", writeErr)
 	}
 
 	// --- Build document title, content, and metadata by kind ---
@@ -366,9 +399,16 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 			"transcription":    "pending",
 		}
 	default: // "call"
+		// Security: when the caller supplies no contact_name, NEVER fall back
+		// to the raw phone number for Title/Content — unlike SourceID, these
+		// are plaintext user-facing fields and would leak PII. Fall back to a
+		// short, one-way hashed label built from numHash (already computed
+		// above for the SourceID/filename), matching the "number_hash" naming
+		// used elsewhere (sidecar, SourceID) so the fallback is consistent
+		// and non-reversible rather than a partial mask of the real number.
 		contact := contactName
 		if contact == "" {
-			contact = number
+			contact = "상대 " + numHash[:8]
 		}
 		title = fmt.Sprintf("incoming 통화 %s", contact)
 		content = fmt.Sprintf("상대방: %s\n통화 방향: incoming\n통화 시간: %ds\n[TRANSCRIPTION PENDING]",
@@ -418,9 +458,16 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 // All fields are JSON-tagged with omitempty so that absent optional fields
 // (e.g. contact_name for an anonymous call, direction for a voice-memo) are
 // omitted from the sidecar rather than stored as empty strings.
+//
+// Security note (issue #164): the counterpart phone number is intentionally
+// NOT stored in plaintext. NumberHash carries smsmap.ShortHash(number) instead
+// — a one-way SHA-256-derived hash, matching the hash already embedded in the
+// call-log document's SourceID. WhisperCollector's sidecar reader
+// (readRecordingSidecar in internal/collector/whisper.go) does not parse a
+// "number" key today, so this rename carries no consumer-contract risk.
 type recordingSidecar struct {
 	ContactName     string `json:"contact_name,omitempty"`
-	Number          string `json:"number,omitempty"`
+	NumberHash      string `json:"number_hash,omitempty"`
 	Direction       string `json:"direction,omitempty"`
 	RecordingType   string `json:"recording_type,omitempty"`
 	DurationSeconds int    `json:"duration_seconds,omitempty"`

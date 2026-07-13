@@ -265,13 +265,51 @@ func TestMapCall_TitleFormat(t *testing.T) {
 	}
 }
 
-func TestMapCall_TitleFallbackToNumber(t *testing.T) {
+// TestMapCall_TitleFallbackNeverContainsRawNumber verifies that when
+// contactName is empty, Title/Content fall back to a short, one-way hashed
+// label ("상대 " + shortHash(number)[:8]) instead of the raw phone number
+// (issue #164 follow-up — mirrors the ingest-recording handler's anonymous
+// caller fix). SourceID and Metadata remain untouched.
+func TestMapCall_TitleFallbackNeverContainsRawNumber(t *testing.T) {
 	t.Parallel()
 
 	number := "010-9999-8888"
 	doc := smsmap.MapCall(number, time.Now().UnixMilli(), 30, 2, "")
-	if !strings.Contains(doc.Title, number) {
-		t.Errorf("title=%q should contain number %q when contact name is empty", doc.Title, number)
+
+	if strings.Contains(doc.Title, number) {
+		t.Errorf("Title=%q must not contain the raw phone number %q", doc.Title, number)
+	}
+	if strings.Contains(doc.Content, number) {
+		t.Errorf("Content=%q must not contain the raw phone number %q", doc.Content, number)
+	}
+
+	wantHashPrefix := smsmap.ShortHash(number)[:8]
+	if !strings.Contains(doc.Title, wantHashPrefix) {
+		t.Errorf("Title=%q should contain the hashed label %q when contact name is empty", doc.Title, wantHashPrefix)
+	}
+	if !strings.Contains(doc.Content, wantHashPrefix) {
+		t.Errorf("Content=%q should contain the hashed label %q when contact name is empty", doc.Content, wantHashPrefix)
+	}
+
+	// Metadata's contact_name mirrors the (empty) input verbatim — assert
+	// explicitly so a future change doesn't silently reintroduce a leak here.
+	if contactName, _ := doc.Metadata["contact_name"].(string); contactName != "" {
+		t.Errorf("metadata[contact_name]=%q, want empty", contactName)
+	}
+}
+
+// TestMapCall_TitleShowsContactNameWhenPresent is the control test proving
+// the hashed fallback above only applies when contactName is empty — a
+// supplied contact name must still be used verbatim in Title/Content.
+func TestMapCall_TitleShowsContactNameWhenPresent(t *testing.T) {
+	t.Parallel()
+
+	doc := smsmap.MapCall("010-9999-8888", time.Now().UnixMilli(), 30, 2, "Heidi")
+	if doc.Title != "outgoing 통화 Heidi" {
+		t.Errorf("Title=%q, want %q", doc.Title, "outgoing 통화 Heidi")
+	}
+	if !strings.Contains(doc.Content, "Heidi") {
+		t.Errorf("Content=%q should contain contact name %q", doc.Content, "Heidi")
 	}
 }
 

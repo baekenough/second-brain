@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/baekenough/second-brain/internal/collector/smsmap"
 )
 
 // TestIngestRecording_SidecarWrittenForCall verifies that a successful call
@@ -93,6 +96,33 @@ func TestIngestRecording_SidecarWrittenForCall(t *testing.T) {
 	if int(durF) != 120 {
 		t.Errorf("sidecar duration_seconds = %v, want 120", sidecar["duration_seconds"])
 	}
+
+	// Security (issue #164): the raw phone number must never be persisted to
+	// the sidecar in plaintext. Only the ShortHash form is stored, under
+	// number_hash — the legacy "number" key must be entirely absent.
+	if v, ok := sidecar["number"]; ok {
+		t.Errorf("sidecar must not contain plaintext number, got number=%v", v)
+	}
+	wantHash := smsmap.ShortHash(number)
+	if sidecar["number_hash"] != wantHash {
+		t.Errorf("sidecar number_hash = %v, want %q", sidecar["number_hash"], wantHash)
+	}
+	// Defence in depth: the raw number string must not appear anywhere in the
+	// sidecar bytes (covers any future field accidentally re-introducing it).
+	if strings.Contains(string(sidecarData), number) {
+		t.Errorf("sidecar file contents contain the raw phone number %q: %s", number, sidecarData)
+	}
+
+	// Security (issue #164/#165 follow-up): the on-disk audio filename itself
+	// must not embed the raw number either — only its ShortHash. Previously
+	// audioFilename was built from sanitizePhoneNumber(number), which strips
+	// only punctuation and leaves the digits intact.
+	if strings.Contains(audioFile, number) {
+		t.Errorf("audio filename %q must not contain the raw phone number %q", audioFile, number)
+	}
+	if !strings.HasPrefix(audioFile, wantHash+"_") {
+		t.Errorf("audio filename %q must start with the number hash %q", audioFile, wantHash+"_")
+	}
 }
 
 // TestIngestRecording_SidecarWrittenForVoiceMemo verifies that a voice-memo
@@ -163,7 +193,7 @@ func TestIngestRecording_SidecarMarshalling(t *testing.T) {
 			name: "call with contact",
 			sidecar: recordingSidecar{
 				ContactName:     "Bob",
-				Number:          "01099998888",
+				NumberHash:      smsmap.ShortHash("01099998888"),
 				Direction:       "incoming",
 				RecordingType:   "call",
 				DurationSeconds: 90,
@@ -172,13 +202,14 @@ func TestIngestRecording_SidecarMarshalling(t *testing.T) {
 			},
 			wantKeys: map[string]any{
 				"contact_name":     "Bob",
-				"number":           "01099998888",
+				"number_hash":      smsmap.ShortHash("01099998888"),
 				"direction":        "incoming",
 				"recording_type":   "call",
 				"duration_seconds": float64(90),
 				"date_ms":          float64(1705311000000),
 				"kind":             "call",
 			},
+			noKeys: []string{"number"},
 		},
 		{
 			name: "voice-memo omits direction",
@@ -194,10 +225,10 @@ func TestIngestRecording_SidecarMarshalling(t *testing.T) {
 				"duration_seconds": float64(30),
 				"kind":             "voice-memo",
 			},
-			noKeys: []string{"direction", "number"},
+			noKeys: []string{"direction", "number", "number_hash"},
 		},
 		{
-			name: "anonymous call omits contact_name and number",
+			name: "anonymous call omits contact_name and number_hash",
 			sidecar: recordingSidecar{
 				Direction:       "incoming",
 				RecordingType:   "call",
@@ -209,7 +240,7 @@ func TestIngestRecording_SidecarMarshalling(t *testing.T) {
 				"recording_type":   "call",
 				"duration_seconds": float64(60),
 			},
-			noKeys: []string{"contact_name", "number"},
+			noKeys: []string{"contact_name", "number", "number_hash"},
 		},
 	}
 

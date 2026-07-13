@@ -104,7 +104,17 @@ func MapCall(number string, dateMs int64, durationSec int, typ int, contactName 
 	sourceID := fmt.Sprintf("call-log:%d:%s:%s", dateMs, numHash, durationHash)
 
 	direction := callDirection(typ)
-	contact := firstNonEmpty(contactName, number)
+	// Security (issue #164 follow-up): when contactName is empty, never fall
+	// back to the raw phone number for Title/Content — unlike SourceID, these
+	// are plaintext user-facing fields. Fall back to a short, one-way hashed
+	// label built from numHash (already computed above for the SourceID),
+	// matching the same "상대 " + hash[:8] convention used by the
+	// ingest-recording handler (internal/api/ingest_recording.go) for the
+	// identical anonymous-caller case. SourceID and Metadata are untouched.
+	contact := contactName
+	if contact == "" {
+		contact = "상대 " + numHash[:8]
+	}
 	title := fmt.Sprintf("%s 통화 %s", direction, contact)
 
 	callTime := occurredAt.Format("2006-01-02 15:04:05 MST")

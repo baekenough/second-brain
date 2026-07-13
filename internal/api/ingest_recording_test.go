@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/baekenough/second-brain/internal/collector/smsmap"
 )
 
 // --- helpers ---
@@ -184,11 +186,15 @@ func TestIngestRecording_Success(t *testing.T) {
 	audioFile := audioFiles[0]
 
 	// Filename must encode the recording timestamp in TPhoneCallRecords format
-	// so WhisperCollector.recordingTime() can parse it.
-	// Format: {number}_{YYYYMMDDHHMMSS}.m4a
-	expectedPattern := sanitizePhoneNumber(number) + "_"
+	// so WhisperCollector.recordingTime() can parse it. The raw number is
+	// never embedded in the filename (issue #164/#165 follow-up) — only its
+	// one-way hash is. Format: {numHash}_{YYYYMMDDHHMMSS}.m4a
+	expectedPattern := smsmap.ShortHash(number) + "_"
 	if len(audioFile) < len(expectedPattern) || audioFile[:len(expectedPattern)] != expectedPattern {
 		t.Errorf("audio filename %q does not start with %q", audioFile, expectedPattern)
+	}
+	if strings.Contains(audioFile, sanitizePhoneNumber(number)) {
+		t.Errorf("audio filename %q must not contain the raw phone number", audioFile)
 	}
 	if filepath.Ext(audioFile) != ".m4a" {
 		t.Errorf("audio filename ext = %q, want .m4a", filepath.Ext(audioFile))
@@ -421,7 +427,7 @@ func TestIngestRecording_FilenameEncoding(t *testing.T) {
 	}
 	audioFile := audioFiles[0]
 
-	wantName := fmt.Sprintf("%s_%s.m4a", sanitizePhoneNumber(number), expectedTimestamp)
+	wantName := fmt.Sprintf("%s_%s.m4a", smsmap.ShortHash(number), expectedTimestamp)
 	if audioFile != wantName {
 		t.Errorf("audio filename=%q, want %q", audioFile, wantName)
 	}
@@ -619,6 +625,94 @@ func TestIngestRecording_CallRecordingType(t *testing.T) {
 	direction, _ := doc.Metadata["direction"].(string)
 	if direction != "incoming" {
 		t.Errorf("metadata[direction]=%q, want incoming", direction)
+	}
+}
+
+// TestIngestRecording_CallSourceIDStableAcrossFilenameFix verifies that the
+// call-log SourceID format (call-log:{dateMs}:{numHash}:{durHash}) is
+// unaffected by the audio-filename hashing fix (issue #164/#165 follow-up):
+// the on-disk filename and the SourceID are computed independently from the
+// same numHash value, so changing the filename scheme does not change the
+// SourceID for already-ingested documents.
+func TestIngestRecording_CallSourceIDStableAcrossFilenameFix(t *testing.T) {
+	t.Parallel()
+
+	upserter := &stubIngestUpserter{}
+	srv, _ := newRecordingTestServer(t, upserter, "", 0, time.Time{})
+
+	number := "010-7777-8888"
+	dateMs := int64(1705311000000)
+	durationSec := "45"
+
+	body, ct := buildRecordingForm(t, "call.m4a", validM4ABytes(32), number, dateMs,
+		"duration_sec", durationSec,
+	)
+	rr := doRecordingPost(t, srv, body, ct, "Bearer test-key")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", rr.Code, rr.Body.String())
+	}
+	if len(upserter.upserted) != 1 {
+		t.Fatalf("expected 1 upserted doc, got %d", len(upserter.upserted))
+	}
+
+	numHash := smsmap.ShortHash(number)
+	durHash := smsmap.BodyShortHash(durationSec)
+	wantSourceID := fmt.Sprintf("call-log:%d:%s:%s", dateMs, numHash, durHash)
+
+	got := upserter.upserted[0].SourceID
+	if got != wantSourceID {
+		t.Errorf("SourceID = %q, want %q (must match pre-existing format so already-ingested docs are not orphaned)",
+			got, wantSourceID)
+	}
+}
+
+// TestIngestRecording_AnonymousCallTitleNeverContainsRawNumber verifies that
+// when contact_name is absent, the call-log document's Title, Content, and
+// Metadata never fall back to the raw phone number — instead a short,
+// one-way hashed label consistent with number_hash is used (issue #164/#165
+// follow-up).
+func TestIngestRecording_AnonymousCallTitleNeverContainsRawNumber(t *testing.T) {
+	t.Parallel()
+
+	upserter := &stubIngestUpserter{}
+	srv, _ := newRecordingTestServer(t, upserter, "", 0, time.Time{})
+
+	number := "010-5555-6666"
+	dateMs := time.Now().Add(-time.Hour).UnixMilli()
+
+	// contact_name intentionally omitted.
+	body, ct := buildRecordingForm(t, "anon.m4a", validM4ABytes(32), number, dateMs,
+		"duration_sec", "30",
+	)
+	rr := doRecordingPost(t, srv, body, ct, "Bearer test-key")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", rr.Code, rr.Body.String())
+	}
+
+	if len(upserter.upserted) != 1 {
+		t.Fatalf("expected 1 upserted doc, got %d", len(upserter.upserted))
+	}
+	doc := upserter.upserted[0]
+
+	if strings.Contains(doc.Title, number) {
+		t.Errorf("Title = %q must not contain the raw phone number %q", doc.Title, number)
+	}
+	if strings.Contains(doc.Content, number) {
+		t.Errorf("Content = %q must not contain the raw phone number %q", doc.Content, number)
+	}
+	wantHashPrefix := smsmap.ShortHash(number)[:8]
+	if !strings.Contains(doc.Title, wantHashPrefix) {
+		t.Errorf("Title = %q, want it to contain the hashed label %q", doc.Title, wantHashPrefix)
+	}
+	if !strings.Contains(doc.Content, wantHashPrefix) {
+		t.Errorf("Content = %q, want it to contain the hashed label %q", doc.Content, wantHashPrefix)
+	}
+
+	// Metadata's contact_name field mirrors the (empty) form input verbatim —
+	// it is not itself a raw-number leak since it is empty, but assert this
+	// explicitly so a future change doesn't silently reintroduce one.
+	if contactName, _ := doc.Metadata["contact_name"].(string); contactName != "" {
+		t.Errorf("metadata[contact_name] = %q, want empty", contactName)
 	}
 }
 
