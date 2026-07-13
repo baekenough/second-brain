@@ -52,6 +52,62 @@ var (
 	// is deferred to a follow-up.
 	koreanPhoneRe = regexp.MustCompile(`\b(01[016789]|02|0[3-6][1-5])[-. ]?\d{3,4}[-. ]?\d{4}\b`)
 
+	// koreanAreaCodeRe is the shared "area code without its domestic trunk
+	// zero" alternation reused by all three country-code phone patterns
+	// below: mobile 10/11/16/17/18/19, Seoul landline 2, or regional landline
+	// 31-65 (2-digit, first digit 3-6 / second digit 1-5 — mirrors
+	// koreanPhoneRe's 0[3-6][1-5] minus the leading trunk zero).
+	koreanAreaCodeRe = `(?:1[016789]|2|[3-6][1-5])`
+
+	// koreanPhoneIntlPlusRe matches Korean phone numbers (issue #167) written
+	// with an explicit "+82" international dialing prefix, e.g.
+	// "+82 10-1234-5678", "+82-10-1234-5678", "+82 (0)10-1234-5678",
+	// "+82 2-1234-5678" (Seoul landline), "+82 31-1234-5678" (regional
+	// landline). The optional "(0)" covers the common convention of showing
+	// the domestic trunk zero in parentheses even though it is dropped when
+	// actually dialing with the country code.
+	//
+	// Deliberately NO leading \b: RE2 (Go's regexp engine, used here) has no
+	// lookaround support, and \b only matches at a transition between a word
+	// char and a non-word char. '+' is itself a non-word character, so a
+	// leading \b would fail to match the overwhelmingly common case of "+82"
+	// preceded by whitespace (space is also non-word — no transition, no
+	// boundary). "+82" is an unambiguous enough marker on its own that
+	// omitting the leading assertion does not introduce meaningful
+	// false-positive risk; the trailing \b (after a digit, a word char)
+	// still works normally.
+	koreanPhoneIntlPlusRe = regexp.MustCompile(`\+82[-. ]?\(?0?\)?[-. ]?` + koreanAreaCodeRe + `[-. ]?\d{3,4}[-. ]?\d{4}\b`)
+
+	// koreanPhoneIntl00Re matches the same numbers written with the "0082"
+	// international exit-code prefix, e.g. "0082 10 1234 5678". Digit-led,
+	// so a leading \b correctly requires it NOT be preceded by another digit
+	// (avoiding a partial match inside a longer numeric run).
+	koreanPhoneIntl00Re = regexp.MustCompile(`\b0082[-. ]?\(?0?\)?[-. ]?` + koreanAreaCodeRe + `[-. ]?\d{3,4}[-. ]?\d{4}\b`)
+
+	// koreanPhoneIntlBareRe matches the bare "82" country-code form with
+	// neither a '+' nor a "00" exit-code marker, covering both the unbroken
+	// digit-run shape (e.g. "8210 12345678") and the fully-separated shape
+	// (e.g. "82-10-1234-5678", "82 10 1234 5678", "82.10.1234.5678").
+	//
+	// A single optional [-. ] separator is allowed between "82" and the area
+	// code — mirroring the separator already allowed between the area code
+	// and the following digit groups — so that a hyphen/space/dot-delimited
+	// bare-82 number is matched and redacted in ONE pass, rather than being
+	// partially consumed by the (later-run) bankAccountRe pattern and
+	// leaving a trailing digit group unredacted (e.g. "82-10-1234-5678"
+	// previously left "-5678" leaking as "[REDACTED]-5678").
+	//
+	// This remains conservative against Finding-3-style false positives: the
+	// area code segment must still match one of the EXACT
+	// mobile/Seoul/regional patterns in koreanAreaCodeRe, and the trailing
+	// two digit groups (\d{3,4} then \d{4}) must still both be present. A
+	// coincidental standalone "82" (e.g. an age "82" or a score "82점") is
+	// not followed by a valid area-code-shaped digit group at all, so it
+	// still never matches — allowing the separator here does not by itself
+	// make "82 <anything>" match; the full digit-group shape is still
+	// required.
+	koreanPhoneIntlBareRe = regexp.MustCompile(`\b82[-. ]?` + koreanAreaCodeRe + `[-. ]?\d{3,4}[-. ]?\d{4}\b`)
+
 	// bankAccountRe matches hyphen-delimited digit sequences shaped like a
 	// Korean bank account number (bank/branch code + segment + serial,
 	// commonly displayed as 3 hyphenated groups, e.g. "110-123-456789").
@@ -82,7 +138,10 @@ var (
 // PIIRedactionToken:
 //   - Korean resident registration numbers (RRN): \d{6}-\d{7}, plausibility-
 //     checked (see redactRRNIfPlausible).
-//   - Korean phone numbers (digit form only — see koreanPhoneRe).
+//   - Korean phone numbers, domestic trunk-prefix form (see koreanPhoneRe)
+//     and international country-code form — with/without "+"/"0082", and
+//     with hyphen/space/dot separators (see koreanPhoneIntlPlusRe,
+//     koreanPhoneIntl00Re, koreanPhoneIntlBareRe).
 //   - Bank-account-like hyphenated digit runs (see bankAccountRe).
 //   - OTP/auth codes: 4-8 digit runs (the same pattern MapSMS uses) that
 //     appear near an authentication keyword (see redactAuthContextDigits).
@@ -93,6 +152,11 @@ var (
 // require either a large hand-written grammar or a model/NER dependency,
 // neither of which this pass introduces.
 //
+// Scope (issue #167): only Korean (+82) country-code digit-form numbers are
+// covered. Other countries' international numbers (e.g. "+1-...") are out
+// of scope and are left untouched by these patterns — they simply don't
+// match the literal "82"/"+82"/"0082" markers required here.
+//
 // Order matters: RRN and phone patterns run before the bank-account pattern
 // so that, e.g., a phone number's "010-1234-5678" hyphenated groups are
 // already replaced with PIIRedactionToken (no longer digits) by the time the
@@ -102,6 +166,9 @@ var (
 func RedactPII(s string) string {
 	s = rrnRe.ReplaceAllStringFunc(s, redactRRNIfPlausible)
 	s = koreanPhoneRe.ReplaceAllString(s, PIIRedactionToken)
+	s = koreanPhoneIntlPlusRe.ReplaceAllString(s, PIIRedactionToken)
+	s = koreanPhoneIntl00Re.ReplaceAllString(s, PIIRedactionToken)
+	s = koreanPhoneIntlBareRe.ReplaceAllString(s, PIIRedactionToken)
 	s = bankAccountRe.ReplaceAllString(s, PIIRedactionToken)
 	s = redactAuthContextDigits(s)
 	return s

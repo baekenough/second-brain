@@ -1,6 +1,7 @@
 package smsmap_test
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 
@@ -54,6 +55,43 @@ func TestRedactPII(t *testing.T) {
 			wantRedact: true,
 		},
 
+		// --- positive: Korean phone numbers, international (+82) form (issue #167) ---
+		{
+			name:       "+82 mobile with hyphens is redacted",
+			input:      "제 번호는 +82 10-1234-5678 입니다",
+			wantRedact: true,
+		},
+		{
+			name:       "+82 mobile with all-hyphen separators is redacted",
+			input:      "제 번호는 +82-10-1234-5678 입니다",
+			wantRedact: true,
+		},
+		{
+			name:       "+82 mobile with parenthesised trunk zero is redacted",
+			input:      "제 번호는 +82 (0)10-1234-5678 입니다",
+			wantRedact: true,
+		},
+		{
+			name:       "+82 Seoul landline is redacted",
+			input:      "회사 번호는 +82 2-1234-5678 입니다",
+			wantRedact: true,
+		},
+		{
+			name:       "+82 regional landline is redacted",
+			input:      "회사 번호는 +82 31-1234-5678 입니다",
+			wantRedact: true,
+		},
+		{
+			name:       "0082 with space separators is redacted",
+			input:      "국제전화 0082 10 1234 5678 로 연락주세요",
+			wantRedact: true,
+		},
+		{
+			name:       "bare 82 country code with unbroken digits is redacted",
+			input:      "국제전화 8210 12345678 로 연락주세요",
+			wantRedact: true,
+		},
+
 		// --- positive: bank account ---
 		{
 			name:       "hyphenated bank account is redacted",
@@ -101,6 +139,23 @@ func TestRedactPII(t *testing.T) {
 			input:      "안녕하세요 오늘 회의는 3시에 시작합니다",
 			wantRedact: false,
 		},
+
+		// --- negative: issue #167 country-code false-positive guards ---
+		{
+			name:       "standalone 82 as an age is not redacted",
+			input:      "제 나이는 82 입니다",
+			wantRedact: false,
+		},
+		{
+			name:       "standalone 82 as a score is not redacted",
+			input:      "시험 점수는 82점 입니다",
+			wantRedact: false,
+		},
+		{
+			name:       "US +1 number is not swallowed by the 82 country-code pattern",
+			input:      "미국 번호는 +1 202 555 0123 입니다",
+			wantRedact: false,
+		},
 	}
 
 	for _, tc := range tests {
@@ -117,6 +172,55 @@ func TestRedactPII(t *testing.T) {
 			}
 			if !tc.wantRedact && got != tc.input {
 				t.Errorf("RedactPII(%q) = %q, want unchanged (negative case)", tc.input, got)
+			}
+		})
+	}
+}
+
+// trailingDigitGroupRe detects the leak pattern this regression guards
+// against: a redaction token immediately followed by a (possibly
+// hyphen-prefixed) digit group, i.e. the tail end of a phone number that
+// escaped full redaction because it was only partially consumed by
+// bankAccountRe (see TestRedactPII_BareCountryCodeWithSeparatorFullyRedacted).
+var trailingDigitGroupRe = regexp.MustCompile(`\[REDACTED\]-?\d`)
+
+// TestRedactPII_BareCountryCodeWithSeparatorFullyRedacted covers the
+// separator-delimited bare "82" country-code form (no leading '+' or "0082"
+// exit code), which previously fell through every koreanPhoneIntl* pattern
+// (none of which allow a separator between "82" and the area code) and was
+// then only PARTIALLY consumed by bankAccountRe, leaking the final digit
+// group (e.g. "82-10-1234-5678" -> "[REDACTED]-5678"). The whole number must
+// now be redacted in one pass with no leftover digits.
+func TestRedactPII_BareCountryCodeWithSeparatorFullyRedacted(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{name: "hyphen separators", input: "82-10-1234-5678"},
+		{name: "space separators", input: "82 10 1234 5678"},
+		{name: "dot separators", input: "82.10.1234.5678"},
+		{name: "hyphen separators in sentence", input: "국제전화 82-10-1234-5678 로 연락주세요"},
+		{name: "space separators in sentence", input: "국제전화 82 10 1234 5678 로 연락주세요"},
+		{name: "dot separators in sentence", input: "국제전화 82.10.1234.5678 로 연락주세요"},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := smsmap.RedactPII(tc.input)
+
+			if !strings.Contains(got, smsmap.PIIRedactionToken) {
+				t.Fatalf("RedactPII(%q) = %q, want redaction to occur", tc.input, got)
+			}
+			if trailingDigitGroupRe.MatchString(got) {
+				t.Errorf("RedactPII(%q) = %q, leaked a trailing digit group after the redaction token", tc.input, got)
+			}
+			if strings.ContainsAny(got, "0123456789") {
+				t.Errorf("RedactPII(%q) = %q, want no digits left over from the phone number", tc.input, got)
 			}
 		})
 	}
