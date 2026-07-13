@@ -321,6 +321,28 @@ type WhisperCollector struct {
 	httpClient *http.Client
 	baseURL    string // overridable in tests; defaults to cfg.WhisperAPIURL
 
+	// diarizeHTTPClient is a SEPARATE http.Client used only by diarizeAudio
+	// (#169). Unlike httpClient (shared by transcribeFile, where a cloud
+	// endpoint is a supported — if discouraged — operator choice, #100),
+	// diarization audio must never leave the machine (#165), so this client's
+	// Transport.DialContext performs dial-time locality verification: it
+	// resolves the host, confirms EVERY resolved address is
+	// loopback/RFC-1918/link-local, and dials ONLY that verified address
+	// (pinned — never re-resolved). This closes the gap in
+	// isLocalWhisperEndpoint, whose single-label-hostname branch trusts the
+	// host with NO resolution at all, and whose multi-label branch resolves
+	// once during the pre-flight check without pinning the transport's
+	// subsequent dial to the same address (a DNS-rebinding TOCTOU).
+	// See verifiedDialContext.
+	diarizeHTTPClient *http.Client
+
+	// diarizeResolveHost is the DNS resolution function used by
+	// verifiedDialContext. Overridable in tests to simulate DNS-rebinding
+	// scenarios (a resolver answer that differs from whatever the pre-flight
+	// isLocalWhisperEndpoint check observed). Defaults to
+	// defaultDiarizeResolveHost (net.DefaultResolver.LookupHost) when nil.
+	diarizeResolveHost func(ctx context.Context, host string) ([]string, error)
+
 	// maxFileBytes caps the per-file size accepted for transcription (0 = unlimited).
 	// Sourced from cfg.WhisperMaxFileBytes; stored here so tests can override easily.
 	maxFileBytes int64
@@ -377,30 +399,48 @@ func NewWhisperCollector(cfg *config.Config) *WhisperCollector {
 	if httpTimeout <= 0 {
 		httpTimeout = whisperDefaultHTTPTimeout
 	}
-	return &WhisperCollector{
+
+	// Security: refuse to follow HTTP redirects on every request either
+	// client makes. Without this, a compromised/misconfigured "local"
+	// whisper or diarization endpoint could 30x-redirect the request to an
+	// external host, exfiltrating raw call-audio bytes even though
+	// isLocalWhisperEndpoint approved the original (local) URL — the
+	// locality check only inspects the request URL, not where a redirect
+	// might subsequently point. Returning a plain error (rather than
+	// http.ErrUseLastResponse) makes both callers fail loudly with an
+	// explicit security reason instead of silently consuming whatever body
+	// the redirect target returned.
+	refuseRedirect := func(req *http.Request, via []*http.Request) error {
+		return fmt.Errorf("whisper: refusing to follow HTTP redirect to %q (audio exfiltration guard)", req.URL)
+	}
+
+	c := &WhisperCollector{
 		cfg: cfg,
 		httpClient: &http.Client{
-			Timeout: httpTimeout,
-			// Security: refuse to follow HTTP redirects on every request this
-			// client makes (transcribeFile AND diarizeAudio share httpClient).
-			// Without this, a compromised/misconfigured "local" whisper or
-			// diarization endpoint could 30x-redirect the request to an
-			// external host, exfiltrating raw call-audio bytes even though
-			// isLocalWhisperEndpoint approved the original (local) URL — the
-			// locality check only inspects the request URL, not where a
-			// redirect might subsequently point. Returning a plain error
-			// (rather than http.ErrUseLastResponse) makes both callers fail
-			// loudly with an explicit security reason instead of silently
-			// consuming whatever body the redirect target returned.
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return fmt.Errorf("whisper: refusing to follow HTTP redirect to %q (audio exfiltration guard)", req.URL)
-			},
+			Timeout:       httpTimeout,
+			CheckRedirect: refuseRedirect,
 		},
 		baseURL:          cfg.WhisperAPIURL,
 		maxFileBytes:     cfg.WhisperMaxFileBytes,
 		workerCount:      cfg.WhisperConcurrency,
 		failedQuarantine: make(map[string]struct{}),
 	}
+
+	// Diarization gets its OWN http.Client (#169). Its Transport's
+	// DialContext is c.verifiedDialContext, which independently verifies
+	// locality AT DIAL TIME and pins the dial to the exact address it
+	// verified — see the diarizeHTTPClient field doc and verifiedDialContext
+	// for the full rationale. transcribeFile is completely unaffected: it
+	// keeps using c.httpClient, unchanged.
+	c.diarizeHTTPClient = &http.Client{
+		Timeout:       httpTimeout,
+		CheckRedirect: refuseRedirect,
+		Transport: &http.Transport{
+			DialContext: c.verifiedDialContext,
+		},
+	}
+
+	return c
 }
 
 // concurrency returns the effective worker-pool size for transcription, clamped
@@ -476,6 +516,17 @@ func isPrivateIP(ip net.IP) bool {
 		}
 	}
 	return false
+}
+
+// isPrivateOrLinkLocalIP reports whether ip is loopback, RFC-1918, or
+// link-local (RFC 3927 IPv4 169.254.0.0/16, or IPv6 fe80::/10 and its
+// multicast counterpart). Used ONLY by verifiedDialContext, the diarization
+// dial-time verifier (#169) — it is deliberately NOT merged into isPrivateIP
+// because widening isPrivateIP would also widen isLocalWhisperEndpoint, which
+// is shared with the transcribe-path warn-only guard (#100); that guard's
+// behaviour must not change as part of this fix.
+func isPrivateOrLinkLocalIP(ip net.IP) bool {
+	return isPrivateIP(ip) || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
 }
 
 // isLocalWhisperEndpoint reports whether the given URL host resolves to a
@@ -1303,6 +1354,15 @@ func isTPhoneCallPath(path string) bool {
 // plain transcript" (see the existing diarErr handling), so refusing here
 // reuses that same degrade path with no additional plumbing required.
 //
+// This is a cheap fast-fail pre-flight only (#169): it inspects the URL
+// string and, for multi-label hostnames, does a one-off DNS lookup — it does
+// NOT protect against a single-label hostname being blindly trusted, nor
+// against the address the transport actually dials later differing from what
+// this check observed (DNS rebinding). The request below is made through
+// c.diarizeHTTPClient, whose Transport.DialContext (verifiedDialContext)
+// performs the real, dial-time defence: it re-verifies locality of every
+// resolved address and pins the dial to the exact address it verified.
+//
 // Placed once at the top of diarizeAudio (the sole call site for the
 // diarization request) so every caller is covered without needing a
 // per-call-site guard.
@@ -1342,7 +1402,9 @@ func (c *WhisperCollector) diarizeAudio(ctx context.Context, path string, audioB
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 
-	resp, err := c.httpClient.Do(req)
+	// diarizeHTTPClient (not the shared httpClient used by transcribeFile)
+	// enforces dial-time locality verification — see verifiedDialContext.
+	resp, err := c.diarizeHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("diarization http request: %w", err)
 	}
@@ -1367,6 +1429,86 @@ func (c *WhisperCollector) diarizeAudio(ctx context.Context, path string, audioB
 	}
 
 	return result.Segments, nil
+}
+
+// defaultDiarizeResolveHost is the production DNS resolver used by
+// verifiedDialContext when diarizeResolveHost is not overridden. Tests inject
+// an alternative to simulate DNS-rebinding scenarios deterministically.
+func defaultDiarizeResolveHost(ctx context.Context, host string) ([]string, error) {
+	return net.DefaultResolver.LookupHost(ctx, host)
+}
+
+// verifiedDialContext is the DialContext used by diarizeHTTPClient's
+// Transport (#169). It is the real defence-in-depth layer behind the cheap
+// isLocalWhisperEndpoint pre-flight check in diarizeAudio, and closes two
+// gaps that check leaves open:
+//
+//  1. Single-label hostnames (e.g. a Docker/compose service name) are
+//     blindly trusted as local by isLocalWhisperEndpoint with NO resolution
+//     at all. Here, a non-IP-literal host is ALWAYS resolved and every
+//     returned address is verified before any address is dialled.
+//  2. Even isLocalWhisperEndpoint's multi-label DNS-resolution branch has a
+//     classic check/dial TOCTOU (DNS rebinding): the address it looked up
+//     during the pre-flight check is never pinned to what the transport
+//     subsequently dials — a second lookup (e.g. from a malicious or
+//     misconfigured resolver) could return a different, public address.
+//     Here the dial ALWAYS targets the exact address this function just
+//     verified; it is never re-resolved.
+//
+// Algorithm:
+//  1. Split addr into host and port (addr is what net/http passes for the
+//     network connection, e.g. "diarize-host:8080").
+//  2. If host is already a numeric IP literal, verify it directly.
+//  3. Otherwise resolve host via diarizeResolveHost (net.DefaultResolver by
+//     default; injectable in tests) and verify EVERY returned address is
+//     loopback/RFC-1918/link-local. Any non-local address anywhere in the
+//     result refuses the entire dial.
+//  4. Dial ONLY the first verified address (pinned) — never the original
+//     hostname, so no further resolution can occur between verification and
+//     connection.
+//
+// On any refusal, a descriptive error is returned and no connection is
+// attempted to the untrusted address.
+func (c *WhisperCollector) verifiedDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("whisper: diarization dial: invalid address %q: %w", addr, err)
+	}
+
+	var pinnedIP string
+
+	if ip := net.ParseIP(host); ip != nil {
+		// Numeric IP literal — verify directly, no resolution needed.
+		if !isPrivateOrLinkLocalIP(ip) {
+			return nil, fmt.Errorf("whisper: diarization dial: address %q is not local — refusing dial (#169)", host)
+		}
+		pinnedIP = host
+	} else {
+		resolve := c.diarizeResolveHost
+		if resolve == nil {
+			resolve = defaultDiarizeResolveHost
+		}
+		addrs, resolveErr := resolve(ctx, host)
+		if resolveErr != nil {
+			return nil, fmt.Errorf("whisper: diarization dial: resolve %q: %w", host, resolveErr)
+		}
+		if len(addrs) == 0 {
+			return nil, fmt.Errorf("whisper: diarization dial: no addresses resolved for %q", host)
+		}
+		for _, a := range addrs {
+			ip := net.ParseIP(a)
+			if ip == nil || !isPrivateOrLinkLocalIP(ip) {
+				return nil, fmt.Errorf("whisper: diarization dial: resolved address %q for host %q is not local — refusing dial (#169 DNS-rebinding guard)", a, host)
+			}
+		}
+		// Pin the dial to the FIRST verified address. It is never re-resolved,
+		// so a later (possibly different, e.g. rebound) DNS answer can never be
+		// substituted between this check and the actual connection.
+		pinnedIP = addrs[0]
+	}
+
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	return dialer.DialContext(ctx, network, net.JoinHostPort(pinnedIP, port))
 }
 
 // whisperQuarantineDir is the subdirectory name within WhisperAudioDir where
