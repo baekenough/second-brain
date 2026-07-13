@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/baekenough/second-brain/internal/audiovalidate"
+	"github.com/baekenough/second-brain/internal/collector/smsmap"
 	"github.com/baekenough/second-brain/internal/config"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/google/uuid"
@@ -380,6 +381,20 @@ func NewWhisperCollector(cfg *config.Config) *WhisperCollector {
 		cfg: cfg,
 		httpClient: &http.Client{
 			Timeout: httpTimeout,
+			// Security: refuse to follow HTTP redirects on every request this
+			// client makes (transcribeFile AND diarizeAudio share httpClient).
+			// Without this, a compromised/misconfigured "local" whisper or
+			// diarization endpoint could 30x-redirect the request to an
+			// external host, exfiltrating raw call-audio bytes even though
+			// isLocalWhisperEndpoint approved the original (local) URL — the
+			// locality check only inspects the request URL, not where a
+			// redirect might subsequently point. Returning a plain error
+			// (rather than http.ErrUseLastResponse) makes both callers fail
+			// loudly with an explicit security reason instead of silently
+			// consuming whatever body the redirect target returned.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return fmt.Errorf("whisper: refusing to follow HTTP redirect to %q (audio exfiltration guard)", req.URL)
+			},
 		},
 		baseURL:          cfg.WhisperAPIURL,
 		maxFileBytes:     cfg.WhisperMaxFileBytes,
@@ -1008,11 +1023,42 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 		}
 	}
 
+	// PII redaction (issue #163): whisper call transcripts carry raw spoken
+	// content and previously had NO redaction at all (unlike SMS, see
+	// smsmap.MapSMS). Redaction is applied unconditionally to ALL whisper
+	// transcript content — not just TPhone call recordings — because voice
+	// memos can equally contain a spoken phone number or account number, and
+	// distinguishing "call" vs "memo" here to redact only one would leave an
+	// unprincipled gap for no real benefit. Applied to Content only:
+	// SourceID (dedup/upsert identity) and Metadata are left untouched so
+	// dedup behaviour is unaffected by redaction.
+	content = smsmap.RedactPII(content)
+
+	// Title redaction (issue #163 follow-up): item.title is the audio filename
+	// stem, and historical filenames (e.g. TPhoneCallRecords'
+	// "<number>_<timestamp>.ext") embed a raw phone number just as directly as
+	// spoken content does — so Title carries the same PII risk as Content and
+	// must go through the same RedactPII pass.
+	//
+	// RedactPII's structured-PII patterns (koreanPhoneRe, rrnRe) require a
+	// non-word character immediately after the digit run to satisfy their
+	// trailing \b boundary; in a filename stem the digit run instead directly
+	// abuts the timestamp segment's leading "_" (both are word characters),
+	// which defeats \b and would silently leave the number unredacted. Since
+	// underscores in a filename-derived title are purely a display separator
+	// (no semantic meaning worth preserving over the security property),
+	// swapping them for spaces before redaction lets the boundary-sensitive
+	// patterns match without touching the shared smsmap regexes used by other
+	// callers (SMS bodies, spoken transcript content) that don't have this
+	// adjacency problem. This only changes the Title *value* stored on the
+	// document — it does not touch the on-disk filename or SourceID.
+	title := smsmap.RedactPII(strings.ReplaceAll(item.title, "_", " "))
+
 	return model.Document{
 		ID:          uuid.New(),
 		SourceType:  model.SourceCallTranscript,
 		SourceID:    item.sourceID,
-		Title:       item.title,
+		Title:       title,
 		Content:     content,
 		Metadata:    meta,
 		OccurredAt:  &mtime,
@@ -1236,12 +1282,38 @@ func isTPhoneCallPath(path string) bool {
 
 // diarizeAudio posts the audio bytes to the diarization microservice and
 // returns the speaker segments. On any error (service unavailable, bad
-// response, empty segments) the error is returned and the caller should
-// fall back to the plain transcript.
+// response, empty segments, non-local endpoint) the error is returned and the
+// caller should fall back to the plain transcript.
 //
 // When isTPhoneCall is true the request includes num_speakers=2; otherwise
 // the field is omitted and the service auto-detects the number of speakers.
+//
+// Locality guard (#165): unlike transcribeFile's endpoint — where a non-local
+// URL is only logged as a warning once per collection cycle in CollectStream,
+// since deliberately routing whisper to a cloud API is a supported (if
+// discouraged) operator choice — DiarizationAPIURL is a SEPARATE,
+// independently-configured endpoint that receives the SAME raw call-audio
+// bytes. It had no locality check at all before this fix, so a misconfigured
+// or malicious DIARIZATION_API_URL would silently ship raw call audio off the
+// machine. This check runs first, before any audio bytes are placed in the
+// request body, and REFUSES the call outright (hard error, not a warn-and-
+// proceed) rather than mirroring the softer transcribe-endpoint behaviour —
+// audio bytes must never leave the machine for diarization. The caller
+// (buildDocument) already treats any diarizeAudio error as "fall back to the
+// plain transcript" (see the existing diarErr handling), so refusing here
+// reuses that same degrade path with no additional plumbing required.
+//
+// Placed once at the top of diarizeAudio (the sole call site for the
+// diarization request) so every caller is covered without needing a
+// per-call-site guard.
 func (c *WhisperCollector) diarizeAudio(ctx context.Context, path string, audioBytes []byte, isTPhoneCall bool) ([]diarSegment, error) {
+	if !isLocalWhisperEndpoint(c.cfg.DiarizationAPIURL) {
+		slog.Warn("whisper: diarization endpoint does not appear to be local — refusing to send call audio for diarization; falling back to plain transcript",
+			"endpoint", c.cfg.DiarizationAPIURL,
+		)
+		return nil, fmt.Errorf("diarization endpoint %q is not local; refusing to send audio (#165)", c.cfg.DiarizationAPIURL)
+	}
+
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 
