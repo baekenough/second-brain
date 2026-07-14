@@ -1,18 +1,19 @@
 ---
 name: second-brain-project-state-2026-06-06
-description: second-brain 프로젝트 2026-06-06 현재 상태 — v0.10.0 릴리즈, 로컬 Mac mini 배포 미실행
+description: second-brain 프로젝트 2026-07-13 현재 상태 — v0.22.0 릴리즈, 로컬 Mac mini 배포 미실행, recordingbackfill 미실행
 type: project
 ---
 
-## 현재 상태 (2026-06-06 v0.11.0 업데이트)
+## 현재 상태 (2026-07-13 v0.22.0 업데이트)
 
-- **최신 릴리즈**: v0.11.0 (2026-06-06) — #71 per-chunk embedding + #72 remote-file refetch retry
-- **CI**: run 27054544448 green (govulncheck / Docker-multiarch / k8s-gate)
-- **배포**: 미실행. 실 배포 대상 = 로컬 Mac mini, `docker-compose.local.yml`
-- **오픈 이슈**: 0건 (v0.11.0으로 전부 해결)
-- **코드 수정 가능 버그**: 0건 (BUG-001~008 감사 완료, v0.11.0에서 issue#8/9 TODO도 제거됨)
+- **최신 릴리즈**: v0.22.0 (2026-07-13) — #166 recordingbackfill 툴 + #167 국가코드 전화번호 redaction + #169 diarization IP-pin. 직전 v0.21.2(2026-07-13)는 PII 구조적 redaction 3건(#163~#165)
+- **CI**: green (Go 1.26.5 + pgx v5.9.2 bump 반영, commit 45cba92)
+- **배포**: 미실행. 실 배포 대상 = 로컬 Mac mini, `docker-compose.local.yml`. auto-dev.yaml deploy 단계는 placeholder-rotted (#172)
+- **recordingbackfill**: DRY_RUN 기본값 툴 존재하나 실데이터 미실행 — 사용자 수동 실행 대상
+- **오픈 이슈**: decision-needed #168(NER PoC) #170(HMAC) #171(contact_name), research #111 #112, retro #150 #162 #172 #173 — auto-dev 대상 없음
+- **코드 수정 가능 버그**: 0건 (2026-06-06 BUG-001~008 감사 이후 v0.22.0까지 deep-verify가 릴리즈 전 CRITICAL/BROKEN 5건 사전 캐치)
 
-**Why:** 2026-04-15 teardown 이후 v0.7.0~v0.10.0까지 다수 릴리즈됨. 아래 2026-04-15 snapshot은 아카이브.
+**Why:** 2026-06-06 이후 v0.12.0~v0.22.0까지 다수 릴리즈됨. 상세는 [[session-2026-07-13-v0.21-v0.22-fsd]]. 아래 2026-06-06 이전 snapshot은 아카이브.
 
 **How to apply:** 배포 착수 시 docker-compose.local.yml 사용. runbook-deploy.md의 host24/minikube는 stale — 참조 금지.
 
