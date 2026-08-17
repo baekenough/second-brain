@@ -215,6 +215,11 @@ func (s *Server) buildHandler() http.Handler {
 		if s.recordingUpserter != nil && s.recordingDir != "" {
 			r.Post("/api/v1/ingest/recording", s.ingestRecordingHandler)
 		}
+		if s.notesUpserter != nil {
+			r.Post("/api/v1/notes", s.createNoteHandler)
+			r.Post("/api/v1/notes/{id}/retry-enrichment", s.retryEnrichmentHandler)
+			r.Delete("/api/v1/notes/{id}", s.deleteNoteHandler)
+		}
 	})
 
 	return r
