@@ -87,6 +87,14 @@ type Server struct {
 	// route is registered. Set via WithCollectStatus before calling Handler().
 	collectStatus CollectionStatusProvider
 
+	// notesUpserter, notesChunks, and notesEmbedder are optional. When
+	// notesUpserter is non-nil, POST /api/v1/notes,
+	// POST /api/v1/notes/{id}/retry-enrichment, and DELETE /api/v1/notes/{id}
+	// are registered. Set via WithNotes before calling Handler().
+	notesUpserter NotesUpserter
+	notesChunks   IngestFileChunkWriter
+	notesEmbedder IngestFileEmbedder
+
 	// piiNumberHashingEnabled mirrors cfg.PIINumberHashingEnabled (issue #164
 	// policy reversal). Zero value (false) is the new default and is used by
 	// both ingestMessagesHandler (smsmap.MapSMS/MapCall) and
