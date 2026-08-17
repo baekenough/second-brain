@@ -214,11 +214,20 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 		return nil, fmt.Errorf("search store: %w", err)
 	}
 
+	// An event-time window is a hard constraint on WHICH documents may be
+	// returned, and only the document store can enforce it: ChunkSearcher takes
+	// no date range, and the rows it returns carry no occurred_at to post-filter
+	// on. Running the chunk lanes under a window would therefore reintroduce
+	// exactly the documents the window excluded — into the slots the (correctly
+	// narrowed) store result left empty. Skipping them keeps a windowed query
+	// answerable only from evidence that provably falls inside the window.
+	windowed := q.OccurredFrom != nil || q.OccurredTo != nil
+
 	// Chunk vector search: when per-chunk embeddings are available, run a
 	// chunk-level ANN search and merge its results into the candidate set via
 	// RRF. This is an ADDITIVE signal — the full-document path above always
 	// runs first, and chunk results are merged in rather than replacing it.
-	if s.chunkStore != nil && len(queryVec) > 0 {
+	if s.chunkStore != nil && len(queryVec) > 0 && !windowed {
 		chunkVecResults, cerr := s.searchChunksVector(ctx, queryVec, q.Limit)
 		if cerr != nil {
 			slog.Warn("search: chunk vector search failed, skipping",
@@ -230,7 +239,13 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 
 	// When the primary path (full-document FTS / hybrid) + chunk vector
 	// returned no results, fall back to chunk FTS.
-	if len(results) == 0 && s.chunkStore != nil {
+	//
+	// Not under a window: there, "no results" is the answer. The fallback
+	// cannot filter by date, so firing it here would turn "nothing happened
+	// today" into a list of matches from other days — silently widening the
+	// window the caller asked for, which is the one failure mode a date filter
+	// must never have.
+	if len(results) == 0 && s.chunkStore != nil && !windowed {
 		chunkResults, cerr := s.searchChunksFTS(ctx, q.Query, q.Limit)
 		if cerr != nil {
 			// Non-fatal: log and return the empty primary result set.

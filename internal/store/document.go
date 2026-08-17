@@ -417,6 +417,22 @@ func sortOrder(sort string, tableAlias string) string {
 // pg_bigm LIKE matching is added as an OR condition so that Korean queries lacking
 // morphological tsvector coverage are still retrieved via 2-gram index.
 func (s *DocumentStore) fulltextSearch(ctx context.Context, query model.SearchQuery) ([]*model.SearchResult, error) {
+	q, args := buildFulltextSearchQuery(query)
+
+	rows, err := s.pg.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("fulltext search: %w", err)
+	}
+	defer rows.Close()
+
+	return collectResults(rows, "fulltext")
+}
+
+// buildFulltextSearchQuery renders the non-vector search statement and its
+// positional arguments. Split out of fulltextSearch (which only executes it) so
+// the WHERE predicates — status, source type, and the occurred_at window — can
+// be asserted without a database, the same way buildEntityCTE is.
+func buildFulltextSearchQuery(query model.SearchQuery) (string, []interface{}) {
 	args := []interface{}{query.Query, query.Limit}
 
 	statusFilter := "AND status = 'active'"
@@ -435,6 +451,12 @@ func (s *DocumentStore) fulltextSearch(ctx context.Context, query model.SearchQu
 		excludeFilter = fmt.Sprintf("AND source_type <> ALL($%d)", len(args)+1)
 		args = append(args, query.ExcludeSourceTypes)
 	}
+
+	// Event-time window, applied in the WHERE clause for the same reason as in
+	// hybridSearch: this statement is capped by LIMIT $2, so the window has to
+	// constrain what is selected, not what is returned after selection.
+	var occurredFilter string
+	args, occurredFilter, _ = appendOccurredRangeFilters(args, query.OccurredFrom, query.OccurredTo)
 
 	// The LIKE pattern uses SQL string concatenation ('%%' || $1 || '%%') so that
 	// pg_bigm's gin_bigm_ops index is used automatically without embedding literal
@@ -455,20 +477,135 @@ func (s *DocumentStore) fulltextSearch(ctx context.Context, query model.SearchQu
 		%s
 		%s
 		%s
+		%s
 		ORDER BY %s
-		LIMIT $2`, statusFilter, sourceFilter, excludeFilter, sortOrder(query.Sort, ""))
+		LIMIT $2`, statusFilter, sourceFilter, excludeFilter, occurredFilter, sortOrder(query.Sort, ""))
 
-	rows, err := s.pg.pool.Query(ctx, q, args...)
-	if err != nil {
-		return nil, fmt.Errorf("fulltext search: %w", err)
+	return q, args
+}
+
+// appendOccurredRangeFilters binds the caller's event-time window to args and
+// returns the matching WHERE fragments in both the unqualified form (for the
+// CTEs that scan `documents` directly) and the `d.`-qualified form (for the
+// entity lane, which joins it). Both forms reference the SAME positional
+// parameters, so the two must always be produced by this one call.
+//
+// Three properties are deliberate and load-bearing:
+//
+//   - The bounds are bound as parameters, never interpolated. Every other
+//     fragment in this file is assembled with fmt.Sprintf; a timestamp spliced
+//     into the string would be an injection surface and a parse hazard.
+//   - The comparison is against occurred_at alone, not
+//     COALESCE(occurred_at, collected_at). A large share of the corpus has a
+//     NULL occurred_at, and coalescing would reinterpret "ingested during the
+//     window" as "happened during the window" — precisely the noise the window
+//     exists to remove. Rows with a NULL occurred_at are therefore excluded,
+//     which the SQL gets for free: a comparison against NULL is never true.
+//   - The window is half-open, [from, to). Consecutive windows tile without
+//     overlap and a document at exactly `to` belongs only to the next one.
+//
+// Either bound may be nil; both nil returns empty fragments and args unchanged.
+func appendOccurredRangeFilters(args []interface{}, from, to *time.Time) (newArgs []interface{}, plain, qualified string) {
+	var plainParts, qualifiedParts []string
+
+	if from != nil {
+		p := len(args) + 1
+		plainParts = append(plainParts, fmt.Sprintf("AND occurred_at >= $%d", p))
+		qualifiedParts = append(qualifiedParts, fmt.Sprintf("AND d.occurred_at >= $%d", p))
+		args = append(args, *from)
 	}
-	defer rows.Close()
+	if to != nil {
+		p := len(args) + 1
+		plainParts = append(plainParts, fmt.Sprintf("AND occurred_at < $%d", p))
+		qualifiedParts = append(qualifiedParts, fmt.Sprintf("AND d.occurred_at < $%d", p))
+		args = append(args, *to)
+	}
 
-	return collectResults(rows, "fulltext")
+	const sep = "\n\t\t\t"
+	return args, strings.Join(plainParts, sep), strings.Join(qualifiedParts, sep)
 }
 
 // hybridSearch combines full-text and vector search ranks via RRF.
 func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuery) ([]*model.SearchResult, error) {
+	w, err := s.resolveWeights(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	q, args := buildHybridSearchQuery(query, w)
+
+	rows, err := s.pg.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("hybrid search: %w", err)
+	}
+	defer rows.Close()
+
+	results, err := collectResults(rows, "hybrid")
+	if err != nil {
+		return nil, err
+	}
+	if len(results) > query.Limit {
+		results = results[:query.Limit]
+	}
+	return results, nil
+}
+
+// resolveWeights turns the caller-supplied (possibly zero) weights into the
+// effective per-lane weights, applying the two gates that need runtime state:
+// the summary-vec coverage gate (a DB query) and the entity-lane env gate.
+// Kept separate from buildHybridSearchQuery so that query construction stays a
+// pure function of (query, weights) and is testable without a database.
+//
+// The error return is currently always nil — a failing coverage query degrades
+// to "lane disabled" rather than failing the search — but is kept so a future
+// hard failure has somewhere to go.
+func (s *DocumentStore) resolveWeights(ctx context.Context, query model.SearchQuery) (model.SearchWeights, error) {
+	w := query.Weights.Defaults()
+	// Coverage gate: apply only when the caller has not explicitly set a weight
+	// and has not explicitly disabled the summary-vec lane (#63).
+	// - DisableSummaryVec=true → Defaults() already set w.SummaryVec=0.0; skip gate.
+	// - SummaryVec>0 (explicit) → caller bypasses gate; use the value as-is.
+	// - SummaryVec==0 (unset)   → apply gate: enable when corpus coverage is sufficient.
+	if !query.Weights.DisableSummaryVec && query.Weights.SummaryVec == 0 {
+		// Coverage gate: "decide based on corpus coverage".  Defaults() preserved
+		// zero, so we resolve the effective weight here.
+		//
+		// - Coverage >= threshold → enable at DefaultSummaryVecWeight (0.8).
+		// - Coverage <  threshold → disable (0.0) to prevent systematic demotion
+		//   of un-summarised documents during backfill.
+		// - Coverage query error  → disable (safe fallback; avoids bias on error).
+		coverage, coverageErr := s.SummaryCoverageRatio(ctx)
+		if coverageErr == nil && coverage >= model.SummaryVecCoverageThreshold() {
+			w.SummaryVec = model.DefaultSummaryVecWeight
+		} else {
+			w.SummaryVec = 0.0
+		}
+	}
+
+	// Entity lane gate (#139): enable when ENTITY_EXTRACTION_ENABLED env var is set.
+	// EntityWeight<0 means explicit disable by caller; zero means "auto".
+	// The lane is a no-op when entities aren't in the DB — FULL OUTER JOIN is safe.
+	if w.EntityWeight == 0 {
+		if entityExtractionEnabled() {
+			w.EntityWeight = model.DefaultEntityWeight
+		}
+		// else: leave 0 — entity CTE contributes 0 to RRF score (no-op).
+	} else if w.EntityWeight < 0 {
+		w.EntityWeight = 0 // explicit disable
+	}
+
+	return w, nil
+}
+
+// buildHybridSearchQuery renders the five-lane RRF statement and its positional
+// arguments for the given query and already-resolved weights.
+//
+// Split out of hybridSearch so every lane's WHERE predicates are assertable
+// without a database. That matters most for filters that constrain the
+// candidate pool: each lane is capped by LIMIT $3, so a filter missing from one
+// lane does not merely widen that lane — it lets out-of-scope documents consume
+// candidate slots and push in-scope documents out of the fused result entirely.
+func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (string, []interface{}) {
 	args := []interface{}{
 		query.Query,
 		pgvector.NewVector(query.Embedding),
@@ -504,6 +641,15 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		args = append(args, query.ExcludeSourceTypes)
 	}
 
+	// Event-time window. Like the source filters, this constrains the candidate
+	// pool INSIDE every lane rather than reordering the fused result: each lane
+	// is capped by LIMIT $3, so an out-of-window document that reaches a lane
+	// consumes a candidate slot an in-window document needed. Sorting by
+	// recency (sortOrder) cannot substitute — it only permutes what the lanes
+	// already selected.
+	var occurredFilter, entityOccurredFilter string
+	args, occurredFilter, entityOccurredFilter = appendOccurredRangeFilters(args, query.OccurredFrom, query.OccurredTo)
+
 	// RRF formula: w / (k + rank), where w is the per-signal weight and k
 	// prevents very high scores for top-ranked results (standard k=60).
 	// Four CTEs (fts, vec, bigm, summvec) are merged via FULL OUTER JOIN.
@@ -517,48 +663,9 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 	// Weight parameters are injected as Go-formatted literals (not SQL params)
 	// because they are floats under our control, never from user input.
 	//
-	// Coverage gate (#63): SummaryVec is disabled when summary_embedding coverage
-	// is below the configured threshold (default 80%).  Without the gate, the
-	// +26.7% score ceiling for summarised documents causes systematic ranking
-	// bias during backfill — un-summarised documents are demoted even when they
-	// are more content-relevant.  Once the corpus reaches the threshold the
-	// weight activates automatically via the cached ratio (TTL 60 s).
-	// Callers may force-enable by setting query.Weights.SummaryVec explicitly.
-	w := query.Weights.Defaults()
-	// Coverage gate: apply only when the caller has not explicitly set a weight
-	// and has not explicitly disabled the summary-vec lane (#63).
-	// - DisableSummaryVec=true → Defaults() already set w.SummaryVec=0.0; skip gate.
-	// - SummaryVec>0 (explicit) → caller bypasses gate; use the value as-is.
-	// - SummaryVec==0 (unset)   → apply gate: enable when corpus coverage is sufficient.
-	if !query.Weights.DisableSummaryVec && query.Weights.SummaryVec == 0 {
-		// Coverage gate: "decide based on corpus coverage".  Defaults() preserved
-		// zero, so we resolve the effective weight here.
-		//
-		// - Coverage >= threshold → enable at DefaultSummaryVecWeight (0.8).
-		// - Coverage <  threshold → disable (0.0) to prevent systematic demotion
-		//   of un-summarised documents during backfill.
-		// - Coverage query error  → disable (safe fallback; avoids bias on error).
-		coverage, coverageErr := s.SummaryCoverageRatio(ctx)
-		if coverageErr == nil && coverage >= model.SummaryVecCoverageThreshold() {
-			w.SummaryVec = model.DefaultSummaryVecWeight
-		} else {
-			w.SummaryVec = 0.0
-		}
-	}
-
-	// Entity lane gate (#139): enable when ENTITY_EXTRACTION_ENABLED env var is set.
-	// EntityWeight<0 means explicit disable by caller; zero means "auto".
-	// The lane is a no-op when entities aren't in the DB — FULL OUTER JOIN is safe.
-	entityEnabled := entityExtractionEnabled()
-	if w.EntityWeight == 0 {
-		if entityEnabled {
-			w.EntityWeight = model.DefaultEntityWeight
-		}
-		// else: leave 0 — entity CTE contributes 0 to RRF score (no-op).
-	} else if w.EntityWeight < 0 {
-		w.EntityWeight = 0 // explicit disable
-	}
-
+	// Coverage gate (#63) and entity gate (#139) are resolved by resolveWeights
+	// before this function is called; w is the effective per-lane weighting.
+	//
 	// Build a normalised entity query: lower-cased, whitespace-trimmed tokens
 	// joined by OR for the entity name LIKE match. This enables partial-name
 	// matching (e.g. "홍길동" matches entity with normalized_name='홍길동').
@@ -575,7 +682,7 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 	// disabled (weight=0), we use a trivially-empty CTE to avoid syntax errors.
 	entityCTE := emptyEntityCTE
 	if w.EntityWeight > 0 {
-		entityCTE = buildEntityCTE(entityFilterParam, entityStatusFilter, entitySourceFilter, entityExcludeFilter)
+		entityCTE = buildEntityCTE(entityFilterParam, entityStatusFilter, entitySourceFilter, entityExcludeFilter, entityOccurredFilter)
 	}
 
 	q := fmt.Sprintf(`
@@ -591,6 +698,7 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 			%s
 			%s
 			%s
+			%s
 			LIMIT $3
 		),
 		vec AS (
@@ -598,6 +706,7 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
 			FROM documents
 			WHERE embedding IS NOT NULL
+			%s
 			%s
 			%s
 			%s
@@ -616,6 +725,7 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 			%s
 			%s
 			%s
+			%s
 			LIMIT $3
 		),
 		summvec AS (
@@ -623,6 +733,7 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
 			FROM documents
 			WHERE summary_embedding IS NOT NULL
+			%s
 			%s
 			%s
 			%s
@@ -647,28 +758,15 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		JOIN documents d ON d.id = rrf.id
 		ORDER BY %s
 		LIMIT $3`,
-		statusFilter, sourceFilter, excludeFilter,
-		statusFilter, sourceFilter, excludeFilter,
-		statusFilter, sourceFilter, excludeFilter,
-		statusFilter, sourceFilter, excludeFilter,
-		entityCTE,
+		statusFilter, sourceFilter, excludeFilter, occurredFilter, // fts
+		statusFilter, sourceFilter, excludeFilter, occurredFilter, // vec
+		statusFilter, sourceFilter, excludeFilter, occurredFilter, // bigm
+		statusFilter, sourceFilter, excludeFilter, occurredFilter, // summvec
+		entityCTE, // entity lane carries the same filters in d.-qualified form
 		buildRRFScoreExpr(w),
 		sortOrder(query.Sort, "d"))
 
-	rows, err := s.pg.pool.Query(ctx, q, args...)
-	if err != nil {
-		return nil, fmt.Errorf("hybrid search: %w", err)
-	}
-	defer rows.Close()
-
-	results, err := collectResults(rows, "hybrid")
-	if err != nil {
-		return nil, err
-	}
-	if len(results) > query.Limit {
-		results = results[:query.Limit]
-	}
-	return results, nil
+	return q, args
 }
 
 // buildRRFScoreExpr renders the weighted-sum SQL expression that fuses the
@@ -721,7 +819,7 @@ const emptyEntityCTE = `entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank
 // the lane's previous unfiltered form let soft-deleted and excluded documents
 // (including insights) into results whenever they were reachable by entity
 // name alone, and nothing in the test suite could observe it.
-func buildEntityCTE(entityFilterParam, statusFilter, sourceFilter, excludeFilter string) string {
+func buildEntityCTE(entityFilterParam, statusFilter, sourceFilter, excludeFilter, occurredRangeFilter string) string {
 	return fmt.Sprintf(`entity AS (
 			SELECT de.document_id AS id,
 			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
@@ -732,9 +830,10 @@ func buildEntityCTE(entityFilterParam, statusFilter, sourceFilter, excludeFilter
 			%s
 			%s
 			%s
+			%s
 			GROUP BY de.document_id
 			LIMIT $3
-		)`, entityFilterParam, statusFilter, sourceFilter, excludeFilter)
+		)`, entityFilterParam, statusFilter, sourceFilter, excludeFilter, occurredRangeFilter)
 }
 
 // entityExtractionEnabled reports whether entity extraction has been enabled

@@ -23,7 +23,7 @@ import (
 func TestBuildEntityCTE_AppliesAllFilters(t *testing.T) {
 	t.Parallel()
 
-	got := buildEntityCTE("$4", "AND d.status = 'active'", "AND d.source_type = $5", "AND d.source_type <> ALL($6)")
+	got := buildEntityCTE("$4", "AND d.status = 'active'", "AND d.source_type = $5", "AND d.source_type <> ALL($6)", "")
 
 	fragments := []struct {
 		name string
@@ -50,7 +50,7 @@ func TestBuildEntityCTE_AppliesAllFilters(t *testing.T) {
 func TestBuildEntityCTE_FiltersPrecedeTheLimit(t *testing.T) {
 	t.Parallel()
 
-	got := buildEntityCTE("$4", "AND d.status = 'active'", "", "AND d.source_type <> ALL($5)")
+	got := buildEntityCTE("$4", "AND d.status = 'active'", "", "AND d.source_type <> ALL($5)", "")
 
 	limitAt := strings.Index(got, "LIMIT $3")
 	if limitAt < 0 {
@@ -68,7 +68,7 @@ func TestBuildEntityCTE_FiltersPrecedeTheLimit(t *testing.T) {
 func TestBuildEntityCTE_IncludeDeleted_OmitsStatusFilter(t *testing.T) {
 	t.Parallel()
 
-	got := buildEntityCTE("$4", "", "", "")
+	got := buildEntityCTE("$4", "", "", "", "")
 	if strings.Contains(got, "status") {
 		t.Errorf("entity CTE applied a status filter when none was requested:\n%s", got)
 	}
