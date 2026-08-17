@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/baekenough/second-brain/internal/intent"
 	"github.com/baekenough/second-brain/internal/llm"
@@ -87,17 +88,28 @@ type fakeAskLLM struct {
 
 	streamCalls   int
 	completeCalls int
+
+	// gotSystemPrompt / gotMessages record the last synthesis call's
+	// arguments so tests can assert on buildAskSystemPrompt's injected-now
+	// output and buildAskMessages' occurred_at rendering without duplicating
+	// synthesize's plumbing (date-context fix, ask.go askSystemPrompt).
+	gotSystemPrompt string
+	gotMessages     []llm.Message
 }
 
 func (f *fakeAskLLM) Enabled() bool { return f.enabled }
 
-func (f *fakeAskLLM) CompleteWithMessages(_ context.Context, _ string, _ []llm.Message) (string, error) {
+func (f *fakeAskLLM) CompleteWithMessages(_ context.Context, systemPrompt string, messages []llm.Message) (string, error) {
 	f.completeCalls++
+	f.gotSystemPrompt = systemPrompt
+	f.gotMessages = messages
 	return f.completeResp, f.completeErr
 }
 
-func (f *fakeAskLLM) StreamWithMessages(ctx context.Context, _ string, _ []llm.Message, onDelta func(string)) error {
+func (f *fakeAskLLM) StreamWithMessages(ctx context.Context, systemPrompt string, messages []llm.Message, onDelta func(string)) error {
 	f.streamCalls++
+	f.gotSystemPrompt = systemPrompt
+	f.gotMessages = messages
 	if f.streamErr != nil {
 		return f.streamErr
 	}
@@ -137,6 +149,17 @@ func newAskTestServer(searcher documentSearcher, classifier intent.Classifier, l
 	svc := search.NewService(searcher, askDisabledEmbedder{})
 	srv := NewServer(nil, svc, nil, nil, llmClient, "", "test-key")
 	srv.intentClassifier = classifier
+	return srv
+}
+
+// newAskTestServerWithNow is newAskTestServer plus an injected clock,
+// mirroring intent.SetNow's role for LLMClassifier: it lets tests pin
+// buildAskSystemPrompt's "current time" instead of depending on the real
+// clock (date-context fix — see ask.go's askSystemPrompt doc comment for
+// the production bug this covers).
+func newAskTestServerWithNow(searcher documentSearcher, classifier intent.Classifier, llmClient llm.Completer, now func() time.Time) *Server {
+	srv := newAskTestServer(searcher, classifier, llmClient)
+	srv.now = now
 	return srv
 }
 
@@ -441,4 +464,118 @@ func mapKeys(m map[string]json.RawMessage) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+// --- date-context fix tests (issue: "내일 일정" produced "현재 시점을 알 수 없다") ---
+
+// TestBuildAskSystemPrompt_IncludesInjectedNowDateAndWeekday asserts the
+// system prompt is no longer a compile-time constant blind to "now" — it
+// must render the injected current date, its Korean weekday, and an
+// explicit instruction to resolve relative expressions ("내일" etc.)
+// against that date.
+func TestBuildAskSystemPrompt_IncludesInjectedNowDateAndWeekday(t *testing.T) {
+	t.Parallel()
+	// 2026-08-18 03:00 UTC == 2026-08-18 12:00 KST (Tuesday/화).
+	now := time.Date(2026, 8, 18, 3, 0, 0, 0, time.UTC)
+
+	prompt := buildAskSystemPrompt(now)
+
+	if !strings.Contains(prompt, "2026-08-18") {
+		t.Errorf("prompt = %q, want it to contain the injected current date 2026-08-18", prompt)
+	}
+	if !strings.Contains(prompt, "화") {
+		t.Errorf("prompt = %q, want it to contain the Korean weekday 화 for 2026-08-18", prompt)
+	}
+	if !strings.Contains(prompt, "내일") {
+		t.Errorf("prompt = %q, want an instruction referencing relative date terms like 내일", prompt)
+	}
+}
+
+// TestBuildAskSystemPrompt_ConvertsToKST_NotServerLocal pins a UTC instant
+// whose calendar date differs from its KST calendar date (2026-08-17 20:00
+// UTC == 2026-08-18 05:00 KST) — the prompt must show the KST date, proving
+// the conversion is explicit and not dependent on the server's local
+// timezone (which may be UTC in a container).
+func TestBuildAskSystemPrompt_ConvertsToKST_NotServerLocal(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 17, 20, 0, 0, 0, time.UTC)
+
+	prompt := buildAskSystemPrompt(now)
+
+	if !strings.Contains(prompt, "2026-08-18") {
+		t.Errorf("prompt = %q, want the KST date 2026-08-18 (not the UTC date 2026-08-17)", prompt)
+	}
+	if strings.Contains(prompt, "2026-08-17") {
+		t.Errorf("prompt = %q, must not contain the UTC calendar date 2026-08-17", prompt)
+	}
+}
+
+// TestAskHandler_SystemPromptReflectsInjectedNow is the end-to-end version:
+// it drives the full askHandler and asserts the system prompt actually
+// passed to the LLM client (not just buildAskSystemPrompt in isolation)
+// reflects the Server's injected clock.
+func TestAskHandler_SystemPromptReflectsInjectedNow(t *testing.T) {
+	t.Parallel()
+	searcher := &fixedDocSearcher{observed: []*model.SearchResult{docResult(model.SourceSMS, "문서")}}
+	fakeLLM := &fakeAskLLM{enabled: true, chunks: []string{"답"}}
+	fixedNow := time.Date(2026, 8, 18, 3, 0, 0, 0, time.UTC) // 2026-08-18 12:00 KST
+	srv := newAskTestServerWithNow(searcher, &fakeIntentClassifier{}, fakeLLM, func() time.Time { return fixedNow })
+
+	rr := doAskRequest(t, srv, nil, map[string]any{"question": "내일 일정 알려줘"}, "Bearer test-key")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(fakeLLM.gotSystemPrompt, "2026-08-18") {
+		t.Errorf("system prompt = %q, want it to contain the injected current date 2026-08-18", fakeLLM.gotSystemPrompt)
+	}
+}
+
+// TestBuildAskMessages_IncludesOccurredAt asserts each document context
+// line carries its occurred_at timestamp (converted to KST) so the model
+// can reason about when the document's content actually happened, not just
+// what it says.
+func TestBuildAskMessages_IncludesOccurredAt(t *testing.T) {
+	t.Parallel()
+	occurred := time.Date(2026, 6, 21, 5, 30, 0, 0, time.UTC) // 2026-06-21 14:30 KST
+	doc := model.Document{ID: uuid.New(), SourceType: model.SourceSMS, Title: "문자", Content: "내용", OccurredAt: &occurred}
+	result := RetrievalResult{Observed: []*model.SearchResult{{Document: doc, Score: 0.9}}}
+
+	messages := buildAskMessages("질문", result)
+
+	if len(messages) == 0 {
+		t.Fatal("buildAskMessages returned no messages")
+	}
+	contextMsg := messages[0].Content
+	if !strings.Contains(contextMsg, "2026-06-21") || !strings.Contains(contextMsg, "14:30") {
+		t.Errorf("context message = %q, want it to contain occurred_at converted to KST (2026-06-21 14:30)", contextMsg)
+	}
+}
+
+// TestBuildAskMessages_NilOccurredAt_NoPanicAndLabelled covers the
+// llm-memory-source case where OccurredAt is always null: buildAskMessages
+// must not panic on a nil *time.Time, and should render an explicit
+// "no timestamp" label rather than silently omitting the field (so the
+// model doesn't misinterpret absence as "same day as now").
+func TestBuildAskMessages_NilOccurredAt_NoPanicAndLabelled(t *testing.T) {
+	t.Parallel()
+	doc := model.Document{ID: uuid.New(), SourceType: model.SourceInsight, Title: "메모", Content: "내용", OccurredAt: nil}
+	result := RetrievalResult{Observed: []*model.SearchResult{{Document: doc, Score: 0.9}}}
+
+	var messages []llm.Message
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("buildAskMessages panicked on nil OccurredAt: %v", r)
+			}
+		}()
+		messages = buildAskMessages("질문", result)
+	}()
+
+	if len(messages) == 0 {
+		t.Fatal("buildAskMessages returned no messages")
+	}
+	if !strings.Contains(messages[0].Content, "시각 정보 없음") {
+		t.Errorf("context message = %q, want a null-occurred_at placeholder (\"시각 정보 없음\")", messages[0].Content)
+	}
 }

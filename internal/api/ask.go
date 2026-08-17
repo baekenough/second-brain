@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/baekenough/second-brain/internal/intent"
 	"github.com/baekenough/second-brain/internal/llm"
@@ -52,18 +53,81 @@ type askErrorPayload struct {
 	Message string `json:"message"`
 }
 
-// askSystemPrompt instructs the model to answer strictly from the supplied
-// context, degrade to "모른다" when the context is insufficient, and never
-// present [추론] (insight) content as established fact — the echo-chamber
-// guard from spec §3.2/§6.5 extends into the synthesized answer itself, not
-// just the retrieval layer (search.applyInsightExclusionDefault).
-const askSystemPrompt = `당신은 사용자의 개인 지식 베이스에서 검색된 문서를 근거로 질문에 답하는 어시스턴트입니다.
+// kstLocation is the timezone used to render every date/time shown to the
+// model in the Stage 3 prompt: the current-date line in
+// buildAskSystemPrompt and each document's occurred_at in buildAskMessages.
+// Second Brain's users and ingested data are Korea-based, so dates are
+// always rendered in Asia/Seoul rather than the server process's local
+// timezone (which may be UTC in a container) — otherwise a request served
+// near local midnight could show the model the wrong calendar date and
+// reintroduce the exact bug this file fixes.
+//
+// time.LoadLocation reads the OS tzdata database; the production image
+// (Dockerfile's runtime-base stage) installs the tzdata package for exactly
+// this reason. The time.FixedZone fallback below only matters for an
+// environment without a tzdata database (e.g. a minimal test sandbox) —
+// Korea observes no DST, so a fixed UTC+9 offset is equivalent to the IANA
+// zone at every point in time, not just an approximation.
+var kstLocation = loadKSTLocation()
+
+func loadKSTLocation() *time.Location {
+	loc, err := time.LoadLocation("Asia/Seoul")
+	if err != nil {
+		return time.FixedZone("KST", 9*60*60)
+	}
+	return loc
+}
+
+// koreanWeekdayNames is indexed by time.Weekday (Sunday=0 ... Saturday=6).
+var koreanWeekdayNames = [...]string{"일", "월", "화", "수", "목", "금", "토"}
+
+// formatKoreanDateTime renders t (already converted to the desired
+// location by the caller) as "YYYY-MM-DD(요일) HH:MM".
+func formatKoreanDateTime(t time.Time) string {
+	return fmt.Sprintf("%04d-%02d-%02d(%s) %02d:%02d",
+		t.Year(), int(t.Month()), t.Day(), koreanWeekdayNames[t.Weekday()], t.Hour(), t.Minute())
+}
+
+// formatOccurredAt renders a document's OccurredAt in KST, or an explicit
+// "no timestamp" label when nil. nil is common and expected: every
+// llm-memory-source document has OccurredAt == nil (see
+// internal/model/document.go's field comment), so this must not panic and
+// must not silently omit the field — an omitted field could read to the
+// model as "same day as now" rather than "unknown".
+func formatOccurredAt(t *time.Time) string {
+	if t == nil {
+		return "시각 정보 없음"
+	}
+	return formatKoreanDateTime(t.In(kstLocation))
+}
+
+// askSystemPromptTemplate is buildAskSystemPrompt's format string. It
+// instructs the model to answer strictly from the supplied context,
+// degrade to "모른다" when the context is insufficient, and never present
+// [추론] (insight) content as established fact — the echo-chamber guard
+// from spec §3.2/§6.5 extends into the synthesized answer itself, not just
+// the retrieval layer (search.applyInsightExclusionDefault). %s is the
+// current date/time rendered by buildAskSystemPrompt.
+const askSystemPromptTemplate = `당신은 사용자의 개인 지식 베이스에서 검색된 문서를 근거로 질문에 답하는 어시스턴트입니다.
+
+현재 시각: %s (KST, 한국 표준시) 기준입니다.
 
 규칙:
 1. 반드시 아래 제공된 [관측된 사실] 및 [추론] 섹션의 내용에만 근거해 답변하세요. 컨텍스트 밖의 지식을 사용하지 마세요.
 2. 컨텍스트만으로 답할 수 없으면 솔직하게 "제공된 정보로는 답변할 수 없습니다"라고 답하세요. 추측해서 답하지 마세요.
 3. [추론] 섹션은 AI가 문서에서 도출한 가설이며 확정된 사실이 아닙니다. 이 섹션의 내용을 인용할 때는 반드시 "~로 추정됩니다" 등 가설임을 밝히세요. 사실인 것처럼 단정하지 마세요.
-4. 한국어로, 간결하고 명확하게 답변하세요.`
+4. "내일", "어제", "지난주", "이번 달" 등 상대적인 시간 표현이 질문이나 문서 내용에 등장하면, 반드시 위의 현재 시각을 기준으로 날짜를 계산해 해석하세요. 각 문서 하단의 [발생] 시각도 이 기준으로 판단하세요. 현재 시각을 알 수 없다는 이유로 답변을 회피하지 마세요.
+5. 한국어로, 간결하고 명확하게 답변하세요.`
+
+// buildAskSystemPrompt renders askSystemPromptTemplate with now converted
+// to KST. now is normally s.nowFunc() (real time.Now, or an injected clock
+// in tests) — see Server.now's doc comment for why this exists: the prior
+// compile-time askSystemPrompt const gave the model no way to know "today",
+// so it could not resolve "내일"/"어제" and answered that it didn't know
+// what day it was.
+func buildAskSystemPrompt(now time.Time) string {
+	return fmt.Sprintf(askSystemPromptTemplate, formatKoreanDateTime(now.In(kstLocation)))
+}
 
 // writeSSEEvent writes one "event: <name>\ndata: <json>\n\n" frame and
 // flushes immediately so the client sees it without buffering. Returns an
@@ -199,9 +263,10 @@ func (s *Server) synthesize(ctx context.Context, w http.ResponseWriter, flusher 
 	}
 
 	messages := buildAskMessages(question, result)
+	systemPrompt := buildAskSystemPrompt(s.nowFunc())
 
 	if sc, ok := s.llmClient.(llm.StreamCompleter); ok {
-		err := sc.StreamWithMessages(ctx, askSystemPrompt, messages, func(delta string) {
+		err := sc.StreamWithMessages(ctx, systemPrompt, messages, func(delta string) {
 			_ = writeSSEEvent(w, flusher, "token", askTokenPayload{Text: delta})
 		})
 		if err != nil {
@@ -219,7 +284,7 @@ func (s *Server) synthesize(ctx context.Context, w http.ResponseWriter, flusher 
 	// Fallback for a Completer that does not implement StreamCompleter
 	// (e.g. a test fake, or a future non-streaming-only backend): emit the
 	// full answer as a single "token" event.
-	answer, err := s.llmClient.CompleteWithMessages(ctx, askSystemPrompt, messages)
+	answer, err := s.llmClient.CompleteWithMessages(ctx, systemPrompt, messages)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			slog.Info("ask: client disconnected during synthesis", "error", err)
@@ -236,7 +301,11 @@ func (s *Server) synthesize(ctx context.Context, w http.ResponseWriter, flusher 
 // buildAskMessages assembles the multi-turn prompt for Stage 3: a
 // [관측된 사실] section built from result.Observed, an optional
 // [추론 — 가설이며 사실로 인용 불가] section built from result.Inferred, and the
-// user's raw question as the final turn.
+// user's raw question as the final turn. Each document line includes its
+// occurred_at (formatOccurredAt, KST, "시각 정보 없음" when nil) so the model
+// can reason about when the document's content happened, not just what it
+// says — the second half of the date-context fix (see buildAskSystemPrompt
+// for the first half, "what day is today").
 func buildAskMessages(question string, result RetrievalResult) []llm.Message {
 	var b strings.Builder
 	b.WriteString("[관측된 사실]\n")
@@ -244,12 +313,12 @@ func buildAskMessages(question string, result RetrievalResult) []llm.Message {
 		b.WriteString("(없음)\n")
 	}
 	for _, r := range result.Observed {
-		fmt.Fprintf(&b, "- (%s) %s: %s\n", r.Document.SourceType, r.Document.Title, r.Document.Content)
+		fmt.Fprintf(&b, "- (%s) %s [발생: %s]: %s\n", r.Document.SourceType, r.Document.Title, formatOccurredAt(r.Document.OccurredAt), r.Document.Content)
 	}
 	if len(result.Inferred) > 0 {
 		b.WriteString("\n[추론 — 가설이며 사실로 인용 불가]\n")
 		for _, r := range result.Inferred {
-			fmt.Fprintf(&b, "- (%s) %s: %s\n", r.Document.SourceType, r.Document.Title, r.Document.Content)
+			fmt.Fprintf(&b, "- (%s) %s [발생: %s]: %s\n", r.Document.SourceType, r.Document.Title, formatOccurredAt(r.Document.OccurredAt), r.Document.Content)
 		}
 	}
 
