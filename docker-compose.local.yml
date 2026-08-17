@@ -87,8 +87,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      ollama:
-        condition: service_started
     volumes:
       - ${LLM_MEMORY_DB_HOST_PATH:-/Users/user/workspace/llm-memory/data/memory.sqlite}:/data/llm-memory.sqlite:ro
       - ${GMAIL_HOST_PATH:-/Users/user/workspace/private/secretary/gmail}:/data/gmail:ro
@@ -101,7 +99,10 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
-  # ollama — 로컬 LLM 서버 (내부 포트 11434).
+  # ollama — 로컬 LLM 서버 (내부 포트 11434). 기본적으로 기동되지 않는다.
+  #   기본 LLM 백엔드는 원격 API(DeepSeek, LLM_API_URL=https://api.deepseek.com/v1)이며,
+  #   Go 코드베이스 어디에도 ollama 를 참조하는 곳이 없다 (레거시 잔재).
+  #   완전히 opt-in 서비스로만 유지한다: `docker compose --profile local-inference up -d`.
   #   gemma3:12b-it-qat 모델을 사용한다. macOS arm64 CPU 전용 (느림).
   #   모델 파일은 named volume ollama_models 에 영속된다.
   #   첫 기동 후: docker exec second-brain-ollama ollama pull gemma3:12b-it-qat
@@ -109,6 +110,7 @@ services:
   ollama:
     image: ollama/ollama:latest
     container_name: second-brain-ollama
+    profiles: ["local-inference"]
     volumes:
       - ollama_models:/root/.ollama
     restart: unless-stopped
