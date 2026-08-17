@@ -75,8 +75,9 @@ flowchart LR
     PG["PostgreSQL 16\n+ pgvector\n+ pg_bigm"]
     LLM["LLM / Ollama\n(curation + HyDE\n+ entity extract)"]
     OpenAI["OpenAI Embeddings\ntext-embedding-3-small\n1536 dim"]
-    Whisper["Whisper\nASR :8000"]
-    Diarization["diarization\nspeaker sep :8001"]
+    OpenAIWhisper["OpenAI\ngpt-4o-transcribe-diarize\ntranscribe + diarize (default)"]
+    Whisper["whisper (opt-in)\nlocal-inference profile\nASR :8000"]
+    Diarization["diarization (opt-in)\nlocal-inference profile\nspeaker sep :8001"]
     Sources["Collection Sources\nFilesystem / Slack / GitHub\nSMS / Calls / Recordings\nGmail / Calendar / llm-memory"]
 
     Agent -->|REST /api/v1| Server
@@ -87,18 +88,21 @@ flowchart LR
     Collector -->|SQL + pgvector| PG
     Collector -->|POST /embeddings| OpenAI
     Collector -->|collect| Sources
-    Collector -->|audio files| Whisper
-    Collector -->|diarize| Diarization
+    Collector -->|audio transcription| OpenAIWhisper
+    Collector -.->|opt-in local fallback| Whisper
+    Collector -.->|opt-in local fallback| Diarization
     EvalRunner -->|eval query| PG
     EvalRunner -->|regression webhook| LLM
 
     class Server,Collector focal;
     class PG data;
-    class LLM,OpenAI,Whisper,Diarization,Sources ext;
+    class LLM,OpenAI,OpenAIWhisper,Sources ext;
+    class Whisper,Diarization muted;
     class Agent,MCP,EvalRunner muted;
 ```
 
 ![System Runtime Topology](docs/diagrams/01-system-runtime-topology.png)
+> The PNG above renders an older topology where whisper/diarization were always-on services. The mermaid source above the PNG is authoritative (whisper/diarization are now opt-in under the `local-inference` profile; the default transcription path is the OpenAI cloud API).
 
 The server (API) and collector are separate binaries. Each collector runs on a configurable per-source `COLLECT_INTERVAL`. Collected text is split by a rune-based chunker, then embedded and stored in a `pgvector` column. Production runs on **Mac mini docker-compose** (`docker-compose.local.yml`); `deploy/k8s/` is the future Kubernetes target.
 
@@ -112,8 +116,8 @@ The server (API) and collector are separate binaries. Each collector runs on a c
 | second-brain eval (nightly eval) | `second-brain-eval:local` | golang:alpine → alpine | — |
 | postgres | `second-brain-postgres:local` | pgvector/pgvector:pg16 + pg_bigm | — |
 | ollama | `ollama/ollama:latest` | — | — |
-| whisper | `fedirz/faster-whisper-server:latest-cpu` | faster-whisper (int8 CPU) | — |
-| diarization | `second-brain-diarization:local` | pyannote.audio | — |
+| whisper (`local-inference` profile, opt-in) | `fedirz/faster-whisper-server:latest-cpu` | faster-whisper (int8 CPU) | — |
+| diarization (`local-inference` profile, opt-in) | `second-brain-diarization:local` | pyannote.audio | — |
 | web | `second-brain-web:local` | node:alpine (Next.js standalone) | 10001 |
 
 ---
@@ -371,8 +375,12 @@ Key environment variables based on `internal/config/config.go`.
 | `GITHUB_TOKEN` | — | GitHub Personal Access Token |
 | `GITHUB_ORG` | — | GitHub organization name |
 | `GDRIVE_CREDENTIALS_JSON` | — | Google ADC JSON path |
-| `DIARIZATION_API_URL` | — | pyannote.audio speaker diarization server URL |
-| `DIARIZATION_ENABLED` | `false` | Enable speaker diarization |
+| `DIARIZATION_API_URL` | — | (legacy local-only) pyannote.audio speaker diarization server URL — unused by the default cloud transcription path |
+| `DIARIZATION_ENABLED` | `false` | (legacy local-only) selects the local pyannote diarization service — the cloud transcription model always includes diarization regardless of this flag |
+| `WHISPER_API_URL` | `https://api.openai.com/v1` | Transcription API endpoint (default: OpenAI cloud) |
+| `WHISPER_API_KEY` | — | OpenAI API key. Required — empty disables transcription |
+| `WHISPER_MODEL` | `gpt-4o-transcribe-diarize` | Combined transcription + speaker diarization model |
+| `WHISPER_CHUNKING_STRATEGY` | `auto` | Required to receive speaker diarization segments |
 | `ENTITY_EXTRACTION_ENABLED` | `false` | Enable entity extraction |
 
 > When both `EMBEDDING_API_KEY` and `CLIPROXY_AUTH_FILE` are set, `CLIPROXY_AUTH_FILE` takes precedence.
@@ -387,7 +395,7 @@ Key environment variables based on `internal/config/config.go`.
 | slack | `SLACK_BOT_TOKEN` set | Complete | Public channels only; DMs automatically excluded |
 | github | `GITHUB_TOKEN` + `GITHUB_ORG` set | Complete | Issues + PRs |
 | sms / call | Android app + server URL/token configured | Fully operational | Galaxy Z Flip6 live-tested. App: [`mobile/second-brain-push/`](mobile/second-brain-push/README.md) |
-| recording | Same as above + Whisper server | Fully operational | Whisper ASR → text transcription |
+| recording | Same as above + `WHISPER_API_KEY` | Fully operational | OpenAI gpt-4o-transcribe-diarize (cloud) → text transcription + speaker diarization |
 | secretary | `SECRETARY_DB_HOST_PATH` mounted | Fully operational | secretary SQLite read-only mount |
 | gmail | `/data/gmail` mounted | Fully operational | Gmail export via secretary |
 | calendar | `/data/calendar` mounted | Fully operational | Calendar export via secretary |

@@ -75,8 +75,9 @@ flowchart LR
     PG["PostgreSQL 16\n+ pgvector\n+ pg_bigm"]
     LLM["LLM / Ollama\n(curation + HyDE\n+ entity extract)"]
     OpenAI["OpenAI Embeddings\ntext-embedding-3-small\n1536 dim"]
-    Whisper["Whisper\n음성인식 :8000"]
-    Diarization["diarization\n화자분리 :8001"]
+    OpenAIWhisper["OpenAI\ngpt-4o-transcribe-diarize\n전사 + 화자분리 (기본)"]
+    Whisper["whisper (opt-in)\nlocal-inference profile\n음성인식 :8000"]
+    Diarization["diarization (opt-in)\nlocal-inference profile\n화자분리 :8001"]
     Sources["수집 소스\nFilesystem / Slack / GitHub\nSMS·통화·녹음 / Gmail\nCalendar / llm-memory"]
 
     Agent -->|REST /api/v1| Server
@@ -87,18 +88,21 @@ flowchart LR
     Collector -->|SQL + pgvector| PG
     Collector -->|POST /embeddings| OpenAI
     Collector -->|수집| Sources
-    Collector -->|음성 파일| Whisper
-    Collector -->|화자 분리| Diarization
+    Collector -->|음성 파일 전사| OpenAIWhisper
+    Collector -.->|opt-in 로컬 폴백| Whisper
+    Collector -.->|opt-in 로컬 폴백| Diarization
     EvalRunner -->|eval query| PG
     EvalRunner -->|회귀 웹훅| LLM
 
     class Server,Collector focal;
     class PG data;
-    class LLM,OpenAI,Whisper,Diarization,Sources ext;
+    class LLM,OpenAI,OpenAIWhisper,Sources ext;
+    class Whisper,Diarization muted;
     class Agent,MCP,EvalRunner muted;
 ```
 
 ![System Runtime Topology](docs/diagrams/01-system-runtime-topology.png)
+> 위 PNG는 whisper/diarization을 항상 기동되는 서비스로 그린 구 토폴로지 렌더링입니다. 최신 상태는 PNG 위의 mermaid 소스를 기준으로 합니다 (whisper/diarization은 `local-inference` profile opt-in, 기본 전사 경로는 OpenAI 클라우드).
 
 서버(API)와 수집기(Collector)는 독립된 바이너리로 분리되어 있습니다. 수집기는 소스별 `COLLECT_INTERVAL`로 실행되며, 수집된 텍스트는 rune 기반 chunker로 분할 후 임베딩되어 `pgvector` 컬럼에 저장됩니다. 프로덕션은 **Mac mini docker-compose** (`docker-compose.local.yml`) 기반이며 `deploy/k8s/`는 향후 Kubernetes 전환용입니다.
 
@@ -112,8 +116,8 @@ flowchart LR
 | second-brain eval (nightly eval) | `second-brain-eval:local` | golang:alpine → alpine | — |
 | postgres | `second-brain-postgres:local` | pgvector/pgvector:pg16 + pg_bigm | — |
 | ollama | `ollama/ollama:latest` | — | — |
-| whisper | `fedirz/faster-whisper-server:latest-cpu` | faster-whisper (int8 CPU) | — |
-| diarization | `second-brain-diarization:local` | pyannote.audio | — |
+| whisper (`local-inference` profile, opt-in) | `fedirz/faster-whisper-server:latest-cpu` | faster-whisper (int8 CPU) | — |
+| diarization (`local-inference` profile, opt-in) | `second-brain-diarization:local` | pyannote.audio | — |
 | web | `second-brain-web:local` | node:alpine (Next.js standalone) | 10001 |
 
 ---
@@ -373,8 +377,12 @@ Android second-brain-push 앱이 SMS·통화 기록을 JSON 배치로 전송합�
 | `GITHUB_TOKEN` | — | GitHub Personal Access Token |
 | `GITHUB_ORG` | — | GitHub 조직명 |
 | `GDRIVE_CREDENTIALS_JSON` | — | Google ADC JSON 경로 |
-| `DIARIZATION_API_URL` | — | pyannote.audio 화자 분리 서버 URL |
-| `DIARIZATION_ENABLED` | `false` | 화자 분리 활성화 |
+| `DIARIZATION_API_URL` | — | (레거시 로컬 전용) pyannote.audio 화자 분리 서버 URL — 기본 클라우드 전사 경로는 사용하지 않음 |
+| `DIARIZATION_ENABLED` | `false` | (레거시 로컬 전용) 로컬 pyannote 화자 분리 셀렉터 — 클라우드 화자 분리는 항상 내장되어 무관 |
+| `WHISPER_API_URL` | `https://api.openai.com/v1` | 전사 API 엔드포인트 (기본: OpenAI 클라우드) |
+| `WHISPER_API_KEY` | — | OpenAI API 키. 필수 — 비어있으면 전사 비활성화 |
+| `WHISPER_MODEL` | `gpt-4o-transcribe-diarize` | 전사 + 화자 분리 통합 모델 |
+| `WHISPER_CHUNKING_STRATEGY` | `auto` | 화자 분리 세그먼트를 받기 위해 필수 |
 | `ENTITY_EXTRACTION_ENABLED` | `false` | 엔티티 추출 활성화 |
 
 > `EMBEDDING_API_KEY`와 `CLIPROXY_AUTH_FILE`이 모두 설정된 경우 `CLIPROXY_AUTH_FILE`이 우선합니다.
@@ -389,7 +397,7 @@ Android second-brain-push 앱이 SMS·통화 기록을 JSON 배치로 전송합�
 | slack | `SLACK_BOT_TOKEN` 설정 | 구현 완료 | public_channel만, DM 자동 제외 |
 | github | `GITHUB_TOKEN` + `GITHUB_ORG` 설정 | 구현 완료 | Issues + PR 수집 |
 | sms / call | Android 앱 설치 + 서버 URL/토큰 설정 | 완전 동작 | Galaxy Z Flip6 실기 검증. 앱: [`mobile/second-brain-push/`](mobile/second-brain-push/README.md) |
-| recording (통화 녹음) | 위와 동일 + Whisper 서버 | 완전 동작 | Whisper ASR → 텍스트 변환 후 저장 |
+| recording (통화 녹음) | 위와 동일 + `WHISPER_API_KEY` | 완전 동작 | OpenAI gpt-4o-transcribe-diarize (클라우드) → 텍스트 변환 + 화자 분리 후 저장 |
 | secretary | `SECRETARY_DB_HOST_PATH` 마운트 | 완전 동작 | secretary SQLite ro 마운트 |
 | gmail | `/data/gmail` 마운트 | 완전 동작 | secretary 연동 Gmail 익스포트 |
 | calendar | `/data/calendar` 마운트 | 완전 동작 | secretary 연동 Calendar 익스포트 |

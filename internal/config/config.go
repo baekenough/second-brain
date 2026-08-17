@@ -151,22 +151,53 @@ type Config struct {
 	// WHISPER_API_KEY: OpenAI (or compatible) API key
 	// WHISPER_API_URL: base URL (default: "https://api.openai.com/v1")
 	// WHISPER_AUDIO_DIR: directory containing audio files to transcribe
-	// WHISPER_MODEL: model identifier (default: "whisper-1")
+	// WHISPER_MODEL: model identifier (default: "gpt-4o-transcribe-diarize" —
+	// OpenAI's combined transcription + speaker-diarization model, which
+	// performs transcription AND diarization in a single API call; see
+	// collector.modelSupportsNativeDiarization). This reverses the local-only
+	// whisper.cpp default that predated the #100 policy exception below — a
+	// local whisper.cpp deployment must now set WHISPER_MODEL=whisper-1 (or
+	// similar) explicitly.
 	// WHISPER_LANGUAGE: BCP-47 language hint (default: "ko")
 	// WHISPER_MAX_FILE_BYTES: per-file size cap (bytes, int64, default: 100 MiB).
 	// Set 0 to disable the cap entirely (no limit). Invalid values use the default.
+	// This is a LOCAL disk/network-usage guard, distinct from the fixed 25 MiB
+	// hard limit OpenAI's hosted API enforces server-side (whisperCloudMaxFileBytes
+	// in collector/whisper.go, applied only when the resolved endpoint is
+	// non-local; not configurable, since it reflects a third-party constraint,
+	// not an operational preference).
 	// WHISPER_HTTP_TIMEOUT: per-request HTTP timeout for transcription calls
 	// (Go duration string, default: "2h"). Raise for long audio files that exceed
 	// the previous hardcoded 10-minute limit. Invalid values use the 2h default.
 	// A zero duration (e.g. "0") falls back to the 2h default so a misconfigured
 	// value never produces an infinite (zero) timeout.
-	WhisperAPIKey       string
-	WhisperAPIURL       string
-	WhisperAudioDir     string
-	WhisperModel        string
-	WhisperLanguage     string
-	WhisperMaxFileBytes int64
-	WhisperHTTPTimeout  time.Duration
+	// WHISPER_CHUNKING_STRATEGY: value sent as the chunking_strategy multipart
+	// field, ONLY when the resolved model supports native diarization (default:
+	// "auto"). Sent UNCONDITIONALLY of DIARIZATION_ENABLED for such models — see
+	// DiarizationEnabled doc comment below for why. Required by the live
+	// gpt-4o-transcribe-diarize API for the response to contain a "segments"
+	// array at all: verified against the real API — omitting it yields a
+	// text-only response and the model degenerates into repeating text. Set to
+	// the empty string to omit the field entirely (escape hatch for future API
+	// changes; not recommended for the default native-diarize model).
+	// WHISPER_CLOUD_ALLOWED: set "true" to acknowledge that call/recording audio
+	// is intentionally sent to a non-local (cloud) transcription endpoint. This
+	// is the policy-exception flag for issue #100, which originally mandated
+	// call transcription stay on a local whisper.cpp server — a mandate this
+	// collector's cloud-by-default configuration deliberately reverses. Setting
+	// this to true only changes the log level of the cloud-endpoint guard in
+	// WhisperCollector.CollectStream (Info instead of Warn); it never blocks or
+	// gates the request — the request is sent regardless either way. Default
+	// false.
+	WhisperAPIKey           string
+	WhisperAPIURL           string
+	WhisperAudioDir         string
+	WhisperModel            string
+	WhisperLanguage         string
+	WhisperMaxFileBytes     int64
+	WhisperHTTPTimeout      time.Duration
+	WhisperChunkingStrategy string
+	WhisperCloudAllowed     bool
 	// WhisperConcurrency is the number of audio files transcribed in parallel by
 	// the whisper collector. Sourced from WHISPER_CONCURRENCY (default 1, clamped
 	// to >= 1). Values >1 enable 2-node load balancing across whisper backends
@@ -184,6 +215,18 @@ type Config struct {
 	// The collector POSTs audio bytes to {DIARIZATION_API_URL}/diarize and
 	// receives speaker-segment JSON. When empty, diarization is disabled even
 	// if DIARIZATION_ENABLED=true.
+	//
+	// IMPORTANT: this flag does NOT gate diarization for a native-diarizing
+	// model (WhisperModel containing "diarize", e.g. the default
+	// gpt-4o-transcribe-diarize) — those models ALWAYS request and use
+	// diarized_json output, unconditionally of this flag. Whether call audio
+	// leaves the machine is decided entirely by WHISPER_API_URL + WHISPER_MODEL,
+	// not by DIARIZATION_ENABLED; gating native diarization on this flag would
+	// mean paying the full cloud-transcription cost while silently discarding
+	// the speaker labels the model already computed as part of that same
+	// request — full privacy cost, zero benefit, and no error to surface it.
+	// DiarizationEnabled retains its original meaning ONLY for the legacy local
+	// pyannote path (non-native model + DiarizationAPIURL).
 	DiarizationEnabled bool   // DIARIZATION_ENABLED — default false
 	DiarizationAPIURL  string // DIARIZATION_API_URL — default ""
 
@@ -460,14 +503,16 @@ func Load() (*Config, error) {
 		SMSSourceDir:    os.Getenv("SMS_SOURCE_DIR"),
 		SMSMaxFileBytes: smsMaxFileBytes(),
 
-		WhisperAPIKey:       os.Getenv("WHISPER_API_KEY"),
-		WhisperAPIURL:       getenv("WHISPER_API_URL", "https://api.openai.com/v1"),
-		WhisperAudioDir:     os.Getenv("WHISPER_AUDIO_DIR"),
-		WhisperModel:        getenv("WHISPER_MODEL", "whisper-1"),
-		WhisperLanguage:     getenv("WHISPER_LANGUAGE", "ko"),
-		WhisperMaxFileBytes: whisperMaxFileBytes(),
-		WhisperHTTPTimeout:  whisperHTTPTimeout(),
-		WhisperConcurrency:  whisperConcurrency(),
+		WhisperAPIKey:           os.Getenv("WHISPER_API_KEY"),
+		WhisperAPIURL:           getenv("WHISPER_API_URL", "https://api.openai.com/v1"),
+		WhisperAudioDir:         os.Getenv("WHISPER_AUDIO_DIR"),
+		WhisperModel:            getenv("WHISPER_MODEL", "gpt-4o-transcribe-diarize"),
+		WhisperLanguage:         getenv("WHISPER_LANGUAGE", "ko"),
+		WhisperMaxFileBytes:     whisperMaxFileBytes(),
+		WhisperHTTPTimeout:      whisperHTTPTimeout(),
+		WhisperChunkingStrategy: getenv("WHISPER_CHUNKING_STRATEGY", "auto"),
+		WhisperCloudAllowed:     os.Getenv("WHISPER_CLOUD_ALLOWED") == "true",
+		WhisperConcurrency:      whisperConcurrency(),
 
 		DiarizationEnabled: os.Getenv("DIARIZATION_ENABLED") == "true",
 		DiarizationAPIURL:  os.Getenv("DIARIZATION_API_URL"),
