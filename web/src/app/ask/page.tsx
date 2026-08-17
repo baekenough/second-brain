@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState, Suspense } from "react";
 import { useRouter, useSearchParams, usePathname } from "next/navigation";
 import { splitSSEBuffer, parseAskEvent } from "@/lib/sseEvents";
 import { listConversations, getConversation } from "@/lib/api";
-import type { AskSourceItem, AskConversationSummary } from "@/lib/types";
+import type { AskSourceItem, AskConversationSummary, AskLayer } from "@/lib/types";
 import { getAskLayer, ASK_LAYER_LABELS } from "@/lib/constants";
 import { Button } from "@/components/ui";
 import { MarkdownContent } from "@/app/documents/[id]/MarkdownContent";
@@ -31,6 +31,11 @@ interface Turn {
 // without a noticeably laggy typing effect.
 const STREAM_FLUSH_INTERVAL_MS = 80;
 
+// Render order for the evidence layers (spec §5.2, §7.2): the user's own
+// notes first, then everything observed/collected, then LLM-derived
+// inferences last (kept visually and positionally distinct).
+const ASK_LAYER_ORDER: AskLayer[] = ["note", "observed", "insight"];
+
 function SourceCard({ source }: { source: AskSourceItem }) {
   const layer = getAskLayer(source.source_type);
   const isInsight = layer === "insight";
@@ -50,6 +55,61 @@ function SourceCard({ source }: { source: AskSourceItem }) {
   );
 }
 
+/** Collapsible group of source cards for a single evidence layer within one
+ * answer turn. Collapsed by default (spec follow-up: evidence cards were
+ * crowding the screen) — the caller owns the open/closed state so it can be
+ * tracked per turn instead of globally. */
+function SourceLayerGroup({
+  layer,
+  sources,
+  open,
+  onToggle,
+}: {
+  layer: AskLayer;
+  sources: AskSourceItem[];
+  open: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div className="rounded-md border border-border">
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={open}
+        className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-xs font-medium text-foreground-muted transition-colors hover:text-foreground"
+      >
+        <span className="flex items-center gap-1.5">
+          <span>{ASK_LAYER_LABELS[layer]}</span>
+          <span className="rounded-full bg-surface-subtle px-1.5 py-0.5 text-[10px] text-foreground-subtle">
+            {sources.length}
+          </span>
+        </span>
+        <svg
+          viewBox="0 0 20 20"
+          fill="currentColor"
+          aria-hidden="true"
+          className={`h-3.5 w-3.5 shrink-0 text-foreground-subtle transition-transform duration-200 ${
+            open ? "rotate-180" : ""
+          }`}
+        >
+          <path
+            fillRule="evenodd"
+            d="M5.23 7.21a.75.75 0 0 1 1.06.02L10 11.168l3.71-3.938a.75.75 0 1 1 1.08 1.04l-4.25 4.5a.75.75 0 0 1-1.08 0l-4.25-4.5a.75.75 0 0 1 .02-1.06Z"
+            clipRule="evenodd"
+          />
+        </svg>
+      </button>
+      {open && (
+        <div className="flex flex-wrap gap-1.5 border-t border-border px-3 py-2">
+          {sources.map((s) => (
+            <SourceCard key={s.id} source={s} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function UserBubble({ question }: { question: string }) {
   return (
     <div className="flex justify-end">
@@ -60,8 +120,22 @@ function UserBubble({ question }: { question: string }) {
   );
 }
 
-function AssistantBubble({ turn }: { turn: Turn }) {
+function AssistantBubble({
+  turn,
+  isLayerOpen,
+  onToggleLayer,
+}: {
+  turn: Turn;
+  isLayerOpen: (layer: AskLayer) => boolean;
+  onToggleLayer: (layer: AskLayer) => void;
+}) {
   const showTyping = turn.streaming && !turn.answer;
+
+  const sourcesByLayer = ASK_LAYER_ORDER.map((layer) => ({
+    layer,
+    sources: turn.sources.filter((s) => getAskLayer(s.source_type) === layer),
+  })).filter((group) => group.sources.length > 0);
+
   return (
     <div className="flex justify-start">
       <div className="max-w-[90%] space-y-2">
@@ -79,10 +153,16 @@ function AssistantBubble({ turn }: { turn: Turn }) {
           )}
           {turn.error && <p className="text-sm text-danger">{turn.error}</p>}
         </div>
-        {turn.sources.length > 0 && (
-          <div className="flex flex-wrap gap-1.5">
-            {turn.sources.map((s) => (
-              <SourceCard key={s.id} source={s} />
+        {sourcesByLayer.length > 0 && (
+          <div className="space-y-1.5">
+            {sourcesByLayer.map(({ layer, sources }) => (
+              <SourceLayerGroup
+                key={layer}
+                layer={layer}
+                sources={sources}
+                open={isLayerOpen(layer)}
+                onToggle={() => onToggleLayer(layer)}
+              />
             ))}
           </div>
         )}
@@ -142,6 +222,20 @@ function AskPageInner() {
   const [conversations, setConversations] = useState<AskConversationSummary[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [restoring, setRestoring] = useState(false);
+  // Evidence-layer collapse state, keyed per turn so opening one turn's
+  // "관찰 데이터" group never affects any other turn. Absence of a key means
+  // collapsed — cards start hidden (spec follow-up: they crowded the screen).
+  const [openLayers, setOpenLayers] = useState<Record<string, boolean>>({});
+
+  const isLayerOpen = useCallback(
+    (turnIndex: number, layer: AskLayer) => openLayers[`${turnIndex}:${layer}`] ?? false,
+    [openLayers],
+  );
+
+  const toggleLayer = useCallback((turnIndex: number, layer: AskLayer) => {
+    const key = `${turnIndex}:${layer}`;
+    setOpenLayers((prev) => ({ ...prev, [key]: !prev[key] }));
+  }, []);
 
   const bufferRef = useRef("");
   const pendingTextRef = useRef("");
@@ -390,7 +484,11 @@ function AskPageInner() {
           {turns.map((turn) => (
             <div key={turn.turnIndex} className="space-y-3">
               <UserBubble question={turn.question} />
-              <AssistantBubble turn={turn} />
+              <AssistantBubble
+                turn={turn}
+                isLayerOpen={(layer) => isLayerOpen(turn.turnIndex, layer)}
+                onToggleLayer={(layer) => toggleLayer(turn.turnIndex, layer)}
+              />
             </div>
           ))}
           <div ref={scrollEndRef} />
