@@ -581,6 +581,32 @@ type extractionWireResponse struct {
 //
 // Fallback path: if Decode still fails (e.g. leading prose before the JSON
 // object), retry against the substring from the first '{' to the last '}'.
+// llmResponseShape classifies a completion into one of a fixed set of
+// content-free labels, for logging in place of the response itself.
+//
+// It returns only values drawn from the closed vocabulary below, so no part of
+// the model's output — which may contain personal data — can reach the logs
+// through it (issue #194). "empty" is the label for the failure this was built
+// for: a reasoning model that spends its whole max_tokens budget on
+// reasoning_content and returns zero visible characters.
+func llmResponseShape(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	switch {
+	case trimmed == "":
+		return "empty"
+	case strings.HasPrefix(trimmed, "```"):
+		return "fenced-block"
+	case strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}"):
+		return "json-object"
+	case strings.HasPrefix(trimmed, "{"):
+		return "json-object-unterminated"
+	case strings.HasPrefix(trimmed, "["):
+		return "json-array"
+	default:
+		return "non-json-text"
+	}
+}
+
 func parseRelationActionResponse(raw string) (*ExtractionResult, error) {
 	trimmed := strings.TrimSpace(raw)
 	if strings.HasPrefix(trimmed, "```") {
@@ -598,11 +624,16 @@ func parseRelationActionResponse(raw string) (*ExtractionResult, error) {
 		}
 	}
 	if err != nil {
-		truncated := raw
-		if len(truncated) > 200 {
-			truncated = truncated[:200] + "...[truncated]"
-		}
-		slog.Warn("extraction: failed to parse LLM JSON", "error", err, "response", truncated)
+		// The raw completion is NEVER logged: extraction runs over messages,
+		// call transcripts and mail, so a response prefix routinely carries
+		// real names, phone numbers and e-mail addresses (issue #194). A
+		// length plus a content-free shape fingerprint is enough to tell the
+		// three failure modes apart (empty completion, cut-off JSON, prose).
+		slog.Warn("extraction: failed to parse LLM JSON",
+			"error", err,
+			"response_len", len(raw),
+			"response_shape", llmResponseShape(raw),
+		)
 		return nil, fmt.Errorf("parse extraction response: %w", err)
 	}
 
