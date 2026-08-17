@@ -13,10 +13,11 @@
 #   eval       — Eval runner (no port, no healthcheck)
 #   mcp        — MCP server (port 8090)
 #
-# NOTE: go.mod declares `go 1.26.4` with `toolchain go1.26.4`. The builder
-# image uses golang:1.26-alpine so the bundled toolchain matches the module
-# requirement exactly — no runtime download is needed and the build works in
-# air-gapped / GOTOOLCHAIN=local environments.
+# NOTE: go.mod declares `go 1.26.6`. The builder image uses golang:1.26-alpine
+# (floating minor tag) so it always resolves to a bundled toolchain that meets
+# or exceeds the module requirement — no runtime download is needed and the
+# build works in air-gapped / GOTOOLCHAIN=local environments. Re-check this
+# comment whenever go.mod's `go` directive is bumped.
 #
 # NOTE (poppler / OCR — Phase 2, implemented):
 #   The collector shells out to pdftotext / pdfinfo (poppler-utils),
