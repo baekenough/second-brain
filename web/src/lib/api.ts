@@ -1,5 +1,6 @@
 import type {
   BaselineStats,
+  CreateNoteResponse,
   DocumentDetail,
   DocumentsResponse,
   RecentItemsResponse,
@@ -134,4 +135,26 @@ export async function getBaselineStats(): Promise<BaselineStats> {
 
 export async function getSources(): Promise<SourcesResponse> {
   return fetchJson<SourcesResponse>(`${getApiBase()}/sources`);
+}
+
+// ── Notes (Capture) ──────────────────────────────────────────────────────
+
+export async function createNote(content: string, title = ""): Promise<CreateNoteResponse> {
+  return fetchJson<CreateNoteResponse>(`${getApiBase()}/notes`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title, content }),
+  });
+}
+
+export async function retryNoteEnrichment(id: string): Promise<void> {
+  await fetchJson<unknown>(`${getApiBase()}/notes/${encodeURIComponent(id)}/retry-enrichment`, {
+    method: "POST",
+  });
+}
+
+export async function deleteNote(id: string): Promise<void> {
+  await fetchJson<unknown>(`${getApiBase()}/notes/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
 }
