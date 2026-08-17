@@ -36,7 +36,13 @@ import (
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
+	"github.com/baekenough/second-brain/internal/telemetry"
 )
+
+// otelShutdownTimeout bounds how long the deferred telemetry shutdown may
+// block process exit. A dead/unreachable Langfuse collector must never
+// delay shutdown — see internal/telemetry's non-blocking guarantee.
+const otelShutdownTimeout = 5 * time.Second
 
 // errRegression is returned by run() when a metric regression is detected.
 // main() maps this to os.Exit(1) so that deferred cleanup runs normally.
@@ -118,6 +124,25 @@ func run() error {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	// --- Telemetry (OpenTelemetry → Langfuse, OTLP/HTTP) ---
+	// A no-op TracerProvider is configured when cfg.LangfuseOTLPEndpoint is
+	// empty (the default) — zero behavior change until an operator sets
+	// LANGFUSE_OTLP_ENDPOINT/LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY. eval
+	// only calls the embedding engine (via search.NewEmbeddingEngine below)
+	// — the NDCG/MRR Score-API push described in the plan's Task 4 is
+	// explicitly out of scope for this change.
+	otelShutdown, err := telemetry.InitOTel(ctx, cfg.LangfuseOTLPEndpoint, cfg.LangfusePublicKey, cfg.LangfuseSecretKey)
+	if err != nil {
+		return fmt.Errorf("telemetry: %w", err)
+	}
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), otelShutdownTimeout)
+		defer shutdownCancel()
+		if err := otelShutdown(shutdownCtx); err != nil {
+			slog.Warn("telemetry: shutdown error (spans may have been dropped)", "error", err)
+		}
+	}()
 
 	// --- Database ---
 	pg, err := store.NewPostgres(ctx, cfg.DatabaseURL)

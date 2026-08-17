@@ -22,9 +22,15 @@ import (
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/setup"
 	"github.com/baekenough/second-brain/internal/store"
+	"github.com/baekenough/second-brain/internal/telemetry"
 	"github.com/baekenough/second-brain/internal/worker"
 	"github.com/joho/godotenv"
 )
+
+// otelShutdownTimeout bounds how long the deferred telemetry shutdown may
+// block process exit. A dead/unreachable Langfuse collector must never
+// delay shutdown — see internal/telemetry's non-blocking guarantee.
+const otelShutdownTimeout = 5 * time.Second
 
 // extractionMaxDetachedWriteDuration bounds how long ExtractionWorker's
 // detached persist+bookkeeping write phases can keep running after the
@@ -79,6 +85,22 @@ func run() error {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	// --- Telemetry (OpenTelemetry → Langfuse, OTLP/HTTP) ---
+	// A no-op TracerProvider is configured when cfg.LangfuseOTLPEndpoint is
+	// empty (the default) — zero behavior change until an operator sets
+	// LANGFUSE_OTLP_ENDPOINT/LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY.
+	otelShutdown, err := telemetry.InitOTel(ctx, cfg.LangfuseOTLPEndpoint, cfg.LangfusePublicKey, cfg.LangfuseSecretKey)
+	if err != nil {
+		return fmt.Errorf("telemetry: %w", err)
+	}
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), otelShutdownTimeout)
+		defer shutdownCancel()
+		if err := otelShutdown(shutdownCtx); err != nil {
+			slog.Warn("telemetry: shutdown error (spans may have been dropped)", "error", err)
+		}
+	}()
 
 	// --- Database ---
 	pg, err := store.NewPostgres(ctx, cfg.DatabaseURL)
