@@ -126,12 +126,40 @@ export interface AskSourceItem {
   score: number;
 }
 
-/** Parsed, typed form of the four /api/v1/ask SSE event types (spec §5.1). */
+/** Parsed, typed form of the five /api/v1/ask SSE event types (spec §5.1).
+ * "conversation" is always the first event of a stream — see
+ * internal/api/ask_conversations.go's askConversationPayload doc comment. */
 export type AskStreamEvent =
+  | { type: "conversation"; conversation_id: string; turn_index: number }
   | { type: "sources"; sources: AskSourceItem[] }
   | { type: "token"; text: string }
   | { type: "done"; finish_reason: "stop" | "error" | "no_evidence" }
   | { type: "error"; message: string };
+
+/** One element of GET /api/ask/conversations (backend:
+ * askConversationSummary, internal/api/ask_conversations.go) — the latest
+ * turn of a conversation, used to render the recent-conversations list. */
+export interface AskConversationSummary {
+  conversation_id: string;
+  turn_index: number;
+  question: string;
+  answer: string;
+  finish_reason: "stop" | "error" | "no_evidence";
+  created_at: string;
+}
+
+/** One element of GET /api/ask/conversations/{id} (backend:
+ * askConversationTurn, internal/api/ask_conversations.go) — a full turn
+ * including its sources, used to restore a conversation after a refresh. */
+export interface AskConversationTurn {
+  id: string;
+  turn_index: number;
+  question: string;
+  answer: string;
+  finish_reason: "stop" | "error" | "no_evidence";
+  sources: AskSourceItem[];
+  created_at: string;
+}
 
 /** Which of the three Ask-answer lanes (spec §5.2, §7.2) a source belongs to. */
 export type AskLayer = "note" | "observed" | "insight";

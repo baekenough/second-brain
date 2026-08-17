@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { splitSSEBuffer, parseAskEvent } from "./sseEvents";
 
+const CONVERSATION_EVENT =
+  'event: conversation\ndata: {"conversation_id":"c1","turn_index":0}\n\n';
 const SOURCES_EVENT =
   'event: sources\ndata: {"sources":[{"id":"a","title":"t","source_type":"sms","score":0.8}]}\n\n';
 const TOKEN_EVENT = 'event: token\ndata: {"text":"hello "}\n\n';
@@ -20,6 +22,11 @@ describe("splitSSEBuffer", () => {
     expect(events.map((e) => e.event)).toEqual(["sources", "token", "done"]);
   });
 
+  it("parses a conversation event ahead of the others", () => {
+    const { events } = splitSSEBuffer(CONVERSATION_EVENT + SOURCES_EVENT);
+    expect(events.map((e) => e.event)).toEqual(["conversation", "sources"]);
+  });
+
   it("holds back an incomplete trailing event across chunk boundaries", () => {
     // Simulates fetch's ReadableStream splitting mid-event — a byte
     // boundary that lands inside the DONE_EVENT, not at its edge.
@@ -37,6 +44,15 @@ describe("splitSSEBuffer", () => {
 });
 
 describe("parseAskEvent", () => {
+  it("parses a conversation event", () => {
+    const [raw] = splitSSEBuffer(CONVERSATION_EVENT).events;
+    expect(parseAskEvent(raw!)).toEqual({
+      type: "conversation",
+      conversation_id: "c1",
+      turn_index: 0,
+    });
+  });
+
   it("parses a sources event", () => {
     // Non-null assertion is safe: the "parses a single complete event" test
     // above already establishes that a well-formed event produces exactly

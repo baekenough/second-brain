@@ -1,4 +1,6 @@
 import type {
+  AskConversationSummary,
+  AskConversationTurn,
   BaselineStats,
   CreateNoteResponse,
   DocumentDetail,
@@ -163,6 +165,27 @@ export async function deleteNote(id: string): Promise<void> {
   await fetchJson<unknown>(`${getApiBase()}/notes/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
+}
+
+// ── Ask (conversations) ──────────────────────────────────────────────────
+//
+// Both helpers are client-only: they hit /api/ask/conversations[/:id], the
+// session-protected proxy pair (web/src/app/api/ask/conversations/*), not
+// the backend's /api/v1/ask/conversations directly. getApiBase()'s server
+// branch would prepend /api/v1, which does not exist under this proxy —
+// these are only ever called from "use client" components (the /ask page).
+
+export async function listConversations(limit = 20): Promise<AskConversationSummary[]> {
+  const res = await fetchJson<AskConversationSummary[]>(
+    `${getApiBase()}/ask/conversations?limit=${limit}`,
+  );
+  return res ?? [];
+}
+
+export async function getConversation(id: string): Promise<AskConversationTurn[]> {
+  return fetchJson<AskConversationTurn[]>(
+    `${getApiBase()}/ask/conversations/${encodeURIComponent(id)}`,
+  );
 }
 
 // ── File upload (Capture) ────────────────────────────────────────────────
