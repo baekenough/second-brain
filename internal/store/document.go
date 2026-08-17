@@ -10,11 +10,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/baekenough/second-brain/internal/model"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/pgvector/pgvector-go"
-	"github.com/baekenough/second-brain/internal/model"
 )
 
 // summaryCoverageCache is a process-level cache for SummaryCoverageRatio results.
@@ -65,11 +65,11 @@ const callTranscriptDupCheckQuery = `
 // Change detection uses a WITH CTE that captures the pre-update content in the
 // same MVCC snapshot as the INSERT … ON CONFLICT statement, then compares it
 // against the incoming value in RETURNING. This avoids two PostgreSQL pitfalls:
-//   1. EXCLUDED cannot be referenced in the RETURNING clause (only valid inside
-//      ON CONFLICT DO UPDATE SET/WHERE).
-//   2. `documents.col` in RETURNING reflects the post-update value, so a naive
-//      `documents.content IS DISTINCT FROM EXCLUDED.content` would always be
-//      false after the UPDATE overwrites the column.
+//  1. EXCLUDED cannot be referenced in the RETURNING clause (only valid inside
+//     ON CONFLICT DO UPDATE SET/WHERE).
+//  2. `documents.col` in RETURNING reflects the post-update value, so a naive
+//     `documents.content IS DISTINCT FROM EXCLUDED.content` would always be
+//     false after the UPDATE overwrites the column.
 //
 // *DocumentStore satisfies the api.IngestMessagesUpserter interface via this method.
 func (s *DocumentStore) UpsertTracked(ctx context.Context, doc *model.Document) (contentChanged bool, err error) {
@@ -475,20 +475,32 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		query.Limit * 2, // fetch more candidates before RRF merge
 	}
 
-	statusFilter := "AND status = 'active'"
+	// Each filter is built twice: once unqualified for the four CTEs that scan
+	// `documents` directly, and once qualified for the entity CTE, which joins
+	// `documents` rather than scanning it. Same positional parameters, same
+	// semantics — only the column prefix differs. Keeping the pairs adjacent is
+	// deliberate: the entity lane previously applied NONE of these filters and
+	// the outer join re-applied nothing, so a document reachable only through
+	// the entity lane bypassed both the soft-delete filter and every source
+	// type exclusion, insight documents included.
+	statusFilter, entityStatusFilter := "AND status = 'active'", "AND d.status = 'active'"
 	if query.IncludeDeleted {
-		statusFilter = ""
+		statusFilter, entityStatusFilter = "", ""
 	}
 
-	sourceFilter := ""
+	sourceFilter, entitySourceFilter := "", ""
 	if query.SourceType != nil {
-		sourceFilter = fmt.Sprintf("AND source_type = $%d", len(args)+1)
+		p := len(args) + 1
+		sourceFilter = fmt.Sprintf("AND source_type = $%d", p)
+		entitySourceFilter = fmt.Sprintf("AND d.source_type = $%d", p)
 		args = append(args, *query.SourceType)
 	}
 
-	excludeFilter := ""
+	excludeFilter, entityExcludeFilter := "", ""
 	if len(query.ExcludeSourceTypes) > 0 {
-		excludeFilter = fmt.Sprintf("AND source_type <> ALL($%d)", len(args)+1)
+		p := len(args) + 1
+		excludeFilter = fmt.Sprintf("AND source_type <> ALL($%d)", p)
+		entityExcludeFilter = fmt.Sprintf("AND d.source_type <> ALL($%d)", p)
 		args = append(args, query.ExcludeSourceTypes)
 	}
 
@@ -561,17 +573,9 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 
 	// entityCTE is the SQL fragment for the entity lane. When the lane is
 	// disabled (weight=0), we use a trivially-empty CTE to avoid syntax errors.
-	entityCTE := `entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false)`
+	entityCTE := emptyEntityCTE
 	if w.EntityWeight > 0 {
-		entityCTE = fmt.Sprintf(`entity AS (
-			SELECT de.document_id AS id,
-			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
-			FROM document_entities de
-			JOIN entities e ON e.id = de.entity_id
-			WHERE e.normalized_name LIKE '%%%%' || %s || '%%%%'
-			GROUP BY de.document_id
-			LIMIT $3
-		)`, entityFilterParam)
+		entityCTE = buildEntityCTE(entityFilterParam, entityStatusFilter, entitySourceFilter, entityExcludeFilter)
 	}
 
 	q := fmt.Sprintf(`
@@ -673,6 +677,44 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		results = results[:query.Limit]
 	}
 	return results, nil
+}
+
+// emptyEntityCTE is the entity lane when its RRF weight is zero: a
+// trivially-empty CTE, so the FULL OUTER JOIN below stays syntactically valid
+// and contributes nothing to the score.
+const emptyEntityCTE = `entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false)`
+
+// buildEntityCTE renders the entity RRF lane (#139).
+//
+// It joins `documents` purely so the status/source filters can be applied
+// INSIDE the lane. Applying them here rather than at the outer join matters:
+// the CTE is capped by `LIMIT $3`, so filtering afterwards would let excluded
+// documents consume candidate slots and silently shrink the entity lane's
+// contribution.
+//
+// The filter fragments must be `d.`-qualified — they are the entityStatusFilter
+// / entitySourceFilter / entityExcludeFilter variants built in hybridSearch,
+// not the unqualified ones used by the fts/vec/bigm/summvec CTEs. They bind the
+// same positional parameters.
+//
+// Split out of hybridSearch so the filters can be asserted without a database:
+// the lane's previous unfiltered form let soft-deleted and excluded documents
+// (including insights) into results whenever they were reachable by entity
+// name alone, and nothing in the test suite could observe it.
+func buildEntityCTE(entityFilterParam, statusFilter, sourceFilter, excludeFilter string) string {
+	return fmt.Sprintf(`entity AS (
+			SELECT de.document_id AS id,
+			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			FROM document_entities de
+			JOIN entities e ON e.id = de.entity_id
+			JOIN documents d ON d.id = de.document_id
+			WHERE e.normalized_name LIKE '%%%%' || %s || '%%%%'
+			%s
+			%s
+			%s
+			GROUP BY de.document_id
+			LIMIT $3
+		)`, entityFilterParam, statusFilter, sourceFilter, excludeFilter)
 }
 
 // entityExtractionEnabled reports whether entity extraction has been enabled
@@ -852,8 +894,8 @@ type DocumentSourceStats struct {
 
 // BaselineDocumentStats aggregates document-level baseline metrics.
 type BaselineDocumentStats struct {
-	Total      int                            `json:"total"`
-	BySource   map[string]DocumentSourceStats `json:"by_source_type"`
+	Total    int                            `json:"total"`
+	BySource map[string]DocumentSourceStats `json:"by_source_type"`
 }
 
 // BaselineChunkStats aggregates chunk-level baseline metrics.
@@ -872,7 +914,7 @@ type BaselineFailureStats struct {
 
 // BaselineCollectionStats holds the most recent collection timestamps per source.
 type BaselineCollectionStats struct {
-	MostRecentCollectedAt *time.Time         `json:"most_recent_collected_at"`
+	MostRecentCollectedAt *time.Time            `json:"most_recent_collected_at"`
 	BySource              map[string]*time.Time `json:"by_source_type"`
 }
 
@@ -939,10 +981,10 @@ func (s *DocumentStore) queryDocumentStats(ctx context.Context) (BaselineDocumen
 	total := 0
 	for rows.Next() {
 		var (
-			src                      string
-			cnt                      int64
-			meanLen, p50Len, p95Len  float64
-			maxLen                   int64
+			src                     string
+			cnt                     int64
+			meanLen, p50Len, p95Len float64
+			maxLen                  int64
 		)
 		if err := rows.Scan(&src, &cnt, &meanLen, &p50Len, &p95Len, &maxLen); err != nil {
 			return BaselineDocumentStats{}, fmt.Errorf("document stats scan: %w", err)
@@ -1476,12 +1518,12 @@ type scannable interface {
 
 func scanDocument(row scannable) (*model.Document, error) {
 	var (
-		doc          model.Document
-		metaJSON     []byte
-		vec          *pgvector.Vector
-		titleSum     pgtype.Text
-		bulletSum    pgtype.Text
-		summVec      *pgvector.Vector
+		doc       model.Document
+		metaJSON  []byte
+		vec       *pgvector.Vector
+		titleSum  pgtype.Text
+		bulletSum pgtype.Text
+		summVec   *pgvector.Vector
 	)
 	err := row.Scan(
 		&doc.ID, &doc.SourceType, &doc.SourceID,
