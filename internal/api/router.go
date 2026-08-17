@@ -117,6 +117,14 @@ type Server struct {
 	askTopK          int
 	askInsightM      int
 
+	// now is the clock buildAskSystemPrompt uses to render "current date" in
+	// the Stage 3 system prompt (date-context fix: askSystemPrompt used to
+	// be a compile-time const with no way to know "today", so the model
+	// could not resolve "내일"/"어제" and answered that it didn't know what
+	// day it was). nil means time.Now — mirrors intent.LLMClassifier.now's
+	// injected-clock convention for deterministic tests.
+	now func() time.Time
+
 	// piiNumberHashingEnabled mirrors cfg.PIINumberHashingEnabled (issue #164
 	// policy reversal). Zero value (false) is the new default and is used by
 	// both ingestMessagesHandler (smsmap.MapSMS/MapCall) and
@@ -180,6 +188,16 @@ func (s *Server) WithAskConfig(timeout time.Duration, topK, insightM int) *Serve
 		s.askInsightM = insightM
 	}
 	return s
+}
+
+// nowFunc returns s.now() if a clock was injected (tests), otherwise the
+// real time.Now. Used by askHandler to render buildAskSystemPrompt's
+// "current date" line.
+func (s *Server) nowFunc() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
 }
 
 // WithPIINumberHashing sets the phone-number hashing policy (issue #164;
