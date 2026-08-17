@@ -251,21 +251,24 @@ services:
   #   server 가 기동된 뒤 시작한다.
   #   BRAIN_API_URL 로 내부 API 서버를 가리켜 ingest 프록시가 올바르게 포워딩된다.
   # ---------------------------------------------------------------------------
+  # Cloudflare Access 뒤에서만 접근 가능(next-auth 제거, JWT 검증은 web/src/proxy.ts).
+  # 포트는 호스트 localhost에만 바인딩되며, 공개 노출은 호스트 프로세스인
+  # cloudflared ingress(sb.baekenough.com)를 통해서만 이루어진다(심층 방어).
   web:
     build:
       context: ./web
       dockerfile: Dockerfile
     image: second-brain-web:local
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     env_file:
       - web/.env.local
       - .env.local
     environment:
       BRAIN_API_URL: "http://server:8080"
-      AUTH_TRUST_HOST: "true"
-      AUTH_URL: "${AUTH_URL}"
-      NEXT_PUBLIC_APP_URL: "${NEXT_PUBLIC_APP_URL}"
+      CF_ACCESS_TEAM_DOMAIN: "baekenough.cloudflareaccess.com"
+      CF_ACCESS_AUD: "276c0cbbe67a4044699334ed7ea446eda5fb287f5fc8e194b08bc067847ab272"
+      NEXT_PUBLIC_APP_URL: "${NEXT_PUBLIC_APP_URL:-https://sb.baekenough.com}"
       NODE_ENV: "production"
       PORT: "3000"
       HOSTNAME: "0.0.0.0"
