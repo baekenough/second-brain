@@ -1137,6 +1137,26 @@ func (s *DocumentStore) ListUnembedded(ctx context.Context, limit int) ([]*model
 	return collectDocuments(rows)
 }
 
+// listWithoutEntitiesQuery backs ListWithoutEntities.
+//
+// The source_type filter is load-bearing, not cosmetic: without it the
+// EntityWorker picks up every model-derived insight document and spends an LLM
+// call extracting entities from an inference. Those entity links then feed the
+// entity RRF lane in hybridSearch, which is how an unlabelled inference earns
+// its way back into retrieval — the exact loop the insight-exclusion guard in
+// search.Service exists to close. Exclusion is by source_type rather than by
+// metadata so it cannot be undone by an enrichment-status edit.
+const listWithoutEntitiesQuery = `
+		SELECT id, source_type, source_id, title, content, metadata, embedding,
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding
+		FROM documents
+		WHERE status = 'active'
+		  AND entities_processed_at IS NULL
+		  AND source_type <> 'insight'
+		ORDER BY collected_at ASC
+		LIMIT $1`
+
 // ListWithoutEntities returns up to limit active documents whose
 // entities_processed_at column is NULL, ordered by collected_at ASC (oldest
 // first) so that entity-extraction backfill progresses forward in time.
@@ -1147,18 +1167,10 @@ func (s *DocumentStore) ListUnembedded(ctx context.Context, limit int) ([]*model
 //
 // Soft-deleted documents are excluded — there is no value in extracting
 // entities from documents that are not served in search results.
+//
+// Insight documents are excluded too; see listWithoutEntitiesQuery.
 func (s *DocumentStore) ListWithoutEntities(ctx context.Context, limit int) ([]*model.Document, error) {
-	const q = `
-		SELECT id, source_type, source_id, title, content, metadata, embedding,
-		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
-		       title_summary, bullet_summary, summary_embedding
-		FROM documents
-		WHERE status = 'active'
-		  AND entities_processed_at IS NULL
-		ORDER BY collected_at ASC
-		LIMIT $1`
-
-	rows, err := s.pg.pool.Query(ctx, q, limit)
+	rows, err := s.pg.pool.Query(ctx, listWithoutEntitiesQuery, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list without entities: %w", err)
 	}
@@ -1349,23 +1361,31 @@ func (s *DocumentStore) SoftDeleteInsightsByNoteID(ctx context.Context, noteID u
 	return count, nil
 }
 
-// ListUnsummarized returns up to limit active documents whose title_summary
-// column is NULL, ordered by collected_at ASC (oldest first) so backfill
-// progresses forward in time.
+// listUnsummarizedQuery backs ListUnsummarized.
 //
-// Soft-deleted documents are excluded; there is no value in summarizing them.
-func (s *DocumentStore) ListUnsummarized(ctx context.Context, limit int) ([]*model.Document, error) {
-	const q = `
+// The source_type filter is load-bearing, not cosmetic: without it the
+// SummarizerWorker picks up every model-derived insight document and pays for
+// an LLM summary of an LLM inference — a document that is already a single
+// sentence. That is unbudgeted spend per note, on output nobody reads.
+const listUnsummarizedQuery = `
 		SELECT id, source_type, source_id, title, content, metadata, embedding,
 		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
 		       title_summary, bullet_summary, summary_embedding
 		FROM documents
 		WHERE title_summary IS NULL
 		  AND status = 'active'
+		  AND source_type <> 'insight'
 		ORDER BY collected_at ASC
 		LIMIT $1`
 
-	rows, err := s.pg.pool.Query(ctx, q, limit)
+// ListUnsummarized returns up to limit active documents whose title_summary
+// column is NULL, ordered by collected_at ASC (oldest first) so backfill
+// progresses forward in time.
+//
+// Soft-deleted documents are excluded; there is no value in summarizing them.
+// Insight documents are excluded too; see listUnsummarizedQuery.
+func (s *DocumentStore) ListUnsummarized(ctx context.Context, limit int) ([]*model.Document, error) {
+	rows, err := s.pg.pool.Query(ctx, listUnsummarizedQuery, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list unsummarized: %w", err)
 	}
