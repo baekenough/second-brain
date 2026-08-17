@@ -120,7 +120,8 @@ func run() error {
 		WithIngestFile(docStore, chunkStore, embedClient, cfg.IngestMaxFileBytes).
 		WithPIINumberHashing(cfg.PIINumberHashingEnabled).
 		WithIngestMessages(docStore, chunkStore, embedClient, cfg.IngestMaxBatchMessages, cfg.CollectorCutover).
-		WithIngestRecording(docStore, cfg.IngestRecordingDir, cfg.IngestMaxFileBytes, cfg.CollectorCutover)
+		WithIngestRecording(docStore, cfg.IngestRecordingDir, cfg.IngestMaxFileBytes, cfg.CollectorCutover).
+		WithNotes(docStore, chunkStore, embedClient)
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      srv.Handler(),
