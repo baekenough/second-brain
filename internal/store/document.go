@@ -1137,6 +1137,176 @@ func (s *DocumentStore) MarkEntitiesProcessed(ctx context.Context, documentID uu
 	return nil
 }
 
+// ListPendingNotes returns up to limit active model.SourceNote documents
+// whose Metadata.enrichment_status is "pending" and whose
+// enrichment_next_retry_at backoff (if any) has elapsed. Used by
+// NoteEnrichmentWorker (spec §6.3). insight documents are never returned —
+// source_type is hard-scoped to 'note', enforcing spec §3.2 gate 1
+// (insight-of-insight is structurally impossible via this query).
+func (s *DocumentStore) ListPendingNotes(ctx context.Context, limit int) ([]*model.Document, error) {
+	const q = `
+		SELECT id, source_type, source_id, title, content, metadata, embedding,
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding
+		FROM documents
+		WHERE source_type = 'note'
+		  AND status = 'active'
+		  AND metadata->>'enrichment_status' = 'pending'
+		  AND (metadata->>'enrichment_next_retry_at' IS NULL
+		       OR (metadata->>'enrichment_next_retry_at')::timestamptz <= now())
+		ORDER BY collected_at ASC
+		LIMIT $1`
+
+	rows, err := s.pg.pool.Query(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list pending notes: %w", err)
+	}
+	defer rows.Close()
+
+	return collectDocuments(rows)
+}
+
+// MarkNoteEnriched merges the Organized-layer fields (spec §3) into a note's
+// Metadata and marks enrichment_status "done". title, when non-empty,
+// overwrites the document's Title column — this is how POST /api/v1/notes'
+// server-left-empty title (spec §6.1) gets filled in. Content is never
+// touched by this method or any caller of it (spec §3.1 write-once
+// guarantee) — there is no content parameter to accidentally pass one.
+func (s *DocumentStore) MarkNoteEnriched(ctx context.Context, documentID uuid.UUID, title string, metadata map[string]any) error {
+	meta, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("mark note enriched: marshal metadata: %w", err)
+	}
+	const q = `
+		UPDATE documents
+		SET title = CASE WHEN $2 <> '' THEN $2 ELSE title END,
+		    metadata = metadata || $3::jsonb,
+		    updated_at = now()
+		WHERE id = $1`
+	if _, err := s.pg.pool.Exec(ctx, q, documentID, title, meta); err != nil {
+		return fmt.Errorf("mark note enriched %s: %w", documentID, err)
+	}
+	return nil
+}
+
+// MarkNoteEnrichmentAttemptFailed records a non-terminal enrichment failure
+// (attempts 1-2 of the 3-attempt cap, spec §6.3): increments the attempt
+// counter, records the failure reason, and schedules the next eligible
+// retry time. enrichment_status is left "pending" so ListPendingNotes will
+// pick the note back up once nextRetryAt elapses.
+func (s *DocumentStore) MarkNoteEnrichmentAttemptFailed(ctx context.Context, documentID uuid.UUID, attempts int, reason string, nextRetryAt time.Time) error {
+	const q = `
+		UPDATE documents
+		SET metadata = metadata || jsonb_build_object(
+		        'enrichment_attempts', $2::int,
+		        'enrichment_last_error', $3::text,
+		        'enrichment_next_retry_at', $4::timestamptz
+		    ),
+		    updated_at = now()
+		WHERE id = $1`
+	if _, err := s.pg.pool.Exec(ctx, q, documentID, attempts, reason, nextRetryAt); err != nil {
+		return fmt.Errorf("mark note enrichment attempt failed %s: %w", documentID, err)
+	}
+	return nil
+}
+
+// MarkNoteEnrichmentTerminal records the 3rd (terminal) enrichment failure
+// (spec §6.3): sets enrichment_status "failed" so ListPendingNotes stops
+// returning the note. Only POST /api/v1/notes/{id}/retry-enrichment
+// (ResetNoteEnrichment) can revive it.
+func (s *DocumentStore) MarkNoteEnrichmentTerminal(ctx context.Context, documentID uuid.UUID, reason string) error {
+	const q = `
+		UPDATE documents
+		SET metadata = metadata || jsonb_build_object(
+		        'enrichment_status', 'failed',
+		        'enrichment_last_error', $2::text
+		    ),
+		    updated_at = now()
+		WHERE id = $1`
+	if _, err := s.pg.pool.Exec(ctx, q, documentID, reason); err != nil {
+		return fmt.Errorf("mark note enrichment terminal %s: %w", documentID, err)
+	}
+	return nil
+}
+
+// ResetNoteEnrichment reverts a terminal "failed" note back to "pending"
+// with a zeroed attempt counter, for manual retry via
+// POST /api/v1/notes/{id}/retry-enrichment (spec §6.3, §9.2). Returns
+// found=false (no error) when documentID does not exist, is not a note, or
+// is not currently in the terminal "failed" state — the caller (Task 7
+// retryEnrichmentHandler) maps found=false to 409 Conflict.
+func (s *DocumentStore) ResetNoteEnrichment(ctx context.Context, documentID uuid.UUID) (bool, error) {
+	const q = `
+		UPDATE documents
+		SET metadata = metadata || jsonb_build_object(
+		        'enrichment_status', 'pending',
+		        'enrichment_attempts', 0,
+		        'enrichment_last_error', NULL,
+		        'enrichment_next_retry_at', NULL
+		    ),
+		    updated_at = now()
+		WHERE id = $1
+		  AND source_type = 'note'
+		  AND metadata->>'enrichment_status' = 'failed'
+		RETURNING id`
+	var returnedID uuid.UUID
+	err := s.pg.pool.QueryRow(ctx, q, documentID).Scan(&returnedID)
+	if err != nil {
+		if isNoRows(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("reset note enrichment %s: %w", documentID, err)
+	}
+	return true, nil
+}
+
+// SoftDeleteByID soft-deletes a single model.SourceNote document (spec §6.5
+// delete path). Scoped to source_type='note' so this method cannot be used
+// to soft-delete arbitrary documents of other source types. Returns nil
+// without effect when the id does not exist or the document is not an
+// active note — callers that need to distinguish "not found" from
+// "not a note" should GetByID first (Task 7 deleteNoteHandler does this).
+func (s *DocumentStore) SoftDeleteByID(ctx context.Context, id uuid.UUID) error {
+	const q = `
+		UPDATE documents
+		SET status = 'deleted', deleted_at = now()
+		WHERE id = $1 AND source_type = 'note' AND status = 'active'`
+	if _, err := s.pg.pool.Exec(ctx, q, id); err != nil {
+		return fmt.Errorf("soft delete note %s: %w", id, err)
+	}
+	return nil
+}
+
+// SoftDeleteInsightsByNoteID cascades a note's soft-delete to every
+// model.SourceInsight document derived from it (spec §6.5 permanent
+// policy): "근거가 사라진 추론은 반증 불가능하고 감사 불가능하다". Matches
+// on the JSONB path Metadata.provenance.source_note_id, which is how
+// insight documents record their origin note (Task 6 EnrichNote). Returns
+// the number of insight documents soft-deleted.
+func (s *DocumentStore) SoftDeleteInsightsByNoteID(ctx context.Context, noteID uuid.UUID) (int, error) {
+	const q = `
+		UPDATE documents
+		SET status = 'deleted', deleted_at = now()
+		WHERE source_type = 'insight'
+		  AND status = 'active'
+		  AND metadata->'provenance'->>'source_note_id' = $1
+		RETURNING id`
+	rows, err := s.pg.pool.Query(ctx, q, noteID.String())
+	if err != nil {
+		return 0, fmt.Errorf("soft delete insights for note %s: %w", noteID, err)
+	}
+	defer rows.Close()
+
+	count := 0
+	for rows.Next() {
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("soft delete insights for note %s: iterate: %w", noteID, err)
+	}
+	return count, nil
+}
+
 // ListUnsummarized returns up to limit active documents whose title_summary
 // column is NULL, ordered by collected_at ASC (oldest first) so backfill
 // progresses forward in time.
