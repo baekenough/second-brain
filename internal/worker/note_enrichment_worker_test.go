@@ -10,6 +10,7 @@ import (
 
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/baekenough/second-brain/internal/store"
 	"github.com/google/uuid"
 )
 
@@ -77,34 +78,41 @@ func (f *fakeNoteLister) MarkNoteEnrichmentTerminal(_ context.Context, id uuid.U
 	return nil
 }
 
-// fakeInsightUpserter records insight documents created during a tick.
-type fakeInsightUpserter struct {
-	mu   sync.Mutex
-	docs []*model.Document
+// fakeInsightWriter records insight writes performed during a tick.
+type fakeInsightWriter struct {
+	mu     sync.Mutex
+	writes []insightWrite
+	err    error // when non-nil, every SaveInsight call fails
 }
 
-func (f *fakeInsightUpserter) Upsert(_ context.Context, doc *model.Document) error {
+type insightWrite struct {
+	content  string
+	sourceID string
+	metadata map[string]any
+}
+
+func (f *fakeInsightWriter) SaveInsight(_ context.Context, content, sourceID string, metadata map[string]any) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if doc.ID == (uuid.UUID{}) {
-		doc.ID = uuid.New()
+	if f.err != nil {
+		return f.err
 	}
-	f.docs = append(f.docs, doc)
+	f.writes = append(f.writes, insightWrite{content, sourceID, metadata})
 	return nil
 }
 
-func (f *fakeInsightUpserter) count() int {
+func (f *fakeInsightWriter) count() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.docs)
+	return len(f.writes)
 }
 
-// snapshot returns a copy of the recorded insight documents.
-func (f *fakeInsightUpserter) snapshot() []*model.Document {
+// snapshot returns a copy of the recorded insight writes.
+func (f *fakeInsightWriter) snapshot() []insightWrite {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := make([]*model.Document, len(f.docs))
-	copy(out, f.docs)
+	out := make([]insightWrite, len(f.writes))
+	copy(out, f.writes)
 	return out
 }
 
@@ -126,7 +134,7 @@ func newNoteDoc(id uuid.UUID, attempts int) *model.Document {
 // enrichFn, mirroring the entity_worker_test.go newTestWorker pattern.
 func newTestNoteWorker(
 	lister NoteEnrichmentLister,
-	insights InsightUpserter,
+	insights InsightWriter,
 	entities EntityLinker,
 	fn func(context.Context, llm.Completer, *model.Document) (*NoteEnrichmentResult, error),
 ) *NoteEnrichmentWorker {
@@ -156,7 +164,7 @@ func TestNoteEnrichmentWorker_Success_MergesMetadataLinksEntities(t *testing.T) 
 
 	docID := uuid.New()
 	lister := &fakeNoteLister{docs: []*model.Document{newNoteDoc(docID, 0)}}
-	insights := &fakeInsightUpserter{}
+	insights := &fakeInsightWriter{}
 	entities := &fakeEntityLinker{}
 
 	calls := 0
@@ -203,7 +211,7 @@ func TestNoteEnrichmentWorker_ContentNeverMutated(t *testing.T) {
 	doc := newNoteDoc(docID, 0)
 	originalContent := doc.Content
 	lister := &fakeNoteLister{docs: []*model.Document{doc}}
-	insights := &fakeInsightUpserter{}
+	insights := &fakeInsightWriter{}
 	entities := &fakeEntityLinker{}
 
 	w := newTestNoteWorker(lister, insights, entities,
@@ -226,7 +234,7 @@ func TestNoteEnrichmentWorker_InsightCapAt3(t *testing.T) {
 
 	docID := uuid.New()
 	lister := &fakeNoteLister{docs: []*model.Document{newNoteDoc(docID, 0)}}
-	insights := &fakeInsightUpserter{}
+	insights := &fakeInsightWriter{}
 	entities := &fakeEntityLinker{}
 
 	candidates := make([]NoteInsightCandidate, 5)
@@ -252,7 +260,7 @@ func TestNoteEnrichmentWorker_RetryPolicy_BelowMax_NotTerminal(t *testing.T) {
 
 	docID := uuid.New()
 	lister := &fakeNoteLister{docs: []*model.Document{newNoteDoc(docID, 1)}} // already failed once
-	insights := &fakeInsightUpserter{}
+	insights := &fakeInsightWriter{}
 	entities := &fakeEntityLinker{}
 
 	w := newTestNoteWorker(lister, insights, entities,
@@ -278,7 +286,7 @@ func TestNoteEnrichmentWorker_RetryPolicy_AtMax_MarksTerminal(t *testing.T) {
 
 	docID := uuid.New()
 	lister := &fakeNoteLister{docs: []*model.Document{newNoteDoc(docID, 2)}} // already failed twice
-	insights := &fakeInsightUpserter{}
+	insights := &fakeInsightWriter{}
 	entities := &fakeEntityLinker{}
 
 	w := newTestNoteWorker(lister, insights, entities,
@@ -302,7 +310,7 @@ func TestNoteEnrichmentWorker_EmptyBatch_NoOp(t *testing.T) {
 	t.Parallel()
 
 	lister := &fakeNoteLister{docs: nil}
-	insights := &fakeInsightUpserter{}
+	insights := &fakeInsightWriter{}
 	entities := &fakeEntityLinker{}
 
 	w := newTestNoteWorker(lister, insights, entities,
@@ -335,7 +343,7 @@ func TestNoteEnrichmentWorker_InsightsAreSeparateDocuments(t *testing.T) {
 	docID := uuid.New()
 	note := newNoteDoc(docID, 0)
 	lister := &fakeNoteLister{docs: []*model.Document{note}}
-	insights := &fakeInsightUpserter{}
+	insights := &fakeInsightWriter{}
 	entities := &fakeEntityLinker{}
 
 	w := newTestNoteWorker(lister, insights, entities,
@@ -350,44 +358,34 @@ func TestNoteEnrichmentWorker_InsightsAreSeparateDocuments(t *testing.T) {
 	)
 	w.tick(context.Background())
 
-	docs := insights.snapshot()
-	if len(docs) != 1 {
-		t.Fatalf("insight docs created = %d, want 1", len(docs))
+	writes := insights.snapshot()
+	if len(writes) != 1 {
+		t.Fatalf("insight writes = %d, want 1", len(writes))
 	}
-	ins := docs[0]
+	ins := writes[0]
 
-	if ins.SourceType != model.SourceInsight {
-		t.Errorf("insight SourceType = %q, want %q (must never be a note: it would re-enter enrichment)",
-			ins.SourceType, model.SourceInsight)
+	if ins.content != "자금 사정이 어렵다" {
+		t.Errorf("insight content = %q, want the inference text", ins.content)
 	}
-	if ins.Content != "자금 사정이 어렵다" {
-		t.Errorf("insight Content = %q, want the inference text", ins.Content)
+	if ins.content == note.Content {
+		t.Error("insight content must not be a copy of the note's verbatim content")
 	}
-	if ins.Content == note.Content {
-		t.Error("insight Content must not be a copy of the note's verbatim content")
-	}
-	if !strings.HasPrefix(ins.SourceID, "insight:"+docID.String()+":") {
-		t.Errorf("insight SourceID = %q, want deterministic prefix %q", ins.SourceID, "insight:"+docID.String()+":")
-	}
-	if ins.Status != "active" {
-		t.Errorf("insight Status = %q, want %q", ins.Status, "active")
-	}
-	if ins.CollectedAt.IsZero() {
-		t.Error("insight CollectedAt must be set (zero sorts to the bottom of collected_at DESC queries)")
+	if !strings.HasPrefix(ins.sourceID, "insight:"+docID.String()+":") {
+		t.Errorf("insight sourceID = %q, want deterministic prefix %q", ins.sourceID, "insight:"+docID.String()+":")
 	}
 
-	prov, ok := ins.Metadata["provenance"].(map[string]any)
+	prov, ok := ins.metadata["provenance"].(map[string]any)
 	if !ok {
-		t.Fatalf("insight Metadata[provenance] = %#v, want map[string]any", ins.Metadata["provenance"])
+		t.Fatalf("insight metadata[provenance] = %#v, want map[string]any", ins.metadata["provenance"])
 	}
 	if prov["source_note_id"] != docID.String() {
 		t.Errorf("provenance.source_note_id = %v, want %s", prov["source_note_id"], docID)
 	}
-	if ins.Metadata["confidence"] != 0.42 {
-		t.Errorf("insight Metadata[confidence] = %v, want 0.42 (auditability)", ins.Metadata["confidence"])
+	if ins.metadata["confidence"] != 0.42 {
+		t.Errorf("insight metadata[confidence] = %v, want 0.42 (auditability)", ins.metadata["confidence"])
 	}
-	if ins.Metadata["source_span"] != "예산 얘기를 피했다" {
-		t.Errorf("insight Metadata[source_span] = %v, want the quoted excerpt", ins.Metadata["source_span"])
+	if ins.metadata["source_span"] != "예산 얘기를 피했다" {
+		t.Errorf("insight metadata[source_span] = %v, want the quoted excerpt", ins.metadata["source_span"])
 	}
 
 	// The note's own metadata write must not carry the inference or content.
@@ -417,7 +415,7 @@ func TestNoteEnrichmentWorker_InsightSourceIDsAreStableAcrossRetries(t *testing.
 
 	docID := uuid.New()
 	lister := &fakeNoteLister{docs: []*model.Document{newNoteDoc(docID, 0)}}
-	insights := &fakeInsightUpserter{}
+	insights := &fakeInsightWriter{}
 	entities := &fakeEntityLinker{}
 
 	w := newTestNoteWorker(lister, insights, entities,
@@ -434,16 +432,16 @@ func TestNoteEnrichmentWorker_InsightSourceIDsAreStableAcrossRetries(t *testing.
 	w.tick(context.Background())
 	w.tick(context.Background())
 
-	docs := insights.snapshot()
-	if len(docs) != 4 {
-		t.Fatalf("upsert calls = %d, want 4 (2 insights x 2 ticks)", len(docs))
+	writes := insights.snapshot()
+	if len(writes) != 4 {
+		t.Fatalf("insight writes = %d, want 4 (2 insights x 2 ticks)", len(writes))
 	}
-	if docs[0].SourceID != docs[2].SourceID || docs[1].SourceID != docs[3].SourceID {
+	if writes[0].sourceID != writes[2].sourceID || writes[1].sourceID != writes[3].sourceID {
 		t.Errorf("insight source_ids not stable across ticks: %q/%q then %q/%q",
-			docs[0].SourceID, docs[1].SourceID, docs[2].SourceID, docs[3].SourceID)
+			writes[0].sourceID, writes[1].sourceID, writes[2].sourceID, writes[3].sourceID)
 	}
-	if docs[0].SourceID == docs[1].SourceID {
-		t.Errorf("insights within one note must have distinct source_ids, both were %q", docs[0].SourceID)
+	if writes[0].sourceID == writes[1].sourceID {
+		t.Errorf("insights within one note must have distinct source_ids, both were %q", writes[0].sourceID)
 	}
 }
 
@@ -480,14 +478,14 @@ func (o *orderingLister) MarkNoteEnriched(ctx context.Context, id uuid.UUID, tit
 	return o.fakeNoteLister.MarkNoteEnriched(ctx, id, title, metadata)
 }
 
-type orderingUpserter struct {
-	*fakeInsightUpserter
+type orderingWriter struct {
+	*fakeInsightWriter
 	rec *orderRecorder
 }
 
-func (o *orderingUpserter) Upsert(ctx context.Context, doc *model.Document) error {
-	o.rec.add("insight_upsert")
-	return o.fakeInsightUpserter.Upsert(ctx, doc)
+func (o *orderingWriter) SaveInsight(ctx context.Context, content, sourceID string, metadata map[string]any) error {
+	o.rec.add("insight_write")
+	return o.fakeInsightWriter.SaveInsight(ctx, content, sourceID, metadata)
 }
 
 type orderingLinker struct {
@@ -513,7 +511,7 @@ func TestNoteEnrichmentWorker_MarkEnrichedIsTheCommitPoint(t *testing.T) {
 	rec := &orderRecorder{}
 	docID := uuid.New()
 	lister := &orderingLister{fakeNoteLister: &fakeNoteLister{docs: []*model.Document{newNoteDoc(docID, 0)}}, rec: rec}
-	insights := &orderingUpserter{fakeInsightUpserter: &fakeInsightUpserter{}, rec: rec}
+	insights := &orderingWriter{fakeInsightWriter: &fakeInsightWriter{}, rec: rec}
 	entities := &orderingLinker{fakeEntityLinker: &fakeEntityLinker{}, rec: rec}
 
 	w := newTestNoteWorker(lister, insights, entities,
@@ -529,7 +527,7 @@ func TestNoteEnrichmentWorker_MarkEnrichedIsTheCommitPoint(t *testing.T) {
 
 	events := rec.snapshot()
 	if len(events) != 3 {
-		t.Fatalf("recorded events = %v, want 3 (insight_upsert, link_entities, mark_enriched)", events)
+		t.Fatalf("recorded events = %v, want 3 (insight_write, link_entities, mark_enriched)", events)
 	}
 	if events[len(events)-1] != "mark_enriched" {
 		t.Errorf("event order = %v, want mark_enriched last (it is the commit point)", events)
@@ -548,7 +546,7 @@ func TestNoteEnrichmentWorker_ContextCancelled_StopsLaunchingWork(t *testing.T) 
 		newNoteDoc(uuid.New(), 0),
 		newNoteDoc(uuid.New(), 0),
 	}}
-	insights := &fakeInsightUpserter{}
+	insights := &fakeInsightWriter{}
 	entities := &fakeEntityLinker{}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -581,7 +579,7 @@ func TestNoteEnrichmentWorker_Run_StopsOnContextCancel(t *testing.T) {
 	t.Parallel()
 
 	lister := &fakeNoteLister{}
-	w := newTestNoteWorker(lister, &fakeInsightUpserter{}, &fakeEntityLinker{},
+	w := newTestNoteWorker(lister, &fakeInsightWriter{}, &fakeEntityLinker{},
 		func(_ context.Context, _ llm.Completer, _ *model.Document) (*NoteEnrichmentResult, error) {
 			return &NoteEnrichmentResult{}, nil
 		},
@@ -738,7 +736,7 @@ func TestNewNoteEnrichmentWorker_Defaults(t *testing.T) {
 
 	w := NewNoteEnrichmentWorker(NoteEnrichmentWorkerConfig{
 		Store:    &fakeNoteLister{},
-		Insights: &fakeInsightUpserter{},
+		Insights: &fakeInsightWriter{},
 		Entities: &fakeEntityLinker{},
 		LLM:      &fakeLLM{},
 	})
@@ -754,5 +752,325 @@ func TestNewNoteEnrichmentWorker_Defaults(t *testing.T) {
 	}
 	if w.enrichFn == nil {
 		t.Error("enrichFn must default to EnrichNote")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Insight persistence: failed writes must fail the attempt
+// ---------------------------------------------------------------------------
+
+// TestNoteEnrichmentWorker_InsightWriteFails_DrivesRetryPath verifies a failed
+// insight write is treated as a failed enrichment attempt, not a success.
+// Marking the note "done" would drop the inference permanently with no retry
+// and no trace. The write is idempotent (stable source_ids), so retrying is
+// safe.
+func TestNoteEnrichmentWorker_InsightWriteFails_DrivesRetryPath(t *testing.T) {
+	t.Parallel()
+
+	docID := uuid.New()
+	lister := &fakeNoteLister{docs: []*model.Document{newNoteDoc(docID, 0)}}
+	insights := &fakeInsightWriter{err: errors.New("chunk write failed")}
+	entities := &fakeEntityLinker{}
+
+	w := newTestNoteWorker(lister, insights, entities,
+		func(_ context.Context, _ llm.Completer, _ *model.Document) (*NoteEnrichmentResult, error) {
+			return &NoteEnrichmentResult{
+				Title:    "t",
+				Entities: []model.Entity{{Name: "Alice", Type: model.EntityTypePerson}},
+				Insights: []NoteInsightCandidate{{Content: "a", Confidence: 0.3, SourceSpan: "s"}},
+			}, nil
+		},
+	)
+	w.tick(context.Background())
+
+	if len(lister.enrichedCalls) != 0 {
+		t.Errorf("MarkNoteEnriched called %d times after a failed insight write, want 0 (the note must stay pending)",
+			len(lister.enrichedCalls))
+	}
+	if len(lister.attemptFailedCalls) != 1 {
+		t.Fatalf("MarkNoteEnrichmentAttemptFailed called %d times, want 1 (failed insight write burns an attempt)",
+			len(lister.attemptFailedCalls))
+	}
+	if got := lister.attemptFailedCalls[0].attempts; got != 1 {
+		t.Errorf("attempts = %d, want 1", got)
+	}
+	if !strings.Contains(lister.attemptFailedCalls[0].reason, "chunk write failed") {
+		t.Errorf("failure reason = %q, want it to carry the underlying insight error", lister.attemptFailedCalls[0].reason)
+	}
+	if entities.callCount() != 0 {
+		t.Errorf("UpsertAndLinkEntities called %d times, want 0 (the attempt aborts at the failed insight)",
+			entities.callCount())
+	}
+}
+
+// TestNoteEnrichmentWorker_InsightWriteFails_AtMaxAttempts_MarksTerminal
+// verifies the insight-write failure path shares the same bounded retry policy
+// as an LLM failure: it cannot retry forever.
+func TestNoteEnrichmentWorker_InsightWriteFails_AtMaxAttempts_MarksTerminal(t *testing.T) {
+	t.Parallel()
+
+	docID := uuid.New()
+	lister := &fakeNoteLister{docs: []*model.Document{newNoteDoc(docID, 2)}} // already failed twice
+	insights := &fakeInsightWriter{err: errors.New("db down")}
+
+	w := newTestNoteWorker(lister, insights, &fakeEntityLinker{},
+		func(_ context.Context, _ llm.Completer, _ *model.Document) (*NoteEnrichmentResult, error) {
+			return &NoteEnrichmentResult{
+				Title:    "t",
+				Insights: []NoteInsightCandidate{{Content: "a", Confidence: 0.3, SourceSpan: "s"}},
+			}, nil
+		},
+	)
+	w.tick(context.Background())
+
+	if len(lister.terminalCalls) != 1 {
+		t.Errorf("MarkNoteEnrichmentTerminal called %d times, want 1 (3rd failure is terminal)", len(lister.terminalCalls))
+	}
+	if len(lister.enrichedCalls) != 0 {
+		t.Errorf("MarkNoteEnriched called %d times, want 0", len(lister.enrichedCalls))
+	}
+}
+
+// TestNoteEnrichmentWorker_BlankInsightCandidate_Skipped verifies a blank
+// candidate is dropped rather than persisted. note.Save rejects empty content,
+// so persisting one would fail every attempt and drive an otherwise-fine note
+// terminal — one malformed model output would cost the note its enrichment.
+func TestNoteEnrichmentWorker_BlankInsightCandidate_Skipped(t *testing.T) {
+	t.Parallel()
+
+	docID := uuid.New()
+	lister := &fakeNoteLister{docs: []*model.Document{newNoteDoc(docID, 0)}}
+	insights := &fakeInsightWriter{}
+
+	w := newTestNoteWorker(lister, insights, &fakeEntityLinker{},
+		func(_ context.Context, _ llm.Completer, _ *model.Document) (*NoteEnrichmentResult, error) {
+			return &NoteEnrichmentResult{
+				Title: "t",
+				Insights: []NoteInsightCandidate{
+					{Content: "   ", Confidence: 0.1, SourceSpan: "s"},
+					{Content: "kept", Confidence: 0.4, SourceSpan: "s"},
+				},
+			}, nil
+		},
+	)
+	w.tick(context.Background())
+
+	writes := insights.snapshot()
+	if len(writes) != 1 || writes[0].content != "kept" {
+		t.Errorf("insight writes = %+v, want only the non-blank candidate", writes)
+	}
+	if len(lister.enrichedCalls) != 1 {
+		t.Errorf("MarkNoteEnriched calls = %d, want 1 (a blank candidate must not fail the note)", len(lister.enrichedCalls))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// insightSaver: the production InsightWriter (note.Save-backed)
+// ---------------------------------------------------------------------------
+
+// fakeNoteDocs is a note.DocumentUpserter recording the documents note.Save
+// persists.
+type fakeNoteDocs struct {
+	mu   sync.Mutex
+	docs []*model.Document
+	err  error
+}
+
+func (f *fakeNoteDocs) Upsert(_ context.Context, doc *model.Document) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	if doc.ID == (uuid.UUID{}) {
+		doc.ID = uuid.New()
+	}
+	f.docs = append(f.docs, doc)
+	return nil
+}
+
+// fakeNoteChunks is a note.ChunkWriter recording chunk and embedding writes.
+type fakeNoteChunks struct {
+	mu         sync.Mutex
+	chunks     []store.Chunk
+	embeddings []store.ChunkEmbedding
+	replaceErr error
+}
+
+func (f *fakeNoteChunks) ReplaceDocument(_ context.Context, _ uuid.UUID, chunks []store.Chunk) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.replaceErr != nil {
+		return f.replaceErr
+	}
+	f.chunks = make([]store.Chunk, 0, len(chunks))
+	for i, c := range chunks {
+		c.ID = int64(i + 1) // the store assigns ids on insert
+		f.chunks = append(f.chunks, c)
+	}
+	return nil
+}
+
+func (f *fakeNoteChunks) ListByDocument(_ context.Context, _ uuid.UUID) ([]store.Chunk, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.chunks, nil
+}
+
+func (f *fakeNoteChunks) UpdateChunkEmbeddings(_ context.Context, embeddings []store.ChunkEmbedding) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.embeddings = append(f.embeddings, embeddings...)
+	return nil
+}
+
+// fakeNoteEmbedder is a note.Embedder recording the texts submitted for
+// embedding.
+type fakeNoteEmbedder struct {
+	mu       sync.Mutex
+	disabled bool
+	err      error
+	texts    []string
+}
+
+func (f *fakeNoteEmbedder) Enabled() bool { return !f.disabled }
+
+func (f *fakeNoteEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.texts = append(f.texts, texts...)
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := make([][]float32, len(texts))
+	for i := range out {
+		out[i] = []float32{0.1, 0.2, 0.3}
+	}
+	return out, nil
+}
+
+// TestInsightSaver_PersistsChunksAndEmbeds verifies an insight is not merely
+// upserted as a bare row: it is chunked and embedded, which is what makes it
+// retrievable by the /ask vector lane (spec §6.5). A row with no chunks and no
+// vector is an inference the system drew and can never surface again.
+func TestInsightSaver_PersistsChunksAndEmbeds(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeNoteDocs{}
+	chunks := &fakeNoteChunks{}
+	embed := &fakeNoteEmbedder{}
+	saver := NewInsightSaver(docs, chunks, embed)
+
+	noteID := uuid.New()
+	sourceID := insightSourceID(noteID, 0)
+	metadata := map[string]any{
+		"confidence":  0.55,
+		"source_span": "예산 얘기를 피했다",
+		"provenance":  map[string]any{"source_note_id": noteID.String()},
+	}
+
+	if err := saver.SaveInsight(context.Background(), "자금 사정이 어렵다", sourceID, metadata); err != nil {
+		t.Fatalf("SaveInsight returned error: %v", err)
+	}
+
+	if len(docs.docs) != 1 {
+		t.Fatalf("documents upserted = %d, want 1", len(docs.docs))
+	}
+	doc := docs.docs[0]
+	if doc.SourceType != model.SourceInsight {
+		t.Errorf("SourceType = %q, want %q (an insight must never be a note: it would re-enter enrichment)",
+			doc.SourceType, model.SourceInsight)
+	}
+	if doc.SourceID != sourceID {
+		t.Errorf("SourceID = %q, want %q", doc.SourceID, sourceID)
+	}
+	if doc.Content != "자금 사정이 어렵다" {
+		t.Errorf("Content = %q, want the inference text", doc.Content)
+	}
+	if doc.Title != "" {
+		t.Errorf("Title = %q, want empty (the origin note holds the title)", doc.Title)
+	}
+	if doc.Status != "active" || doc.CollectedAt.IsZero() {
+		t.Errorf("Status/CollectedAt = %q/%v, want active and non-zero", doc.Status, doc.CollectedAt)
+	}
+	prov, ok := doc.Metadata["provenance"].(map[string]any)
+	if !ok || prov["source_note_id"] != noteID.String() {
+		t.Errorf("Metadata[provenance] = %#v, want source_note_id %s", doc.Metadata["provenance"], noteID)
+	}
+
+	if len(chunks.chunks) == 0 {
+		t.Fatal("no chunks written: an unchunked insight is invisible to chunk-level search")
+	}
+	if len(embed.texts) == 0 {
+		t.Fatal("no embedding requested: an unembedded insight is invisible to the /ask vector lane")
+	}
+	if len(chunks.embeddings) != len(chunks.chunks) {
+		t.Errorf("embeddings persisted = %d, want %d (one per chunk)", len(chunks.embeddings), len(chunks.chunks))
+	}
+}
+
+// TestInsightSaver_UpsertFailure_ReturnsError verifies a durability failure
+// surfaces as an error, so the worker fails the enrichment attempt instead of
+// marking the note done.
+func TestInsightSaver_UpsertFailure_ReturnsError(t *testing.T) {
+	t.Parallel()
+
+	saver := NewInsightSaver(&fakeNoteDocs{err: errors.New("connection refused")}, &fakeNoteChunks{}, &fakeNoteEmbedder{})
+	err := saver.SaveInsight(context.Background(), "content", insightSourceID(uuid.New(), 0), map[string]any{})
+	if err == nil {
+		t.Fatal("SaveInsight returned nil error when the document upsert failed, want error")
+	}
+}
+
+// TestInsightSaver_ChunkFailure_ReturnsError verifies a chunk-write failure is
+// also a durability failure: an insight with no chunks is not retrievable.
+func TestInsightSaver_ChunkFailure_ReturnsError(t *testing.T) {
+	t.Parallel()
+
+	saver := NewInsightSaver(&fakeNoteDocs{}, &fakeNoteChunks{replaceErr: errors.New("deadlock")}, &fakeNoteEmbedder{})
+	err := saver.SaveInsight(context.Background(), "content", insightSourceID(uuid.New(), 0), map[string]any{})
+	if err == nil {
+		t.Fatal("SaveInsight returned nil error when the chunk write failed, want error")
+	}
+}
+
+// TestInsightSaver_EmbedFailure_Tolerated pins the one deliberately tolerated
+// sub-case: an embedding failure does NOT fail the attempt. The document and
+// its chunks are durably stored and the existing chunk-embedding backfill
+// fills the vector in later, so retrying the whole enrichment would burn a
+// paid LLM call for work a backfill already does for free.
+func TestInsightSaver_EmbedFailure_Tolerated(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeNoteDocs{}
+	chunks := &fakeNoteChunks{}
+	saver := NewInsightSaver(docs, chunks, &fakeNoteEmbedder{err: errors.New("embed service down")})
+
+	if err := saver.SaveInsight(context.Background(), "content", insightSourceID(uuid.New(), 0), map[string]any{}); err != nil {
+		t.Fatalf("SaveInsight returned error on embedding failure: %v, want nil (document + chunks are stored)", err)
+	}
+	if len(docs.docs) != 1 || len(chunks.chunks) == 0 {
+		t.Errorf("documents = %d, chunks = %d; want the insight and its chunks persisted despite the embed failure",
+			len(docs.docs), len(chunks.chunks))
+	}
+	if len(chunks.embeddings) != 0 {
+		t.Errorf("embeddings persisted = %d, want 0 when the embedder failed", len(chunks.embeddings))
+	}
+}
+
+// TestInsightSaver_NilEmbedder_StillPersists verifies embedding is optional:
+// with no embedder configured the insight is still stored and chunked.
+func TestInsightSaver_NilEmbedder_StillPersists(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeNoteDocs{}
+	chunks := &fakeNoteChunks{}
+	saver := NewInsightSaver(docs, chunks, nil)
+
+	if err := saver.SaveInsight(context.Background(), "content", insightSourceID(uuid.New(), 0), map[string]any{}); err != nil {
+		t.Fatalf("SaveInsight returned error with a nil embedder: %v", err)
+	}
+	if len(docs.docs) != 1 || len(chunks.chunks) == 0 {
+		t.Errorf("documents = %d, chunks = %d; want both persisted", len(docs.docs), len(chunks.chunks))
 	}
 }

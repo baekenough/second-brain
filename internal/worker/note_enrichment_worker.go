@@ -10,6 +10,7 @@ import (
 
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/baekenough/second-brain/internal/note"
 	"github.com/google/uuid"
 )
 
@@ -49,17 +50,82 @@ type NoteEnrichmentLister interface {
 	MarkNoteEnrichmentTerminal(ctx context.Context, documentID uuid.UUID, reason string) error
 }
 
-// InsightUpserter is the write side used to persist derived insight
-// documents. *store.DocumentStore satisfies this interface via its existing
-// Upsert method.
-type InsightUpserter interface {
-	Upsert(ctx context.Context, doc *model.Document) error
+// InsightWriter persists one derived insight document.
+//
+// It is deliberately NOT a bare document upsert: an insight that exists as a
+// row but has no chunks and no embedding vector is invisible to the /ask
+// vector lane, i.e. an inference the system drew and can never surface again
+// (spec §6.5). Implementations must persist the document AND its chunks AND
+// request embeddings. insightSaver below is the production implementation;
+// it delegates to note.Save, the same upsert+chunk+embed path used by
+// POST /api/v1/notes.
+type InsightWriter interface {
+	// SaveInsight persists an insight document with the given content,
+	// deterministic sourceID and metadata. Returning a non-nil error means
+	// the insight was NOT durably stored; the caller treats that as a failed
+	// enrichment attempt so the note is retried.
+	SaveInsight(ctx context.Context, content, sourceID string, metadata map[string]any) error
+}
+
+// insightSaver is the production InsightWriter. It routes insight creation
+// through note.Save with model.SourceInsight (Task 2 parameterised sourceType
+// for exactly this caller) and requireTitle=false — an insight carries no
+// title of its own; its origin note holds the title.
+type insightSaver struct {
+	docs   note.DocumentUpserter
+	chunks note.ChunkWriter
+	embed  note.Embedder
+}
+
+// NewInsightSaver returns the production InsightWriter, backed by note.Save.
+// docs and chunks are required; embed may be nil, in which case the insight is
+// stored and chunked but not embedded.
+func NewInsightSaver(docs note.DocumentUpserter, chunks note.ChunkWriter, embed note.Embedder) InsightWriter {
+	if docs == nil {
+		panic("NewInsightSaver: docs must not be nil")
+	}
+	if chunks == nil {
+		panic("NewInsightSaver: chunks must not be nil")
+	}
+	return &insightSaver{docs: docs, chunks: chunks, embed: embed}
+}
+
+// SaveInsight persists content as a model.SourceInsight document with chunks
+// and embeddings.
+//
+// Failure semantics are inherited from note.Save and are deliberately split:
+// an upsert failure, a chunk-write failure or a validation rejection returns a
+// non-nil error (the note's enrichment attempt fails and is retried), whereas
+// an embedding failure is non-fatal inside note.Save — the document and its
+// chunks are durably stored and the existing chunk-embedding backfill fills the
+// vectors in later. Retrying the whole LLM enrichment to recover an embedding
+// would burn a paid call for work a backfill already does for free.
+func (s *insightSaver) SaveInsight(ctx context.Context, content, sourceID string, metadata map[string]any) error {
+	_, errMsg := note.Save(
+		ctx,
+		s.docs,
+		s.chunks,
+		s.embed,
+		model.SourceInsight,
+		"", // title: insights are titled by their origin note
+		content,
+		sourceID,
+		metadata,
+		s.embed != nil, // doEmbed — note.Save additionally checks embed.Enabled()
+		false,          // requireTitle
+	)
+	if errMsg != "" {
+		return fmt.Errorf("save insight %s: %s", sourceID, errMsg)
+	}
+	return nil
 }
 
 // NoteEnrichmentWorkerConfig holds configuration for NoteEnrichmentWorker.
 type NoteEnrichmentWorkerConfig struct {
-	Store        NoteEnrichmentLister
-	Insights     InsightUpserter
+	Store NoteEnrichmentLister
+	// Insights persists derived insight documents with chunks + embeddings.
+	// Production wiring: NewInsightSaver(documentStore, chunkStore, embedClient).
+	Insights     InsightWriter
 	Entities     EntityLinker // reused from entity_worker.go, same package
 	LLM          llm.Completer
 	Interval     time.Duration
@@ -85,7 +151,7 @@ type NoteEnrichmentWorkerConfig struct {
 //     user's own observations.
 type NoteEnrichmentWorker struct {
 	store        NoteEnrichmentLister
-	insights     InsightUpserter
+	insights     InsightWriter
 	entities     EntityLinker
 	llm          llm.Completer
 	interval     time.Duration
@@ -230,12 +296,13 @@ func (w *NoteEnrichmentWorker) processNote(ctx context.Context, doc *model.Docum
 		w.handleFailure(docCtx, doc, err)
 		return
 	}
-	w.handleSuccess(docCtx, doc, result)
+	w.persistEnrichment(docCtx, doc, result)
 }
 
-// handleSuccess persists everything derived from ONE enrichFn call (spec
+// persistEnrichment persists everything derived from ONE enrichFn call (spec
 // §6.3): up to maxInsightsPerNote insight documents, the entity links, and
-// finally the note's Organized-layer Metadata.
+// finally the note's Organized-layer Metadata. Despite following a successful
+// LLM call it may still route to handleFailure — see below.
 //
 // Write order matters. MarkNoteEnriched flips enrichment_status to "done",
 // after which ListPendingNotes never returns this note again — so it is the
@@ -244,33 +311,28 @@ func (w *NoteEnrichmentWorker) processNote(ctx context.Context, doc *model.Docum
 // derived from the note ID and index, and the store upserts on
 // (source_type, source_id)), so retries cannot duplicate insights or exceed
 // the cap. The note's Content is not touched on any of these paths.
-func (w *NoteEnrichmentWorker) handleSuccess(ctx context.Context, doc *model.Document, result *NoteEnrichmentResult) {
-	// Hard cap (spec §6.4): applied here, at persistence, so no prompt change
-	// or parser change can widen it.
-	insights := result.Insights
-	if len(insights) > maxInsightsPerNote {
-		slog.Info("note enrichment worker: capping insight candidates",
-			"doc_id", doc.ID, "returned", len(insights), "cap", maxInsightsPerNote)
-		insights = insights[:maxInsightsPerNote]
-	}
+//
+// A failed insight write is a failed enrichment, not a success: marking the
+// note "done" would drop the inference permanently, with no retry and nothing
+// in the note to show one was ever attempted. Because insight source_ids are
+// stable, replaying them on a later attempt overwrites rather than duplicates,
+// so the retry is safe.
+func (w *NoteEnrichmentWorker) persistEnrichment(ctx context.Context, doc *model.Document, result *NoteEnrichmentResult) {
+	insights := selectInsights(doc.ID, result.Insights)
 	for i, candidate := range insights {
-		insightDoc := &model.Document{
-			SourceType: model.SourceInsight,
-			SourceID:   fmt.Sprintf("insight:%s:%d", doc.ID, i),
-			Content:    candidate.Content,
-			Metadata: map[string]any{
-				"confidence":  candidate.Confidence,
-				"source_span": candidate.SourceSpan,
-				"provenance": map[string]any{
-					"source_note_id": doc.ID.String(),
-				},
+		sourceID := insightSourceID(doc.ID, i)
+		metadata := map[string]any{
+			"confidence":  candidate.Confidence,
+			"source_span": candidate.SourceSpan,
+			"provenance": map[string]any{
+				"source_note_id": doc.ID.String(),
 			},
-			Status:      "active",
-			CollectedAt: time.Now().UTC(),
 		}
-		if err := w.insights.Upsert(ctx, insightDoc); err != nil {
-			slog.Warn("note enrichment worker: insight upsert failed",
+		if err := w.insights.SaveInsight(ctx, candidate.Content, sourceID, metadata); err != nil {
+			slog.Warn("note enrichment worker: insight write failed, failing the attempt",
 				"doc_id", doc.ID, "index", i, "error", err)
+			w.handleFailure(ctx, doc, fmt.Errorf("persist insight %d: %w", i, err))
+			return
 		}
 	}
 
@@ -288,6 +350,40 @@ func (w *NoteEnrichmentWorker) handleSuccess(ctx context.Context, doc *model.Doc
 	if err := w.store.MarkNoteEnriched(ctx, doc.ID, result.Title, metadata); err != nil {
 		slog.Warn("note enrichment worker: mark enriched failed", "doc_id", doc.ID, "error", err)
 	}
+}
+
+// selectInsights applies the hard cap (spec §6.4) and drops blank candidates.
+//
+// The cap lives here, at the persistence boundary, so no prompt edit or parser
+// edit can widen it. Blank candidates are dropped rather than persisted:
+// note.Save rejects empty content, so a single blank candidate would otherwise
+// fail every attempt for the note and drive it terminal — one malformed model
+// output would cost the note its entire enrichment.
+func selectInsights(noteID uuid.UUID, candidates []NoteInsightCandidate) []NoteInsightCandidate {
+	out := make([]NoteInsightCandidate, 0, len(candidates))
+	for _, c := range candidates {
+		if strings.TrimSpace(c.Content) == "" {
+			slog.Warn("note enrichment worker: dropping blank insight candidate", "doc_id", noteID)
+			continue
+		}
+		out = append(out, c)
+		if len(out) == maxInsightsPerNote {
+			break
+		}
+	}
+	if len(candidates) > len(out) {
+		slog.Info("note enrichment worker: insight candidates reduced",
+			"doc_id", noteID, "returned", len(candidates), "kept", len(out), "cap", maxInsightsPerNote)
+	}
+	return out
+}
+
+// insightSourceID derives an insight's source_id from its origin note and
+// position. It must stay deterministic: the store upserts on
+// (source_type, source_id), so stable ids are what make a retried enrichment
+// overwrite its own insights instead of duplicating them past the cap.
+func insightSourceID(noteID uuid.UUID, index int) string {
+	return fmt.Sprintf("insight:%s:%d", noteID, index)
 }
 
 // handleFailure applies the 3-attempt retry policy (spec §6.3). attempts is
