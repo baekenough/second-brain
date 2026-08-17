@@ -1,5 +1,13 @@
 # Speaker Diarization Service
 
+> **Status: legacy local-only fallback, opt-in.** The default transcription
+> path is now OpenAI `gpt-4o-transcribe-diarize`, which returns speaker
+> diarization natively in the same API call (see `WHISPER_MODEL` /
+> `WHISPER_CHUNKING_STRATEGY` in `.env.local.example`). This service is only
+> needed for environments that cannot send call audio to a cloud API; it is
+> started with `docker compose --profile local-inference up -d` and is no
+> longer part of the default `docker compose up -d` stack.
+
 Wraps [pyannote.audio 3.1](https://github.com/pyannote/pyannote-audio) to
 provide speaker-segment output for mono call/voice recordings. The Go
 transcription pipeline calls this service to get *who-spoke-when* timestamps,

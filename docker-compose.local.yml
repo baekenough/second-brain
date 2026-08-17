@@ -10,6 +10,12 @@
 # 중지/정리:
 #   docker compose -f docker-compose.local.yml down
 #   docker compose -f docker-compose.local.yml down -v   # 볼륨 포함 삭제
+# -----------------------------------------------------------------------------
+# 전사(transcription) 경로 — OpenAI gpt-4o-transcribe-diarize (기본, 유일한
+# 운영 경로). 통화/녹음 오디오가 OpenAI로 전송됩니다 (의도적 결정, #100 예외).
+# WHISPER_API_KEY 가 비어있으면 전사 자체가 비활성화됩니다.
+# 아래 whisper/diarization 서비스는 로컬 전용 폴백으로만 남아있으며 기본
+# `docker compose up -d` 로는 기동되지 않습니다 (opt-in, --profile local-inference).
 # =============================================================================
 
 name: second-brain-local
@@ -72,16 +78,16 @@ services:
     env_file:
       - .env.local
     environment:
+      # 레거시 로컬 pyannote 전용 셀렉터. 기본 전사 경로(OpenAI
+      # gpt-4o-transcribe-diarize)는 화자 분리를 자체 내장하며 이 값을
+      # 무시한다. `--profile local-inference` 로 diarization 서비스를
+      # 함께 띄운 경우에만 의미가 있다.
       DIARIZATION_API_URL: "http://diarization:8001"
       DIARIZATION_ENABLED: "${DIARIZATION_ENABLED:-false}"
     depends_on:
       postgres:
         condition: service_healthy
       ollama:
-        condition: service_started
-      whisper:
-        condition: service_started
-      diarization:
         condition: service_started
     volumes:
       - ${LLM_MEMORY_DB_HOST_PATH:-/Users/user/workspace/llm-memory/data/memory.sqlite}:/data/llm-memory.sqlite:ro
@@ -110,11 +116,15 @@ services:
       - default
 
   # ---------------------------------------------------------------------------
-  # diarization — pyannote.audio 기반 화자 분리 서버 (#111, 내부 포트 8001).
+  # diarization — pyannote.audio 기반 로컬 화자 분리 서버 (#111, 내부 포트 8001).
+  #   레거시 로컬 전용 폴백. 기본 전사 경로(OpenAI gpt-4o-transcribe-diarize)는
+  #   화자 분리를 자체 내장하므로 이 서비스는 더 이상 기본 기동되지 않는다
+  #   (opt-in: `docker compose --profile local-inference up -d`).
+  #   클라우드로 오디오를 보낼 수 없는 환경을 위한 대안으로만 유지한다.
   #   엔드포인트: POST /diarize, GET /health
   #   HF_TOKEN: HuggingFace 토큰 (gated 모델 다운로드에 필수 — .env 또는 셸에 설정).
   #   DIARIZATION_DEVICE: cpu (macOS arm64 CPU 전용; 느림).
-  #   collector 가 DIARIZATION_ENABLED=true 일 때 http://diarization:8001 로 호출.
+  #   collector 가 DIARIZATION_ENABLED=true 일 때만 http://diarization:8001 로 호출.
   #   주의: pyannote/speaker-diarization-3.x 모델 사용 전 HuggingFace 모델 페이지에서
   #         약관 동의(gated-model acceptance) 필요.
   # ---------------------------------------------------------------------------
@@ -123,6 +133,7 @@ services:
       context: ./deploy/diarization
       dockerfile: Dockerfile
     image: second-brain-diarization:local
+    profiles: ["local-inference"]
     environment:
       # HF_TOKEN: required for first-time gated-model download; safe blank default
       # suppresses the "variable is not set" compose warning when token is absent.
@@ -134,13 +145,20 @@ services:
       - default
 
   # ---------------------------------------------------------------------------
-  # whisper — OpenAI-호환 음성인식 서버 (내부 포트 8000).
+  # whisper — 레거시 로컬 ASR 서버 (내부 포트 8000, faster-whisper).
+  #   레거시 로컬 전용 폴백. 기본 전사 경로는 OpenAI gpt-4o-transcribe-diarize
+  #   (WHISPER_API_URL=https://api.openai.com/v1, .env.local 에서 설정)이며
+  #   이 서비스는 더 이상 기본 기동되지 않는다
+  #   (opt-in: `docker compose --profile local-inference up -d`).
+  #   클라우드로 오디오를 보낼 수 없는 환경을 위한 대안으로만 유지한다.
   #   fedirz/faster-whisper-server:latest-cpu 사용.
   #   엔드포인트: POST /v1/audio/transcriptions (multipart: file/model/language)
-  #   WHISPER__MODEL 로 모델 지정 (HuggingFace repo ID).
+  #   WHISPER__MODEL 로 모델 지정 (HuggingFace repo ID). 화자 분리는 미지원 —
+  #   이 경로를 쓰려면 위 diarization 서비스를 함께 활성화해야 한다.
   # ---------------------------------------------------------------------------
   whisper:
     image: fedirz/faster-whisper-server:latest-cpu
+    profiles: ["local-inference"]
     environment:
       WHISPER__MODEL: Systran/faster-whisper-medium
       WHISPER__INFERENCE_DEVICE: cpu

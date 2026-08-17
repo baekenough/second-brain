@@ -32,6 +32,15 @@ import (
 // over this constant; this constant exists only as a defence-in-depth fallback.
 const whisperDefaultHTTPTimeout = 2 * time.Hour
 
+// whisperCloudMaxFileBytes is the hard per-file upload limit enforced by
+// OpenAI's /v1/audio/transcriptions endpoint (verified against the live API).
+// This is NOT configurable — it reflects a fixed server-side constraint, not
+// a local operational preference (contrast with cfg.WhisperMaxFileBytes,
+// which IS configurable and exists to bound local disk/network usage). It
+// applies only when the resolved endpoint is non-local (isLocalWhisperEndpoint
+// == false); self-hosted whisper.cpp servers do not enforce this limit.
+const whisperCloudMaxFileBytes = 25 << 20 // 25 MiB
+
 // whisperAudioExts is the set of audio file extensions that the collector will
 // submit for transcription. Extensions are lowercase and include the leading dot.
 var whisperAudioExts = map[string]bool{
@@ -85,30 +94,122 @@ type diarizeResponse struct {
 	Segments []diarSegment `json:"segments"`
 }
 
-// labelTranscript aligns whisper transcript segments with speaker diarization
-// segments and returns speaker-labelled content and the number of distinct
-// speakers.
+// modelSupportsNativeDiarization reports whether model performs speaker
+// diarization as part of the transcription response itself (OpenAI's
+// gpt-4o-transcribe-diarize family), as opposed to a plain transcription
+// model whose output must be aligned against a separate diarization pass
+// (see diarizeAudio / diarSegment above).
 //
-// Alignment strategy:
-//   - For each whisper segment, find the diarization speaker whose time
-//     interval has the maximum overlap (overlap = max(0, min(ends)-max(starts))).
-//   - When no diarization segment overlaps a whisper segment at all, the
-//     nearest diarization speaker by midpoint distance is assigned.
-//   - Diarization speaker IDs (e.g. "SPEAKER_00") are mapped to 화자1, 화자2, …
-//     in order of first appearance across the whisper segments.
+// Detection is a case-insensitive substring match on "diarize" rather than an
+// exact allow-list, so future model variants that follow the same naming
+// convention are recognised without a code change.
+func modelSupportsNativeDiarization(model string) bool {
+	return strings.Contains(strings.ToLower(model), "diarize")
+}
+
+// diarizedSegment is a single speaker-labelled segment from the OpenAI
+// gpt-4o-transcribe-diarize response (response_format=diarized_json).
 //
-// Consecutive whisper segments assigned to the same speaker are grouped into a
-// single block; blocks are rendered as "[화자N] text" and separated by newlines.
+// Verified response shape (ground truth — checked against the live OpenAI
+// API):
 //
-// If whisperSegs or diarSegs is empty the function returns ("", 0) so callers
-// can fall back to the plain transcript text.
-func labelTranscript(whisperSegs []whisperSegment, diarSegs []diarSegment) (content string, speakerCount int) {
-	if len(whisperSegs) == 0 || len(diarSegs) == 0 {
+//	{"type":"transcript.text.segment","text":" ...","speaker":"A",
+//	 "start":0.0,"end":5.55,"id":"seg_0"}
+//
+// Speaker values are single uppercase letters ("A", "B", …) — NOT the
+// "SPEAKER_00" style produced by the pyannote microservice (diarSegment
+// above). The two speaker-ID vocabularies are never mixed: each audio file
+// is processed by exactly one diarization path (see
+// modelSupportsNativeDiarization).
+type diarizedSegment struct {
+	Type    string  `json:"type"`
+	Text    string  `json:"text"`
+	Speaker string  `json:"speaker"`
+	Start   float64 `json:"start"`
+	End     float64 `json:"end"`
+	ID      string  `json:"id"`
+}
+
+// diarizedResponse is the JSON body returned by /v1/audio/transcriptions
+// when response_format=diarized_json is requested. Segments may be absent or
+// empty even on a 200 response — observed when chunking_strategy is
+// omitted/misconfigured (see transcribeFile) or for very short clips the
+// model chooses not to segment. Callers must fall back to the flat Text
+// field in that case; see transcribeFile and buildDocument.
+type diarizedResponse struct {
+	Text     string            `json:"text"`
+	Task     string            `json:"task"`
+	Duration float64           `json:"duration"`
+	Segments []diarizedSegment `json:"segments"`
+}
+
+// rawLabelledSeg pairs a raw (pre-화자N) speaker identifier with a segment's
+// text. It is the common input shape consumed by renderSpeakerBlocks: the two
+// diarization paths (pyannote alignment in labelTranscript, and native
+// diarization in nativeDiarizedSegsToRawLabelled) differ only in HOW they
+// arrive at a (speaker, text) pair per segment — one aligns by time-interval
+// overlap, the other reads an already-authoritative field — but both converge
+// on this same shape so a single renderer guarantees identical stored output
+// format ("[화자N] text" grouped blocks) regardless of path.
+type rawLabelledSeg struct {
+	speaker string // raw ID, e.g. "SPEAKER_00" (pyannote) or "A" (native diarize) — not yet a 화자N label
+	text    string
+}
+
+// nativeDiarizedSegsToRawLabelled converts diarized_json segments into the
+// rawLabelledSeg sequence consumed by renderSpeakerBlocks.
+//
+// This function deliberately does NOT reuse labelTranscript's overlap-based
+// alignment. labelTranscript exists to solve a different problem: aligning
+// two INDEPENDENTLY timestamped sequences (whisper transcript segments vs. a
+// separate diarization service's segments) that were never guaranteed to
+// share boundaries. Native diarize segments have no such problem — each
+// diarizedSegment carries its OWN authoritative speaker for its OWN text,
+// assigned by the model as part of producing that exact segment. There is
+// nothing to align.
+//
+// Routing native segments through labelTranscript's overlap-based
+// assignSpeaker instead would be actively wrong: assignSpeaker scores ALL
+// diarSegs against a given whisper segment and picks the STRICTLY GREATEST
+// overlap (ties go to whichever candidate it evaluates first), so if the API
+// ever returns a segment whose interval fully contains another's — plausible
+// at chunking_strategy=auto chunk boundaries — the contained segment's own
+// interval loses the overlap contest to the containing segment, silently
+// misattributing its text to the wrong speaker. That failure mode is
+// invisible (no error, wrong output) and depends entirely on a third-party
+// API's segmentation behaviour, which this code does not control. Native
+// diarization output must therefore be trusted per-segment, never re-aligned.
+func nativeDiarizedSegsToRawLabelled(segs []diarizedSegment) []rawLabelledSeg {
+	out := make([]rawLabelledSeg, len(segs))
+	for i, s := range segs {
+		out[i] = rawLabelledSeg{speaker: s.Speaker, text: s.Text}
+	}
+	return out
+}
+
+// renderSpeakerBlocks converts a per-segment sequence of (raw speaker, text)
+// pairs — in original segment order — into content formatted as consecutive
+// "[화자N] text" blocks, plus the number of distinct speakers.
+//
+// Raw speaker IDs are mapped to 화자1, 화자2, … in order of FIRST APPEARANCE in
+// segs (not alphabetical/numeric order of the raw ID), so the mapping is
+// stable and readable regardless of whether the raw vocabulary is pyannote's
+// "SPEAKER_00" style or the native diarize API's "A"/"B" style.
+//
+// Consecutive segments assigned to the same 화자N label are merged into a
+// single block (space-joined); blocks themselves are newline-separated.
+// Segments with empty (post-trim) text contribute no text but do not break an
+// in-progress block.
+//
+// If segs is empty the function returns ("", 0) so callers can fall back to
+// the plain transcript text.
+func renderSpeakerBlocks(segs []rawLabelledSeg) (content string, speakerCount int) {
+	if len(segs) == 0 {
 		return "", 0
 	}
 
-	// speakerMap maps raw diarization speaker IDs → 화자N labels in order of
-	// first appearance. A slice is used to keep insertion-order traversal O(n).
+	// speakerMap maps raw speaker IDs → 화자N labels in order of first
+	// appearance. A slice is used to keep insertion-order traversal O(n).
 	speakerMap := map[string]string{}
 	var speakerOrder []string // raw IDs in order of first appearance
 
@@ -120,6 +221,82 @@ func labelTranscript(whisperSegs []whisperSegment, diarSegs []diarSegment) (cont
 		speakerMap[rawID] = label
 		speakerOrder = append(speakerOrder, rawID)
 		return label
+	}
+
+	type labelledSeg struct {
+		speaker string
+		text    string
+	}
+	labelled := make([]labelledSeg, len(segs))
+	for i, s := range segs {
+		labelled[i] = labelledSeg{
+			speaker: speakerLabel(s.speaker),
+			text:    strings.TrimSpace(s.text),
+		}
+	}
+
+	// Group consecutive segments with the same speaker into blocks.
+	var sb strings.Builder
+	blockSpeaker := labelled[0].speaker
+	var blockTexts []string
+
+	flushBlock := func() {
+		if len(blockTexts) == 0 {
+			return
+		}
+		if sb.Len() > 0 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString("[")
+		sb.WriteString(blockSpeaker)
+		sb.WriteString("] ")
+		sb.WriteString(strings.Join(blockTexts, " "))
+	}
+
+	for _, seg := range labelled {
+		if seg.speaker != blockSpeaker {
+			flushBlock()
+			blockSpeaker = seg.speaker
+			blockTexts = blockTexts[:0]
+		}
+		if seg.text != "" {
+			blockTexts = append(blockTexts, seg.text)
+		}
+	}
+	flushBlock()
+
+	return sb.String(), len(speakerOrder)
+}
+
+// labelTranscript aligns whisper transcript segments with speaker diarization
+// segments (from the separate pyannote microservice — see diarizeAudio) and
+// returns speaker-labelled content and the number of distinct speakers.
+//
+// This alignment step exists ONLY because whisper transcript segments and
+// pyannote diarization segments are two INDEPENDENTLY timestamped sequences
+// with no guaranteed shared boundaries — they must be reconciled by
+// time-interval overlap. Native diarization (gpt-4o-transcribe-diarize) has
+// no such problem and does NOT go through this function; see
+// nativeDiarizedSegsToRawLabelled for why re-alignment would be actively
+// wrong for that path.
+//
+// Alignment strategy:
+//   - For each whisper segment, find the diarization speaker whose time
+//     interval has the maximum overlap (overlap = max(0, min(ends)-max(starts))).
+//   - When no diarization segment overlaps a whisper segment at all, the
+//     nearest diarization speaker by midpoint distance is assigned.
+//
+// The resulting (speaker, text) pairs are rendered via renderSpeakerBlocks,
+// which performs the 화자N first-appearance numbering and consecutive-block
+// grouping shared with the native diarization path. This preserves the
+// original labelTranscript output byte-for-byte — only the block-rendering
+// half was extracted into a shared helper.
+//
+// If whisperSegs or diarSegs is empty the function returns ("", 0) so callers
+// can fall back to the plain transcript text.
+func labelTranscript(whisperSegs []whisperSegment, diarSegs []diarSegment) (content string, speakerCount int) {
+	if len(whisperSegs) == 0 || len(diarSegs) == 0 {
+		return "", 0
 	}
 
 	// assignSpeaker returns the diarization speaker for a given whisper segment.
@@ -167,51 +344,14 @@ func labelTranscript(whisperSegs []whisperSegment, diarSegs []diarSegment) (cont
 		return bestSpeaker
 	}
 
-	// Assign each whisper segment a speaker label.
-	type labelledSeg struct {
-		speaker string
-		text    string
-	}
-	labelled := make([]labelledSeg, len(whisperSegs))
+	// Assign each whisper segment a (raw) speaker via overlap alignment, then
+	// hand off to the shared renderer for 화자N numbering and block grouping.
+	segs := make([]rawLabelledSeg, len(whisperSegs))
 	for i, ws := range whisperSegs {
-		raw := assignSpeaker(ws)
-		labelled[i] = labelledSeg{
-			speaker: speakerLabel(raw),
-			text:    strings.TrimSpace(ws.Text),
-		}
+		segs[i] = rawLabelledSeg{speaker: assignSpeaker(ws), text: ws.Text}
 	}
 
-	// Group consecutive segments with the same speaker into blocks.
-	var sb strings.Builder
-	blockSpeaker := labelled[0].speaker
-	var blockTexts []string
-
-	flushBlock := func() {
-		if len(blockTexts) == 0 {
-			return
-		}
-		if sb.Len() > 0 {
-			sb.WriteByte('\n')
-		}
-		sb.WriteString("[")
-		sb.WriteString(blockSpeaker)
-		sb.WriteString("] ")
-		sb.WriteString(strings.Join(blockTexts, " "))
-	}
-
-	for _, seg := range labelled {
-		if seg.speaker != blockSpeaker {
-			flushBlock()
-			blockSpeaker = seg.speaker
-			blockTexts = blockTexts[:0]
-		}
-		if seg.text != "" {
-			blockTexts = append(blockTexts, seg.text)
-		}
-	}
-	flushBlock()
-
-	return sb.String(), len(speakerOrder)
+	return renderSpeakerBlocks(segs)
 }
 
 // Filename patterns for recording timestamps.
@@ -530,9 +670,17 @@ func isPrivateOrLinkLocalIP(ip net.IP) bool {
 }
 
 // isLocalWhisperEndpoint reports whether the given URL host resolves to a
-// loopback, Docker-internal, or RFC-1918 private address. Call-transcription
-// data MUST stay local (issue #100). Misconfiguration producing a cloud endpoint
-// is logged as a prominent warning but does not hard-fail the collector.
+// loopback, Docker-internal, or RFC-1918 private address.
+//
+// Historically (issue #100) call-transcription data was required to stay
+// local; that policy has since been reversed by explicit user decision — this
+// collector now defaults to OpenAI's gpt-4o-transcribe-diarize (a cloud
+// endpoint). This function is retained because CollectStream still needs to
+// know whether the endpoint is local for two purposes unrelated to the old
+// local-only mandate: (1) log level selection for the cloud-endpoint guard
+// (see cfg.WhisperCloudAllowed), and (2) the 25 MiB hard file-size cap that
+// only OpenAI's hosted API enforces (whisperCloudMaxFileBytes). A non-local
+// endpoint no longer hard-fails or blocks the collector either way.
 //
 // Locality detection strategy (#153):
 //  1. Well-known literal aliases (localhost, 127.0.0.1, ::1, host.docker.internal).
@@ -620,8 +768,20 @@ const whisperStreamBatchSize = 5
 // regardless of mtime (fixes late-arriving files on OneDrive FUSE mounts).
 //
 // Cloud-endpoint guard: if the configured Whisper endpoint resolves to a
-// non-local host, a prominent warning is logged on every collect call.
-// Issue #100 mandates call transcription stays LOCAL.
+// non-local host, a message is logged on every collect call — Info when
+// cfg.WhisperCloudAllowed acknowledges the policy exception, Warn otherwise.
+// Issue #100 originally mandated that call transcription stay LOCAL; this
+// collector now defaults to OpenAI's gpt-4o-transcribe-diarize (a cloud
+// endpoint) by design, with cfg.WhisperCloudAllowed documenting that the
+// exception was explicit rather than accidental misconfiguration. The guard
+// never blocks the request either way — it is observability, not enforcement.
+//
+// Cloud file-size guard: OpenAI's /v1/audio/transcriptions endpoint hard-caps
+// uploads at 25 MiB (whisperCloudMaxFileBytes, verified against the live
+// API). When the resolved endpoint is non-local, files over this limit are
+// skipped (not quarantined — they are valid audio, just too large for a
+// single request) and the walk continues; see CollectStream for the exact
+// placement and the transcription-ledger interaction.
 //
 // Partial success: individual transcription failures are logged as warnings and
 // the walk continues. The final error is nil as long as the directory walk
@@ -646,10 +806,10 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 //
 // Pipeline:
 //   - Phase 1 (SEQUENTIAL walk): every filter (ext, cutover, authoritative
-//     index-skip, size cap, failedQuarantine skip-set, header check +
-//     quarantine) runs single-goroutine inside WalkDir, preserving the
-//     single-writer safety of the failedQuarantine map (no mutex). Files that
-//     pass become `pending`.
+//     index-skip, cloud 25 MiB size cap, local size cap, failedQuarantine
+//     skip-set, header check + quarantine) runs single-goroutine inside
+//     WalkDir, preserving the single-writer safety of the failedQuarantine map
+//     (no mutex). Files that pass become `pending`.
 //   - Phase 2 (CONCURRENT transcription): a worker pool of c.concurrency()
 //     workers transcribes pending files and sends each completed document to a
 //     results channel. A SINGLE drain goroutine receives from that channel,
@@ -672,11 +832,20 @@ func (c *WhisperCollector) CollectStream(ctx context.Context, since time.Time, o
 		return fmt.Errorf("whisper: CollectStream requires non-nil onBatch")
 	}
 
-	// LOW: cloud-endpoint guard (issue #100).
-	if !isLocalWhisperEndpoint(c.baseURL) {
-		slog.Warn("whisper: endpoint does not appear to be local — call transcription data may be sent to a cloud API; set WhisperAPIURL to a localhost or private-network address",
-			"endpoint", c.baseURL,
-		)
+	// Cloud-endpoint guard (issue #100 policy exception). isLocal is computed
+	// once here and reused below by the Phase 1 walk for the 25 MiB cloud
+	// file-size cap, which applies only to non-local endpoints.
+	isLocal := isLocalWhisperEndpoint(c.baseURL)
+	if !isLocal {
+		if c.cfg.WhisperCloudAllowed {
+			slog.Info("whisper: call audio is intentionally sent to a cloud transcription endpoint (issue #100 policy exception acknowledged)",
+				"endpoint", c.baseURL,
+			)
+		} else {
+			slog.Warn("whisper: endpoint does not appear to be local — call transcription data may be sent to a cloud API; set WHISPER_CLOUD_ALLOWED=true to acknowledge this is intentional, or WHISPER_API_URL to a localhost/private-network address",
+				"endpoint", c.baseURL,
+			)
+		}
 	}
 
 	now := time.Now().UTC()
@@ -772,6 +941,44 @@ func (c *WhisperCollector) CollectStream(ctx context.Context, since time.Time, o
 			if !mtimeNew {
 				return nil
 			}
+		}
+
+		// Cloud API hard limit (25 MiB): applies only to non-local endpoints
+		// (isLocal, captured once above CollectStream's walk). Unlike the
+		// configurable c.maxFileBytes cap below (a local disk-usage guard),
+		// this reflects a fixed server-side constraint — OpenAI rejects larger
+		// uploads outright. Submitting an oversized file anyway would waste a
+		// network round-trip and log a spurious API error, so it is caught
+		// here first.
+		//
+		// The file is valid audio, not corrupt, so it is skipped (walk
+		// continues) WITHOUT quarantine and WITHOUT emitting a Document —
+		// chunking oversized files for the cloud API is out of scope for this
+		// change.
+		//
+		// Ledger interaction: skipped files here are NEVER passed to the
+		// scheduler's onBatch, so they are never recorded in the transcription
+		// ledger either (RecordTranscribed only runs over documents that
+		// actually reach a batch). This means an oversized file re-triggers
+		// this same WARN on every future collection cycle until it either
+		// shrinks, moves under a local endpoint, or is chunked externally —
+		// deliberately mirroring the existing c.maxFileBytes cap immediately
+		// below, which has always skipped without ledgering (a pre-existing,
+		// accepted trade-off, not one introduced by this change). Doing
+		// anything else here (e.g. ledgering a skip so the WARN fires only
+		// once) would require plumbing store/ledger access into
+		// WhisperCollector, which today only produces model.Document values
+		// and has no store dependency at all — out of scope for this change,
+		// and unlike the original infinite-retry bug (#158) this cost is a
+		// single log line per cycle, not a repeated expensive network/CPU
+		// operation.
+		if !isLocal && info.Size() > whisperCloudMaxFileBytes {
+			slog.Warn("whisper: skipping file over cloud API 25 MiB limit",
+				"path", path,
+				"size_bytes", info.Size(),
+				"limit_bytes", whisperCloudMaxFileBytes,
+			)
+			return nil
 		}
 
 		// Per-file size cap: skip files that exceed the configured limit.
@@ -877,8 +1084,8 @@ type pendingTranscription struct {
 //   - THIS goroutine is the single drain/emitter: it receives from `results`,
 //     buffers documents, and calls onBatch once per whisperStreamBatchSize
 //     (plus a final partial flush). Funnelling every onBatch call through ONE
-//     goroutine is REQUIRED because the scheduler's processBatch (ledger record
-//     + embed + upsert) is not concurrency-safe.
+//     goroutine is REQUIRED because the scheduler's processBatch (ledger
+//     record, embed, upsert) is not concurrency-safe.
 //
 // Each completed document is sent exactly once and received by exactly one drain
 // iteration, so every file appears in exactly one batch (no duplicates, no
@@ -1045,12 +1252,50 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 	// Use the plain transcript as the default content.
 	content := txResult.text
 
-	// Diarization post-processing (feature-flagged OFF by default).
-	// Only attempted when:
-	//   1. DiarizationEnabled=true AND DiarizationAPIURL is set
-	//   2. Whisper returned at least one segment (verbose_json)
-	// On any error the warning is logged and the plain transcript is used.
-	if c.cfg.DiarizationEnabled && c.cfg.DiarizationAPIURL != "" && len(txResult.segments) > 0 {
+	// Diarization post-processing.
+	//
+	// Native-diarizing models (gpt-4o-transcribe-diarize) ALWAYS return
+	// speaker-labelled segments in the transcription response itself —
+	// transcribeFile ALWAYS requests response_format=diarized_json for them,
+	// unconditionally of cfg.DiarizationEnabled (see transcribeFile doc
+	// comment for why: the model cannot transcribe without also diarizing, so
+	// gating on the flag would mean paying the full cloud-transcription cost
+	// while discarding the speaker labels we already received — the worst of
+	// both worlds, and a silent one). No second API call is made or needed
+	// here; this branch is the replacement for the local pyannote microservice
+	// for these models.
+	//
+	// Non-native models (e.g. local whisper.cpp deployments) fall through to
+	// the pyannote alignment path, gated by cfg.DiarizationEnabled as before
+	// (unchanged since #111): a second request is sent to DiarizationAPIURL
+	// and the result is aligned against the verbose_json segments via
+	// labelTranscript. This is the ONLY branch where DiarizationEnabled still
+	// has meaning.
+	//
+	// Both paths converge on the same renderSpeakerBlocks formatter so stored
+	// content is identical in shape ("[화자N] text" grouped blocks) regardless
+	// of which path produced it; meta["diarization"] records which one did,
+	// for observability. The native path does NOT go through labelTranscript's
+	// overlap alignment — each diarizedSegment already carries its own
+	// authoritative speaker, so alignment would only introduce error (see
+	// nativeDiarizedSegsToRawLabelled doc comment).
+	switch {
+	case modelSupportsNativeDiarization(c.cfg.WhisperModel):
+		if len(txResult.diarized) > 0 {
+			labelled, nSpeakers := renderSpeakerBlocks(nativeDiarizedSegsToRawLabelled(txResult.diarized))
+			if labelled != "" {
+				content = labelled
+				meta["speaker_count"] = nSpeakers
+				meta["diarization"] = "native"
+			} else {
+				slog.Warn("whisper: renderSpeakerBlocks produced empty output for native diarization — using plain transcript",
+					"path", item.path)
+			}
+		}
+		// len(txResult.diarized) == 0: transcribeFile already warned and
+		// content already defaults to the flat text — nothing more to do.
+
+	case c.cfg.DiarizationEnabled && c.cfg.DiarizationAPIURL != "" && len(txResult.segments) > 0:
 		audioBytes, readErr := os.ReadFile(item.path)
 		if readErr != nil {
 			slog.Warn("whisper: diarization skipped — cannot re-read audio file",
@@ -1066,6 +1311,7 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 				if labelled != "" {
 					content = labelled
 					meta["speaker_count"] = nSpeakers
+					meta["diarization"] = "pyannote"
 				} else {
 					slog.Warn("whisper: labelTranscript produced empty output — using plain transcript",
 						"path", item.path)
@@ -1202,29 +1448,63 @@ func checkAudioFileHeader(path, ext string) error {
 
 // transcribeFileResult holds the output of a transcription call.
 type transcribeFileResult struct {
-	text     string           // flat transcript text
-	segments []whisperSegment // time-stamped segments; may be nil/empty for older servers
+	text     string            // flat transcript text
+	segments []whisperSegment  // time-stamped segments (verbose_json / pyannote path); may be nil/empty for older servers
+	diarized []diarizedSegment // speaker-labelled segments (diarized_json / native-diarizing models); nil unless requested
 }
 
 // transcribeFile posts the audio file at path to the Whisper transcription
-// endpoint and returns the transcript text and, when diarization is enabled,
-// time-stamped segments.
+// endpoint and returns the transcript text plus, depending on which request
+// shape was used, either time-stamped segments (verbose_json — pyannote
+// alignment path) or speaker-labelled segments (diarized_json — native
+// diarization path).
 //
 // The request is a multipart/form-data POST to {baseURL}/audio/transcriptions
-// with the following fields:
-//   - file: audio file bytes (filename preserved for MIME detection by the server)
-//   - model: cfg.WhisperModel
-//   - language: cfg.WhisperLanguage (omitted when empty)
-//   - response_format: "verbose_json" (ONLY when cfg.DiarizationEnabled is true)
+// with the "file", "model", and "language" fields always present (language
+// omitted when empty). The remaining fields are chosen in priority order:
 //
-// When DiarizationEnabled is false the request is identical to the pre-diarization
-// implementation: no response_format field, plain {"text":"..."} response parsed
-// via whisperTranscribeResponse. This ensures zero behaviour change for deployments
-// running with the flag off.
+//  1. modelSupportsNativeDiarization(cfg.WhisperModel): ALWAYS
+//     response_format=diarized_json, chunking_strategy=cfg.WhisperChunkingStrategy
+//     (field OMITTED entirely when the config value is empty string — NOT sent
+//     as an empty value) — regardless of cfg.DiarizationEnabled.
 //
-// When DiarizationEnabled is true, response_format=verbose_json is added and the
-// response is parsed via whisperVerboseResponse to extract per-segment timestamps
-// needed for speaker alignment.
+//     cfg.DiarizationEnabled is deliberately NOT consulted here. For a
+//     native-diarizing model, transcription and diarization are the same API
+//     call — there is no cheaper "just transcribe" request to fall back to
+//     when the flag is off. Gating this branch on the flag (as an earlier
+//     version of this function did) would mean: with DIARIZATION_ENABLED at
+//     its default false, every call recording still gets sent to the cloud
+//     model (that decision is made by WHISPER_API_URL + WHISPER_MODEL, not by
+//     this flag) but the code would deliberately request response_format
+//     other than diarized_json, discarding the speaker labels the model
+//     already computed as part of that same request. That is full privacy
+//     cost for zero benefit, and it fails silently — no error, just
+//     unlabelled text. So: if the model is native-diarizing, always ask for
+//     diarized_json.
+//
+//     chunking_strategy is REQUIRED by the live API for the response to
+//     contain a "segments" array at all: verified against the real OpenAI
+//     endpoint, omitting it yields a text-only response and the model
+//     degenerates into repeating text. The response is parsed via
+//     diarizedResponse; speaker values are "A", "B", … per the verified
+//     response shape.
+//
+//  2. Non-native model AND cfg.DiarizationEnabled (e.g. a local whisper.cpp
+//     server that understands verbose_json but not diarized_json, paired with
+//     the pyannote microservice): response_format=verbose_json, parsed via
+//     whisperVerboseResponse. IDENTICAL to the #111 behaviour.
+//     cfg.DiarizationEnabled retains its original meaning ONLY for this
+//     branch — it gates the legacy pyannote alignment path, not native
+//     diarization.
+//
+//  3. Neither: no response_format field at all, plain {"text":"..."} response
+//     parsed via whisperTranscribeResponse. IDENTICAL to the original
+//     pre-#111 implementation — this preserves zero behaviour change for
+//     local whisper.cpp deployments running with the flag off.
+//
+// Cases 2 and 3 exist so local whisper.cpp deployments (which do not speak
+// diarized_json) are byte-for-byte unaffected by the introduction of the
+// native diarization path.
 //
 // The Authorization header is set only when cfg.WhisperAPIKey is non-empty,
 // enabling use with local whisper.cpp servers that do not require authentication.
@@ -1233,6 +1513,11 @@ func (c *WhisperCollector) transcribeFile(ctx context.Context, path string) (tra
 	if err != nil {
 		return transcribeFileResult{}, fmt.Errorf("read audio file: %w", err)
 	}
+
+	// See doc comment above: native diarization is requested unconditionally
+	// of cfg.DiarizationEnabled, which retains its original meaning only for
+	// the legacy pyannote path (case 2 below).
+	nativeDiarize := modelSupportsNativeDiarization(c.cfg.WhisperModel)
 
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
@@ -1258,14 +1543,27 @@ func (c *WhisperCollector) transcribeFile(ctx context.Context, path string) (tra
 		}
 	}
 
-	// response_format=verbose_json is only added when diarization is enabled.
-	// When the flag is off this field is absent, preserving the original
-	// request format byte-for-byte.
-	if c.cfg.DiarizationEnabled {
+	switch {
+	case nativeDiarize:
+		// diarized_json is the only format that returns speaker labels for
+		// native-diarizing models. See doc comment above for why
+		// chunking_strategy is required.
+		if err := mw.WriteField("response_format", "diarized_json"); err != nil {
+			return transcribeFileResult{}, fmt.Errorf("write response_format field: %w", err)
+		}
+		if c.cfg.WhisperChunkingStrategy != "" {
+			if err := mw.WriteField("chunking_strategy", c.cfg.WhisperChunkingStrategy); err != nil {
+				return transcribeFileResult{}, fmt.Errorf("write chunking_strategy field: %w", err)
+			}
+		}
+	case c.cfg.DiarizationEnabled:
+		// Legacy pyannote-alignment path: verbose_json gives per-segment
+		// timestamps, unchanged since #111.
 		if err := mw.WriteField("response_format", "verbose_json"); err != nil {
 			return transcribeFileResult{}, fmt.Errorf("write response_format field: %w", err)
 		}
 	}
+	// Neither branch taken: no response_format field — original pre-#111 shape.
 
 	if err := mw.Close(); err != nil {
 		return transcribeFileResult{}, fmt.Errorf("close multipart writer: %w", err)
@@ -1299,34 +1597,70 @@ func (c *WhisperCollector) transcribeFile(ctx context.Context, path string) (tra
 		return transcribeFileResult{}, fmt.Errorf("whisper API returned %d: %s", resp.StatusCode, body)
 	}
 
-	// Parse response according to the requested format.
-	// Flag OFF: plain {"text":"..."} — identical to the original pre-#111 path.
-	// Flag ON:  verbose_json {"text":"...","segments":[...]} for diarization alignment.
-	if !c.cfg.DiarizationEnabled {
+	// Parse response according to the request shape actually sent above.
+	switch {
+	case nativeDiarize:
+		var result diarizedResponse
+		if err := json.Unmarshal(body, &result); err != nil {
+			return transcribeFileResult{}, fmt.Errorf("decode response JSON: %w", err)
+		}
+		if len(result.Segments) == 0 {
+			// Observed when chunking_strategy is missing/misconfigured, or for
+			// very short clips the model chooses not to segment. Fall back to
+			// the flat text rather than erroring — buildDocument still
+			// produces a (non-diarized) document rather than dropping the
+			// file entirely.
+			slog.Warn("whisper: diarized_json response had zero segments — falling back to flat text",
+				"path", path, "model", c.cfg.WhisperModel)
+			return transcribeFileResult{text: result.Text}, nil
+		}
+		return transcribeFileResult{text: result.Text, diarized: result.Segments}, nil
+
+	case !c.cfg.DiarizationEnabled:
+		// Plain {"text":"..."} — identical to the original pre-#111 path.
 		var result whisperTranscribeResponse
 		if err := json.Unmarshal(body, &result); err != nil {
 			return transcribeFileResult{}, fmt.Errorf("decode response JSON: %w", err)
 		}
 		return transcribeFileResult{text: result.Text}, nil
-	}
 
-	var result whisperVerboseResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return transcribeFileResult{}, fmt.Errorf("decode response JSON: %w", err)
+	default:
+		// verbose_json {"text":"...","segments":[...]} for pyannote alignment.
+		var result whisperVerboseResponse
+		if err := json.Unmarshal(body, &result); err != nil {
+			return transcribeFileResult{}, fmt.Errorf("decode response JSON: %w", err)
+		}
+		return transcribeFileResult{
+			text:     result.Text,
+			segments: result.Segments,
+		}, nil
 	}
-	return transcribeFileResult{
-		text:     result.Text,
-		segments: result.Segments,
-	}, nil
 }
 
 // isTPhoneCallPath reports whether path looks like a TPhoneCallRecords audio
-// file based on the reTPhone filename pattern. When true, the diarization
-// request is sent with num_speakers=2 (phone calls are always two-party).
+// file based on the reTPhone filename pattern. When true, the LEGACY pyannote
+// diarization request (diarizeAudio) is sent with num_speakers=2 (phone calls
+// are always two-party).
 //
-// Heuristic: the TPhone pattern requires a phone-number prefix followed by
-// a 14-digit timestamp (see reTPhone). Voice memos and other recordings do
-// not match, so num_speakers is omitted for them.
+// Heuristic: the TPhone pattern requires ANY prefix followed by a 14-digit
+// timestamp (see reTPhone — it anchors only on the trailing
+// "_YYYYMMDDHHMMSS[-N].ext" suffix, not on the prefix's content). This still
+// matches the post-#164 upload filename scheme
+// ("{numHash}_YYYYMMDDHHMMSS.ext", where the raw phone number was replaced by
+// its one-way hash to stop plaintext-number persistence): only the prefix
+// changed, and the function never inspected the prefix. Voice memos and other
+// recordings without a trailing 14-digit timestamp do not match, so
+// num_speakers is omitted for them.
+//
+// This function (and reTPhone, which recordingTime's Pattern B also uses to
+// extract the recording timestamp) is NOT dead code, but it is only ever
+// CALLED from the legacy pyannote branch in buildDocument. A native-diarizing
+// model (gpt-4o-transcribe-diarize) never reaches that branch — see the
+// buildDocument switch — because the model returns per-segment speakers
+// directly and has no num_speakers-style hint parameter to feed. So for
+// audio files transcribed via the cloud native-diarize path specifically,
+// this function is simply never invoked; it remains load-bearing for the
+// local-inference (`local-inference` compose profile) pyannote fallback.
 func isTPhoneCallPath(path string) bool {
 	return reTPhone.MatchString(filepath.Base(path))
 }

@@ -86,14 +86,15 @@ flowchart TD
         end
         subgraph AI["AI Services"]
             OLLAMA["ollama\ngemma3:12b-it-qat\nollama_models volume"]
-            WHISPER["whisper\nfaster-whisper-medium\nint8 CPU :8000"]
-            DIARIZATION["diarization\npyannote.audio\n:8001"]
+            WHISPER["whisper (opt-in)\nlocal-inference profile\nfaster-whisper-medium\nint8 CPU :8000"]
+            DIARIZATION["diarization (opt-in)\nlocal-inference profile\npyannote.audio\n:8001"]
         end
         WEB["web\nNext.js standalone\n:3000"]
     end
 
     subgraph EXTERNAL["External APIs"]
         OPENAI["OpenAI API\ntext-embedding-3-small"]
+        OPENAIWHISPER["OpenAI API\ngpt-4o-transcribe-diarize\n(transcribe + diarize, default)"]
         SLACK["Slack Web API"]
         GITHUB["GitHub REST API"]
         WEBHOOK["Alert Webhook\n(Slack)"]
@@ -118,8 +119,9 @@ flowchart TD
     COLLECTOR --> OPENAI
     COLLECTOR --> SLACK
     COLLECTOR --> GITHUB
-    COLLECTOR --> WHISPER
-    COLLECTOR --> DIARIZATION
+    COLLECTOR --> OPENAIWHISPER
+    COLLECTOR -.->|opt-in local fallback| WHISPER
+    COLLECTOR -.->|opt-in local fallback| DIARIZATION
     COLLECTOR --> OLLAMA
     COLLECTOR -.-> SECRETARYDB
     COLLECTOR -.-> LLMMEMORY
@@ -129,13 +131,15 @@ flowchart TD
 
     class SERVER,COLLECTOR focal;
     class PG data;
-    class OPENAI,SLACK,GITHUB,WEBHOOK ext;
+    class OPENAI,OPENAIWHISPER,SLACK,GITHUB,WEBHOOK ext;
     class OLLAMA,WHISPER,DIARIZATION,WEB,MCP,EVALRUNNER,ANDROID muted;
 ```
 
 > **eraser render** ([edit](https://app.eraser.io/workspace/PyHgjPmM97MYtJNoVD5H)):
 >
 > ![System Runtime Topology](docs/diagrams/01-system-runtime-topology.png)
+>
+> This PNG renders an older topology where whisper/diarization were always-on services. The mermaid source above is authoritative (whisper/diarization are now opt-in under the `local-inference` profile; the default transcription path is the OpenAI cloud API).
 
 ### docker-compose.local.yml Services
 
@@ -147,8 +151,8 @@ flowchart TD
 | mcp | `second-brain-mcp:local` | 8090 | MCP streamable HTTP server |
 | eval-runner | `second-brain-eval:local` | — | Nightly eval scheduler (03:00 KST) |
 | ollama | `ollama/ollama:latest` | 11434 (internal) | Local LLM (gemma3:12b-it-qat) |
-| whisper | `fedirz/faster-whisper-server:latest-cpu` | 8000 (internal) | Whisper ASR (int8 CPU) |
-| diarization | `second-brain-diarization:local` | 8001 (internal) | pyannote.audio speaker diarization |
+| whisper (`local-inference` profile, opt-in) | `fedirz/faster-whisper-server:latest-cpu` | 8000 (internal) | Legacy local ASR fallback (int8 CPU). Default transcription path is OpenAI gpt-4o-transcribe-diarize |
+| diarization (`local-inference` profile, opt-in) | `second-brain-diarization:local` | 8001 (internal) | Legacy local pyannote.audio speaker diarization fallback |
 | web | `second-brain-web:local` | 3000 | Next.js frontend |
 
 ---
@@ -502,7 +506,7 @@ type Scheduler struct {
 
 SMS and calls: The Android second-brain-push app sends data via `POST /api/v1/ingest/messages`. Source ID format: `sms:{dateMs}:{sha256(addr)[:16]}:{direction}`. Migration 019 re-keyed existing bodyHash-based source IDs.
 
-Recordings: Received as `.m4a` multipart via `POST /api/v1/ingest/recording` → Whisper ASR → text conversion and storage. Corrupted audio is isolated (#152).
+Recordings: Received as `.m4a` multipart via `POST /api/v1/ingest/recording` → OpenAI gpt-4o-transcribe-diarize (cloud) → text conversion + speaker diarization and storage. Corrupted audio is isolated (#152).
 
 #### secretary / gmail / calendar / llm-memory
 
@@ -879,8 +883,13 @@ Server-side proxy pattern: backend address and API key are never exposed to the 
 | `ENTITY_EXTRACTION_ENABLED` | `false` | Enable entity extraction + search lane |
 | `FILESYSTEM_PATH` | — | Filesystem collection root |
 | `FILESYSTEM_ENABLED` | `false` | Activate filesystem collector |
-| `DIARIZATION_API_URL` | — | Speaker diarization server URL |
-| `DIARIZATION_ENABLED` | `false` | Enable speaker diarization |
+| `WHISPER_API_URL` | `https://api.openai.com/v1` | Transcription API endpoint (default: OpenAI cloud) |
+| `WHISPER_API_KEY` | — | OpenAI API key. Required — empty disables transcription entirely |
+| `WHISPER_MODEL` | `gpt-4o-transcribe-diarize` | Combined transcription + speaker diarization model |
+| `WHISPER_CHUNKING_STRATEGY` | `auto` | Required to receive speaker diarization segments |
+| `WHISPER_CLOUD_ALLOWED` | `false` | Acknowledges audio is sent to OpenAI. Never blocks — only changes a log level |
+| `DIARIZATION_API_URL` | — | (legacy local-only) Speaker diarization server URL — unused by the default cloud transcription path |
+| `DIARIZATION_ENABLED` | `false` | (legacy local-only) Selects the local pyannote diarization service — the cloud transcription model always includes diarization regardless of this flag |
 
 ### cliproxy Integration
 

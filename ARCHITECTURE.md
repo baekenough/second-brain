@@ -86,14 +86,15 @@ flowchart TD
         end
         subgraph AI["AI Services"]
             OLLAMA["ollama\ngemma3:12b-it-qat\nollama_models volume"]
-            WHISPER["whisper\nfaster-whisper-medium\nint8 CPU :8000"]
-            DIARIZATION["diarization\npyannote.audio\n:8001"]
+            WHISPER["whisper (opt-in)\nlocal-inference profile\nfaster-whisper-medium\nint8 CPU :8000"]
+            DIARIZATION["diarization (opt-in)\nlocal-inference profile\npyannote.audio\n:8001"]
         end
         WEB["web\nNext.js standalone\n:3000"]
     end
 
     subgraph EXTERNAL["External APIs"]
         OPENAI["OpenAI API\ntext-embedding-3-small"]
+        OPENAIWHISPER["OpenAI API\ngpt-4o-transcribe-diarize\n(전사 + 화자분리, 기본)"]
         SLACK["Slack Web API"]
         GITHUB["GitHub REST API"]
         WEBHOOK["Alert Webhook\n(Slack)"]
@@ -118,8 +119,9 @@ flowchart TD
     COLLECTOR --> OPENAI
     COLLECTOR --> SLACK
     COLLECTOR --> GITHUB
-    COLLECTOR --> WHISPER
-    COLLECTOR --> DIARIZATION
+    COLLECTOR --> OPENAIWHISPER
+    COLLECTOR -.->|opt-in 로컬 폴백| WHISPER
+    COLLECTOR -.->|opt-in 로컬 폴백| DIARIZATION
     COLLECTOR --> OLLAMA
     COLLECTOR -.-> SECRETARYDB
     COLLECTOR -.-> LLMMEMORY
@@ -129,13 +131,15 @@ flowchart TD
 
     class SERVER,COLLECTOR focal;
     class PG data;
-    class OPENAI,SLACK,GITHUB,WEBHOOK ext;
+    class OPENAI,OPENAIWHISPER,SLACK,GITHUB,WEBHOOK ext;
     class OLLAMA,WHISPER,DIARIZATION,WEB,MCP,EVALRUNNER,ANDROID muted;
 ```
 
 > **eraser 렌더** ([편집](https://app.eraser.io/workspace/PyHgjPmM97MYtJNoVD5H)):
 >
 > ![시스템 런타임 토폴로지](docs/diagrams/01-system-runtime-topology.png)
+>
+> 위 PNG는 whisper/diarization을 항상 기동되는 서비스로 그린 구 토폴로지 렌더링입니다. 최신 상태는 위 mermaid 소스를 기준으로 합니다 (whisper/diarization은 `local-inference` profile opt-in, 기본 전사 경로는 OpenAI 클라우드 API).
 
 ### docker-compose.local.yml 서비스 목록
 
@@ -147,8 +151,8 @@ flowchart TD
 | mcp | `second-brain-mcp:local` | 8090 | MCP streamable HTTP 서버 |
 | eval-runner | `second-brain-eval:local` | — | nightly eval 스케줄러 (03:00 KST) |
 | ollama | `ollama/ollama:latest` | 11434 (내부) | 로컬 LLM (gemma3:12b-it-qat) |
-| whisper | `fedirz/faster-whisper-server:latest-cpu` | 8000 (내부) | Whisper ASR (int8 CPU) |
-| diarization | `second-brain-diarization:local` | 8001 (내부) | pyannote.audio 화자 분리 |
+| whisper (`local-inference` profile, opt-in) | `fedirz/faster-whisper-server:latest-cpu` | 8000 (내부) | 레거시 로컬 ASR 폴백 (int8 CPU). 기본 전사 경로는 OpenAI gpt-4o-transcribe-diarize |
+| diarization (`local-inference` profile, opt-in) | `second-brain-diarization:local` | 8001 (내부) | 레거시 로컬 pyannote.audio 화자 분리 폴백 |
 | web | `second-brain-web:local` | 3000 | Next.js 프론트엔드 |
 
 ---
@@ -502,7 +506,7 @@ type Scheduler struct {
 
 SMS·통화: Android second-brain-push 앱이 `POST /api/v1/ingest/messages`로 전송. `source_id = sms:{dateMs}:{sha256(addr)[:16]}:{direction}`. migration 019로 이전 bodyHash 기반 source_id를 재키잉.
 
-녹음: `POST /api/v1/ingest/recording`으로 `.m4a` multipart 수신 → Whisper ASR → 텍스트 변환 후 저장. 손상 오디오는 격리 처리 (#152).
+녹음: `POST /api/v1/ingest/recording`으로 `.m4a` multipart 수신 → OpenAI gpt-4o-transcribe-diarize (클라우드) → 텍스트 변환 + 화자 분리 후 저장. 손상 오디오는 격리 처리 (#152).
 
 #### secretary / gmail / calendar / llm-memory
 
@@ -897,8 +901,13 @@ const API_KEY = process.env.API_KEY ?? "";  // 서버사이드만 사용 (클라
 | `ENTITY_EXTRACTION_ENABLED` | `false` | 엔티티 추출 + 검색 레인 활성화 |
 | `FILESYSTEM_PATH` | — | 파일시스템 수집 루트 |
 | `FILESYSTEM_ENABLED` | `false` | 파일시스템 수집기 활성화 |
-| `DIARIZATION_API_URL` | — | 화자 분리 서버 URL |
-| `DIARIZATION_ENABLED` | `false` | 화자 분리 활성화 |
+| `WHISPER_API_URL` | `https://api.openai.com/v1` | 전사 API 엔드포인트 (기본: OpenAI 클라우드) |
+| `WHISPER_API_KEY` | — | OpenAI API 키. 필수 — 비어있으면 전사 자체가 비활성화 |
+| `WHISPER_MODEL` | `gpt-4o-transcribe-diarize` | 전사 + 화자 분리 통합 모델 |
+| `WHISPER_CHUNKING_STRATEGY` | `auto` | 화자 분리 세그먼트를 받기 위해 필수 |
+| `WHISPER_CLOUD_ALLOWED` | `false` | 오디오가 OpenAI로 전송됨을 인지했다는 플래그. 동작을 막지 않고 로그 레벨만 변경 |
+| `DIARIZATION_API_URL` | — | (레거시 로컬 전용) pyannote 화자 분리 서버 URL — 기본 클라우드 전사 경로(gpt-4o-transcribe-diarize)는 이 값을 사용하지 않음 |
+| `DIARIZATION_ENABLED` | `false` | (레거시 로컬 전용) 로컬 pyannote 화자 분리 셀렉터 — 클라우드 화자 분리는 항상 내장되어 있어 이 값과 무관 |
 
 ### cliproxy 통합
 

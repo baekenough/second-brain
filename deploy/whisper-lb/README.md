@@ -1,5 +1,15 @@
 # Whisper Deployment Guide
 
+> **Status: decommissioned / historical.** The default transcription path is
+> now OpenAI `gpt-4o-transcribe-diarize` (cloud, deliberate exception to the
+> local-only stance below — see `.env.local.example`). The local whisper
+> containers referenced throughout this guide have been removed from all
+> servers; "Mode B" is no longer running anywhere. This document is kept for
+> historical reference and as a fallback recipe (`docker-compose.local.yml`
+> `whisper` service, now behind the opt-in `local-inference` compose profile)
+> for anyone who needs to run transcription without sending audio to a cloud
+> API.
+
 Two deployment modes are available. The collector switches between them via
 `WHISPER_API_URL` and `WHISPER_CONCURRENCY` in `.env.local`.
 
@@ -31,10 +41,12 @@ WHISPER_CONCURRENCY=1
 ### Start
 
 ```bash
-docker compose -f docker-compose.local.yml up -d
+docker compose -f docker-compose.local.yml --profile local-inference up -d
 ```
 
-The `whisper` service starts automatically via `depends_on`.
+The `whisper` service is opt-in behind the `local-inference` compose profile
+(it is no longer started by a plain `docker compose up -d`, nor via
+`depends_on` on `collector`).
 
 ---
 
@@ -173,9 +185,9 @@ If the distributed setup is unavailable:
    WHISPER_API_URL=http://whisper:8000/v1
    WHISPER_CONCURRENCY=1
    ```
-2. Start the local whisper service and recreate the collector:
+2. Start the local whisper service (opt-in profile) and recreate the collector:
    ```bash
-   docker compose -f docker-compose.local.yml up -d whisper
+   docker compose -f docker-compose.local.yml --profile local-inference up -d whisper
    docker compose -f docker-compose.local.yml up -d --no-deps collector
    ```
 3. The Mac whisper container picks up any backlog; no data loss occurs because
