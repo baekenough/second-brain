@@ -4,6 +4,7 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -91,8 +92,24 @@ type Completer interface {
 // It is exported so callers can build multi-turn conversation histories
 // for CompleteWithMessages.
 type Message struct {
-	Role    string `json:"role"`    // "system", "user", or "assistant"
+	Role    string `json:"role"` // "system", "user", or "assistant"
 	Content string `json:"content"`
+}
+
+// StreamCompleter is implemented by LLM clients that support token-by-token
+// streaming. It is intentionally NOT merged into Completer — existing fake
+// Completer implementations across internal/curation, internal/collector,
+// internal/search/hyde.go, internal/worker/{summarizer,note_enrichment_worker,
+// entity_extractor}.go would all break if Completer grew a new required
+// method. Callers that need streaming type-assert:
+//
+//	if sc, ok := completer.(llm.StreamCompleter); ok { ... } else { /* fallback */ }
+type StreamCompleter interface {
+	// StreamWithMessages sends a multi-turn chat completion request with
+	// stream: true. onDelta is called once per received content delta
+	// (never called with an empty string). Returns when the stream ends
+	// (a literal "data: [DONE]" line) or ctx is cancelled/times out.
+	StreamWithMessages(ctx context.Context, system string, messages []Message, onDelta func(string)) error
 }
 
 // chatRequest is the request body for POST /v1/chat/completions.
@@ -101,6 +118,18 @@ type chatRequest struct {
 	Messages    []Message `json:"messages"`
 	Temperature float64   `json:"temperature"`
 	MaxTokens   int       `json:"max_tokens"`
+	Stream      bool      `json:"stream,omitempty"`
+}
+
+// streamChunk is a single OpenAI-compatible streaming SSE data payload:
+// {"choices":[{"delta":{"content":"..."},"finish_reason":null}]}
+type streamChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content string `json:"content"`
+		} `json:"delta"`
+		FinishReason *string `json:"finish_reason"`
+	} `json:"choices"`
 }
 
 // chatResponse is the relevant subset of the OpenAI chat completion response.
@@ -164,6 +193,103 @@ func (c *Client) CompleteWithMessages(ctx context.Context, system string, messag
 		)
 	}
 	return "", fmt.Errorf("llm: all retries exhausted: %w", lastErr)
+}
+
+// StreamWithMessages sends a multi-turn chat completion request with
+// stream: true and invokes onDelta once per received content delta.
+//
+// Unlike CompleteWithMessages, a failed request is never retried: once the
+// HTTP response body starts streaming, retrying risks emitting duplicate
+// tokens to a caller that has already forwarded earlier deltas downstream
+// (e.g. to an SSE client). A 4xx/5xx status returned before any body is
+// read is reported as a plain error with onDelta never called.
+func (c *Client) StreamWithMessages(ctx context.Context, system string, messages []Message, onDelta func(string)) error {
+	if !c.Enabled() {
+		return fmt.Errorf("llm: client is not configured (missing base URL or model)")
+	}
+
+	allMessages := make([]Message, 0, len(messages)+1)
+	allMessages = append(allMessages, Message{Role: "system", Content: system})
+	allMessages = append(allMessages, messages...)
+
+	reqBody := chatRequest{
+		Model:       c.model,
+		Messages:    allMessages,
+		Temperature: c.temperature,
+		MaxTokens:   c.maxTokens,
+		Stream:      true,
+	}
+
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("llm: marshal request: %w", err)
+	}
+
+	url := c.baseURL + "/chat/completions"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("llm: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	if c.tokens != nil {
+		tok, err := c.tokens.Token()
+		if err != nil {
+			return fmt.Errorf("llm: token source: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("llm: HTTP request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return &clientError{statusCode: resp.StatusCode, body: string(body)}
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		data, ok := strings.CutPrefix(line, "data: ")
+		if !ok {
+			continue
+		}
+		if data == "[DONE]" {
+			return nil
+		}
+
+		var chunk streamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			// Skip a single malformed chunk rather than aborting a stream
+			// that has already delivered good tokens to the caller.
+			continue
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		if content := chunk.Choices[0].Delta.Content; content != "" {
+			onDelta(content)
+		}
+	}
+
+	// Prefer ctx.Err() over the raw scanner error: when the caller cancels
+	// (client disconnect, timeout), the underlying transport error message
+	// varies by platform/Go version, but the caller only needs to reliably
+	// detect "this was a cancellation" via errors.Is(err, context.Canceled).
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("llm: stream canceled: %w", ctxErr)
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("llm: read stream: %w", err)
+	}
+	return nil
 }
 
 // clientError wraps an HTTP 4xx response so the caller can detect it without retrying.

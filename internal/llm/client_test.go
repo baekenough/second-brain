@@ -3,8 +3,10 @@ package llm_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -318,3 +320,184 @@ func TestClient_DefaultTimeout_UsedWhenZero(t *testing.T) {
 
 // Compile-time assertion: *Client satisfies Completer.
 var _ llm.Completer = (*llm.Client)(nil)
+
+// Compile-time assertion: *Client satisfies StreamCompleter.
+var _ llm.StreamCompleter = (*llm.Client)(nil)
+
+// --- StreamWithMessages tests ---
+
+// sseChunk builds a single OpenAI-style streaming SSE data line for one
+// content delta (without the trailing blank line).
+func sseChunk(content string) string {
+	data, _ := json.Marshal(map[string]any{
+		"choices": []map[string]any{
+			{"delta": map[string]any{"content": content}},
+		},
+	})
+	return "data: " + string(data) + "\n\n"
+}
+
+func TestClient_StreamWithMessages_MultipleChunks(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("ResponseWriter does not support flushing")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		for _, part := range []string{"Hel", "lo", " world"} {
+			w.Write([]byte(sseChunk(part))) //nolint:errcheck
+			flusher.Flush()
+		}
+		w.Write([]byte("data: [DONE]\n\n")) //nolint:errcheck
+		flusher.Flush()
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newClient(t, srv.URL, "key")
+	var got []string
+	err := c.StreamWithMessages(context.Background(), "sys", []llm.Message{
+		{Role: "user", Content: "hi"},
+	}, func(delta string) {
+		got = append(got, delta)
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"Hel", "lo", " world"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("deltas: want %v, got %v", want, got)
+	}
+}
+
+// TestClient_StreamWithMessages_ChunkSplitMidEvent verifies that a single
+// SSE data line arriving split across two separate TCP writes/flushes
+// (simulating a proxy or network chunk boundary landing mid-event) is
+// still reconstructed into exactly one delta callback.
+func TestClient_StreamWithMessages_ChunkSplitMidEvent(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("ResponseWriter does not support flushing")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+
+		// Split a single "data: {...}\n\n" line across two writes so the
+		// client's underlying Read() calls land mid-event.
+		w.Write([]byte(`data: {"choices":[{"delta":{"content":"Hel`)) //nolint:errcheck
+		flusher.Flush()
+		time.Sleep(10 * time.Millisecond)
+		w.Write([]byte(`lo world"}}]}` + "\n\n")) //nolint:errcheck
+		flusher.Flush()
+		w.Write([]byte("data: [DONE]\n\n")) //nolint:errcheck
+		flusher.Flush()
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newClient(t, srv.URL, "key")
+	var got []string
+	err := c.StreamWithMessages(context.Background(), "sys", nil, func(delta string) {
+		got = append(got, delta)
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"Hello world"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("deltas: want %v, got %v (event should be reassembled across the chunk split)", want, got)
+	}
+}
+
+// TestClient_StreamWithMessages_ContextCancelMidStream verifies that
+// cancelling ctx after the first delta stops the stream cleanly: the
+// returned error wraps context.Canceled, no further deltas are delivered,
+// and no panic occurs.
+func TestClient_StreamWithMessages_ContextCancelMidStream(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("ResponseWriter does not support flushing")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(sseChunk("first"))) //nolint:errcheck
+		flusher.Flush()
+		// Block until the client disconnects (ctx cancel propagates to the
+		// request's context), then return without sending more data.
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newClient(t, srv.URL, "key")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	var got []string
+	err := c.StreamWithMessages(ctx, "sys", nil, func(delta string) {
+		got = append(got, delta)
+		cancel()
+	})
+	if err == nil {
+		t.Fatal("expected error after context cancel, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected error wrapping context.Canceled, got: %v", err)
+	}
+	if want := []string{"first"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("deltas: want %v, got %v", want, got)
+	}
+}
+
+func TestClient_StreamWithMessages_HTTPErrorBeforeFirstByte(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newClient(t, srv.URL, "key")
+	called := false
+	err := c.StreamWithMessages(context.Background(), "sys", nil, func(string) {
+		called = true
+	})
+	if err == nil {
+		t.Fatal("expected error for HTTP 500, got nil")
+	}
+	if called {
+		t.Fatal("onDelta must not be called when the server errors before streaming any body")
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("expected exactly 1 call (no retry for streaming errors), got %d", n)
+	}
+}
+
+func TestClient_StreamWithMessages_NotEnabled(t *testing.T) {
+	t.Parallel()
+
+	// No APIKey and no AuthFile → token source is nil → Enabled() is false.
+	c := llm.New(llm.Config{
+		BaseURL: "http://localhost:1",
+		Model:   "gpt-test",
+	}, nil)
+
+	called := false
+	err := c.StreamWithMessages(context.Background(), "sys", nil, func(string) {
+		called = true
+	})
+	if err == nil {
+		t.Fatal("expected error when client is not configured")
+	}
+	if called {
+		t.Fatal("onDelta must not be called when the client is not enabled")
+	}
+}

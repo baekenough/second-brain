@@ -488,3 +488,24 @@ func TestLoad_PIINumberHashingEnabled(t *testing.T) {
 		})
 	}
 }
+
+// TestLoad_UserEmailAddresses verifies USER_EMAIL_ADDRESSES parsing (reuses
+// splitCSV, same convention as FILESYSTEM_EXCLUDE_DIRS).
+func TestLoad_UserEmailAddresses(t *testing.T) {
+	setenv(t, "USER_EMAIL_ADDRESSES", "me@example.com, alias@example.com ,")
+	defer unsetenv(t, "USER_EMAIL_ADDRESSES")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	want := []string{"me@example.com", "alias@example.com"}
+	if len(cfg.UserEmailAddresses) != len(want) {
+		t.Fatalf("UserEmailAddresses = %v, want %v", cfg.UserEmailAddresses, want)
+	}
+	for i, w := range want {
+		if cfg.UserEmailAddresses[i] != w {
+			t.Errorf("UserEmailAddresses[%d] = %q, want %q", i, cfg.UserEmailAddresses[i], w)
+		}
+	}
+}

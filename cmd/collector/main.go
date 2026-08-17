@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -24,6 +25,23 @@ import (
 	"github.com/baekenough/second-brain/internal/worker"
 	"github.com/joho/godotenv"
 )
+
+// extractionMaxDetachedWriteDuration bounds how long ExtractionWorker's
+// detached persist+bookkeeping write phases can keep running after the
+// shutdown context is cancelled (mirrors
+// NoteEnrichmentWorker.MaxDetachedWriteDuration()'s formula: persist timeout
+// + 2×bookkeeping timeout).
+//
+// This is a literal duration, not a call to an equivalent method on
+// ExtractionWorker, because internal/worker/extraction_worker.go is out of
+// scope for this change (concurrent work elsewhere in internal/ during this
+// task) — see internal/worker/extraction_worker.go's own
+// defaultExtractionPersistTimeout (30s) and
+// defaultExtractionBookkeepingTimeout (10s) constants, which this value is
+// computed from and which ExtractionWorkerConfig does not currently expose
+// as configurable fields (only LLMTimeout affects the worker's other,
+// cancellable, work budget).
+const extractionMaxDetachedWriteDuration = 30*time.Second + 2*10*time.Second
 
 func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "setup" {
@@ -196,6 +214,81 @@ func run() error {
 		entityWorker.Run(ctx)
 	}()
 
+	// --- Extraction pipeline (Part A, knowledge-graph/actions design) ---
+	// One LLM call per document via ExtractionWorker, plus a SQL-only
+	// structural-signal pass via StructuralSignalWorker — see
+	// internal/worker/extraction_worker.go and internal/worker/structural_signals.go
+	// package comments for the retry/deadline model.
+	//
+	// Both workers are gated behind the single EXTRACTION_ENABLED flag,
+	// mirroring ENTITY_EXTRACTION_ENABLED's exact opt-in pattern above: a
+	// vanilla deployment must incur zero extra LLM cost, and the summary
+	// backfill currently in progress (45% complete) shares the same LLM
+	// quota as ExtractionWorker, so nothing here may start firing at deploy
+	// time without an explicit operator decision.
+	//
+	// Deviation from the design doc: docs/superpowers/plans/2026-08-17-extraction-pipeline.md's
+	// Task 13 has StructuralSignalWorker run unconditionally (it is SQL-only,
+	// no LLM call, so the doc reasons it is safe to always run). This
+	// deployment gates it behind EXTRACTION_ENABLED as well, on explicit
+	// instruction, so the two workers this pipeline introduces have exactly
+	// one on/off switch operators need to reason about during backfill.
+	relationStore := store.NewRelationStore(pg)
+	actionStore := store.NewActionStore(pg)
+
+	xv := os.Getenv("EXTRACTION_ENABLED")
+	extractionEnabled := xv == "true" || xv == "1"
+	if extractionEnabled {
+		slog.Info("extraction pipeline enabled via EXTRACTION_ENABLED=" + xv)
+	} else {
+		slog.Info("extraction pipeline disabled (set EXTRACTION_ENABLED=true to enable)")
+	}
+
+	// Interval/BatchSize are environment-configurable, mirroring
+	// SummarizerWorker's cfg.SummarizerInterval/cfg.SummarizerBatchSize
+	// pattern (see envDuration/envInt below) — unlike EntityWorker's
+	// hardcoded Interval/BatchSize a few lines above, which throttles it to
+	// ~30 docs/hour and is out of scope for this change.
+	extractionWorker := worker.NewExtractionWorker(worker.ExtractionWorkerConfig{
+		Store:         docStore,
+		Entities:      entityStore,
+		Relations:     relationStore,
+		Actions:       actionStore,
+		LLM:           llmClient,
+		UserAddresses: cfg.UserEmailAddresses,
+		Interval:      envDuration("EXTRACTION_INTERVAL", 5*time.Minute),
+		BatchSize:     envInt("EXTRACTION_BATCH_SIZE", 5),
+		LLMTimeout:    time.Duration(cfg.LLMTimeoutSeconds) * time.Second,
+	})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if !extractionEnabled {
+			// Block until shutdown so the WaitGroup stays balanced.
+			<-ctx.Done()
+			return
+		}
+		extractionWorker.Run(ctx)
+	}()
+
+	structuralSignalWorker := worker.NewStructuralSignalWorker(worker.StructuralSignalWorkerConfig{
+		Store:         worker.NewPgStructuralSignalLister(pg.Pool()),
+		Actions:       actionStore,
+		UserAddresses: cfg.UserEmailAddresses,
+		Interval:      envDuration("STRUCTURAL_SIGNAL_INTERVAL", 10*time.Minute),
+		BatchSize:     envInt("STRUCTURAL_SIGNAL_BATCH_SIZE", 500),
+	})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if !extractionEnabled {
+			// Block until shutdown so the WaitGroup stays balanced.
+			<-ctx.Done()
+			return
+		}
+		structuralSignalWorker.Run(ctx)
+	}()
+
 	// --- Note enrichment worker (Capture backend) ---
 	// Runs unconditionally, like retryWorker and summarizerWorker — unlike
 	// entity extraction, there is no feature-flag gate here because Capture
@@ -243,13 +336,23 @@ func run() error {
 	//     not its much larger LLM work budget. The status write it protects
 	//     is the one that enforces the enrichment retry cap.
 	//
+	//   - ExtractionWorker (when EXTRACTION_ENABLED) detaches only its
+	//     persist and bookkeeping write phases — its LLM call is cancelled by
+	//     the shutdown context, same shape as NoteEnrichmentWorker — so it
+	//     contributes extractionMaxDetachedWriteDuration, not its larger LLM
+	//     work budget.
+	//
 	// The +10s margin covers goroutine scheduling/cleanup overhead on top of
-	// those budgets. The entity-extraction and extraction-retry workers use
-	// the raw (non-detached) shutdown context directly, so they are cancelled
-	// near-instantly and do not drive this timeout.
+	// those budgets. The entity-extraction, extraction-retry, and
+	// structural-signal workers use the raw (non-detached) shutdown context
+	// directly, so they are cancelled near-instantly and do not drive this
+	// timeout.
 	drainTimeout := cfg.SummarizerDocTimeout
 	if d := noteEnrichmentWorker.MaxDetachedWriteDuration(); d > drainTimeout {
 		drainTimeout = d
+	}
+	if extractionEnabled && extractionMaxDetachedWriteDuration > drainTimeout {
+		drainTimeout = extractionMaxDetachedWriteDuration
 	}
 	drainTimeout += 10 * time.Second
 	if drainTimeout < 15*time.Second {
@@ -412,4 +515,41 @@ func migrationsPath() string {
 	// filename is cmd/collector/main.go; walk up two levels to reach project root.
 	root := filepath.Join(filepath.Dir(filename), "..", "..")
 	return filepath.Join(root, "migrations")
+}
+
+// envDuration parses a time.Duration from the environment variable key,
+// falling back to def when unset or invalid. Mirrors
+// internal/config.summarizerInterval's convention (parse, log a warning on
+// an invalid value, never fail startup) — duplicated here rather than added
+// to internal/config because internal/ is out of scope for this change
+// (concurrent work elsewhere in internal/ during this task).
+func envDuration(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		slog.Warn("config: invalid duration env var, using default",
+			"key", key, "value", v, "default", def, "error", err)
+		return def
+	}
+	return d
+}
+
+// envInt parses an int from the environment variable key, falling back to
+// def when unset or invalid. See envDuration's doc comment for why this
+// lives here instead of internal/config.
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		slog.Warn("config: invalid int env var, using default",
+			"key", key, "value", v, "default", def, "error", err)
+		return def
+	}
+	return n
 }
