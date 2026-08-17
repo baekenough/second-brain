@@ -193,4 +193,22 @@
   .badge-notion { background: oklch(18% 0.02 50); color: oklch(70% 0.02 50); }
   .badge-telegram { background: oklch(19% 0.06 215); color: oklch(60% 0.11 215); }
   .badge-discord { background: oklch(20% 0.07 275); color: oklch(62% 0.13 275); }
+
+  /* note: muted indigo-charcoal — echoes the accent hue without competing
+     with it, since note badges appear constantly (every Capture list row)
+     while the accent itself is reserved for interactive elements. */
+  .badge-note {
+    background: oklch(20% 0.05 265);
+    color: oklch(78% 0.03 265);
+  }
+  /* insight: reuses the accent tokens directly. This app has exactly one
+     accent (design brief: "single lavender-blue accent") — marking
+     insight/inference content with that same, otherwise-unused-for-badges
+     color makes it visually distinct without introducing a second hue,
+     and doubles as a constant visual reminder that insights are inferences,
+     not facts (spec §3.2 echo-chamber guard 2). */
+  .badge-insight {
+    background: var(--color-accent-subtle);
+    color: var(--color-accent);
+  }
 }
