@@ -7,7 +7,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/search"
+	"github.com/baekenough/second-brain/internal/store"
 	"github.com/google/uuid"
 )
 
@@ -28,9 +31,16 @@ type fixedDocSearcher struct {
 	observed []*model.SearchResult
 	inferred []*model.SearchResult
 	err      error
+
+	// gotQueries records every SearchQuery.Query this fake received, in
+	// call order — used by the query-rewrite tests to assert Stage 2 saw
+	// the rewritten (standalone) question, not the user's raw follow-up
+	// wording.
+	gotQueries []string
 }
 
 func (f *fixedDocSearcher) Search(_ context.Context, q model.SearchQuery) ([]*model.SearchResult, error) {
+	f.gotQueries = append(f.gotQueries, q.Query)
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -95,6 +105,13 @@ type fakeAskLLM struct {
 	// synthesize's plumbing (date-context fix, ask.go askSystemPrompt).
 	gotSystemPrompt string
 	gotMessages     []llm.Message
+
+	// completeMessagesLog records every CompleteWithMessages call's
+	// messages argument, in call order — unlike gotSystemPrompt/gotMessages
+	// (which the streaming synthesis call for the SAME request overwrites
+	// right after rewriteStandaloneQuestion runs), this lets rewrite tests
+	// inspect exactly what was sent to the rewrite call specifically.
+	completeMessagesLog [][]llm.Message
 }
 
 func (f *fakeAskLLM) Enabled() bool { return f.enabled }
@@ -103,6 +120,7 @@ func (f *fakeAskLLM) CompleteWithMessages(_ context.Context, systemPrompt string
 	f.completeCalls++
 	f.gotSystemPrompt = systemPrompt
 	f.gotMessages = messages
+	f.completeMessagesLog = append(f.completeMessagesLog, messages)
 	return f.completeResp, f.completeErr
 }
 
@@ -131,6 +149,76 @@ func (f *fakeAskLLM) StreamWithMessages(ctx context.Context, systemPrompt string
 }
 
 var _ llm.StreamCompleter = (*fakeAskLLM)(nil)
+
+// fakeAskSessionStore is an in-memory AskConversationStore fake — no real
+// DB needed to test askHandler's persistence/history behaviour. insertErr /
+// listErr, when non-nil, make every Insert / List* call fail respectively,
+// exercising askHandler's "a storage failure must never affect the client
+// response" contract.
+type fakeAskSessionStore struct {
+	mu        sync.Mutex
+	turnsByID map[uuid.UUID][]store.AskSession
+	insertErr error
+	listErr   error
+
+	insertCalls []store.AskSession
+}
+
+func newFakeAskSessionStore() *fakeAskSessionStore {
+	return &fakeAskSessionStore{turnsByID: map[uuid.UUID][]store.AskSession{}}
+}
+
+// seed pre-populates one conversation's turn history, as if earlier
+// requests had already been answered and saved.
+func (f *fakeAskSessionStore) seed(conversationID uuid.UUID, turns ...store.AskSession) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.turnsByID[conversationID] = append([]store.AskSession{}, turns...)
+}
+
+func (f *fakeAskSessionStore) Insert(_ context.Context, session store.AskSession) (store.AskSession, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.insertCalls = append(f.insertCalls, session)
+	if f.insertErr != nil {
+		return store.AskSession{}, f.insertErr
+	}
+	if session.ID == uuid.Nil {
+		session.ID = uuid.New()
+	}
+	session.CreatedAt = time.Now()
+	f.turnsByID[session.ConversationID] = append(f.turnsByID[session.ConversationID], session)
+	return session, nil
+}
+
+func (f *fakeAskSessionStore) ListConversationTurns(_ context.Context, conversationID uuid.UUID) ([]store.AskSession, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return append([]store.AskSession{}, f.turnsByID[conversationID]...), nil
+}
+
+func (f *fakeAskSessionStore) ListRecentConversations(_ context.Context, limit int) ([]store.AskSession, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	var latest []store.AskSession
+	for _, turns := range f.turnsByID {
+		if len(turns) == 0 {
+			continue
+		}
+		latest = append(latest, turns[len(turns)-1])
+	}
+	sort.Slice(latest, func(i, j int) bool { return latest[i].CreatedAt.After(latest[j].CreatedAt) })
+	if limit > 0 && len(latest) > limit {
+		latest = latest[:limit]
+	}
+	return latest, nil
+}
 
 // --- helpers ---
 
@@ -161,6 +249,16 @@ func newAskTestServerWithNow(searcher documentSearcher, classifier intent.Classi
 	srv := newAskTestServer(searcher, classifier, llmClient)
 	srv.now = now
 	return srv
+}
+
+// newAskTestServerWithSessions is newAskTestServer plus conversation
+// persistence wired via WithAskSessions — the multi-turn (query rewrite +
+// turn history + save) tests use this instead of newAskTestServer, which
+// deliberately leaves askSessions nil (single-turn only, matching every
+// pre-existing ask_test.go test's behaviour unchanged).
+func newAskTestServerWithSessions(searcher documentSearcher, classifier intent.Classifier, llmClient llm.Completer, sessions AskConversationStore) *Server {
+	srv := newAskTestServer(searcher, classifier, llmClient)
+	return srv.WithAskSessions(sessions)
 }
 
 func doAskRequest(t *testing.T, srv *Server, ctx context.Context, body any, authHeader string) *httptest.ResponseRecorder {
@@ -259,7 +357,7 @@ func TestAskHandler_NoObservedResults_NoEvidenceNoLLMCall(t *testing.T) {
 	}
 	frames := parseSSEFrames(t, rr.Body.String())
 	got := frameEvents(frames)
-	want := []string{"sources", "done"}
+	want := []string{"conversation", "sources", "done"}
 	if len(got) != len(want) {
 		t.Fatalf("events = %v, want %v", got, want)
 	}
@@ -270,7 +368,7 @@ func TestAskHandler_NoObservedResults_NoEvidenceNoLLMCall(t *testing.T) {
 	}
 
 	var done askDonePayload
-	if err := json.Unmarshal([]byte(frames[1].data), &done); err != nil {
+	if err := json.Unmarshal([]byte(frames[2].data), &done); err != nil {
 		t.Fatalf("unmarshal done payload: %v", err)
 	}
 	if done.FinishReason != "no_evidence" {
@@ -309,7 +407,7 @@ func TestAskHandler_HappyPath_EventOrderAndSourceIDs(t *testing.T) {
 
 	frames := parseSSEFrames(t, rr.Body.String())
 	got := frameEvents(frames)
-	want := []string{"sources", "token", "token", "token", "done"}
+	want := []string{"conversation", "sources", "token", "token", "token", "done"}
 	if len(got) != len(want) {
 		t.Fatalf("events = %v, want %v; body=%s", got, want, rr.Body.String())
 	}
@@ -320,8 +418,8 @@ func TestAskHandler_HappyPath_EventOrderAndSourceIDs(t *testing.T) {
 	}
 
 	var sources askSourcesPayload
-	if err := json.Unmarshal([]byte(frames[0].data), &sources); err != nil {
-		t.Fatalf("unmarshal sources payload: %v; raw=%s", err, frames[0].data)
+	if err := json.Unmarshal([]byte(frames[1].data), &sources); err != nil {
+		t.Fatalf("unmarshal sources payload: %v; raw=%s", err, frames[1].data)
 	}
 	if len(sources.Sources) != 2 {
 		t.Fatalf("sources = %v, want 2 items (1 observed + 1 inferred)", sources.Sources)
@@ -334,7 +432,7 @@ func TestAskHandler_HappyPath_EventOrderAndSourceIDs(t *testing.T) {
 	}
 
 	var doneP askDonePayload
-	if err := json.Unmarshal([]byte(frames[4].data), &doneP); err != nil {
+	if err := json.Unmarshal([]byte(frames[5].data), &doneP); err != nil {
 		t.Fatalf("unmarshal done payload: %v", err)
 	}
 	if doneP.FinishReason != "stop" {
@@ -352,7 +450,7 @@ func TestAskHandler_LLMNotConfigured_EmitsErrorThenDoneError(t *testing.T) {
 
 	frames := parseSSEFrames(t, rr.Body.String())
 	got := frameEvents(frames)
-	want := []string{"sources", "error", "done"}
+	want := []string{"conversation", "sources", "error", "done"}
 	if len(got) != len(want) {
 		t.Fatalf("events = %v, want %v", got, want)
 	}
@@ -362,7 +460,7 @@ func TestAskHandler_LLMNotConfigured_EmitsErrorThenDoneError(t *testing.T) {
 		}
 	}
 	var doneP askDonePayload
-	_ = json.Unmarshal([]byte(frames[2].data), &doneP)
+	_ = json.Unmarshal([]byte(frames[3].data), &doneP)
 	if doneP.FinishReason != "error" {
 		t.Errorf("finish_reason = %q, want %q", doneP.FinishReason, "error")
 	}
@@ -381,12 +479,12 @@ func TestAskHandler_RetrievalError_EmitsErrorDoneNoSources(t *testing.T) {
 
 	frames := parseSSEFrames(t, rr.Body.String())
 	got := frameEvents(frames)
-	want := []string{"error", "done"}
+	want := []string{"conversation", "error", "done"}
 	if len(got) != len(want) {
 		t.Fatalf("events = %v, want %v (no sources event — search failed before sources could be computed)", got, want)
 	}
 	var doneP askDonePayload
-	_ = json.Unmarshal([]byte(frames[1].data), &doneP)
+	_ = json.Unmarshal([]byte(frames[2].data), &doneP)
 	if doneP.FinishReason != "error" {
 		t.Errorf("finish_reason = %q, want %q", doneP.FinishReason, "error")
 	}
@@ -403,9 +501,10 @@ func TestAskHandler_ClientDisconnectMidStream_NoFurtherWrites(t *testing.T) {
 
 	frames := parseSSEFrames(t, rr.Body.String())
 	got := frameEvents(frames)
-	// Exactly "sources" + the single token delivered before cancellation was
-	// observed; no "done" (connection is gone) and no further "token" frames.
-	want := []string{"sources", "token"}
+	// Exactly "conversation" + "sources" + the single token delivered
+	// before cancellation was observed; no "done" (connection is gone) and
+	// no further "token" frames.
+	want := []string{"conversation", "sources", "token"}
 	if len(got) != len(want) {
 		t.Fatalf("events = %v, want %v (no writes after client disconnect)", got, want)
 	}
@@ -428,10 +527,19 @@ func TestAskHandler_SSEFieldNames(t *testing.T) {
 
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(frames[0].data), &raw); err != nil {
+		t.Fatalf("conversation payload not valid JSON: %v", err)
+	}
+	for _, want := range []string{"conversation_id", "turn_index"} {
+		if _, ok := raw[want]; !ok {
+			t.Errorf("conversation payload missing key %q; raw=%s", want, frames[0].data)
+		}
+	}
+
+	if err := json.Unmarshal([]byte(frames[1].data), &raw); err != nil {
 		t.Fatalf("sources payload not valid JSON: %v", err)
 	}
 	if _, ok := raw["sources"]; !ok {
-		t.Fatalf("sources payload missing top-level %q key; raw=%s", "sources", frames[0].data)
+		t.Fatalf("sources payload missing top-level %q key; raw=%s", "sources", frames[1].data)
 	}
 	var items []map[string]json.RawMessage
 	if err := json.Unmarshal(raw["sources"], &items); err != nil {
@@ -443,14 +551,14 @@ func TestAskHandler_SSEFieldNames(t *testing.T) {
 		}
 	}
 
-	if err := json.Unmarshal([]byte(frames[1].data), &raw); err != nil {
+	if err := json.Unmarshal([]byte(frames[2].data), &raw); err != nil {
 		t.Fatalf("token payload not valid JSON: %v", err)
 	}
 	if _, ok := raw["text"]; !ok {
 		t.Errorf("token payload missing key %q", "text")
 	}
 
-	if err := json.Unmarshal([]byte(frames[2].data), &raw); err != nil {
+	if err := json.Unmarshal([]byte(frames[3].data), &raw); err != nil {
 		t.Fatalf("done payload not valid JSON: %v", err)
 	}
 	if _, ok := raw["finish_reason"]; !ok {
@@ -541,7 +649,7 @@ func TestBuildAskMessages_IncludesOccurredAt(t *testing.T) {
 	doc := model.Document{ID: uuid.New(), SourceType: model.SourceSMS, Title: "문자", Content: "내용", OccurredAt: &occurred}
 	result := RetrievalResult{Observed: []*model.SearchResult{{Document: doc, Score: 0.9}}}
 
-	messages := buildAskMessages("질문", result)
+	messages := buildAskMessages("질문", result, nil)
 
 	if len(messages) == 0 {
 		t.Fatal("buildAskMessages returned no messages")
@@ -569,7 +677,7 @@ func TestBuildAskMessages_NilOccurredAt_NoPanicAndLabelled(t *testing.T) {
 				t.Fatalf("buildAskMessages panicked on nil OccurredAt: %v", r)
 			}
 		}()
-		messages = buildAskMessages("질문", result)
+		messages = buildAskMessages("질문", result, nil)
 	}()
 
 	if len(messages) == 0 {

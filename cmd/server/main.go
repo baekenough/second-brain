@@ -66,6 +66,7 @@ func run() error {
 	metricsStore := store.NewEvalMetricsStore(pg)       // issue #19: eval metrics history
 	reindexStateStore := store.NewReindexStateStore(pg) // issue #20: reindex state tracking
 	entityStore := store.NewEntityStore(pg)             // issue #77: knowledge-graph entities
+	askSessionStore := store.NewAskSessionStore(pg)     // multi-turn /ask conversation history
 
 	// --- Embedding engine ---
 	embedClient, err := search.NewEmbeddingEngine(cfg)
@@ -122,7 +123,8 @@ func run() error {
 		WithIngestMessages(docStore, chunkStore, embedClient, cfg.IngestMaxBatchMessages, cfg.CollectorCutover).
 		WithIngestRecording(docStore, cfg.IngestRecordingDir, cfg.IngestMaxFileBytes, cfg.CollectorCutover).
 		WithNotes(docStore, chunkStore, embedClient).
-		WithAskConfig(time.Duration(cfg.AskTimeoutSeconds)*time.Second, cfg.AskContextTopK, cfg.AskContextInsightM)
+		WithAskConfig(time.Duration(cfg.AskTimeoutSeconds)*time.Second, cfg.AskContextTopK, cfg.AskContextInsightM).
+		WithAskSessions(askSessionStore)
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      srv.Handler(),

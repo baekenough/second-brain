@@ -42,6 +42,14 @@ export function splitSSEBuffer(buffer: string): { events: RawSSEEvent[]; remaind
 export function parseAskEvent(raw: RawSSEEvent): AskStreamEvent | null {
   try {
     switch (raw.event) {
+      case "conversation": {
+        const payload = JSON.parse(raw.data) as { conversation_id: string; turn_index: number };
+        return {
+          type: "conversation",
+          conversation_id: payload.conversation_id,
+          turn_index: payload.turn_index,
+        };
+      }
       case "sources": {
         const payload = JSON.parse(raw.data) as { sources: AskSourceItem[] };
         return { type: "sources", sources: payload.sources ?? [] };
