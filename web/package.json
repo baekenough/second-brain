@@ -11,6 +11,8 @@
     "format": "prettier --write src",
     "format:check": "prettier --check src",
     "type-check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "prepare": "husky"
   },
   "dependencies": {
@@ -42,7 +44,8 @@
     "prettier-plugin-tailwindcss": "^0.6.12",
     "tailwindcss": "^4.1.10",
     "typescript": "^5.8.3",
-    "typescript-eslint": "^8.33.0"
+    "typescript-eslint": "^8.33.0",
+    "vitest": "^3.2.7"
   },
   "lint-staged": {
     "src/**/*.{ts,tsx}": [
