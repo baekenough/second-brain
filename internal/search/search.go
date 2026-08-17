@@ -345,9 +345,38 @@ func (s *Service) searchChunksVector(ctx context.Context, queryVec []float32, li
 
 // mergeRRF fuses two ranked result lists using Reciprocal Rank Fusion.
 // k=60 is the standard RRF constant (same as the document store's fusion).
-// Results are deduplicated by document ID: when a document appears in both
-// lists, the RRF score from both ranks is summed. The merged list is
-// truncated to limit entries, ordered by descending RRF score.
+//
+// primary and secondary are NOT equal-standing evidence. primary is the
+// document store's own hybrid fusion of up to five independently-weighted
+// signals (fts/vec/bigm/summvec/entity — see hybridSearch in
+// internal/store/document.go); secondary is a single un-corroborated
+// semantic signal (raw chunk-embedding proximity, no term-match required).
+// Naively rank-fusing two lists of the same size with equal weight lets a
+// same-size secondary list that shares no documents with primary evict half
+// of primary's genuinely matched results — measured against production data
+// for the proper-noun query "한영석" (a name absent from every secretary
+// document): primary alone returned 20/20 documents containing the literal
+// name; the chunk-vector secondary list, fetched and deduplicated exactly as
+// production does, was 20/20 documents that did NOT contain the name at all
+// and shared zero IDs with primary. Equal-weight RRF replaced half of the
+// correct results with these unrelated documents.
+//
+// The fix keeps secondary genuinely supplementary rather than competing:
+//   - A document present in BOTH lists gets its score summed (boosted) —
+//     primary's document-level fusion and secondary's passage-level match
+//     independently agree the document is relevant, which is a real signal.
+//   - A document present ONLY in secondary is admitted as a new result ONLY
+//     while primary has not yet filled the requested page (limit). Once
+//     primary supplies `limit` results, a lone chunk-vector hit is not
+//     sufficient grounds to displace one of them.
+//   - When primary is short of `limit` (including empty), secondary still
+//     fills the remaining slots — preserving chunk search's designed roles:
+//     surfacing a passage in a long document that primary's document-level
+//     scoring missed, and acting as a semantic-only fallback when primary
+//     finds nothing.
+//
+// Results are deduplicated by document ID and the merged list is truncated
+// to limit entries, ordered by descending RRF score.
 func mergeRRF(primary, secondary []*model.SearchResult, limit int) []*model.SearchResult {
 	const k = 60.0
 
@@ -357,19 +386,29 @@ func mergeRRF(primary, secondary []*model.SearchResult, limit int) []*model.Sear
 	}
 	merged := make(map[uuid.UUID]*entry, len(primary)+len(secondary))
 
-	addList := func(list []*model.SearchResult) {
-		for rank, r := range list {
-			rrf := 1.0 / (k + float64(rank+1))
-			if e, ok := merged[r.ID]; ok {
-				e.score += rrf
-			} else {
-				cp := *r // shallow copy — do not mutate callers' slice
-				merged[r.ID] = &entry{result: &cp, score: rrf}
-			}
-		}
+	for rank, r := range primary {
+		rrf := 1.0 / (k + float64(rank+1))
+		cp := *r // shallow copy — do not mutate callers' slice
+		merged[r.ID] = &entry{result: &cp, score: rrf}
 	}
-	addList(primary)
-	addList(secondary)
+
+	// Slots still open for brand-new (secondary-only) documents. Negative or
+	// zero means primary already filled the page.
+	remaining := limit - len(primary)
+
+	for rank, r := range secondary {
+		rrf := 1.0 / (k + float64(rank+1))
+		if e, ok := merged[r.ID]; ok {
+			e.score += rrf
+			continue
+		}
+		if remaining <= 0 {
+			continue
+		}
+		cp := *r
+		merged[r.ID] = &entry{result: &cp, score: rrf}
+		remaining--
+	}
 
 	out := make([]*model.SearchResult, 0, len(merged))
 	for _, e := range merged {
