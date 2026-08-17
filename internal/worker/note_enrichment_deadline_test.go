@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -294,5 +295,91 @@ func TestNoteEnrichmentWorker_BookkeepingFailure_IsSurfacedNotSwallowed(t *testi
 		if c.ctxErr != nil {
 			t.Errorf("attemptFailedCalls[%d] ran on a dead context: %v", i, c.ctxErr)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Commit-point failure tests (C-2).
+//
+// MarkNoteEnriched is the commit point: after it, ListPendingNotes never
+// returns the note again. Its error used to be logged and then dropped, which
+// meant a persistently failing UPDATE left the note "pending" with an
+// unincremented counter — the worker redid the whole paid LLM call and
+// rewrote every insight on every tick, with nothing bounding it.
+// ---------------------------------------------------------------------------
+
+// TestNoteEnrichmentWorker_MarkEnrichedFails_DrivesFailurePath verifies a
+// failing commit write is routed through the retry policy rather than
+// reported as a success.
+func TestNoteEnrichmentWorker_MarkEnrichedFails_DrivesFailurePath(t *testing.T) {
+	t.Parallel()
+
+	docID := uuid.New()
+	lister := &fakeNoteLister{
+		docs:        []*model.Document{newNoteDoc(docID, 0)},
+		enrichedErr: errors.New("deadlock detected"),
+	}
+	insights := &fakeInsightWriter{}
+	w := newTestNoteWorker(lister, insights, &fakeEntityLinker{},
+		func(_ context.Context, _ llm.Completer, _ *model.Document) (*NoteEnrichmentResult, error) {
+			return &NoteEnrichmentResult{
+				Title:    "t",
+				Insights: []NoteInsightCandidate{{Content: "an inference", Confidence: 0.5, SourceSpan: "s"}},
+			}, nil
+		},
+	)
+
+	w.tick(context.Background())
+
+	if len(lister.enrichedCalls) != 1 {
+		t.Fatalf("MarkNoteEnriched calls = %d, want 1", len(lister.enrichedCalls))
+	}
+	if len(lister.attemptFailedCalls) != 1 {
+		t.Fatalf("MarkNoteEnrichmentAttemptFailed calls = %d, want 1 — a failed commit write is a failed attempt, not a silent success",
+			len(lister.attemptFailedCalls))
+	}
+	call := lister.attemptFailedCalls[0]
+	if call.attempts != 1 {
+		t.Errorf("attempts = %d, want 1", call.attempts)
+	}
+	if call.ctxErr != nil {
+		t.Errorf("failure bookkeeping ran on a dead context (ctx.Err() = %v)", call.ctxErr)
+	}
+	if !strings.Contains(call.reason, "mark note enriched") {
+		t.Errorf("recorded reason = %q, want it to name the failing commit write", call.reason)
+	}
+}
+
+// TestNoteEnrichmentWorker_MarkEnrichedFails_EventuallyTerminal pins the bound:
+// a permanently failing commit write costs three LLM calls, not an unbounded
+// stream of them. Without the fix this loops for the lifetime of the process.
+func TestNoteEnrichmentWorker_MarkEnrichedFails_EventuallyTerminal(t *testing.T) {
+	t.Parallel()
+
+	docID := uuid.New()
+	lister := &fakeNoteLister{
+		docs:        []*model.Document{newNoteDoc(docID, 0)},
+		enrichedErr: errors.New("deadlock detected"),
+	}
+	enrichCalls := 0
+	w := newTestNoteWorker(lister, &fakeInsightWriter{}, &fakeEntityLinker{},
+		func(_ context.Context, _ llm.Completer, _ *model.Document) (*NoteEnrichmentResult, error) {
+			enrichCalls++
+			return &NoteEnrichmentResult{Title: "t"}, nil
+		},
+	)
+
+	for i := 0; i < 6; i++ {
+		w.tick(context.Background())
+	}
+
+	if enrichCalls != 3 {
+		t.Errorf("paid LLM calls = %d, want 3 (the attempt cap) — an unhandled commit failure re-bills the note every tick", enrichCalls)
+	}
+	if len(lister.terminalCalls) != 1 {
+		t.Errorf("MarkNoteEnrichmentTerminal calls = %d, want 1", len(lister.terminalCalls))
+	}
+	if lister.pendingCount() != 0 {
+		t.Errorf("pending notes = %d, want 0", lister.pendingCount())
 	}
 }

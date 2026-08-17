@@ -447,7 +447,8 @@ func (w *NoteEnrichmentWorker) processNote(ctx context.Context, doc *model.Docum
 //
 // Write order matters. MarkNoteEnriched flips enrichment_status to "done",
 // after which ListPendingNotes never returns this note again — so it is the
-// commit point and must come last. A crash before it leaves the note pending;
+// commit point and must come last, and its failure must be handled like the
+// commit failure it is. A crash before it leaves the note pending;
 // the next tick redoes the insight writes idempotently (their source_ids are
 // derived from the note ID and index, and the store upserts on
 // (source_type, source_id)), so retries cannot duplicate insights or exceed
@@ -499,7 +500,16 @@ func (w *NoteEnrichmentWorker) persistEnrichment(base context.Context, doc *mode
 	commitCtx, cancelCommit := context.WithTimeout(base, w.bookkeepingTimeout())
 	defer cancelCommit()
 	if err := w.store.MarkNoteEnriched(commitCtx, doc.ID, result.Title, metadata); err != nil {
-		slog.Warn("note enrichment worker: mark enriched failed", "doc_id", doc.ID, "error", err)
+		// This is the commit point, so its failure is a failed attempt — not
+		// something to log and walk away from. Left unhandled, the note stays
+		// "pending" with an unincremented counter and the next tick redoes the
+		// whole paid LLM call and rewrites every insight, once per interval,
+		// indefinitely. Routing it through the retry policy is what bounds
+		// that: the same three attempts, then terminal.
+		slog.Warn("note enrichment worker: mark enriched failed, failing the attempt",
+			"doc_id", doc.ID, "error", err)
+		w.handleFailure(base, doc, fmt.Errorf("mark note enriched: %w", err))
+		return
 	}
 }
 
