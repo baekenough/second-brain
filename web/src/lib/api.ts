@@ -3,12 +3,18 @@ import type {
   CreateNoteResponse,
   DocumentDetail,
   DocumentsResponse,
+  IngestFileResponse,
   RecentItemsResponse,
   SearchParams,
   SearchResponse,
   SourcesResponse,
   StatsResponse,
 } from "./types";
+
+/** Per-upload size cap enforced by the backend (internal/api/ingest_file.go
+ * defaultIngestMaxFileBytes) — mirrored here so the Capture screen can
+ * reject oversized files before spending an upload round-trip. */
+export const MAX_UPLOAD_FILE_BYTES = 100 * 1024 * 1024;
 
 /**
  * Resolve the API base URL depending on execution environment.
@@ -156,5 +162,19 @@ export async function retryNoteEnrichment(id: string): Promise<void> {
 export async function deleteNote(id: string): Promise<void> {
   await fetchJson<unknown>(`${getApiBase()}/notes/${encodeURIComponent(id)}`, {
     method: "DELETE",
+  });
+}
+
+// ── File upload (Capture) ────────────────────────────────────────────────
+
+/** Uploads a file to POST /api/upload (browser-only). No Content-Type is
+ * set explicitly — the browser derives the multipart boundary from the
+ * FormData body automatically; setting it manually would drop the boundary. */
+export async function uploadFile(file: File): Promise<IngestFileResponse> {
+  const formData = new FormData();
+  formData.append("file", file);
+  return fetchJson<IngestFileResponse>(`${getApiBase()}/upload`, {
+    method: "POST",
+    body: formData,
   });
 }
