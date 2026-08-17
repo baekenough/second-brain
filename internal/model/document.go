@@ -28,6 +28,17 @@ const (
 	SourceCallLog        SourceType = "call-log"
 	SourceCallTranscript SourceType = "call-transcript"
 	SourceUpload         SourceType = "upload"
+	// SourceNote is a user-authored note captured via POST /api/v1/notes
+	// (Capture). Distinct from SourceLLMMemory (MCP add_note tool,
+	// AI-agent-authored) — see spec §3.3. Content is write-once; only
+	// Title/Metadata are ever updated after creation, by NoteEnrichmentWorker.
+	SourceNote SourceType = "note"
+	// SourceInsight is an LLM-derived inference extracted from a SourceNote
+	// document by NoteEnrichmentWorker. Never user-authored; always carries
+	// Metadata.provenance.source_note_id back to its origin note (spec §3,
+	// §6.5). Excluded from default /api/v1/search results (see
+	// internal/api/search.go applyInsightExclusionDefault).
+	SourceInsight SourceType = "insight"
 )
 
 // Document represents a piece of content collected from an external source.
