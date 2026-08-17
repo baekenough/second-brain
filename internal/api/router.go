@@ -117,6 +117,15 @@ type Server struct {
 	askTopK          int
 	askInsightM      int
 
+	// askSessions is optional. When non-nil, POST /api/v1/ask persists each
+	// turn and rewrites follow-up questions using prior turns (multi-turn
+	// conversations, ask_history.go), and GET /api/v1/ask/conversations +
+	// GET /api/v1/ask/conversations/{id} are registered. Set via
+	// WithAskSessions before calling Handler(). nil (the default) keeps
+	// /api/v1/ask fully functional but single-turn only — see
+	// resolveConversation.
+	askSessions AskConversationStore
+
 	// now is the clock buildAskSystemPrompt uses to render "current date" in
 	// the Stage 3 system prompt (date-context fix: askSystemPrompt used to
 	// be a compile-time const with no way to know "today", so the model
@@ -272,6 +281,10 @@ func (s *Server) buildHandler() http.Handler {
 		r.Post("/api/v1/feedback", s.feedbackHandler)
 
 		r.Post("/api/v1/ask", s.askHandler)
+		if s.askSessions != nil {
+			r.Get("/api/v1/ask/conversations", s.askConversationsHandler)
+			r.Get("/api/v1/ask/conversations/{id}", s.askConversationDetailHandler)
+		}
 
 		r.Handle("/api/v1/graphql", s.graphqlHandler())
 

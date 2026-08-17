@@ -15,9 +15,12 @@ import (
 	"github.com/baekenough/second-brain/internal/model"
 )
 
-// AskRequest is the JSON body accepted by POST /api/v1/ask.
+// AskRequest is the JSON body accepted by POST /api/v1/ask. ConversationID
+// is optional: omitted (or an unparsable value) starts a brand-new
+// conversation with a server-generated id — see resolveConversation.
 type AskRequest struct {
-	Question string `json:"question"`
+	Question       string `json:"question"`
+	ConversationID string `json:"conversation_id,omitempty"`
 }
 
 // AskSourceItem mirrors web/src/lib/types.ts:122-127 EXACTLY — field names
@@ -30,6 +33,20 @@ type AskSourceItem struct {
 	Title      string  `json:"title"`
 	SourceType string  `json:"source_type"`
 	Score      float64 `json:"score"`
+}
+
+// askConversationPayload is the "conversation" SSE event body. It is sent
+// once, before "sources", so the client can learn the conversation_id for
+// a brand-new conversation (or have the requested one echoed back) and the
+// 0-based turn_index of the turn currently being answered — both needed to
+// pass conversation_id back on the client's next follow-up request. This
+// event was added after the frontend shipped; parseAskEvent
+// (web/src/lib/sseEvents.ts) returns null for unrecognized event names and
+// the caller ignores nulls, so adding it here does not break the deployed
+// frontend (frontend wiring to actually use it is separate work).
+type askConversationPayload struct {
+	ConversationID string `json:"conversation_id"`
+	TurnIndex      int    `json:"turn_index"`
 }
 
 // askSourcesPayload is the "sources" SSE event body (spec §5.1).
@@ -181,13 +198,37 @@ func (s *Server) askHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.askTimeout)
 	defer cancel()
 
+	// Multi-turn setup: resolve/mint the conversation id + this turn's
+	// index, and load capped recent history (question/answer text only —
+	// see askHistoryTurn). Emitted BEFORE "sources" so the client can learn
+	// conversation_id even if retrieval subsequently fails.
+	conversationID, turnIndex, history := s.resolveConversation(ctx, req.ConversationID)
+	if err := writeSSEEvent(w, flusher, "conversation", askConversationPayload{
+		ConversationID: conversationID.String(),
+		TurnIndex:      turnIndex,
+	}); err != nil {
+		slog.Error("ask: failed to write conversation event", "error", err)
+		return
+	}
+
+	// Query rewrite: a follow-up like "그거 더 자세히" carries no searchable
+	// content on its own, so Stage 1/2 must see a standalone question
+	// instead of the user's raw wording. No-op (returns req.Question
+	// unchanged) when this is the first turn of the conversation — see
+	// rewriteStandaloneQuestion's doc comment for the full fallback
+	// contract. The user's ORIGINAL question (req.Question), not this
+	// rewritten one, is what Stage 3 shows the model as the current turn
+	// (buildAskMessages) and what gets persisted (saveAskTurn) — the
+	// rewrite is a search-only artifact.
+	searchQuestion, _ := s.rewriteStandaloneQuestion(ctx, history, req.Question)
+
 	// Stage 1: intent classification. Classify's contract never returns a
 	// non-nil error in the shipped implementation, but the defensive
 	// fallback keeps this handler correct even against a future
 	// Classifier implementation that does fail (spec §4.4).
-	params, err := s.intentClassifier.Classify(ctx, req.Question)
+	params, err := s.intentClassifier.Classify(ctx, searchQuestion)
 	if err != nil {
-		params = intent.Params{RawQuery: req.Question, Kind: intent.KindGeneral}
+		params = intent.Params{RawQuery: searchQuestion, Kind: intent.KindGeneral}
 	}
 
 	// Stage 2: retrieval assembly (원문/정리 vs 추론 layers, spec §5.3).
@@ -196,6 +237,10 @@ func (s *Server) askHandler(w http.ResponseWriter, r *http.Request) {
 		slog.Error("ask: retrieval failed", "error", err)
 		_ = writeSSEEvent(w, flusher, "error", askErrorPayload{Message: "retrieval failed"})
 		_ = writeSSEEvent(w, flusher, "done", askDonePayload{FinishReason: "error"})
+		// No turn is persisted here: this is a total-pipeline failure with
+		// no sources and no answer text — there is nothing worth replaying
+		// into a future turn's history, and persisting an empty/error stub
+		// would just consume a turn_index for no benefit.
 		return
 	}
 
@@ -214,20 +259,39 @@ func (s *Server) askHandler(w http.ResponseWriter, r *http.Request) {
 	// (spec §6.3). insight-only results never satisfy this check.
 	if len(result.Observed) == 0 {
 		_ = writeSSEEvent(w, flusher, "done", askDonePayload{FinishReason: "no_evidence"})
+		s.saveAskTurn(ctx, conversationID, turnIndex, req.Question, "", "no_evidence", sources)
 		return
 	}
 
-	// Stage 3: synthesis + streaming.
-	finishReason := s.synthesize(ctx, w, flusher, req.Question, result)
+	// Stage 3: synthesis + streaming. question passed here is the user's
+	// ORIGINAL wording (not searchQuestion) — see the rewrite comment above.
+	finishReason, answer := s.synthesize(ctx, w, flusher, req.Question, result, history)
 	if finishReason == "" {
 		// Sentinel for "client disconnected mid-stream" (context.Canceled):
 		// the connection is already gone, so attempting a final "done"
 		// write would be a doomed w.Write call. A server-side timeout
 		// (context.DeadlineExceeded) is NOT this case — synthesize already
 		// wrote an "error" event and returned "error" for that path.
+		//
+		// Still persist a partial turn when synthesize managed to stream at
+		// least one token before the disconnect: it is more useful to a
+		// same-conversation retry than nothing (the rewrite/synthesis
+		// stages for the NEXT turn can see how far the previous answer
+		// got), and no client is waiting on this write so it costs nothing
+		// to attempt. finish_reason "error" (not a new enum value) because
+		// the answer never legitimately completed. An empty partial answer
+		// (cancelled before the first token) is not worth a turn_index.
+		if answer != "" {
+			s.saveAskTurn(ctx, conversationID, turnIndex, req.Question, answer, "error", sources)
+		}
 		return
 	}
 	_ = writeSSEEvent(w, flusher, "done", askDonePayload{FinishReason: finishReason})
+	// Saved AFTER the client-visible "done" write so a slow/failing DB
+	// write never delays or breaks the response the client already has —
+	// saveAskTurn itself also swallows its own errors (see its doc
+	// comment), this ordering is the second half of that guarantee.
+	s.saveAskTurn(ctx, conversationID, turnIndex, req.Question, answer, finishReason, sources)
 }
 
 // mapAskSources converts search results into the wire-contract AskSourceItem
@@ -249,64 +313,92 @@ func mapAskSources(results []*model.SearchResult) []AskSourceItem {
 
 // synthesize is Stage 3. It writes "token" SSE events directly (streaming
 // side effect) as the LLM produces them, rather than returning the full
-// answer.
+// answer to the client — but it also accumulates that same text into the
+// answer return value so askHandler can persist it (saveAskTurn) without
+// synthesize needing to know anything about ask_sessions/persistence.
 //
-// Return value is the finish_reason to use for the "done" event, with one
+// finishReason is the value to use for the "done" event, with one
 // exception: an empty string is a sentinel meaning "the client disconnected
 // mid-stream (context.Canceled) — do not write a done event at all", since
 // askHandler cannot distinguish "stop" from "the caller already handled it"
-// any other way without an extra return value.
-func (s *Server) synthesize(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, question string, result RetrievalResult) string {
+// any other way without an extra return value. answer holds whatever text
+// was produced before that happened, which may be empty (disconnected
+// before the first token) or partial (disconnected mid-stream) — it is
+// never the empty string for finishReason "stop".
+func (s *Server) synthesize(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, question string, result RetrievalResult, history []askHistoryTurn) (finishReason, answer string) {
 	if !s.llmClient.Enabled() {
 		_ = writeSSEEvent(w, flusher, "error", askErrorPayload{Message: "LLM is not configured"})
-		return "error"
+		return "error", ""
 	}
 
-	messages := buildAskMessages(question, result)
+	messages := buildAskMessages(question, result, history)
 	systemPrompt := buildAskSystemPrompt(s.nowFunc())
 
 	if sc, ok := s.llmClient.(llm.StreamCompleter); ok {
+		var answerBuilder strings.Builder
 		err := sc.StreamWithMessages(ctx, systemPrompt, messages, func(delta string) {
+			answerBuilder.WriteString(delta)
 			_ = writeSSEEvent(w, flusher, "token", askTokenPayload{Text: delta})
 		})
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				slog.Info("ask: client disconnected during synthesis", "error", err)
-				return ""
+				return "", answerBuilder.String()
 			}
 			slog.Error("ask: streaming synthesis failed", "error", err)
 			_ = writeSSEEvent(w, flusher, "error", askErrorPayload{Message: "synthesis failed"})
-			return "error"
+			return "error", answerBuilder.String()
 		}
-		return "stop"
+		return "stop", answerBuilder.String()
 	}
 
 	// Fallback for a Completer that does not implement StreamCompleter
 	// (e.g. a test fake, or a future non-streaming-only backend): emit the
 	// full answer as a single "token" event.
-	answer, err := s.llmClient.CompleteWithMessages(ctx, systemPrompt, messages)
+	full, err := s.llmClient.CompleteWithMessages(ctx, systemPrompt, messages)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			slog.Info("ask: client disconnected during synthesis", "error", err)
-			return ""
+			return "", ""
 		}
 		slog.Error("ask: synthesis failed", "error", err)
 		_ = writeSSEEvent(w, flusher, "error", askErrorPayload{Message: "synthesis failed"})
-		return "error"
+		return "error", ""
 	}
-	_ = writeSSEEvent(w, flusher, "token", askTokenPayload{Text: answer})
-	return "stop"
+	_ = writeSSEEvent(w, flusher, "token", askTokenPayload{Text: full})
+	return "stop", full
 }
 
-// buildAskMessages assembles the multi-turn prompt for Stage 3: a
-// [관측된 사실] section built from result.Observed, an optional
+// buildAskMessages assembles the multi-turn prompt for Stage 3.
+//
+// history (askHistoryTurn: question/answer TEXT only, capped at
+// askMaxHistoryTurns) is replayed FIRST as genuine alternating
+// user/assistant turns, exactly as the LLM originally produced/received
+// them. It deliberately carries no source-document content — evidence for
+// a previous turn already shaped that turn's answer text, and re-attaching
+// its full document bodies here would both (a) duplicate information the
+// model already has via the answer text and (b) make prompt size grow with
+// total conversation evidence rather than just conversation length. This
+// is the single reviewer-visible guarantee behind requirement (c) of the
+// multi-turn ask feature: no prior turn's document body is ever replayed.
+//
+// After history, the CURRENT turn is appended as: a [관측된 사실] section
+// built from result.Observed, an optional
 // [추론 — 가설이며 사실로 인용 불가] section built from result.Inferred, and the
 // user's raw question as the final turn. Each document line includes its
 // occurred_at (formatOccurredAt, KST, "시각 정보 없음" when nil) so the model
 // can reason about when the document's content happened, not just what it
 // says — the second half of the date-context fix (see buildAskSystemPrompt
 // for the first half, "what day is today").
-func buildAskMessages(question string, result RetrievalResult) []llm.Message {
+func buildAskMessages(question string, result RetrievalResult, history []askHistoryTurn) []llm.Message {
+	messages := make([]llm.Message, 0, len(history)*2+2)
+	for _, h := range history {
+		messages = append(messages,
+			llm.Message{Role: "user", Content: h.Question},
+			llm.Message{Role: "assistant", Content: h.Answer},
+		)
+	}
+
 	var b strings.Builder
 	b.WriteString("[관측된 사실]\n")
 	if len(result.Observed) == 0 {
@@ -322,8 +414,9 @@ func buildAskMessages(question string, result RetrievalResult) []llm.Message {
 		}
 	}
 
-	return []llm.Message{
-		{Role: "user", Content: b.String()},
-		{Role: "user", Content: question},
-	}
+	messages = append(messages,
+		llm.Message{Role: "user", Content: b.String()},
+		llm.Message{Role: "user", Content: question},
+	)
+	return messages
 }
