@@ -262,3 +262,89 @@ func TestSearchChunksVector_Empty(t *testing.T) {
 		t.Fatalf("want 0 results, got %d", len(got))
 	}
 }
+
+// TestMergeRRF_FullPrimary_SecondaryDoesNotDisplace reproduces the production
+// bug behind a proper-noun query ("한영석") returning "secretary 10 + call-log
+// 10" for a name that exists in zero secretary documents. Root cause,
+// confirmed against prod data: the chunk-vector secondary list is a single
+// un-corroborated semantic (embedding-only) signal with no term-match
+// requirement, while primary already fuses up to five independently-weighted
+// signals in the document store (fts/vec/bigm/summvec/entity). When primary
+// already fills the requested page with genuine matches, RRF's rank-only,
+// equal-weight fusion let a same-size secondary list that shares NO documents
+// with primary evict half of the correct results — reproduced exactly by this
+// test's 3-and-3, zero-overlap setup.
+func TestMergeRRF_FullPrimary_SecondaryDoesNotDisplace(t *testing.T) {
+	t.Parallel()
+
+	// primary: 3 documents that genuinely matched the query term (e.g. via
+	// fts/bigm), filling the requested limit.
+	p1 := uuid.MustParse("00000000-0000-0000-0000-000000000101")
+	p2 := uuid.MustParse("00000000-0000-0000-0000-000000000102")
+	p3 := uuid.MustParse("00000000-0000-0000-0000-000000000103")
+	primary := []*model.SearchResult{
+		makeSearchResult(p1, "call-log match 1", 0.9),
+		makeSearchResult(p2, "call-log match 2", 0.8),
+		makeSearchResult(p3, "call-log match 3", 0.7),
+	}
+
+	// secondary: 3 UNRELATED documents (no term overlap, no shared IDs with
+	// primary) that merely happen to be the closest embeddings by chance —
+	// exactly what the prod probe measured for the chunk-vector lane.
+	s1 := uuid.MustParse("00000000-0000-0000-0000-000000000201")
+	s2 := uuid.MustParse("00000000-0000-0000-0000-000000000202")
+	s3 := uuid.MustParse("00000000-0000-0000-0000-000000000203")
+	secondary := []*model.SearchResult{
+		makeSearchResult(s1, "unrelated secretary note 1", 0.95),
+		makeSearchResult(s2, "unrelated secretary note 2", 0.93),
+		makeSearchResult(s3, "unrelated secretary note 3", 0.91),
+	}
+
+	got := mergeRRF(primary, secondary, 3)
+
+	if len(got) != 3 {
+		t.Fatalf("want 3 results, got %d: %+v", len(got), got)
+	}
+	want := map[uuid.UUID]bool{p1: true, p2: true, p3: true}
+	for _, r := range got {
+		if !want[r.ID] {
+			t.Errorf("secondary-only document %s (%q) displaced a primary match; got %+v",
+				r.ID, r.Title, got)
+		}
+	}
+}
+
+// TestMergeRRF_PartialPrimary_SecondaryFillsRemainingSlots verifies that
+// secondary still supplies new documents — preserving its designed role of
+// surfacing passages the whole-document search missed, and of acting as a
+// semantic fallback — whenever primary does not already fill the page.
+func TestMergeRRF_PartialPrimary_SecondaryFillsRemainingSlots(t *testing.T) {
+	t.Parallel()
+
+	p1 := uuid.MustParse("00000000-0000-0000-0000-000000000301")
+	primary := []*model.SearchResult{
+		makeSearchResult(p1, "the one real match", 0.9),
+	}
+
+	s1 := uuid.MustParse("00000000-0000-0000-0000-000000000401")
+	s2 := uuid.MustParse("00000000-0000-0000-0000-000000000402")
+	secondary := []*model.SearchResult{
+		makeSearchResult(s1, "relevant passage in a long doc", 0.85),
+		makeSearchResult(s2, "another relevant passage", 0.80),
+	}
+
+	got := mergeRRF(primary, secondary, 3)
+
+	if len(got) != 3 {
+		t.Fatalf("want 3 results (1 primary + 2 secondary fill-in), got %d: %+v", len(got), got)
+	}
+	found := map[uuid.UUID]bool{}
+	for _, r := range got {
+		found[r.ID] = true
+	}
+	for _, id := range []uuid.UUID{p1, s1, s2} {
+		if !found[id] {
+			t.Errorf("want document %s present in merged results, got %+v", id, got)
+		}
+	}
+}
