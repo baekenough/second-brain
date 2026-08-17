@@ -7,10 +7,10 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/note"
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 )
 
 // notesRequestEnvelopeMaxBytes bounds the whole JSON request body for
@@ -54,6 +54,33 @@ func (s *Server) WithNotes(upserter NotesUpserter, chunks IngestFileChunkWriter,
 // createNoteHandler handles POST /api/v1/notes (spec §6.1). Persists the
 // raw note synchronously via note.Save and returns 202 immediately;
 // enrichment happens asynchronously via NoteEnrichmentWorker (Task 6).
+//
+// Capture never blocks on a remote call. note.Save is invoked with
+// doEmbed=false, so the request does an upsert and a chunk write — two local
+// database round-trips — and returns. Chunk vectors are filled in by the
+// scheduler's existing per-cycle chunk-embedding backfill
+// (Scheduler.backfillChunkEmbeddings, which selects chunks WHERE embedding IS
+// NULL), the same path that already recovers chunks whose inline embedding hit
+// a transient 429.
+//
+// This is the binding contract: a note must persist and return promptly even
+// when the embedding backend is down. It is not a latency preference. With
+// doEmbed=true the handler ran EmbedBatch over up to note.MaxEmbedChunks (2000)
+// chunks inside the request, and sourceID is empty here so note.Save mints a
+// fresh UUID on every call. A degraded embedding endpoint therefore blew the
+// write timeout, the client retried, and each retry created ANOTHER note —
+// each independently enriched, each generating its own insights. This repo has
+// already lived through that exact geometry once: a 70-second synchronous
+// re-embed in message ingest produced gateway 502s and a phone-side
+// retransmit loop (commit fe74316).
+//
+// An idempotency key was the alternative. It was not chosen because it treats
+// the duplicates rather than the cause: the request would still block on a
+// remote call, still burn the gateway timeout, and still return nothing useful
+// while the embedding backend is down. Deferring the embedding removes the
+// blocking call entirely, and with it the retries the key would have had to
+// deduplicate. A client-supplied key remains available later as a defence
+// against ordinary network retries, on top of this rather than instead of it.
 func (s *Server) createNoteHandler(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, notesRequestEnvelopeMaxBytes)
 
@@ -88,7 +115,9 @@ func (s *Server) createNoteHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, errMsg := note.Save(r.Context(), s.notesUpserter, s.notesChunks, s.notesEmbedder,
-		model.SourceNote, req.Title, req.Content, "", metadata, true, false /* requireTitle */)
+		model.SourceNote, req.Title, req.Content, "", metadata,
+		false, /* doEmbed — deferred to the chunk-embedding backfill; see above */
+		false /* requireTitle */)
 	if errMsg != "" {
 		// note.Save's remaining validation failures (empty content after
 		// trimming) are 400s; anything else is an internal error string.
