@@ -54,15 +54,30 @@ func TestInitOTel_NoopWhenEndpointEmpty(t *testing.T) {
 // TestInitOTel_ConfiguresRealProviderWhenEndpointSet verifies that a
 // non-empty endpoint configures a real (non-no-op) SDK TracerProvider that
 // produces recording spans and successfully exports them with the expected
-// Basic Auth header. No real Langfuse instance or external network is
-// contacted: the endpoint is a local httptest.Server stub that accepts the
-// OTLP/HTTP POST and returns 200.
+// Basic Auth header, POSTed to "{endpoint}/v1/traces" — NOT the bare
+// endpoint. This locks in a real deployment finding: Langfuse's OTLP
+// receiver lives at "{base}/v1/traces", and POSTing to the bare base path
+// (which otlptracehttp.WithEndpointURL would do if InitOTel used the
+// configured endpoint verbatim) hits Langfuse's own web app router and gets
+// a silently-swallowed 404 instead of a real export — see InitOTel's doc
+// comment "Endpoint path contract". The stub server below only accepts the
+// "/v1/traces" path and 404s everything else, so this test would have
+// caught that exact regression. No real Langfuse instance or external
+// network is contacted.
 func TestInitOTel_ConfiguresRealProviderWhenEndpointSet(t *testing.T) {
 	t.Cleanup(resetGlobalTracerProvider)
 
 	var gotAuthHeader atomic.Value // string
+	var gotPath atomic.Value       // string
 	var exportCalled atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath.Store(r.URL.Path)
+		if r.URL.Path != "/api/public/otel/v1/traces" {
+			// Mirrors the real Langfuse deployment: anything other than the
+			// exact OTLP traces path 404s via the web app's own router.
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		exportCalled.Store(true)
 		gotAuthHeader.Store(r.Header.Get("Authorization"))
 		w.WriteHeader(http.StatusOK)
@@ -89,6 +104,9 @@ func TestInitOTel_ConfiguresRealProviderWhenEndpointSet(t *testing.T) {
 		t.Errorf("shutdown() after configured InitOTel returned error: %v", err)
 	}
 
+	if got, _ := gotPath.Load().(string); got != "/api/public/otel/v1/traces" {
+		t.Fatalf("exporter POSTed to path %q, want \"/api/public/otel/v1/traces\" (InitOTel must append /v1/traces to the configured base endpoint)", got)
+	}
 	if !exportCalled.Load() {
 		t.Error("shutdown() did not flush the buffered span to the local stub OTLP server")
 	}
