@@ -219,6 +219,27 @@ func run() error {
 		entityWorker.Run(ctx)
 	}()
 
+	// --- Note enrichment worker (Capture backend) ---
+	// Runs unconditionally, like retryWorker and summarizerWorker — unlike
+	// entity extraction, there is no feature-flag gate here because Capture
+	// notes are only created via an explicit user action (POST
+	// /api/v1/notes), not a bulk backfill over the existing 46,000+ document
+	// corpus. The worker itself idles gracefully when llmClient.Enabled() is
+	// false (see NoteEnrichmentWorker.Run), matching EntityWorker's pattern.
+	noteEnrichmentWorker := worker.NewNoteEnrichmentWorker(worker.NoteEnrichmentWorkerConfig{
+		Store:     docStore,
+		Insights:  worker.NewInsightSaver(docStore, chunkStore, embedClient),
+		Entities:  entityStore,
+		LLM:       llmClient,
+		Interval:  5 * time.Minute,
+		BatchSize: 5,
+	})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		noteEnrichmentWorker.Run(ctx)
+	}()
+
 	// --- Collectors ---
 	// Discord is intentionally excluded from the collector daemon; it is handled
 	// by the API server which owns the WebSocket gateway and mention responses.
