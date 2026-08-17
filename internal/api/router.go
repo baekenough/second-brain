@@ -10,13 +10,23 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
-	"github.com/google/uuid"
+	"github.com/baekenough/second-brain/internal/intent"
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
+)
+
+// Ask pipeline defaults (spec §5.2/§6, plan Task 5). Used whenever
+// WithAskConfig is not called — NewServer always constructs a working ask
+// pipeline, mirroring how /api/v1/search needs no optional builder.
+const (
+	defaultAskTimeout  = 60 * time.Second
+	defaultAskTopK     = 8
+	defaultAskInsightM = 3
 )
 
 // DocumentStore is the subset of store.DocumentStore used by the API.
@@ -95,6 +105,18 @@ type Server struct {
 	notesChunks   IngestFileChunkWriter
 	notesEmbedder IngestFileEmbedder
 
+	// intentClassifier, askTimeout, askTopK, and askInsightM back the
+	// POST /api/v1/ask pipeline (ask backend plan Task 3-5). Unlike the
+	// optional With* dependencies above, these are always non-nil/non-zero
+	// — set to defaults inside NewServer — because /ask depends only on
+	// s.search and s.llmClient, both already unconditional NewServer
+	// params (same tier as /api/v1/search, not /api/v1/notes). Override
+	// tuning knobs via WithAskConfig.
+	intentClassifier intent.Classifier
+	askTimeout       time.Duration
+	askTopK          int
+	askInsightM      int
+
 	// piiNumberHashingEnabled mirrors cfg.PIINumberHashingEnabled (issue #164
 	// policy reversal). Zero value (false) is the new default and is used by
 	// both ingestMessagesHandler (smsmap.MapSMS/MapCall) and
@@ -129,7 +151,35 @@ func NewServer(
 		llmClient:      llmClient,
 		filesystemPath: filesystemPath,
 		apiKey:         apiKey,
+
+		// intentClassifier degrades safely even when llmClient.Enabled()
+		// is false (intent.LLMClassifier's LLM fallback path collapses to
+		// KindGeneral on any error — spec §4.4), so it is always
+		// constructed here rather than gated behind a nil check.
+		intentClassifier: intent.NewLLMClassifier(llmClient),
+		askTimeout:       defaultAskTimeout,
+		askTopK:          defaultAskTopK,
+		askInsightM:      defaultAskInsightM,
 	}
+}
+
+// WithAskConfig sets the ask-pipeline tuning knobs: the overall
+// request timeout and the Stage 2 result-count caps (본검색/인사이트검색
+// limits). Optional — a Server that never calls this still has a working
+// /api/v1/ask route using the package defaults (60s / 8 / 3). Values <= 0
+// are ignored (defaults are kept) so a misconfigured env var cannot zero
+// out the pipeline.
+func (s *Server) WithAskConfig(timeout time.Duration, topK, insightM int) *Server {
+	if timeout > 0 {
+		s.askTimeout = timeout
+	}
+	if topK > 0 {
+		s.askTopK = topK
+	}
+	if insightM > 0 {
+		s.askInsightM = insightM
+	}
+	return s
 }
 
 // WithPIINumberHashing sets the phone-number hashing policy (issue #164;
@@ -202,6 +252,8 @@ func (s *Server) buildHandler() http.Handler {
 		r.Get("/api/v1/stats/baseline", s.baselineStatsHandler)
 
 		r.Post("/api/v1/feedback", s.feedbackHandler)
+
+		r.Post("/api/v1/ask", s.askHandler)
 
 		r.Handle("/api/v1/graphql", s.graphqlHandler())
 

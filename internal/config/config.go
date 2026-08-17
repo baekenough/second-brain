@@ -93,6 +93,16 @@ type Config struct {
 	TelegramBotToken string
 	TelegramChatIDs  []int64
 
+	// UserEmailAddresses lists the account owner's own email addresses
+	// (comma-separated in USER_EMAIL_ADDRESSES). Used by Part A's structural
+	// "awaiting my reply" signal (spec §7.1) and by the extraction worker's
+	// counterpart resolution for the same kind: gmail carries no `direction`
+	// metadata key (unlike sms/call), only a `from` address, so direction
+	// must be inferred by comparing `from` against the account's own
+	// address(es). A list (not a single string) accommodates aliases on the
+	// same Gmail account.
+	UserEmailAddresses []string
+
 	// Reranker (optional — cross-encoder post-retrieval reranking disabled when empty)
 	RerankURL    string // RERANKER_URL — Jina-compatible /rerank endpoint base URL
 	RerankAPIKey string // RERANKER_API_KEY — Bearer token for the reranker API
@@ -414,6 +424,23 @@ type Config struct {
 	// Source: COLLECTOR_CUTOVER env var (RFC3339 format).
 	// Default: zero time.Time{} = floor DISABLED (no behaviour change).
 	CollectorCutover time.Time
+
+	// Ask pipeline (POST /api/v1/ask, ask backend plan Task 5) — all three
+	// have sane defaults, so no feature flag: /ask is registered
+	// unconditionally, same tier as /api/v1/search.
+	//
+	// AskTimeoutSeconds bounds the whole request (intent classify + both
+	// retrieval calls + LLM synthesis). ASK_TIMEOUT_SECONDS env var,
+	// default 60 (mirrors llm.Config.Timeout's own default).
+	AskTimeoutSeconds int
+	// AskContextTopK is the Limit passed to the 본검색 (main/Observed)
+	// search call. ASK_CONTEXT_TOP_K env var, default 8.
+	AskContextTopK int
+	// AskContextInsightM is the Limit passed to the 인사이트검색 (Inferred)
+	// search call — intentionally smaller than AskContextTopK since
+	// insight documents are supporting hypotheses, not primary evidence.
+	// ASK_CONTEXT_INSIGHT_M env var, default 3.
+	AskContextInsightM int
 }
 
 // Load reads configuration from environment variables and returns a Config.
@@ -568,6 +595,8 @@ func Load() (*Config, error) {
 		TelegramBotToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
 		TelegramChatIDs:  telegramChatIDs,
 
+		UserEmailAddresses: splitCSV(os.Getenv("USER_EMAIL_ADDRESSES")),
+
 		RerankURL:    os.Getenv("RERANKER_URL"),
 		RerankAPIKey: os.Getenv("RERANKER_API_KEY"),
 		RerankModel:  getenv("RERANKER_MODEL", "jina-reranker-v2-base-multilingual"),
@@ -640,6 +669,10 @@ func Load() (*Config, error) {
 		// PIIRedactionEnabled / PIINumberHashingEnabled doc comments above.
 		PIIRedactionEnabled:     os.Getenv("PII_REDACTION_ENABLED") == "true",
 		PIINumberHashingEnabled: os.Getenv("PII_NUMBER_HASHING_ENABLED") == "true",
+
+		AskTimeoutSeconds:  askTimeoutSeconds(),
+		AskContextTopK:     askContextTopK(),
+		AskContextInsightM: askContextInsightM(),
 	}, nil
 }
 
@@ -897,6 +930,66 @@ func ingestMaxBatchMessages() int {
 			"error", err,
 		)
 		return defaultCap
+	}
+	return n
+}
+
+// askTimeoutSeconds parses ASK_TIMEOUT_SECONDS from the environment.
+// Default is 60 (mirrors llm.Config.Timeout's own default).
+// Invalid values are ignored and the default is used.
+func askTimeoutSeconds() int {
+	const defaultSeconds = 60
+	v := os.Getenv("ASK_TIMEOUT_SECONDS")
+	if v == "" {
+		return defaultSeconds
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		slog.Warn("config: ASK_TIMEOUT_SECONDS is invalid; using default 60",
+			"value", v,
+			"error", err,
+		)
+		return defaultSeconds
+	}
+	return n
+}
+
+// askContextTopK parses ASK_CONTEXT_TOP_K from the environment: the result
+// limit for the 본검색 (Observed) search call. Default is 8.
+// Invalid values are ignored and the default is used.
+func askContextTopK() int {
+	const defaultTopK = 8
+	v := os.Getenv("ASK_CONTEXT_TOP_K")
+	if v == "" {
+		return defaultTopK
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		slog.Warn("config: ASK_CONTEXT_TOP_K is invalid; using default 8",
+			"value", v,
+			"error", err,
+		)
+		return defaultTopK
+	}
+	return n
+}
+
+// askContextInsightM parses ASK_CONTEXT_INSIGHT_M from the environment: the
+// result limit for the 인사이트검색 (Inferred) search call. Default is 3.
+// Invalid values are ignored and the default is used.
+func askContextInsightM() int {
+	const defaultInsightM = 3
+	v := os.Getenv("ASK_CONTEXT_INSIGHT_M")
+	if v == "" {
+		return defaultInsightM
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		slog.Warn("config: ASK_CONTEXT_INSIGHT_M is invalid; using default 3",
+			"value", v,
+			"error", err,
+		)
+		return defaultInsightM
 	}
 	return n
 }

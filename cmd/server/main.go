@@ -121,7 +121,8 @@ func run() error {
 		WithPIINumberHashing(cfg.PIINumberHashingEnabled).
 		WithIngestMessages(docStore, chunkStore, embedClient, cfg.IngestMaxBatchMessages, cfg.CollectorCutover).
 		WithIngestRecording(docStore, cfg.IngestRecordingDir, cfg.IngestMaxFileBytes, cfg.CollectorCutover).
-		WithNotes(docStore, chunkStore, embedClient)
+		WithNotes(docStore, chunkStore, embedClient).
+		WithAskConfig(time.Duration(cfg.AskTimeoutSeconds)*time.Second, cfg.AskContextTopK, cfg.AskContextInsightM)
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      srv.Handler(),
