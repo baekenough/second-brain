@@ -67,6 +67,14 @@ type Config struct {
 	LLMMaxTokens      int
 	LLMTemperature    float64
 	LLMTimeoutSeconds int // LLM_TIMEOUT_SECONDS — HTTP client timeout; default 120
+	// LLMThinking: LLM_THINKING env var — "disabled" (default) or "enabled".
+	// Reasoning models bill reasoning_content against max_tokens; on long
+	// reasoning the budget is spent before any visible content is produced
+	// and the response comes back empty with finish_reason="length". Both
+	// consumers of the client (summarizer, extraction worker) do mechanical
+	// structured-output work, so reasoning is off by default. Any value other
+	// than "enabled" is treated as "disabled".
+	LLMThinking string
 
 	// Slack (optional)
 	SlackBotToken string
@@ -541,6 +549,25 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// LLM_THINKING: "disabled" (default) or "enabled". Anything else falls
+	// back to "disabled" with a warning — an unrecognised value must not
+	// silently re-enable reasoning and reintroduce empty completions.
+	// The literals mirror llm.ThinkingDisabled / llm.ThinkingEnabled; they are
+	// repeated rather than imported to keep config free of a dependency on
+	// internal/llm.
+	llmThinking := strings.ToLower(strings.TrimSpace(os.Getenv("LLM_THINKING")))
+	switch llmThinking {
+	case "":
+		llmThinking = "disabled"
+	case "disabled", "enabled":
+		// valid
+	default:
+		slog.Warn("config: LLM_THINKING is invalid; using \"disabled\"",
+			"value", llmThinking,
+		)
+		llmThinking = "disabled"
+	}
+
 	// SUMMARIZER_BACKFILL_ENABLED: default true.
 	// Set =false to skip the ListUnsummarized scan when running a slow local LLM.
 	summarizerBackfill := true
@@ -601,6 +628,7 @@ func Load() (*Config, error) {
 		LLMMaxTokens:      llmMaxTokens,
 		LLMTemperature:    llmTemperature,
 		LLMTimeoutSeconds: llmTimeoutSeconds,
+		LLMThinking:       llmThinking,
 
 		SlackBotToken: os.Getenv("SLACK_BOT_TOKEN"),
 		SlackTeamID:   os.Getenv("SLACK_TEAM_ID"),

@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -55,8 +56,34 @@ type Client struct {
 	tokens      auth.TokenSource // nil when no auth configured
 	maxTokens   int
 	temperature float64
-	httpClient  *http.Client
+	// thinking is the value serialised into the request's "thinking" field.
+	// nil means the field is omitted entirely from the request body (see
+	// Config.Thinking).
+	thinking   *thinkingParam
+	httpClient *http.Client
 }
+
+// Thinking modes accepted by Config.Thinking.
+//
+// Reasoning models (e.g. deepseek-v4-flash) charge reasoning_content against
+// the same max_tokens budget as the visible completion. On inputs whose
+// reasoning runs long the budget is consumed entirely by reasoning and the
+// response comes back with zero-length content and finish_reason="length" —
+// measured on a 2,768-character document: max_tokens=8000 produced 25,388
+// reasoning characters and 0 content characters. Disabling reasoning on the
+// same document produced a complete answer in 750 completion tokens.
+//
+// Both users of this client (the summarizer and the extraction worker) do
+// mechanical structured-output work, so ThinkingDisabled is the default.
+const (
+	// ThinkingDisabled sends "thinking": {"type": "disabled"}.
+	ThinkingDisabled = "disabled"
+	// ThinkingEnabled omits the "thinking" field entirely, leaving the
+	// endpoint's own default in force. The field is omitted rather than sent
+	// as {"type":"enabled"} because OpenAI-compatible endpoints that do not
+	// implement this vendor parameter reject unknown fields with HTTP 400.
+	ThinkingEnabled = "enabled"
+)
 
 // Config holds the parameters required to construct a Client.
 //
@@ -76,6 +103,12 @@ type Config struct {
 	// Increase for slow local CPU inference (e.g. gemma3:4b) by setting
 	// LLM_TIMEOUT_SECONDS in the environment.
 	Timeout time.Duration
+	// Thinking controls the vendor "thinking" request parameter:
+	// ThinkingDisabled (or "", the zero value) sends
+	// "thinking": {"type": "disabled"}; ThinkingEnabled omits the field.
+	// Any other value is treated as ThinkingDisabled. Sourced from the
+	// LLM_THINKING environment variable via config.Config.LLMThinking.
+	Thinking string
 }
 
 // New returns a Client configured with the given Config.
@@ -98,8 +131,19 @@ func New(cfg Config, httpClient *http.Client) *Client {
 		tokens:      auth.Resolve(cfg.APIKey, cfg.AuthFile),
 		maxTokens:   cfg.MaxTokens,
 		temperature: cfg.Temperature,
+		thinking:    thinkingFor(cfg.Thinking),
 		httpClient:  httpClient,
 	}
+}
+
+// thinkingFor maps a Config.Thinking value to the request field value.
+// Returning nil means "omit the field" — see the ThinkingEnabled doc comment
+// for why enabling is expressed as an omission.
+func thinkingFor(mode string) *thinkingParam {
+	if strings.EqualFold(strings.TrimSpace(mode), ThinkingEnabled) {
+		return nil
+	}
+	return &thinkingParam{Type: ThinkingDisabled}
 }
 
 // Enabled reports whether the client has the minimum required configuration
@@ -147,7 +191,60 @@ type chatRequest struct {
 	Temperature float64   `json:"temperature"`
 	MaxTokens   int       `json:"max_tokens"`
 	Stream      bool      `json:"stream,omitempty"`
+	// Thinking is a POINTER with omitempty on purpose: encoding/json's
+	// omitempty does not treat an empty struct as empty, so a value type
+	// would serialise "thinking":{"type":""} on every request and any
+	// OpenAI-compatible endpoint that does not implement this vendor
+	// parameter would answer HTTP 400. nil omits the key entirely.
+	Thinking *thinkingParam `json:"thinking,omitempty"`
 }
+
+// thinkingParam is the vendor "thinking" request object, e.g.
+// {"type": "disabled"}.
+type thinkingParam struct {
+	Type string `json:"type"`
+}
+
+// finishReasonLength is the finish_reason a provider returns when generation
+// stopped because the max_tokens budget ran out.
+const finishReasonLength = "length"
+
+// ErrTruncated is the sentinel behind every *TruncatedError, so callers can
+// branch with errors.Is without depending on the struct type.
+var ErrTruncated = errors.New("llm: response truncated by token budget")
+
+// TruncatedError reports that generation stopped on the token budget
+// (finish_reason="length") rather than at a natural stop. Both variants are
+// errors:
+//
+//   - empty content: the whole budget was spent on reasoning_content, and the
+//     caller would otherwise see only a confusing "cannot parse empty JSON".
+//   - non-empty content: a partial completion. Passing it on as success
+//     silently loses data (half-parsed entities, half-written summaries).
+//
+// The response body is deliberately NOT a field of this error and never
+// appears in Error(): completions contain personal data (issue #194).
+type TruncatedError struct {
+	// FinishReason is the raw finish_reason reported by the provider.
+	FinishReason string
+	// CompletionTokens is the provider-reported completion token count, or 0
+	// when the response carried no usage block (streaming responses usually
+	// do not).
+	CompletionTokens int
+	// ContentLength is the byte length of the content that was produced —
+	// a length only, never the content itself.
+	ContentLength int
+}
+
+func (e *TruncatedError) Error() string {
+	return fmt.Sprintf(
+		"llm: generation stopped on the token budget (finish_reason=%q, completion_tokens=%d, content_length=%d); raise LLM_MAX_TOKENS or set LLM_THINKING=disabled",
+		e.FinishReason, e.CompletionTokens, e.ContentLength,
+	)
+}
+
+// Unwrap makes errors.Is(err, ErrTruncated) hold.
+func (e *TruncatedError) Unwrap() error { return ErrTruncated }
 
 // streamChunk is a single OpenAI-compatible streaming SSE data payload:
 // {"choices":[{"delta":{"content":"..."},"finish_reason":null}]}
@@ -166,6 +263,9 @@ type chatResponse struct {
 		Message struct {
 			Content string `json:"content"`
 		} `json:"message"`
+		// FinishReason is absent on some OpenAI-compatible proxies; an empty
+		// value is treated as "no signal" and never fails the request.
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	// Usage is optional: some OpenAI-compatible proxies omit it. A nil Usage
 	// (or a struct that never unmarshals because the field is entirely
@@ -229,6 +329,7 @@ func (c *Client) CompleteWithMessages(ctx context.Context, system string, messag
 		Messages:    allMessages,
 		Temperature: c.temperature,
 		MaxTokens:   c.maxTokens,
+		Thinking:    c.thinking,
 	}
 
 	const maxRetries = 2
@@ -244,8 +345,13 @@ func (c *Client) CompleteWithMessages(ctx context.Context, system string, messag
 			}
 			return result, nil
 		}
-		if isClientError(err) {
+		if isClientError(err) || errors.Is(err, ErrTruncated) {
 			// 4xx — do not retry.
+			//
+			// Truncation is not retried either: the same prompt against the
+			// same budget deterministically exhausts it again, so retrying
+			// only bills three full max_tokens generations for one failure.
+			// The error tells the operator which knob to turn instead.
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
 			return "", err
@@ -332,6 +438,7 @@ func (c *Client) StreamWithMessages(ctx context.Context, system string, messages
 		Temperature: c.temperature,
 		MaxTokens:   c.maxTokens,
 		Stream:      true,
+		Thinking:    c.thinking,
 	}
 
 	payload, err := json.Marshal(reqBody)
@@ -365,6 +472,17 @@ func (c *Client) StreamWithMessages(ctx context.Context, system string, messages
 		return &clientError{statusCode: resp.StatusCode, body: string(body)}
 	}
 
+	// finishReason keeps the last non-empty finish_reason seen on the stream:
+	// providers report it on the final chunk (often one carrying no content),
+	// and it is the only signal distinguishing a complete answer from one cut
+	// off by the token budget. Discarding it is what made budget exhaustion
+	// look like a JSON parse failure to callers.
+	var finishReason string
+	// contentLen accumulates delivered delta bytes so a truncation error can
+	// report a length without retaining the content itself.
+	var contentLen int
+	var sawDone bool
+
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -376,7 +494,8 @@ func (c *Client) StreamWithMessages(ctx context.Context, system string, messages
 			continue
 		}
 		if data == "[DONE]" {
-			return nil
+			sawDone = true
+			break
 		}
 
 		var chunk streamChunk
@@ -388,20 +507,38 @@ func (c *Client) StreamWithMessages(ctx context.Context, system string, messages
 		if len(chunk.Choices) == 0 {
 			continue
 		}
+		if fr := chunk.Choices[0].FinishReason; fr != nil && *fr != "" {
+			finishReason = *fr
+		}
 		if content := chunk.Choices[0].Delta.Content; content != "" {
+			contentLen += len(content)
 			onDelta(content)
 		}
 	}
 
-	// Prefer ctx.Err() over the raw scanner error: when the caller cancels
-	// (client disconnect, timeout), the underlying transport error message
-	// varies by platform/Go version, but the caller only needs to reliably
-	// detect "this was a cancellation" via errors.Is(err, context.Canceled).
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return fmt.Errorf("llm: stream canceled: %w", ctxErr)
+	if !sawDone {
+		// Prefer ctx.Err() over the raw scanner error: when the caller cancels
+		// (client disconnect, timeout), the underlying transport error message
+		// varies by platform/Go version, but the caller only needs to reliably
+		// detect "this was a cancellation" via errors.Is(err, context.Canceled).
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("llm: stream canceled: %w", ctxErr)
+		}
+		if err := scanner.Err(); err != nil {
+			return fmt.Errorf("llm: read stream: %w", err)
+		}
 	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("llm: read stream: %w", err)
+
+	// Same verdict as the non-streaming path. Deltas already handed to
+	// onDelta are NOT retracted — the caller has typically forwarded them
+	// downstream already — but the call still fails so the caller does not
+	// treat a cut-off answer as complete. Streaming responses carry no usage
+	// block, hence CompletionTokens is left at 0.
+	if finishReason == finishReasonLength {
+		return &TruncatedError{
+			FinishReason:  finishReason,
+			ContentLength: contentLen,
+		}
 	}
 	return nil
 }
@@ -486,5 +623,23 @@ func (c *Client) doRequest(ctx context.Context, reqBody chatRequest) (string, *t
 		return "", nil, fmt.Errorf("llm: response contains no choices")
 	}
 
-	return chatResp.Choices[0].Message.Content, chatResp.Usage, nil
+	choice := chatResp.Choices[0]
+
+	// A budget-truncated completion is an error, whether the content is empty
+	// (reasoning ate the budget) or partial (silently lossy). Reported before
+	// returning any content so no caller can accidentally parse half a JSON
+	// document as a complete one.
+	if choice.FinishReason == finishReasonLength {
+		completionTokens := 0
+		if chatResp.Usage != nil {
+			completionTokens = chatResp.Usage.CompletionTokens
+		}
+		return "", chatResp.Usage, &TruncatedError{
+			FinishReason:     choice.FinishReason,
+			CompletionTokens: completionTokens,
+			ContentLength:    len(choice.Message.Content),
+		}
+	}
+
+	return choice.Message.Content, chatResp.Usage, nil
 }
