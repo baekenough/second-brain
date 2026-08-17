@@ -11,6 +11,25 @@ import (
 	"github.com/baekenough/second-brain/internal/model"
 )
 
+// applyInsightExclusionDefault enforces the permanent policy from spec
+// §3.2 (echo-chamber guard 4) and §6.5: insight documents are excluded from
+// /api/v1/search results by default. The ONLY way to see them is an
+// explicit SourceType == model.SourceInsight request. This prevents
+// unlabelled inferences from surfacing next to factual search results,
+// where a caller could mistake a model's guess for an observed fact.
+func applyInsightExclusionDefault(q model.SearchQuery) model.SearchQuery {
+	if q.SourceType != nil && *q.SourceType == model.SourceInsight {
+		return q
+	}
+	for _, st := range q.ExcludeSourceTypes {
+		if st == model.SourceInsight {
+			return q
+		}
+	}
+	q.ExcludeSourceTypes = append(q.ExcludeSourceTypes, model.SourceInsight)
+	return q
+}
+
 // searchRequest is the JSON body for POST /api/v1/search.
 // It mirrors model.SearchQuery but uses snake_case JSON tags explicitly so that
 // include_deleted is properly decoded from the request body.
@@ -48,6 +67,7 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 		UseHyDE:            req.UseHyDE,
 		UseRerank:          req.UseRerank,
 	}
+	q = applyInsightExclusionDefault(q)
 
 	start := time.Now()
 	results, err := s.search.Search(r.Context(), q)
@@ -116,6 +136,7 @@ func (s *Server) searchGetHandler(w http.ResponseWriter, r *http.Request) {
 		UseHyDE:    useHyDE,
 		UseRerank:  useRerank,
 	}
+	q = applyInsightExclusionDefault(q)
 
 	start := time.Now()
 	results, err := s.search.Search(r.Context(), q)
