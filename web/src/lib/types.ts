@@ -112,6 +112,12 @@ export interface CreateNoteResponse {
   status: "pending";
 }
 
+/** Response shape of POST /api/v1/ingest/file (internal/api/ingest_file.go). */
+export interface IngestFileResponse {
+  document_id: string;
+  accepted: boolean;
+}
+
 /** One entry of the `sources` SSE event (spec §5.1). */
 export interface AskSourceItem {
   id: string;

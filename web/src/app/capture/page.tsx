@@ -1,7 +1,14 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { listDocuments, createNote, retryNoteEnrichment, deleteNote } from "@/lib/api";
+import {
+  listDocuments,
+  createNote,
+  retryNoteEnrichment,
+  deleteNote,
+  uploadFile,
+  MAX_UPLOAD_FILE_BYTES,
+} from "@/lib/api";
 import { getNoteMetadata } from "@/lib/types";
 import type { DocumentDetail } from "@/lib/types";
 import { describeEnrichmentStatus } from "@/lib/enrichmentStatus";
@@ -77,6 +84,8 @@ export default function CapturePage() {
   const [notes, setNotes] = useState<DocumentDetail[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const refresh = useCallback(async () => {
@@ -145,6 +154,32 @@ export default function CapturePage() {
     }
   }
 
+  async function handleFileSelected(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    // Always clear the input value so selecting the same file twice in a
+    // row (e.g. retry after an error) still fires a change event.
+    e.target.value = "";
+    if (!file || uploading) return;
+
+    if (file.size > MAX_UPLOAD_FILE_BYTES) {
+      setError(
+        `파일이 너무 큽니다 (최대 ${Math.floor(MAX_UPLOAD_FILE_BYTES / (1024 * 1024))}MB).`,
+      );
+      return;
+    }
+
+    setUploading(true);
+    setError(null);
+    try {
+      await uploadFile(file);
+      await refresh();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "파일 업로드 중 오류가 발생했습니다.");
+    } finally {
+      setUploading(false);
+    }
+  }
+
   async function handleRetry(id: string) {
     try {
       await retryNoteEnrichment(id);
@@ -192,6 +227,34 @@ export default function CapturePage() {
           저장
         </Button>
         {error && <p className="text-sm text-danger">{error}</p>}
+      </div>
+
+      {/* File upload — separate from the text compose field above; the
+          backend ingests the file as its own document (source: upload). */}
+      <div className="space-y-2 rounded-lg border border-border bg-surface p-4">
+        <h2 className="text-sm font-medium text-foreground">파일로 저장</h2>
+        <p className="text-xs text-foreground-muted">
+          PDF, DOCX, XLSX, PPTX, HWPX, HTML, TXT, MD 파일을 업로드할 수 있습니다.
+        </p>
+        <div className="flex items-center gap-2">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".pdf,.docx,.xlsx,.pptx,.hwpx,.html,.htm,.txt,.md,.text"
+            onChange={(e) => void handleFileSelected(e)}
+            disabled={uploading}
+            className="hidden"
+          />
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={() => fileInputRef.current?.click()}
+            loading={uploading}
+            disabled={uploading}
+          >
+            파일 선택 및 업로드
+          </Button>
+        </div>
       </div>
 
       {/* Recent notes */}
