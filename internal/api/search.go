@@ -11,24 +11,14 @@ import (
 	"github.com/baekenough/second-brain/internal/model"
 )
 
-// applyInsightExclusionDefault enforces the permanent policy from spec
-// §3.2 (echo-chamber guard 4) and §6.5: insight documents are excluded from
-// /api/v1/search results by default. The ONLY way to see them is an
-// explicit SourceType == model.SourceInsight request. This prevents
-// unlabelled inferences from surfacing next to factual search results,
-// where a caller could mistake a model's guess for an observed fact.
-func applyInsightExclusionDefault(q model.SearchQuery) model.SearchQuery {
-	if q.SourceType != nil && *q.SourceType == model.SourceInsight {
-		return q
-	}
-	for _, st := range q.ExcludeSourceTypes {
-		if st == model.SourceInsight {
-			return q
-		}
-	}
-	q.ExcludeSourceTypes = append(q.ExcludeSourceTypes, model.SourceInsight)
-	return q
-}
+// The insight-exclusion default (spec §3.2 echo-chamber guard 4, §6.5) used to
+// be applied here, in these two handlers. It now lives in
+// search.Service.Search, because three other callers of the same service —
+// the Discord RAG gateway, the GraphQL search resolver and the MCP search tool
+// — went through no handler at all and so got no exclusion. The call sites
+// here are removed rather than left as no-ops: keeping them would imply the
+// handler is where the policy lives, and the next endpoint added would be
+// written to match.
 
 // searchRequest is the JSON body for POST /api/v1/search.
 // It mirrors model.SearchQuery but uses snake_case JSON tags explicitly so that
@@ -39,10 +29,10 @@ type searchRequest struct {
 	ExcludeSourceTypes []model.SourceType `json:"exclude_source_types"` // source types to exclude
 	Limit              int                `json:"limit"`
 	IncludeDeleted     bool               `json:"include_deleted"`
-	Sort               string             `json:"sort"`              // "relevance" (default) | "recent"
-	UseHyDE            bool               `json:"use_hyde,omitempty"`    // opt-in HyDE query expansion; default false
-	UseRerank          bool               `json:"use_rerank,omitempty"`  // opt-in cross-encoder reranking; default false
-	Curated            bool               `json:"curated,omitempty"`     // opt-in LLM curation and re-ranking; default false
+	Sort               string             `json:"sort"`                 // "relevance" (default) | "recent"
+	UseHyDE            bool               `json:"use_hyde,omitempty"`   // opt-in HyDE query expansion; default false
+	UseRerank          bool               `json:"use_rerank,omitempty"` // opt-in cross-encoder reranking; default false
+	Curated            bool               `json:"curated,omitempty"`    // opt-in LLM curation and re-ranking; default false
 }
 
 // searchHandler handles POST /api/v1/search.
@@ -67,7 +57,6 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 		UseHyDE:            req.UseHyDE,
 		UseRerank:          req.UseRerank,
 	}
-	q = applyInsightExclusionDefault(q)
 
 	start := time.Now()
 	results, err := s.search.Search(r.Context(), q)
@@ -136,7 +125,6 @@ func (s *Server) searchGetHandler(w http.ResponseWriter, r *http.Request) {
 		UseHyDE:    useHyDE,
 		UseRerank:  useRerank,
 	}
-	q = applyInsightExclusionDefault(q)
 
 	start := time.Now()
 	results, err := s.search.Search(r.Context(), q)
