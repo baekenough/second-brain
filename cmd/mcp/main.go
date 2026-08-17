@@ -33,9 +33,9 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
-	"github.com/baekenough/second-brain/internal/chunker"
 	"github.com/baekenough/second-brain/internal/config"
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/baekenough/second-brain/internal/note"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
 )
@@ -487,219 +487,11 @@ func registerStatsTool(s *server.MCPServer, docs StatsProvider) {
 // Tool: add_note
 // ---------------------------------------------------------------------------
 
-// maxNoteContentBytes is the upper bound for add_note content (10 MiB).
-const maxNoteContentBytes = 10 * 1024 * 1024
-
-// maxNoteTitleBytes is the upper bound for add_note title (1 KiB).
-const maxNoteTitleBytes = 1024
-
-// maxEmbedChunks is the upper bound for the number of chunks to embed in a
-// single add_note call. Notes that produce more chunks are stored and
-// indexed via FTS, but embedding is skipped to avoid unbounded API cost and
-// long-running DB transactions.
-const maxEmbedChunks = 2000
-
-// errEmbedSkipped is returned by embedNoteChunks when the chunk count exceeds
-// maxEmbedChunks. It is a sentinel that handleAddNote treats as a deliberate
-// skip (non-fatal, non-success) rather than an actual embedding failure.
-// The caller MUST NOT surface this as a user-facing error.
-var errEmbedSkipped = errors.New("embedding skipped: chunk count exceeds limit")
-
-// NoteDocumentUpserter is the subset of DocumentStore used by the add_note tool.
-type NoteDocumentUpserter interface {
-	Upsert(ctx context.Context, doc *model.Document) error
-}
-
-// NoteChunkWriter is the subset of ChunkStore used by the add_note tool.
-type NoteChunkWriter interface {
-	ReplaceDocument(ctx context.Context, documentID uuid.UUID, chunks []store.Chunk) error
-	ListByDocument(ctx context.Context, documentID uuid.UUID) ([]store.Chunk, error)
-	UpdateChunkEmbeddings(ctx context.Context, embeddings []store.ChunkEmbedding) error
-}
-
-// NoteEmbedder is the subset of EmbedClient used by the add_note tool.
-type NoteEmbedder interface {
-	Enabled() bool
-	EmbedBatch(ctx context.Context, texts []string) ([][]float32, error)
-}
-
-// addNoteResult is the JSON response returned by the add_note tool.
-type addNoteResult struct {
-	ID               string `json:"id"`
-	ChunksCreated    int    `json:"chunks_created"`
-	EmbeddingCreated bool   `json:"embedding_created"`
-}
-
-// handleAddNote contains the core logic for add_note, extracted for unit
-// testability without the MCP framing overhead.
-//
-// Returns (result, "") on success, or (nil, errMsg) on failure.
-func handleAddNote(
-	ctx context.Context,
-	docs NoteDocumentUpserter,
-	chunks NoteChunkWriter,
-	embed NoteEmbedder,
-	title, content, sourceID string,
-	metadata map[string]any,
-	doEmbed bool,
-) (*addNoteResult, string) {
-	// Input validation.
-	if strings.TrimSpace(title) == "" {
-		return nil, "title is required and must be non-empty"
-	}
-	if len(title) > maxNoteTitleBytes {
-		return nil, fmt.Sprintf("title exceeds maximum size of %d bytes", maxNoteTitleBytes)
-	}
-	if strings.TrimSpace(content) == "" {
-		return nil, "content is required and must be non-empty"
-	}
-	if len(content) > maxNoteContentBytes {
-		return nil, fmt.Sprintf("content exceeds maximum size of %d bytes", maxNoteContentBytes)
-	}
-
-	// Resolve source_id: use provided value or generate a new UUID.
-	if strings.TrimSpace(sourceID) == "" {
-		sourceID = uuid.New().String()
-	}
-
-	// Build document.
-	// CollectedAt must be set explicitly; leaving it as the zero value
-	// (0001-01-01) causes the note to sort to the bottom of any
-	// ORDER BY collected_at DESC query (issue #87 deep-verify).
-	// OccurredAt is intentionally left nil: llm-memory notes have no
-	// meaningful original event time, and COALESCE(occurred_at, collected_at)
-	// in sort expressions will fall back to CollectedAt correctly.
-	doc := &model.Document{
-		SourceType:  model.SourceLLMMemory,
-		SourceID:    sourceID,
-		Title:       strings.TrimSpace(title),
-		Content:     content,
-		Metadata:    metadata,
-		Status:      "active",
-		CollectedAt: time.Now().UTC(),
-	}
-
-	// Persist document (upsert by source_type + source_id).
-	if err := docs.Upsert(ctx, doc); err != nil {
-		slog.Error("mcp add_note: upsert failed", "source_id", sourceID, "error", err)
-		return nil, "internal error saving note"
-	}
-
-	// Split content into chunks.
-	texts := chunker.Split(content, chunker.SelectOptions(*doc))
-	chunkSlice := make([]store.Chunk, 0, len(texts))
-	for i, t := range texts {
-		chunkSlice = append(chunkSlice, store.Chunk{
-			DocumentID: doc.ID,
-			ChunkIndex: i,
-			Content:    t,
-			ByteSize:   len(t),
-		})
-	}
-
-	if err := chunks.ReplaceDocument(ctx, doc.ID, chunkSlice); err != nil {
-		slog.Error("mcp add_note: chunk replace failed", "doc_id", doc.ID, "error", err)
-		return nil, "internal error storing note chunks"
-	}
-
-	result := &addNoteResult{
-		ID:            doc.ID.String(),
-		ChunksCreated: len(chunkSlice),
-	}
-
-	// Optionally embed chunks.
-	if doEmbed && embed.Enabled() && len(chunkSlice) > 0 {
-		embErr := embedNoteChunks(ctx, doc.ID, chunkSlice, chunks, embed)
-		switch {
-		case embErr == nil:
-			// Embedding completed successfully.
-			result.EmbeddingCreated = true
-		case errors.Is(embErr, errEmbedSkipped):
-			// Deliberate skip due to chunk count limit — EmbeddingCreated stays
-			// false. The warning was already emitted inside embedNoteChunks.
-		default:
-			// Real embedding failure: non-fatal, note is stored and FTS-searchable,
-			// but vector search is degraded.
-			slog.Warn("mcp add_note: embedding failed (non-fatal)", "doc_id", doc.ID, "error", embErr)
-		}
-	}
-
-	return result, ""
-}
-
-// embedNoteChunks generates and persists embedding vectors for the given chunks.
-func embedNoteChunks(
-	ctx context.Context,
-	docID uuid.UUID,
-	chunkSlice []store.Chunk,
-	chunkStore NoteChunkWriter,
-	embedClient NoteEmbedder,
-) error {
-	// Guard: skip embedding for excessively large notes to avoid unbounded
-	// API cost and long-running DB transactions. The note is already stored
-	// and fully searchable via FTS; only vector search is degraded.
-	// Return errEmbedSkipped so that handleAddNote can distinguish a deliberate
-	// skip from a real embedding failure and leave EmbeddingCreated=false.
-	if len(chunkSlice) > maxEmbedChunks {
-		slog.Warn("mcp add_note: chunk count exceeds embed limit, skipping embedding",
-			"doc_id", docID,
-			"chunks", len(chunkSlice),
-			"limit", maxEmbedChunks,
-		)
-		return errEmbedSkipped
-	}
-
-	texts := make([]string, 0, len(chunkSlice))
-	for _, c := range chunkSlice {
-		texts = append(texts, c.Content)
-	}
-
-	vectors, err := embedClient.EmbedBatch(ctx, texts)
-	if err != nil {
-		return fmt.Errorf("embed batch: %w", err)
-	}
-
-	// Fetch stored chunk IDs to build the ChunkEmbedding slice.
-	storedChunks, err := chunkStore.ListByDocument(ctx, docID)
-	if err != nil {
-		return fmt.Errorf("list stored chunks: %w", err)
-	}
-
-	idxToID := make(map[int]int64, len(storedChunks))
-	for _, sc := range storedChunks {
-		idxToID[sc.ChunkIndex] = sc.ID
-	}
-
-	embeddings := make([]store.ChunkEmbedding, 0, len(chunkSlice))
-	for i, vec := range vectors {
-		if i >= len(chunkSlice) {
-			break
-		}
-		id, ok := idxToID[chunkSlice[i].ChunkIndex]
-		if !ok {
-			slog.Warn("embedNoteChunks: chunk index not found in stored chunks",
-				"doc_id", docID,
-				"chunk_index", chunkSlice[i].ChunkIndex,
-			)
-			continue
-		}
-		embeddings = append(embeddings, store.ChunkEmbedding{
-			ChunkID:   id,
-			Embedding: vec,
-		})
-	}
-
-	if len(embeddings) == 0 {
-		return nil
-	}
-	return chunkStore.UpdateChunkEmbeddings(ctx, embeddings)
-}
-
 func registerAddNoteTool(
 	s *server.MCPServer,
-	docs NoteDocumentUpserter,
-	chunks NoteChunkWriter,
-	embed NoteEmbedder,
+	docs note.DocumentUpserter,
+	chunks note.ChunkWriter,
+	embed note.Embedder,
 	_ string, // apiKey is consumed via WithHTTPContextFunc; kept for clarity
 ) {
 	tool := mcp.NewTool(
@@ -758,7 +550,11 @@ func registerAddNoteTool(
 			}
 		}
 
-		result, errMsg := handleAddNote(ctx, docs, chunks, embed, title, content, sourceID, metadata, doEmbed)
+		// MCP add_note always writes model.SourceLLMMemory (spec §6.2) and
+		// always requires a non-empty title — this is the one deliberate
+		// behavioural difference from POST /api/v1/notes.
+		result, errMsg := note.Save(ctx, docs, chunks, embed,
+			model.SourceLLMMemory, title, content, sourceID, metadata, doEmbed, true)
 		if errMsg != "" {
 			return mcp.NewToolResultError(errMsg), nil
 		}
