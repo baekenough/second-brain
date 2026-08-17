@@ -162,6 +162,19 @@ func (s *Server) buildHandler() http.Handler {
 	r := chi.NewRouter()
 
 	// Global middleware
+	//
+	// middleware.RealIP (chi v5.3.0+) is deprecated: it unconditionally trusts
+	// True-Client-IP/X-Real-IP/X-Forwarded-For and mutates r.RemoteAddr, which
+	// is spoofable by any client that can reach this service directly
+	// (GHSA-3fxj-6jh8-hvhx, GHSA-rjr7-jggh-pgcp / govulncheck GO-2026-5774,
+	// GO-2026-5775). Verified this mutation is currently a no-op in this
+	// service: r.RemoteAddr is not read anywhere downstream — requestLogger
+	// below logs method/path/status/bytes only (no IP), requireAPIKey does a
+	// constant-time Bearer-token compare with no IP component, and there is no
+	// rate limiter. Kept for now since removing it changes no observable
+	// behavior; if RemoteAddr is ever wired into logging, auth, or rate
+	// limiting, switch to middleware.ClientIPFromXFFTrustedProxies (with the
+	// Cloudflare tunnel's proxy CIDR/header allowlisted) instead of RealIP.
 	r.Use(middleware.RealIP)
 	r.Use(requestLogger)
 	r.Use(recoverer)
