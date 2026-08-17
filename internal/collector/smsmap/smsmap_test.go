@@ -19,7 +19,7 @@ func TestMapSMS_SourceIDFormat(t *testing.T) {
 	body := "hello"
 	dateMs := int64(1705311000000)
 	// typ=1 → direction="received"
-	doc := smsmap.MapSMS(addr, body, dateMs, 1, "Alice")
+	doc := smsmap.MapSMS(addr, body, dateMs, 1, "Alice", true)
 
 	wantAddrHash := smsmap.ShortHash(addr)
 	// SourceID now uses direction (stable) instead of bodyHash.
@@ -36,7 +36,7 @@ func TestMapSMS_SourceIDFormat(t *testing.T) {
 
 func TestMapSMS_SourceType(t *testing.T) {
 	t.Parallel()
-	doc := smsmap.MapSMS("010-0000-0001", "test", time.Now().UnixMilli(), 1, "")
+	doc := smsmap.MapSMS("010-0000-0001", "test", time.Now().UnixMilli(), 1, "", true)
 	if doc.SourceType != model.SourceSMS {
 		t.Errorf("SourceType=%q, want %q", doc.SourceType, model.SourceSMS)
 	}
@@ -49,7 +49,7 @@ func TestMapSMS_OccurredAt(t *testing.T) {
 	dateMs := int64(1705311000000)
 	want := time.Unix(1705311000, 0).UTC()
 
-	doc := smsmap.MapSMS("010-0000-0001", "test", dateMs, 1, "")
+	doc := smsmap.MapSMS("010-0000-0001", "test", dateMs, 1, "", true)
 	if doc.OccurredAt == nil {
 		t.Fatal("OccurredAt is nil")
 	}
@@ -78,7 +78,7 @@ func TestMapSMS_DirectionMapping(t *testing.T) {
 		tc := tc
 		t.Run(tc.wantDir, func(t *testing.T) {
 			t.Parallel()
-			doc := smsmap.MapSMS("010-0000-0001", "body", time.Now().UnixMilli(), tc.typ, "")
+			doc := smsmap.MapSMS("010-0000-0001", "body", time.Now().UnixMilli(), tc.typ, "", true)
 			dir, _ := doc.Metadata["direction"].(string)
 			if dir != tc.wantDir {
 				t.Errorf("direction=%q, want %q", dir, tc.wantDir)
@@ -112,7 +112,7 @@ func TestMapSMS_AuthLikeRedaction(t *testing.T) {
 		tc := tc
 		t.Run(tc.body, func(t *testing.T) {
 			t.Parallel()
-			doc := smsmap.MapSMS("010-0000-0001", tc.body, time.Now().UnixMilli(), 1, "")
+			doc := smsmap.MapSMS("010-0000-0001", tc.body, time.Now().UnixMilli(), 1, "", true)
 			isAuth, _ := doc.Metadata["is_auth_like"].(bool)
 			if isAuth != tc.wantAuth {
 				t.Errorf("body=%q: is_auth_like=%v, want %v", tc.body, isAuth, tc.wantAuth)
@@ -133,13 +133,13 @@ func TestMapSMS_ContactNameFallback(t *testing.T) {
 
 	addr := "010-5555-1234"
 	// Empty contact name → title should contain the address.
-	doc := smsmap.MapSMS(addr, "hello", time.Now().UnixMilli(), 1, "")
+	doc := smsmap.MapSMS(addr, "hello", time.Now().UnixMilli(), 1, "", true)
 	if !strings.Contains(doc.Title, addr) {
 		t.Errorf("title=%q should contain address %q when contact name is empty", doc.Title, addr)
 	}
 
 	// Non-empty contact name → title should contain contact, not addr.
-	doc2 := smsmap.MapSMS(addr, "hello", time.Now().UnixMilli(), 1, "Alice")
+	doc2 := smsmap.MapSMS(addr, "hello", time.Now().UnixMilli(), 1, "Alice", true)
 	if !strings.Contains(doc2.Title, "Alice") {
 		t.Errorf("title=%q should contain contact name 'Alice'", doc2.Title)
 	}
@@ -148,7 +148,7 @@ func TestMapSMS_ContactNameFallback(t *testing.T) {
 func TestMapSMS_TitleFormat(t *testing.T) {
 	t.Parallel()
 
-	doc := smsmap.MapSMS("010-0000-0001", "test", time.Now().UnixMilli(), 1, "Bob")
+	doc := smsmap.MapSMS("010-0000-0001", "test", time.Now().UnixMilli(), 1, "Bob", true)
 	if doc.Title != "SMS received Bob" {
 		t.Errorf("Title=%q, want %q", doc.Title, "SMS received Bob")
 	}
@@ -157,11 +157,39 @@ func TestMapSMS_TitleFormat(t *testing.T) {
 func TestMapSMS_MetadataKeys(t *testing.T) {
 	t.Parallel()
 
-	doc := smsmap.MapSMS("010-0000-0001", "hello", time.Now().UnixMilli(), 2, "Carol")
+	doc := smsmap.MapSMS("010-0000-0001", "hello", time.Now().UnixMilli(), 2, "Carol", true)
 	for _, key := range []string{"contact_name", "direction", "is_auth_like"} {
 		if _, ok := doc.Metadata[key]; !ok {
 			t.Errorf("metadata missing key %q", key)
 		}
+	}
+}
+
+// TestMapSMS_MetadataNumber_HashingDisabled verifies that when
+// numberHashingEnabled=false (the default), the raw address is written into
+// Metadata["number"] so it is searchable/visible — the point of disabling
+// phone-number hashing (issue #164 reversal).
+func TestMapSMS_MetadataNumber_HashingDisabled(t *testing.T) {
+	t.Parallel()
+
+	addr := "010-1111-2222"
+	doc := smsmap.MapSMS(addr, "hello", time.Now().UnixMilli(), 1, "", false)
+
+	gotNumber, _ := doc.Metadata["number"].(string)
+	if gotNumber != addr {
+		t.Errorf("metadata[number]=%q, want %q", gotNumber, addr)
+	}
+}
+
+// TestMapSMS_MetadataNumber_HashingEnabled verifies that Metadata carries no
+// "number" key at all when numberHashingEnabled=true, matching the
+// pre-#164-reversal metadata shape byte-for-byte.
+func TestMapSMS_MetadataNumber_HashingEnabled(t *testing.T) {
+	t.Parallel()
+
+	doc := smsmap.MapSMS("010-1111-2222", "hello", time.Now().UnixMilli(), 1, "", true)
+	if _, ok := doc.Metadata["number"]; ok {
+		t.Errorf("metadata should not contain \"number\" when numberHashingEnabled=true, got %v", doc.Metadata["number"])
 	}
 }
 
@@ -172,8 +200,8 @@ func TestMapSMS_Deterministic(t *testing.T) {
 	body := "test message"
 	dateMs := int64(1705311000000)
 
-	doc1 := smsmap.MapSMS(addr, body, dateMs, 1, "Test")
-	doc2 := smsmap.MapSMS(addr, body, dateMs, 1, "Test")
+	doc1 := smsmap.MapSMS(addr, body, dateMs, 1, "Test", true)
+	doc2 := smsmap.MapSMS(addr, body, dateMs, 1, "Test", true)
 
 	if doc1.SourceID != doc2.SourceID {
 		t.Errorf("MapSMS is not deterministic: %q != %q", doc1.SourceID, doc2.SourceID)
@@ -189,7 +217,7 @@ func TestMapCall_SourceIDFormat(t *testing.T) {
 	durationSec := 90
 	dateMs := int64(1705311000000)
 
-	doc := smsmap.MapCall(number, dateMs, durationSec, 2, "Eve")
+	doc := smsmap.MapCall(number, dateMs, durationSec, 2, "Eve", true)
 
 	wantNumHash := smsmap.ShortHash(number)
 	wantDurHash := smsmap.BodyShortHash(fmt.Sprintf("%d", durationSec))
@@ -206,7 +234,7 @@ func TestMapCall_SourceIDFormat(t *testing.T) {
 
 func TestMapCall_SourceType(t *testing.T) {
 	t.Parallel()
-	doc := smsmap.MapCall("010-0000-0001", time.Now().UnixMilli(), 30, 1, "")
+	doc := smsmap.MapCall("010-0000-0001", time.Now().UnixMilli(), 30, 1, "", true)
 	if doc.SourceType != model.SourceCallLog {
 		t.Errorf("SourceType=%q, want %q", doc.SourceType, model.SourceCallLog)
 	}
@@ -218,7 +246,7 @@ func TestMapCall_OccurredAt(t *testing.T) {
 	dateMs := int64(1705311000000)
 	want := time.Unix(1705311000, 0).UTC()
 
-	doc := smsmap.MapCall("010-0000-0001", dateMs, 60, 1, "")
+	doc := smsmap.MapCall("010-0000-0001", dateMs, 60, 1, "", true)
 	if doc.OccurredAt == nil {
 		t.Fatal("OccurredAt is nil")
 	}
@@ -247,7 +275,7 @@ func TestMapCall_DirectionMapping(t *testing.T) {
 		tc := tc
 		t.Run(tc.wantDir, func(t *testing.T) {
 			t.Parallel()
-			doc := smsmap.MapCall("010-0000-0001", time.Now().UnixMilli(), 30, tc.typ, "")
+			doc := smsmap.MapCall("010-0000-0001", time.Now().UnixMilli(), 30, tc.typ, "", true)
 			dir, _ := doc.Metadata["direction"].(string)
 			if dir != tc.wantDir {
 				t.Errorf("direction=%q, want %q", dir, tc.wantDir)
@@ -259,7 +287,7 @@ func TestMapCall_DirectionMapping(t *testing.T) {
 func TestMapCall_TitleFormat(t *testing.T) {
 	t.Parallel()
 
-	doc := smsmap.MapCall("010-0000-0001", time.Now().UnixMilli(), 60, 1, "Dave")
+	doc := smsmap.MapCall("010-0000-0001", time.Now().UnixMilli(), 60, 1, "Dave", true)
 	if doc.Title != "incoming 통화 Dave" {
 		t.Errorf("Title=%q, want %q", doc.Title, "incoming 통화 Dave")
 	}
@@ -274,7 +302,7 @@ func TestMapCall_TitleFallbackNeverContainsRawNumber(t *testing.T) {
 	t.Parallel()
 
 	number := "010-9999-8888"
-	doc := smsmap.MapCall(number, time.Now().UnixMilli(), 30, 2, "")
+	doc := smsmap.MapCall(number, time.Now().UnixMilli(), 30, 2, "", true)
 
 	if strings.Contains(doc.Title, number) {
 		t.Errorf("Title=%q must not contain the raw phone number %q", doc.Title, number)
@@ -304,7 +332,7 @@ func TestMapCall_TitleFallbackNeverContainsRawNumber(t *testing.T) {
 func TestMapCall_TitleShowsContactNameWhenPresent(t *testing.T) {
 	t.Parallel()
 
-	doc := smsmap.MapCall("010-9999-8888", time.Now().UnixMilli(), 30, 2, "Heidi")
+	doc := smsmap.MapCall("010-9999-8888", time.Now().UnixMilli(), 30, 2, "Heidi", true)
 	if doc.Title != "outgoing 통화 Heidi" {
 		t.Errorf("Title=%q, want %q", doc.Title, "outgoing 통화 Heidi")
 	}
@@ -313,10 +341,56 @@ func TestMapCall_TitleShowsContactNameWhenPresent(t *testing.T) {
 	}
 }
 
+// TestMapCall_TitleFallsBackToRawNumberWhenHashingDisabled is the mirror of
+// TestMapCall_TitleFallbackNeverContainsRawNumber for the numberHashingEnabled=false
+// (default) case: when contact_name is empty, Title/Content fall back to the
+// raw number instead of a hashed label, and Metadata carries the raw number
+// under "number" so it is searchable. SourceID stays hashed regardless (see
+// MapCall doc comment).
+func TestMapCall_TitleFallsBackToRawNumberWhenHashingDisabled(t *testing.T) {
+	t.Parallel()
+
+	number := "010-9999-8888"
+	doc := smsmap.MapCall(number, time.Now().UnixMilli(), 30, 2, "", false)
+
+	if !strings.Contains(doc.Title, number) {
+		t.Errorf("Title=%q should contain the raw phone number %q when hashing is disabled", doc.Title, number)
+	}
+	if !strings.Contains(doc.Content, number) {
+		t.Errorf("Content=%q should contain the raw phone number %q when hashing is disabled", doc.Content, number)
+	}
+
+	gotNumber, _ := doc.Metadata["number"].(string)
+	if gotNumber != number {
+		t.Errorf("metadata[number]=%q, want %q", gotNumber, number)
+	}
+
+	// SourceID must still be hashed — this flag never touches dedup identity.
+	wantNumHash := smsmap.ShortHash(number)
+	if !strings.Contains(doc.SourceID, wantNumHash) {
+		t.Errorf("SourceID=%q should still contain the hashed number %q regardless of the flag", doc.SourceID, wantNumHash)
+	}
+	if strings.Contains(doc.SourceID, number) {
+		t.Errorf("SourceID=%q must never contain the raw phone number %q", doc.SourceID, number)
+	}
+}
+
+// TestMapCall_MetadataNumberAbsentWhenHashingEnabled verifies that Metadata
+// carries no "number" key at all when numberHashingEnabled=true, matching the
+// pre-#164-reversal metadata shape byte-for-byte.
+func TestMapCall_MetadataNumberAbsentWhenHashingEnabled(t *testing.T) {
+	t.Parallel()
+
+	doc := smsmap.MapCall("010-9999-8888", time.Now().UnixMilli(), 30, 2, "Heidi", true)
+	if _, ok := doc.Metadata["number"]; ok {
+		t.Errorf("metadata should not contain \"number\" when numberHashingEnabled=true, got %v", doc.Metadata["number"])
+	}
+}
+
 func TestMapCall_ContentFormat(t *testing.T) {
 	t.Parallel()
 
-	doc := smsmap.MapCall("010-0000-0001", time.Now().UnixMilli(), 120, 2, "Frank")
+	doc := smsmap.MapCall("010-0000-0001", time.Now().UnixMilli(), 120, 2, "Frank", true)
 	for _, want := range []string{"Frank", "outgoing", "120s"} {
 		if !strings.Contains(doc.Content, want) {
 			t.Errorf("content=%q should contain %q", doc.Content, want)
@@ -327,7 +401,7 @@ func TestMapCall_ContentFormat(t *testing.T) {
 func TestMapCall_MetadataKeys(t *testing.T) {
 	t.Parallel()
 
-	doc := smsmap.MapCall("010-0000-0001", time.Now().UnixMilli(), 45, 1, "Grace")
+	doc := smsmap.MapCall("010-0000-0001", time.Now().UnixMilli(), 45, 1, "Grace", true)
 	for _, key := range []string{"contact_name", "direction", "duration_seconds"} {
 		if _, ok := doc.Metadata[key]; !ok {
 			t.Errorf("metadata missing key %q", key)
@@ -346,8 +420,8 @@ func TestMapCall_Deterministic(t *testing.T) {
 	dateMs := int64(1705311000000)
 	durationSec := 90
 
-	doc1 := smsmap.MapCall(number, dateMs, durationSec, 1, "Test")
-	doc2 := smsmap.MapCall(number, dateMs, durationSec, 1, "Test")
+	doc1 := smsmap.MapCall(number, dateMs, durationSec, 1, "Test", true)
+	doc2 := smsmap.MapCall(number, dateMs, durationSec, 1, "Test", true)
 
 	if doc1.SourceID != doc2.SourceID {
 		t.Errorf("MapCall is not deterministic: %q != %q", doc1.SourceID, doc2.SourceID)
@@ -401,7 +475,7 @@ func TestMapSMS_ParityWithSMSCollector(t *testing.T) {
 	wantAddrHash := smsmap.ShortHash(addr)
 	wantSourceID := fmt.Sprintf("sms:%d:%s:received", dateMs, wantAddrHash)
 
-	doc := smsmap.MapSMS(addr, body, dateMs, 1, "Alice")
+	doc := smsmap.MapSMS(addr, body, dateMs, 1, "Alice", true)
 	if doc.SourceID != wantSourceID {
 		t.Errorf("SourceID=%q, want %q", doc.SourceID, wantSourceID)
 	}
@@ -421,7 +495,7 @@ func TestMapCall_ParityWithSMSCollector(t *testing.T) {
 	wantDurHash := smsmap.BodyShortHash(fmt.Sprintf("%d", duration))
 	wantSourceID := fmt.Sprintf("call-log:%d:%s:%s", dateMs, wantNumHash, wantDurHash)
 
-	doc := smsmap.MapCall(number, dateMs, duration, 2, "Bob")
+	doc := smsmap.MapCall(number, dateMs, duration, 2, "Bob", true)
 	if doc.SourceID != wantSourceID {
 		t.Errorf("SourceID=%q, want %q", doc.SourceID, wantSourceID)
 	}

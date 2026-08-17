@@ -75,6 +75,154 @@ func TestLoad_SummarizerBackfillEnabled(t *testing.T) {
 	}
 }
 
+// TestLoad_SummarizerBatchSize verifies SUMMARIZER_BATCH_SIZE parsing.
+func TestLoad_SummarizerBatchSize(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		envVal string
+		unset  bool
+		want   int
+	}{
+		{name: "default_when_unset", unset: true, want: 50},
+		{name: "explicit_100", envVal: "100", want: 100},
+		{name: "invalid_string_uses_default", envVal: "notanumber", want: 50},
+		{name: "zero_uses_default", envVal: "0", want: 50},
+		{name: "negative_uses_default", envVal: "-1", want: 50},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unset {
+				unsetenv(t, "SUMMARIZER_BATCH_SIZE")
+			} else {
+				setenv(t, "SUMMARIZER_BATCH_SIZE", tc.envVal)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.SummarizerBatchSize != tc.want {
+				t.Errorf("SummarizerBatchSize = %d, want %d", cfg.SummarizerBatchSize, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoad_SummarizerInterval verifies SUMMARIZER_INTERVAL parsing.
+func TestLoad_SummarizerInterval(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		envVal string
+		unset  bool
+		want   time.Duration
+	}{
+		{name: "default_when_unset", unset: true, want: 30 * time.Second},
+		{name: "explicit_1m", envVal: "1m", want: time.Minute},
+		{name: "invalid_string_uses_default", envVal: "notaduration", want: 30 * time.Second},
+		{name: "zero_uses_default", envVal: "0s", want: 30 * time.Second},
+		{name: "negative_uses_default", envVal: "-5s", want: 30 * time.Second},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unset {
+				unsetenv(t, "SUMMARIZER_INTERVAL")
+			} else {
+				setenv(t, "SUMMARIZER_INTERVAL", tc.envVal)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.SummarizerInterval != tc.want {
+				t.Errorf("SummarizerInterval = %v, want %v", cfg.SummarizerInterval, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoad_SummarizerDocTimeout verifies SUMMARIZER_DOC_TIMEOUT parsing.
+func TestLoad_SummarizerDocTimeout(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		envVal string
+		unset  bool
+		want   time.Duration
+	}{
+		{name: "default_when_unset", unset: true, want: 30 * time.Second},
+		{name: "explicit_45s", envVal: "45s", want: 45 * time.Second},
+		{name: "invalid_string_uses_default", envVal: "notaduration", want: 30 * time.Second},
+		{name: "zero_uses_default", envVal: "0s", want: 30 * time.Second},
+		{name: "negative_uses_default", envVal: "-5s", want: 30 * time.Second},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unset {
+				unsetenv(t, "SUMMARIZER_DOC_TIMEOUT")
+			} else {
+				setenv(t, "SUMMARIZER_DOC_TIMEOUT", tc.envVal)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.SummarizerDocTimeout != tc.want {
+				t.Errorf("SummarizerDocTimeout = %v, want %v", cfg.SummarizerDocTimeout, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoad_SummarizerConcurrency verifies SUMMARIZER_CONCURRENCY parsing.
+func TestLoad_SummarizerConcurrency(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		envVal string
+		unset  bool
+		want   int
+	}{
+		{name: "default_when_unset", unset: true, want: 5},
+		{name: "explicit_10", envVal: "10", want: 10},
+		{name: "invalid_string_uses_default", envVal: "notanumber", want: 5},
+		{name: "zero_uses_default", envVal: "0", want: 5},
+		{name: "negative_uses_default", envVal: "-1", want: 5},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unset {
+				unsetenv(t, "SUMMARIZER_CONCURRENCY")
+			} else {
+				setenv(t, "SUMMARIZER_CONCURRENCY", tc.envVal)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.SummarizerConcurrency != tc.want {
+				t.Errorf("SummarizerConcurrency = %d, want %d", cfg.SummarizerConcurrency, tc.want)
+			}
+		})
+	}
+}
+
 // TestLoad_GmailMaxMessages verifies GMAIL_MAX_MESSAGES parsing.
 func TestLoad_GmailMaxMessages(t *testing.T) {
 	t.Parallel()
@@ -258,6 +406,84 @@ func TestLoad_LLMTimeoutSeconds(t *testing.T) {
 			}
 			if cfg.LLMTimeoutSeconds != tc.want {
 				t.Errorf("LLMTimeoutSeconds = %d, want %d", cfg.LLMTimeoutSeconds, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoad_PIIRedactionEnabled verifies PII_REDACTION_ENABLED parsing
+// (issue #163/#165/#167 policy reversal — default false, unlike the
+// "false"/"0"-only-disables pattern used by SUMMARIZER_BACKFILL_ENABLED: this
+// flag follows the simpler "only literal 'true' enables" convention already
+// used by WHISPER_CLOUD_ALLOWED / DIARIZATION_ENABLED).
+func TestLoad_PIIRedactionEnabled(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		envVal string
+		unset  bool
+		want   bool
+	}{
+		{name: "default_when_unset", unset: true, want: false},
+		{name: "explicit_true", envVal: "true", want: true},
+		{name: "explicit_false", envVal: "false", want: false},
+		{name: "empty_string_disabled", envVal: "", want: false},
+		{name: "invalid_value_disabled", envVal: "yes", want: false}, // only literal "true" enables
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unset {
+				unsetenv(t, "PII_REDACTION_ENABLED")
+			} else {
+				setenv(t, "PII_REDACTION_ENABLED", tc.envVal)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.PIIRedactionEnabled != tc.want {
+				t.Errorf("PIIRedactionEnabled = %v, want %v", cfg.PIIRedactionEnabled, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoad_PIINumberHashingEnabled verifies PII_NUMBER_HASHING_ENABLED
+// parsing (issue #164 policy reversal — default false).
+func TestLoad_PIINumberHashingEnabled(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		envVal string
+		unset  bool
+		want   bool
+	}{
+		{name: "default_when_unset", unset: true, want: false},
+		{name: "explicit_true", envVal: "true", want: true},
+		{name: "explicit_false", envVal: "false", want: false},
+		{name: "invalid_value_disabled", envVal: "1", want: false}, // only literal "true" enables
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unset {
+				unsetenv(t, "PII_NUMBER_HASHING_ENABLED")
+			} else {
+				setenv(t, "PII_NUMBER_HASHING_ENABLED", tc.envVal)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.PIINumberHashingEnabled != tc.want {
+				t.Errorf("PIINumberHashingEnabled = %v, want %v", cfg.PIINumberHashingEnabled, tc.want)
 			}
 		})
 	}

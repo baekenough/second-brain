@@ -52,6 +52,14 @@ func validM4ABytes(n int) []byte {
 
 // newRecordingTestServer creates a Server wired for the ingest-recording handler.
 // If recordingDir is empty a temp dir is created and its path returned.
+//
+// PII number hashing (issue #164) is explicitly turned ON here so every
+// existing test in this file — written when hashing was the only behaviour —
+// keeps passing unmodified. Tests exercising the new default (hashing OFF,
+// raw number surfaced) build their own Server directly with
+// WithPIINumberHashing(false) instead of using this helper; see
+// TestIngestRecording_AnonymousCallTitleRawNumberWhenHashingDisabled and
+// TestIngestRecording_FilenameUsesRawNumberWhenHashingDisabled.
 func newRecordingTestServer(
 	t *testing.T,
 	upserter IngestRecordingUpserter,
@@ -63,7 +71,8 @@ func newRecordingTestServer(
 	if recordingDir == "" {
 		recordingDir = t.TempDir()
 	}
-	srv := NewServer(nil, nil, nil, nil, nil, "", "test-key")
+	srv := NewServer(nil, nil, nil, nil, nil, "", "test-key").
+		WithPIINumberHashing(true)
 	srv.WithIngestRecording(upserter, recordingDir, maxFileBytes, cutover)
 	return srv, recordingDir
 }
@@ -433,6 +442,60 @@ func TestIngestRecording_FilenameEncoding(t *testing.T) {
 	}
 }
 
+// TestIngestRecording_FilenameUsesRawNumberWhenHashingDisabled is the mirror
+// of TestIngestRecording_FilenameEncoding for the default
+// (PIINumberHashingEnabled=false) case: the saved audio filename embeds the
+// sanitized raw number instead of its hash (issue #164 policy reversal), and
+// the sidecar carries "number" (raw) rather than "number_hash".
+func TestIngestRecording_FilenameUsesRawNumberWhenHashingDisabled(t *testing.T) {
+	t.Parallel()
+
+	upserter := &stubIngestUpserter{}
+	recordingDir := t.TempDir()
+	srv := NewServer(nil, nil, nil, nil, nil, "", "test-key")
+	srv.WithIngestRecording(upserter, recordingDir, 0, time.Time{})
+
+	number := "01012345678"
+	// 2024-01-15 09:30:00 UTC
+	dateMs := int64(1705311000000)
+	localTime := time.Unix(1705311000, 0).In(time.Local)
+	expectedTimestamp := localTime.Format("20060102150405")
+
+	body, ct := buildRecordingForm(t, "call.m4a", validM4ABytes(32), number, dateMs)
+	rr := doRecordingPost(t, srv, body, ct, "Bearer test-key")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", rr.Code, rr.Body.String())
+	}
+
+	audioFiles := audioFilesInDir(t, recordingDir)
+	if len(audioFiles) != 1 {
+		t.Fatalf("expected 1 audio file, got %d", len(audioFiles))
+	}
+	audioFile := audioFiles[0]
+
+	wantName := fmt.Sprintf("%s_%s.m4a", sanitizePhoneNumber(number), expectedTimestamp)
+	if audioFile != wantName {
+		t.Errorf("audio filename=%q, want %q", audioFile, wantName)
+	}
+
+	// Sidecar must carry "number" (raw), not "number_hash".
+	sidecarPath := filepath.Join(recordingDir, audioFile+".meta.json")
+	sidecarData, err := os.ReadFile(sidecarPath)
+	if err != nil {
+		t.Fatalf("read sidecar: %v", err)
+	}
+	var sidecar map[string]any
+	if err := json.Unmarshal(sidecarData, &sidecar); err != nil {
+		t.Fatalf("unmarshal sidecar: %v", err)
+	}
+	if sidecar["number"] != number {
+		t.Errorf("sidecar number = %v, want %q", sidecar["number"], number)
+	}
+	if _, ok := sidecar["number_hash"]; ok {
+		t.Errorf("sidecar must not contain number_hash when hashing is disabled, got %v", sidecar["number_hash"])
+	}
+}
+
 // TestIngestRecording_NotConfigured verifies that the endpoint returns 503 when
 // not wired up.
 func TestIngestRecording_NotConfigured(t *testing.T) {
@@ -713,6 +776,56 @@ func TestIngestRecording_AnonymousCallTitleNeverContainsRawNumber(t *testing.T) 
 	// explicitly so a future change doesn't silently reintroduce one.
 	if contactName, _ := doc.Metadata["contact_name"].(string); contactName != "" {
 		t.Errorf("metadata[contact_name] = %q, want empty", contactName)
+	}
+}
+
+// TestIngestRecording_AnonymousCallTitleRawNumberWhenHashingDisabled is the
+// mirror of TestIngestRecording_AnonymousCallTitleNeverContainsRawNumber for
+// the default (PIINumberHashingEnabled=false) case: Title/Content fall back
+// to the raw number instead of a hashed label, and the raw number is
+// additionally surfaced in Metadata["number"] so it stays searchable (issue
+// #164 policy reversal). SourceID stays hashed regardless.
+func TestIngestRecording_AnonymousCallTitleRawNumberWhenHashingDisabled(t *testing.T) {
+	t.Parallel()
+
+	upserter := &stubIngestUpserter{}
+	recordingDir := t.TempDir()
+	srv := NewServer(nil, nil, nil, nil, nil, "", "test-key")
+	srv.WithIngestRecording(upserter, recordingDir, 0, time.Time{})
+
+	number := "010-5555-6666"
+	dateMs := time.Now().Add(-time.Hour).UnixMilli()
+
+	// contact_name intentionally omitted.
+	body, ct := buildRecordingForm(t, "anon.m4a", validM4ABytes(32), number, dateMs,
+		"duration_sec", "30",
+	)
+	rr := doRecordingPost(t, srv, body, ct, "Bearer test-key")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", rr.Code, rr.Body.String())
+	}
+
+	if len(upserter.upserted) != 1 {
+		t.Fatalf("expected 1 upserted doc, got %d", len(upserter.upserted))
+	}
+	doc := upserter.upserted[0]
+
+	if !strings.Contains(doc.Title, number) {
+		t.Errorf("Title = %q should contain the raw phone number %q when hashing is disabled", doc.Title, number)
+	}
+	if !strings.Contains(doc.Content, number) {
+		t.Errorf("Content = %q should contain the raw phone number %q when hashing is disabled", doc.Content, number)
+	}
+
+	gotNumber, _ := doc.Metadata["number"].(string)
+	if gotNumber != number {
+		t.Errorf("metadata[number] = %q, want %q", gotNumber, number)
+	}
+
+	// SourceID must still be hashed — this flag never touches dedup identity.
+	wantNumHash := smsmap.ShortHash(number)
+	if !strings.Contains(doc.SourceID, wantNumHash) {
+		t.Errorf("SourceID = %q should still contain the hashed number %q regardless of the flag", doc.SourceID, wantNumHash)
 	}
 }
 

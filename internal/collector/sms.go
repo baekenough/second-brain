@@ -37,6 +37,14 @@ type SMSCollector struct {
 	indexedIDs   map[string]struct{} // nil = mtime-only mode
 	maxFileBytes int64               // per-file size cap; 0 or negative means no limit
 	cutover      time.Time           // zero = floor disabled (no behaviour change)
+
+	// numberHashingEnabled mirrors cfg.PIINumberHashingEnabled (issue #164
+	// policy reversal). Zero value (false) is the new default: MapSMS/MapCall
+	// write the raw number into Metadata["number"] and MapCall's
+	// anonymous-caller fallback uses the raw number instead of a hash. Set via
+	// WithNumberHashingEnabled. Does NOT affect SourceID hashing, which stays
+	// unconditional (see smsmap.MapSMS / smsmap.MapCall doc comments).
+	numberHashingEnabled bool
 }
 
 // NewSMSCollector returns an SMSCollector that reads XML exports from sourceDir.
@@ -65,6 +73,16 @@ func (c *SMSCollector) WithIndexedIDs(ids map[string]struct{}) {
 // Zero t disables the floor (no behaviour change).
 func (c *SMSCollector) WithCutover(t time.Time) {
 	c.cutover = t
+}
+
+// WithNumberHashingEnabled sets the phone-number hashing policy (issue #164;
+// cfg.PIINumberHashingEnabled). Default false (zero value) — MapSMS/MapCall
+// then write the raw number into Metadata and MapCall's anonymous-caller
+// fallback uses the raw number rather than a hash. Pass true to restore the
+// original #164 behaviour byte-for-byte.
+func (c *SMSCollector) WithNumberHashingEnabled(enabled bool) *SMSCollector {
+	c.numberHashingEnabled = enabled
+	return c
 }
 
 // smsStreamBatchSize is the maximum number of documents accumulated before
@@ -234,7 +252,7 @@ func (c *SMSCollector) streamSMSFile(ctx context.Context, path string, since tim
 			continue
 		}
 
-		doc := smsmap.MapSMS(rec.Address, rec.Body, rec.Date, rec.Type, rec.ContactName)
+		doc := smsmap.MapSMS(rec.Address, rec.Body, rec.Date, rec.Type, rec.ContactName, c.numberHashingEnabled)
 		batch = append(batch, doc)
 
 		if len(batch) >= smsStreamBatchSize {
@@ -316,7 +334,7 @@ func (c *SMSCollector) streamCallsFile(ctx context.Context, path string, since t
 			continue
 		}
 
-		doc := smsmap.MapCall(rec.Number, rec.Date, int(rec.Duration), rec.Type, rec.ContactName)
+		doc := smsmap.MapCall(rec.Number, rec.Date, int(rec.Duration), rec.Type, rec.ContactName, c.numberHashingEnabled)
 		batch = append(batch, doc)
 
 		if len(batch) >= smsStreamBatchSize {
@@ -525,7 +543,7 @@ func (c *SMSCollector) parseSMSFile(ctx context.Context, path string, since time
 			continue
 		}
 
-		doc := smsmap.MapSMS(rec.Address, rec.Body, rec.Date, rec.Type, rec.ContactName)
+		doc := smsmap.MapSMS(rec.Address, rec.Body, rec.Date, rec.Type, rec.ContactName, c.numberHashingEnabled)
 		docs = append(docs, doc)
 	}
 	return docs, nil
@@ -604,7 +622,7 @@ func (c *SMSCollector) parseCallsFile(ctx context.Context, path string, since ti
 			continue
 		}
 
-		doc := smsmap.MapCall(rec.Number, rec.Date, int(rec.Duration), rec.Type, rec.ContactName)
+		doc := smsmap.MapCall(rec.Number, rec.Date, int(rec.Duration), rec.Type, rec.ContactName, c.numberHashingEnabled)
 		docs = append(docs, doc)
 	}
 	return docs, nil

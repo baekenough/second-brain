@@ -778,6 +778,10 @@ func TestWhisperCollector_NativeDiarization_RedactsPII(t *testing.T) {
 		WhisperModel:            "gpt-4o-transcribe-diarize",
 		WhisperLanguage:         "ko",
 		WhisperChunkingStrategy: "auto",
+		// Redaction is OFF by default (issue #163/#165/#167 policy reversal) —
+		// this test specifically pins the redaction-ON behaviour, so set the
+		// flag explicitly rather than relying on the (now different) default.
+		PIIRedactionEnabled: true,
 	}
 	c := makeWhisperCollector(cfg, srv)
 

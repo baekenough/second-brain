@@ -29,6 +29,10 @@ func TestWhisperCollector_Collect_RedactsPhoneNumberInContent(t *testing.T) {
 		WhisperAPIURL:   srv.URL,
 		WhisperModel:    "whisper-1",
 		WhisperLanguage: "ko",
+		// Redaction is OFF by default (issue #163/#165/#167 policy reversal) —
+		// this test specifically exercises the redaction-ON behaviour, so set
+		// the flag explicitly rather than relying on the (now different) default.
+		PIIRedactionEnabled: true,
 	}
 	c := makeWhisperCollector(cfg, srv)
 
@@ -78,6 +82,10 @@ func TestWhisperCollector_Collect_RedactsPhoneNumberInTitle(t *testing.T) {
 		WhisperAPIURL:   srv.URL,
 		WhisperModel:    "whisper-1",
 		WhisperLanguage: "ko",
+		// Redaction is OFF by default (issue #163/#165/#167 policy reversal) —
+		// this test specifically exercises the redaction-ON behaviour, so set
+		// the flag explicitly rather than relying on the (now different) default.
+		PIIRedactionEnabled: true,
 	}
 	c := makeWhisperCollector(cfg, srv)
 
@@ -124,6 +132,9 @@ func TestWhisperCollector_Collect_NoFalsePositiveRedaction(t *testing.T) {
 		WhisperAPIURL:   srv.URL,
 		WhisperModel:    "whisper-1",
 		WhisperLanguage: "ko",
+		// Redaction ON: this test guards against over-redaction, which is only
+		// a meaningful assertion when the redaction pass actually runs.
+		PIIRedactionEnabled: true,
 	}
 	c := makeWhisperCollector(cfg, srv)
 
@@ -137,5 +148,53 @@ func TestWhisperCollector_Collect_NoFalsePositiveRedaction(t *testing.T) {
 
 	if docs[0].Content != rawTranscript {
 		t.Errorf("Content = %q, want unchanged %q (no PII present)", docs[0].Content, rawTranscript)
+	}
+}
+
+// TestWhisperCollector_Collect_NoRedactionByDefault verifies the new default
+// (issue #163/#165/#167 policy reversal): with PIIRedactionEnabled left unset
+// (false), Content and Title are stored exactly as produced — the phone
+// number in both the transcript and the filename-derived title survives
+// verbatim, and no PIIRedactionToken marker appears anywhere.
+func TestWhisperCollector_Collect_NoRedactionByDefault(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	const rawTranscript = "안녕하세요 제 번호는 010-1234-5678 입니다 제 주민번호는 901231-1234567 입니다"
+
+	srv, _ := newWhisperTestServer(t, rawTranscript)
+
+	mtime := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+	const filename = "010-1234-5678_20260327202518.m4a"
+	writeDummyAudio(t, dir, filename, mtime)
+
+	cfg := &config.Config{
+		WhisperAudioDir: dir,
+		WhisperAPIURL:   srv.URL,
+		WhisperModel:    "whisper-1",
+		WhisperLanguage: "ko",
+		// PIIRedactionEnabled intentionally left unset (false) — the default.
+	}
+	c := makeWhisperCollector(cfg, srv)
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect() error: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("Collect() returned %d docs, want 1", len(docs))
+	}
+
+	if docs[0].Content != rawTranscript {
+		t.Errorf("Content = %q, want unchanged (verbatim) %q", docs[0].Content, rawTranscript)
+	}
+	if strings.Contains(docs[0].Content, smsmap.PIIRedactionToken) {
+		t.Errorf("Content = %q must not contain %q when redaction is disabled", docs[0].Content, smsmap.PIIRedactionToken)
+	}
+	if !strings.Contains(docs[0].Title, "010-1234-5678") {
+		t.Errorf("Title = %q should contain the raw phone number when redaction is disabled", docs[0].Title)
+	}
+	if strings.Contains(docs[0].Title, smsmap.PIIRedactionToken) {
+		t.Errorf("Title = %q must not contain %q when redaction is disabled", docs[0].Title, smsmap.PIIRedactionToken)
 	}
 }

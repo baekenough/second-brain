@@ -5,12 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/google/uuid"
 )
 
 // ---------------------------------------------------------------------------
@@ -18,11 +19,18 @@ import (
 // ---------------------------------------------------------------------------
 
 // mockSummaryStore satisfies SummaryStore using ListUnsummarized (#64 simplified).
+//
+// SummarizerWorker now processes documents from a bounded worker pool
+// (#170), so UpdateSummary can be called concurrently for different document
+// IDs within a single tick — mu guards updateCalls against concurrent
+// appends (go test -race).
 type mockSummaryStore struct {
 	unsummarized []*model.Document
 	listErr      error
-	updateCalls  []updateSummaryCall
 	updateErr    error
+
+	mu          sync.Mutex
+	updateCalls []updateSummaryCall
 }
 
 type updateSummaryCall struct {
@@ -44,6 +52,8 @@ func (m *mockSummaryStore) ListUnsummarized(_ context.Context, limit int) ([]*mo
 }
 
 func (m *mockSummaryStore) UpdateSummary(_ context.Context, id uuid.UUID, titleSummary, bulletSummary string, summaryEmbedding []float32) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.updateCalls = append(m.updateCalls, updateSummaryCall{
 		id:               id,
 		titleSummary:     titleSummary,
@@ -321,36 +331,44 @@ func TestSummarizerWorker_tick_updateErr_continues(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Tests: tick timeout (#65) — tick must complete within maxTickDuration
+// Tests: per-document timeout (#65, #170) — replaces the old whole-tick
+// maxTickDuration ceiling. A single document is bounded by DocTimeout;
+// launching NEW documents stops as soon as the tick's own context is
+// cancelled, independent of DocTimeout.
 // ---------------------------------------------------------------------------
 
-// TestSummarizerWorker_tick_respectsTimeout verifies that tick() honours its
-// context deadline and does not block indefinitely when the LLM is slow.
-func TestSummarizerWorker_tick_respectsTimeout(t *testing.T) {
+// TestSummarizerWorker_tick_respectsDocTimeout verifies that a hung LLM call
+// is bounded by DocTimeout (not the caller's context, which may have no
+// deadline at all) and does not block tick() indefinitely.
+func TestSummarizerWorker_tick_respectsDocTimeout(t *testing.T) {
 	// slowLLM blocks until its context is cancelled.
 	slowLLM := &slowLLMClient{}
 
 	doc := makeDoc("slow content")
 	st := &mockSummaryStore{unsummarized: []*model.Document{doc}}
 
-	w := NewSummarizerWorker(SummarizerConfig{Store: st, LLM: slowLLM, BatchSize: 10})
-
-	// Use a very short deadline to keep the test fast.
-	const tickDeadline = 50 * time.Millisecond
-	tickCtx, cancel := context.WithTimeout(context.Background(), tickDeadline)
-	defer cancel()
+	// Use a very short DocTimeout to keep the test fast. The parent context
+	// (context.Background()) has no deadline of its own — DocTimeout alone
+	// must bound the call.
+	const docTimeout = 50 * time.Millisecond
+	w := NewSummarizerWorker(SummarizerConfig{
+		Store:      st,
+		LLM:        slowLLM,
+		BatchSize:  10,
+		DocTimeout: docTimeout,
+	})
 
 	start := time.Now()
-	w.tick(tickCtx)
+	w.tick(context.Background())
 	elapsed := time.Since(start)
 
-	// The tick must have returned within a reasonable margin of the deadline.
-	if elapsed > tickDeadline*5 {
-		t.Errorf("tick did not respect context deadline: elapsed %s, deadline %s", elapsed, tickDeadline)
+	// The tick must have returned within a reasonable margin of DocTimeout.
+	if elapsed > docTimeout*10 {
+		t.Errorf("tick did not respect DocTimeout: elapsed %s, DocTimeout %s", elapsed, docTimeout)
 	}
 	// The slow LLM must not have produced an UpdateSummary call.
 	if len(st.updateCalls) != 0 {
-		t.Errorf("expected no UpdateSummary call when LLM is cancelled, got %d", len(st.updateCalls))
+		t.Errorf("expected no UpdateSummary call when the document's LLM call times out, got %d", len(st.updateCalls))
 	}
 }
 
@@ -363,34 +381,100 @@ func (s *slowLLMClient) CompleteWithMessages(ctx context.Context, _ string, _ []
 	return "", ctx.Err()
 }
 
-// TestSummarizerWorker_runTick_boundedByMaxTickDuration verifies that runTick
-// returns within the configured MaxTickDuration even when the LLM is slow.
-func TestSummarizerWorker_runTick_boundedByMaxTickDuration(t *testing.T) {
-	slowLLM := &slowLLMClient{}
+// TestSummarizerWorker_tick_stopsLaunchingWhenContextCancelled verifies that
+// tick() does not start any new document work when the caller's context is
+// already cancelled on entry — this is what keeps the shutdown drain window
+// (cmd/collector/main.go) bounded regardless of BatchSize/Concurrency,
+// independent of DocTimeout.
+func TestSummarizerWorker_tick_stopsLaunchingWhenContextCancelled(t *testing.T) {
 	doc := makeDoc("content")
 	st := &mockSummaryStore{unsummarized: []*model.Document{doc}}
+	lm := &callCountingLLM{response: validSummaryJSON("T", "• B")}
 
-	// Use a short MaxTickDuration so the test completes quickly.
-	const shortTick = 50 * time.Millisecond
-	w := NewSummarizerWorker(SummarizerConfig{
-		Store:           st,
-		LLM:             slowLLM,
-		BatchSize:       10,
-		MaxTickDuration: shortTick,
-	})
+	w := NewSummarizerWorker(SummarizerConfig{Store: st, LLM: lm, BatchSize: 10})
 
-	// Parent context is already cancelled — runTick must still return within
-	// MaxTickDuration (bounded by context.WithTimeout(WithoutCancel(ctx), MaxTickDuration)).
 	cancelledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	start := time.Now()
-	w.runTick(cancelledCtx)
+	w.tick(cancelledCtx)
 	elapsed := time.Since(start)
 
-	// Must complete well within shortTick (with 10× tolerance for slow CI).
-	if elapsed > shortTick*10 {
-		t.Errorf("runTick exceeded expected bound: elapsed %s, MaxTickDuration %s", elapsed, shortTick)
+	// Must return near-instantly — no document work is ever launched.
+	const budget = 200 * time.Millisecond
+	if elapsed > budget {
+		t.Errorf("tick with an already-cancelled context took %s, want < %s", elapsed, budget)
+	}
+	if calls := atomic.LoadInt64(&lm.calls); calls != 0 {
+		t.Errorf("expected 0 LLM calls when context is already cancelled, got %d", calls)
+	}
+	if len(st.updateCalls) != 0 {
+		t.Errorf("expected no UpdateSummary calls when context is already cancelled, got %d", len(st.updateCalls))
+	}
+}
+
+// callCountingLLM counts CompleteWithMessages invocations; safe for
+// concurrent use (tracks max-in-flight for the concurrency test below).
+type callCountingLLM struct {
+	response string
+	err      error
+
+	calls       int64 // atomic
+	inFlight    int64 // atomic
+	maxInFlight int64 // atomic — high-water mark of concurrent calls
+}
+
+func (m *callCountingLLM) Enabled() bool { return true }
+
+func (m *callCountingLLM) CompleteWithMessages(_ context.Context, _ string, _ []llm.Message) (string, error) {
+	atomic.AddInt64(&m.calls, 1)
+	cur := atomic.AddInt64(&m.inFlight, 1)
+	defer atomic.AddInt64(&m.inFlight, -1)
+	for {
+		max := atomic.LoadInt64(&m.maxInFlight)
+		if cur <= max || atomic.CompareAndSwapInt64(&m.maxInFlight, max, cur) {
+			break
+		}
+	}
+	// Simulate remote-API latency so concurrent goroutines actually overlap.
+	time.Sleep(20 * time.Millisecond)
+	if m.err != nil {
+		return "", m.err
+	}
+	return m.response, nil
+}
+
+// TestSummarizerWorker_tick_boundsConcurrency verifies that at most
+// Concurrency documents are ever in flight simultaneously within one tick,
+// and that all documents are still eventually processed via the bounded
+// worker pool (#170).
+func TestSummarizerWorker_tick_boundsConcurrency(t *testing.T) {
+	const docCount = 10
+	const concurrency = 3
+
+	docs := make([]*model.Document, docCount)
+	for i := range docs {
+		docs[i] = makeDoc("content")
+	}
+	st := &mockSummaryStore{unsummarized: docs}
+	lm := &callCountingLLM{response: validSummaryJSON("T", "• B")}
+
+	w := NewSummarizerWorker(SummarizerConfig{
+		Store:       st,
+		LLM:         lm,
+		BatchSize:   docCount,
+		Concurrency: concurrency,
+	})
+	w.tick(context.Background())
+
+	if len(st.updateCalls) != docCount {
+		t.Errorf("expected %d UpdateSummary calls, got %d", docCount, len(st.updateCalls))
+	}
+	if got := atomic.LoadInt64(&lm.maxInFlight); got > concurrency {
+		t.Errorf("max concurrent LLM calls = %d, want <= %d", got, concurrency)
+	}
+	if got := atomic.LoadInt64(&lm.maxInFlight); got < 2 {
+		t.Errorf("max concurrent LLM calls = %d, want >= 2 (pool should actually run in parallel)", got)
 	}
 }
 

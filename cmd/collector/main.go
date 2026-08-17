@@ -85,11 +85,27 @@ func run() error {
 	var wg sync.WaitGroup
 
 	// drainTimeout is the maximum time to wait for in-flight ticks to finish
-	// after the shutdown signal is received.  10 s is long enough to let a
-	// running UpdateSummary or embedding call complete; if the LLM is slow the
-	// tick exits cleanly because it uses context.WithoutCancel internally and
-	// the WaitGroup drain acts as the hard ceiling.
-	const drainTimeout = 10 * time.Second
+	// after the shutdown signal is received.
+	//
+	// It is derived from cfg.SummarizerDocTimeout (default 30s) rather than a
+	// bare constant: SummarizerWorker detaches an in-flight document's LLM
+	// call + embed + UpdateSummary write from SIGTERM (context.WithoutCancel)
+	// so the write is never truncated mid-write, and bounds that work only by
+	// SummarizerDocTimeout (#170, was a fixed 8s "maxTickDuration" tuned for a
+	// fast local LLM — see summarizer.go doc comments). If drainTimeout were
+	// still a hardcoded value shorter than the configured doc timeout, a
+	// SIGTERM during an in-flight document could be killed by drainTimeout
+	// before the detached UpdateSummary write completes, defeating the whole
+	// point of detaching it. The +10s margin covers goroutine
+	// scheduling/cleanup overhead on top of the LLM/embed/write budget itself.
+	//
+	// The entity-extraction and extraction-retry workers use the raw
+	// (non-detached) shutdown context directly, so they are cancelled
+	// near-instantly and do not drive this timeout.
+	drainTimeout := cfg.SummarizerDocTimeout + 10*time.Second
+	if drainTimeout < 15*time.Second {
+		drainTimeout = 15 * time.Second
+	}
 
 	// --- Extraction retry worker ---
 	// Periodically re-attempts failed file extractions.
@@ -152,8 +168,10 @@ func run() error {
 		Store:           docStore,
 		LLM:             llmClient,
 		Embedder:        embedClient,
-		Interval:        5 * time.Minute,
-		BatchSize:       10,
+		Interval:        cfg.SummarizerInterval,
+		BatchSize:       cfg.SummarizerBatchSize,
+		DocTimeout:      cfg.SummarizerDocTimeout,
+		Concurrency:     cfg.SummarizerConcurrency,
 		BackfillEnabled: &cfg.SummarizerBackfillEnabled,
 	})
 	wg.Add(1)
@@ -212,7 +230,8 @@ func run() error {
 		collector.NewTelegramCollector(cfg.TelegramBotToken, cfg.TelegramChatIDs),
 		collector.NewGmailCollector(cfg),
 		collector.NewCalendarCollector(cfg),
-		collector.NewSMSCollector(cfg.SMSSourceDir, cfg.SMSMaxFileBytes),
+		collector.NewSMSCollector(cfg.SMSSourceDir, cfg.SMSMaxFileBytes).
+			WithNumberHashingEnabled(cfg.PIINumberHashingEnabled),
 		collector.NewWhisperCollector(cfg),
 	}
 	if cfg.FilesystemEnabled && cfg.FilesystemPath != "" {
@@ -311,9 +330,10 @@ func run() error {
 	// Bounded drain: give in-flight goroutines (summarizer, retry worker) time
 	// to finish their current tick before the process exits.
 	//
-	// SummarizerWorker uses maxTickDuration (8 s) which is shorter than
-	// drainTimeout (10 s), so in-flight ticks always complete before the
-	// drain window closes (#65).
+	// SummarizerWorker bounds any in-flight document to SummarizerDocTimeout
+	// (default 30 s), and drainTimeout is derived from that same value above,
+	// so in-flight documents always complete before the drain window closes
+	// (#65, #170).
 	//
 	// The drainDone channel is buffered so that the wg.Wait() goroutine can
 	// send without blocking even when the drain timeout fires first — this
