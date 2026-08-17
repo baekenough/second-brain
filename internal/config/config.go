@@ -260,6 +260,46 @@ type Config struct {
 	// local LLM to avoid a flood of LLM calls for the pre-existing backlog.
 	SummarizerBackfillEnabled bool // SUMMARIZER_BACKFILL_ENABLED
 
+	// SummarizerBatchSize is the number of documents fetched and processed by
+	// SummarizerWorker per tick.
+	// SUMMARIZER_BATCH_SIZE: default 50. The previous default of 10 was sized
+	// for a local LLM sharing an 8s whole-tick budget; a remote chat-completion
+	// API is latency- not CPU-bound, so a larger batch keeps the bounded
+	// worker pool (SummarizerConcurrency) saturated for the whole tick
+	// interval instead of idling after 10 documents. Invalid values use the default.
+	SummarizerBatchSize int // SUMMARIZER_BATCH_SIZE
+
+	// SummarizerInterval controls how often SummarizerWorker polls for
+	// unsummarized documents.
+	// SUMMARIZER_INTERVAL: Go duration string, default "30s". The previous 5m
+	// default assumed a slow local LLM where polling more often was pointless;
+	// a remote API can clear a full batch in well under 30s, so a short
+	// interval keeps backlog throughput high without busy-looping
+	// (ListUnsummarized is a cheap indexed SELECT once caught up).
+	// Invalid values use the default.
+	SummarizerInterval time.Duration // SUMMARIZER_INTERVAL
+
+	// SummarizerDocTimeout bounds a single document's summarization work
+	// (LLM call + optional embed + UpdateSummary write).
+	// SUMMARIZER_DOC_TIMEOUT: Go duration string, default "30s". Replaces the
+	// old whole-tick ceiling (formerly 8s, tuned for gemma3:4b on local CPU),
+	// which silently truncated a multi-document batch once the LLM backend
+	// became a remote API. Each document is independently idempotent
+	// (UpdateSummary's WHERE title_summary IS NULL guard), so a timed-out
+	// document simply stays unsummarized and is retried on a later tick.
+	// NOTE: cmd/collector's shutdown drain window is derived from this value —
+	// raising it also raises the drain timeout. Invalid values use the default.
+	SummarizerDocTimeout time.Duration // SUMMARIZER_DOC_TIMEOUT
+
+	// SummarizerConcurrency is the number of documents SummarizerWorker
+	// processes in parallel within a single tick, via a bounded worker pool.
+	// SUMMARIZER_CONCURRENCY: default 5. A remote LLM call is latency-bound,
+	// not CPU-bound, so running several requests concurrently is the primary
+	// throughput lever against a remote backend; kept conservative to avoid
+	// tripping a remote provider's rate limit. Clamped to >= 1. Invalid
+	// values use the default.
+	SummarizerConcurrency int // SUMMARIZER_CONCURRENCY
+
 	// Freshness monitoring (issue #159)
 	//
 	// SMSFreshnessMaxAge is the maximum time since the most recent active SMS
@@ -306,6 +346,61 @@ type Config struct {
 	// collector_state watermark table. Defaults to os.Hostname() (or
 	// "default" when that fails) when COLLECTOR_INSTANCE is unset.
 	CollectorInstance string
+
+	// PII redaction (issues #163/#165/#167) and phone-number hashing (issue
+	// #164) are OFF by default. This is a deliberate policy reversal, not an
+	// oversight: second-brain is a single-user personal knowledge base, not a
+	// shared or third-party-facing system, and the owner has explicitly asked
+	// for both mechanisms disabled — a call transcript reading "[REDACTED]"
+	// instead of the actual phone number, or a document searchable only by an
+	// opaque hash, is strictly less useful to the person who OWNS that data
+	// than the raw text/number would be. The redaction/hashing machinery
+	// itself is NOT removed: both flags reactivate the exact prior behaviour
+	// (byte-for-byte, per their respective call sites) when set to "true", so
+	// this remains available for a future multi-tenant deployment or a
+	// compliance requirement without a code revert.
+	//
+	// Forward-only, by necessity: flipping either flag changes behaviour only
+	// for documents ingested AFTER the change. Content stored while
+	// PIIRedactionEnabled=false was never redacted — the raw text is exactly
+	// what is in the database, and there is nothing to "restore" if the flag
+	// is later turned on. Numbers hashed while PIINumberHashingEnabled=true
+	// went through smsmap.ShortHash (SHA-256-derived, one-way) before being
+	// written to the sidecar/filename/title — that hash cannot be reversed
+	// back to the original number, by this codebase or any other, so turning
+	// PIINumberHashingEnabled off later does not and cannot recover numbers
+	// hashed under the old default. There is no migration in either
+	// direction; do not go looking for the old plaintext/original values —
+	// they are simply gone for anything ingested before the flag changed.
+	//
+	// PII_REDACTION_ENABLED: set "true" to redact structured PII (Korean
+	// resident-registration numbers, phone numbers, bank-account-shaped digit
+	// runs — see smsmap.RedactPII) from whisper call-transcript Content and
+	// Title (internal/collector/whisper.go buildDocument). Default false.
+	PIIRedactionEnabled bool // PII_REDACTION_ENABLED — default false
+
+	// PII_NUMBER_HASHING_ENABLED: set "true" to hash the counterpart phone
+	// number (via smsmap.ShortHash) before it is written to:
+	//   1. the ingest-recording sidecar (.meta.json "number_hash" field)
+	//   2. the uploaded call-recording audio filename ({hash}_{timestamp}.ext)
+	//   3. the anonymous-caller Title/Content fallback label ("상대 {hash8}"),
+	//      both in smsmap.MapCall and the ingest-recording handler
+	//   4. ingest-recording error/warn logs, which are restricted to the
+	//      audio file's basename rather than its full (number-bearing) path
+	// Default false: all four write the raw number instead, and (additive,
+	// not part of the original #164 behaviour) the raw number is also written
+	// into the document's Metadata under the "number" key so it is
+	// searchable/visible — hashing it away was making it unrecoverable for no
+	// benefit to a single-user deployment.
+	//
+	// Document SourceIDs (dedup/upsert identity, e.g.
+	// "call-log:{dateMs}:{numHash}:{durHash}" or "sms:{dateMs}:{addrHash}:{direction}")
+	// are NOT affected by this flag in either state — they are always hashed,
+	// independent of PII_NUMBER_HASHING_ENABLED. Changing an established
+	// SourceID scheme would silently orphan every already-ingested document
+	// under a new identity (the exact failure mode #144 was blocked on), so
+	// SourceID hashing is out of scope for this flag entirely.
+	PIINumberHashingEnabled bool // PII_NUMBER_HASHING_ENABLED — default false
 
 	// CollectorCutover is an optional floor time for IndexAware collectors
 	// (SMS, Whisper). When non-zero, the collector will not emit any record
@@ -523,6 +618,10 @@ func Load() (*Config, error) {
 		IngestMaxBatchMessages: ingestMaxBatchMessages(),
 
 		SummarizerBackfillEnabled: summarizerBackfill,
+		SummarizerBatchSize:       summarizerBatchSize(),
+		SummarizerInterval:        summarizerInterval(),
+		SummarizerDocTimeout:      summarizerDocTimeout(),
+		SummarizerConcurrency:     summarizerConcurrency(),
 
 		SMSFreshnessMaxAge:     smsFreshnessMaxAge(),
 		FreshnessCheckInterval: freshnessCheckInterval(),
@@ -536,6 +635,11 @@ func Load() (*Config, error) {
 		// #147 escape hatch: bypasses deletion-ratio guard when set.
 		// See Scheduler.WithDeletionRatioOverride for trade-offs.
 		DeletionRatioOverride: os.Getenv("DELETION_RATIO_OVERRIDE") == "true",
+
+		// #163/#164/#165/#167 policy reversal: both default false. See the
+		// PIIRedactionEnabled / PIINumberHashingEnabled doc comments above.
+		PIIRedactionEnabled:     os.Getenv("PII_REDACTION_ENABLED") == "true",
+		PIINumberHashingEnabled: os.Getenv("PII_NUMBER_HASHING_ENABLED") == "true",
 	}, nil
 }
 
@@ -655,6 +759,87 @@ func whisperConcurrency() int {
 	n, err := strconv.Atoi(v)
 	if err != nil || n < 1 {
 		slog.Warn("config: WHISPER_CONCURRENCY is invalid; using default 1",
+			"value", v,
+			"error", err,
+		)
+		return defaultConcurrency
+	}
+	return n
+}
+
+// summarizerBatchSize parses SUMMARIZER_BATCH_SIZE from the environment.
+// Default is 50 (see SummarizerBatchSize doc comment for rationale).
+// Invalid values are ignored and the default is used.
+func summarizerBatchSize() int {
+	const defaultBatch = 50
+	v := os.Getenv("SUMMARIZER_BATCH_SIZE")
+	if v == "" {
+		return defaultBatch
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		slog.Warn("config: SUMMARIZER_BATCH_SIZE is invalid; using default 50",
+			"value", v,
+			"error", err,
+		)
+		return defaultBatch
+	}
+	return n
+}
+
+// summarizerInterval parses SUMMARIZER_INTERVAL from the environment.
+// Default is 30s (see SummarizerInterval doc comment for rationale).
+// Invalid values are ignored and the default is used.
+func summarizerInterval() time.Duration {
+	const defaultInterval = 30 * time.Second
+	v := os.Getenv("SUMMARIZER_INTERVAL")
+	if v == "" {
+		return defaultInterval
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		slog.Warn("config: SUMMARIZER_INTERVAL is invalid; using default 30s",
+			"value", v,
+			"error", err,
+		)
+		return defaultInterval
+	}
+	return d
+}
+
+// summarizerDocTimeout parses SUMMARIZER_DOC_TIMEOUT from the environment.
+// Default is 30s (see SummarizerDocTimeout doc comment for rationale).
+// Invalid values are ignored and the default is used.
+func summarizerDocTimeout() time.Duration {
+	const defaultTimeout = 30 * time.Second
+	v := os.Getenv("SUMMARIZER_DOC_TIMEOUT")
+	if v == "" {
+		return defaultTimeout
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		slog.Warn("config: SUMMARIZER_DOC_TIMEOUT is invalid; using default 30s",
+			"value", v,
+			"error", err,
+		)
+		return defaultTimeout
+	}
+	return d
+}
+
+// summarizerConcurrency parses SUMMARIZER_CONCURRENCY from the environment.
+// Default is 5 (see SummarizerConcurrency doc comment for rationale).
+// The value is clamped to >= 1: zero, negative, or invalid values fall back
+// to the default so the worker pool always has at least one slot.
+func summarizerConcurrency() int {
+	const defaultConcurrency = 5
+	v := os.Getenv("SUMMARIZER_CONCURRENCY")
+	if v == "" {
+		return defaultConcurrency
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		slog.Warn("config: SUMMARIZER_CONCURRENCY is invalid; using default 5",
 			"value", v,
 			"error", err,
 		)

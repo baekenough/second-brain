@@ -286,31 +286,38 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 			audioFilename = fmt.Sprintf("voice-memo_%s%s", timestampStr, ext)
 		}
 	default: // "call"
-		// Mirrors smsmap.MapCall SourceID format. Computed BEFORE audioFilename
-		// so the filename can reuse the same one-way hash (issue #164/#165
-		// follow-up) — see the audioFilename comment below. This does not
-		// change the SourceID itself, so already-ingested call-log documents
-		// keep an identical SourceID after this change (dedup/upsert identity
-		// is unaffected).
+		// Mirrors smsmap.MapCall SourceID format. This hashing is UNCONDITIONAL
+		// — independent of s.piiNumberHashingEnabled — since changing the
+		// SourceID scheme would orphan every already-ingested call-log document
+		// (dedup/upsert identity). numHash is also reused below for the
+		// audioFilename when hashing IS enabled (see the audioFilename comment).
 		numHash = smsmap.ShortHash(number)
 		durHash := smsmap.BodyShortHash(fmt.Sprintf("%d", durationSec))
 		sourceID = fmt.Sprintf("call-log:%d:%s:%s", dateMs, numHash, durHash)
 
-		// Format: {numHash}_{YYYYMMDDHHMMSS}{ext}
+		// Format when s.piiNumberHashingEnabled: {numHash}_{YYYYMMDDHHMMSS}{ext}
+		// Format when disabled (default, issue #164 policy reversal):
+		// {sanitizePhoneNumber(number)}_{YYYYMMDDHHMMSS}{ext} — the pre-#164
+		// behaviour, restored verbatim via sanitizePhoneNumber (digits/+/- only).
 		//
-		// Security: previously this embedded sanitizePhoneNumber(number) — the
-		// raw phone number with only punctuation stripped — directly in the
-		// on-disk filename, leaking PII into filesystem paths, logs, backups,
-		// and any sync tooling that mirrors the recording directory. numHash
-		// is already computed above for the SourceID, so reusing it here for
-		// the filename is free and keeps the two identifiers consistent.
+		// Security note (retained for the hashing-enabled path): embedding
+		// numHash instead of the raw number keeps PII out of filesystem paths,
+		// logs, backups, and any sync tooling that mirrors the recording
+		// directory. With hashing disabled this protection is intentionally
+		// traded away — see PIINumberHashingEnabled's doc comment in
+		// internal/config/config.go for the owner's rationale.
 		//
 		// WhisperCollector.recordingTime() (reTPhone) only parses the trailing
 		// "_YYYYMMDDHHMMSS[-N]" timestamp suffix and does not care what
-		// precedes it, so this rename is fully transparent to the cutover /
-		// watermark logic and to isTPhoneCallPath's diarization heuristic.
+		// precedes it, so either naming choice is fully transparent to the
+		// cutover / watermark logic and to isTPhoneCallPath's diarization
+		// heuristic.
+		filenamePrefix := numHash
+		if !s.piiNumberHashingEnabled {
+			filenamePrefix = sanitizePhoneNumber(number)
+		}
 		audioFilename = fmt.Sprintf("%s_%s%s",
-			numHash,
+			filenamePrefix,
 			timestampStr,
 			ext,
 		)
@@ -327,12 +334,19 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 	// audioBytes was validated above; write from memory to disk.
 	destPath := filepath.Join(s.recordingDir, audioFilename)
 	if err := os.WriteFile(destPath, audioBytes, 0o644); err != nil {
-		// Security: log only the basename, never the full destPath. audioFilename
-		// is hash-based for kind=call as of this change (see numHash above), but
-		// logging the basename rather than the directory-qualified path is kept
-		// as defence-in-depth against any future/legacy naming path that still
-		// embeds raw PII.
-		slog.Error("ingest_recording: write audio file", "filename", filepath.Base(destPath), "error", err)
+		// Security (issue #164): when hashing is enabled, log only the basename,
+		// never the full destPath — audioFilename is hash-based for kind=call in
+		// that mode, but logging just the basename is kept as defence-in-depth
+		// against any future/legacy naming path that still embeds raw PII. When
+		// hashing is disabled (default), the number is already embedded in
+		// audioFilename regardless, so restricting the log to the basename would
+		// only hide the directory context without protecting anything — log the
+		// full destPath instead.
+		if s.piiNumberHashingEnabled {
+			slog.Error("ingest_recording: write audio file", "filename", filepath.Base(destPath), "error", err)
+		} else {
+			slog.Error("ingest_recording: write audio file", "path", destPath, "error", err)
+		}
 		writeError(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
@@ -349,28 +363,47 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 	// doc already succeeded, and missing sidecars are handled gracefully by
 	// WhisperCollector (historical files have no sidecar).
 	//
-	// Security (issue #164): the counterpart phone number is never written to
-	// the sidecar in plaintext. Only its ShortHash (numHash, already computed
-	// above for the SourceID) is stored, under the number_hash key. This is a
-	// one-way hash — the sidecar cannot be used to recover the raw number.
+	// Security (issue #164), now conditional on s.piiNumberHashingEnabled: when
+	// enabled, the counterpart phone number is never written to the sidecar in
+	// plaintext — only its ShortHash (numHash, already computed above for the
+	// SourceID) is stored, under the number_hash key, a one-way hash the
+	// sidecar cannot be used to recover the raw number from. When disabled
+	// (default, policy reversal), the raw number is written under the "number"
+	// key instead — number_hash is omitted entirely — so WhisperCollector's
+	// sidecar reader (readRecordingSidecar in internal/collector/whisper.go)
+	// can additively surface it as Metadata["number"] on the eventual
+	// call-transcript document (see that function's doc comment).
 	sidecarDirection := ""
 	if kind == "call" {
 		sidecarDirection = "incoming"
 	}
 	sidecar := recordingSidecar{
 		ContactName:     contactName,
-		NumberHash:      numHash,
 		Direction:       sidecarDirection,
 		RecordingType:   kind,
 		DurationSeconds: durationSec,
 		DateMs:          dateMs,
 		Kind:            kind,
 	}
+	if s.piiNumberHashingEnabled {
+		sidecar.NumberHash = numHash
+	} else if kind == "call" {
+		sidecar.Number = number
+	}
 	if sidecarData, marshalErr := json.Marshal(sidecar); marshalErr != nil {
-		// Security: basename only — see the write-audio-file log above.
-		slog.Warn("ingest_recording: marshal sidecar", "filename", filepath.Base(destPath), "error", marshalErr)
+		// Security: basename only when hashing is enabled — see the
+		// write-audio-file log above for the same disabled-hashing rationale.
+		if s.piiNumberHashingEnabled {
+			slog.Warn("ingest_recording: marshal sidecar", "filename", filepath.Base(destPath), "error", marshalErr)
+		} else {
+			slog.Warn("ingest_recording: marshal sidecar", "path", destPath, "error", marshalErr)
+		}
 	} else if writeErr := os.WriteFile(destPath+".meta.json", sidecarData, 0o644); writeErr != nil {
-		slog.Warn("ingest_recording: write sidecar", "filename", filepath.Base(destPath)+".meta.json", "error", writeErr)
+		if s.piiNumberHashingEnabled {
+			slog.Warn("ingest_recording: write sidecar", "filename", filepath.Base(destPath)+".meta.json", "error", writeErr)
+		} else {
+			slog.Warn("ingest_recording: write sidecar", "path", destPath+".meta.json", "error", writeErr)
+		}
 	}
 
 	// --- Build document title, content, and metadata by kind ---
@@ -399,16 +432,22 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 			"transcription":    "pending",
 		}
 	default: // "call"
-		// Security: when the caller supplies no contact_name, NEVER fall back
-		// to the raw phone number for Title/Content — unlike SourceID, these
-		// are plaintext user-facing fields and would leak PII. Fall back to a
-		// short, one-way hashed label built from numHash (already computed
-		// above for the SourceID/filename), matching the "number_hash" naming
-		// used elsewhere (sidecar, SourceID) so the fallback is consistent
-		// and non-reversible rather than a partial mask of the real number.
+		// Security (issue #164), now conditional on s.piiNumberHashingEnabled:
+		// when enabled AND the caller supplies no contact_name, never fall back
+		// to the raw phone number for Title/Content — unlike SourceID, these are
+		// plaintext user-facing fields. Fall back to a short, one-way hashed
+		// label built from numHash (already computed above for the
+		// SourceID/filename), matching the "number_hash" naming used elsewhere
+		// (sidecar, SourceID). When hashing is disabled (default, policy
+		// reversal), fall back to the raw number instead — that's the point of
+		// disabling the flag.
 		contact := contactName
 		if contact == "" {
-			contact = "상대 " + numHash[:8]
+			if s.piiNumberHashingEnabled {
+				contact = "상대 " + numHash[:8]
+			} else {
+				contact = number
+			}
 		}
 		title = fmt.Sprintf("incoming 통화 %s", contact)
 		content = fmt.Sprintf("상대방: %s\n통화 방향: incoming\n통화 시간: %ds\n[TRANSCRIPTION PENDING]",
@@ -420,6 +459,15 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 			"duration_seconds": durationSec,
 			"audio_file":       audioFilename,
 			"transcription":    "pending",
+		}
+		// Additive (issue #164 policy reversal, not part of the original #164
+		// behaviour): when hashing is disabled, also surface the raw number in
+		// Metadata so it is searchable/visible in the UI — the point of turning
+		// hashing off. Verified against prod: 0 of 1,759 existing call/sms
+		// documents carry "number" or "number_hash" in Metadata today, so this
+		// is a forward-only addition with no backfill implication.
+		if !s.piiNumberHashingEnabled {
+			meta["number"] = number
 		}
 	}
 
@@ -459,14 +507,24 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 // (e.g. contact_name for an anonymous call, direction for a voice-memo) are
 // omitted from the sidecar rather than stored as empty strings.
 //
-// Security note (issue #164): the counterpart phone number is intentionally
-// NOT stored in plaintext. NumberHash carries smsmap.ShortHash(number) instead
-// — a one-way SHA-256-derived hash, matching the hash already embedded in the
-// call-log document's SourceID. WhisperCollector's sidecar reader
-// (readRecordingSidecar in internal/collector/whisper.go) does not parse a
-// "number" key today, so this rename carries no consumer-contract risk.
+// Security note (issue #164), now policy-flagged via cfg.PIINumberHashingEnabled:
+// when the flag is true, the counterpart phone number is NOT stored in
+// plaintext — NumberHash carries smsmap.ShortHash(number) instead, a one-way
+// SHA-256-derived hash matching the hash already embedded in the call-log
+// document's SourceID, and Number is left empty (omitted from the JSON).
+// When the flag is false (the new default — see PIINumberHashingEnabled's doc
+// comment in internal/config/config.go for the owner's rationale), Number
+// carries the raw phone number instead and NumberHash is left empty. The
+// handler (ingestRecordingHandler) only ever populates one of the two fields
+// for a given upload, never both. WhisperCollector's sidecar reader
+// (readRecordingSidecar in internal/collector/whisper.go) parses the "number"
+// key and, when present, additively surfaces it as Metadata["number"] on the
+// eventual call-transcript document — NumberHash is intentionally NOT
+// surfaced there, since the whole point of the raw-number addition is
+// searchability, which a hash does not provide.
 type recordingSidecar struct {
 	ContactName     string `json:"contact_name,omitempty"`
+	Number          string `json:"number,omitempty"`
 	NumberHash      string `json:"number_hash,omitempty"`
 	Direction       string `json:"direction,omitempty"`
 	RecordingType   string `json:"recording_type,omitempty"`

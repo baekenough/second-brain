@@ -1320,36 +1320,50 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 		}
 	}
 
-	// PII redaction (issue #163): whisper call transcripts carry raw spoken
-	// content and previously had NO redaction at all (unlike SMS, see
-	// smsmap.MapSMS). Redaction is applied unconditionally to ALL whisper
-	// transcript content — not just TPhone call recordings — because voice
-	// memos can equally contain a spoken phone number or account number, and
-	// distinguishing "call" vs "memo" here to redact only one would leave an
-	// unprincipled gap for no real benefit. Applied to Content only:
-	// SourceID (dedup/upsert identity) and Metadata are left untouched so
-	// dedup behaviour is unaffected by redaction.
-	content = smsmap.RedactPII(content)
+	// PII redaction (issue #163), now gated by cfg.PIIRedactionEnabled (default
+	// false — see that flag's doc comment in internal/config/config.go for the
+	// owner's rationale: this is a single-user personal knowledge base, and a
+	// transcript reading "[REDACTED]" instead of the actual phone number is
+	// strictly less useful to the person who owns that data). When enabled,
+	// this reproduces the original #163 behaviour byte-for-byte: redaction is
+	// applied unconditionally to ALL whisper transcript content — not just
+	// TPhone call recordings — because voice memos can equally contain a
+	// spoken phone number or account number, and distinguishing "call" vs
+	// "memo" here to redact only one would leave an unprincipled gap for no
+	// real benefit. Applied to Content only: SourceID (dedup/upsert identity)
+	// and Metadata are left untouched either way so dedup behaviour is
+	// unaffected by this flag.
+	// title defaults to the raw filename stem, unmodified — "stored exactly as
+	// produced" when redaction is disabled. The underscore→space swap below
+	// exists ONLY to make RedactPII's \b-boundary patterns match (see the
+	// comment inside the branch); it is not an independent formatting feature,
+	// so it stays inside the PIIRedactionEnabled branch rather than applying
+	// unconditionally.
+	title := item.title
+	if c.cfg.PIIRedactionEnabled {
+		content = smsmap.RedactPII(content)
 
-	// Title redaction (issue #163 follow-up): item.title is the audio filename
-	// stem, and historical filenames (e.g. TPhoneCallRecords'
-	// "<number>_<timestamp>.ext") embed a raw phone number just as directly as
-	// spoken content does — so Title carries the same PII risk as Content and
-	// must go through the same RedactPII pass.
-	//
-	// RedactPII's structured-PII patterns (koreanPhoneRe, rrnRe) require a
-	// non-word character immediately after the digit run to satisfy their
-	// trailing \b boundary; in a filename stem the digit run instead directly
-	// abuts the timestamp segment's leading "_" (both are word characters),
-	// which defeats \b and would silently leave the number unredacted. Since
-	// underscores in a filename-derived title are purely a display separator
-	// (no semantic meaning worth preserving over the security property),
-	// swapping them for spaces before redaction lets the boundary-sensitive
-	// patterns match without touching the shared smsmap regexes used by other
-	// callers (SMS bodies, spoken transcript content) that don't have this
-	// adjacency problem. This only changes the Title *value* stored on the
-	// document — it does not touch the on-disk filename or SourceID.
-	title := smsmap.RedactPII(strings.ReplaceAll(item.title, "_", " "))
+		// Title redaction (issue #163 follow-up): item.title is the audio
+		// filename stem, and historical filenames (e.g. TPhoneCallRecords'
+		// "<number>_<timestamp>.ext") embed a raw phone number just as
+		// directly as spoken content does — so Title carries the same PII
+		// risk as Content and must go through the same RedactPII pass.
+		//
+		// RedactPII's structured-PII patterns (koreanPhoneRe, rrnRe) require a
+		// non-word character immediately after the digit run to satisfy their
+		// trailing \b boundary; in a filename stem the digit run instead
+		// directly abuts the timestamp segment's leading "_" (both are word
+		// characters), which defeats \b and would silently leave the number
+		// unredacted. Since underscores in a filename-derived title are purely
+		// a display separator (no semantic meaning worth preserving over the
+		// security property), swapping them for spaces before redaction lets
+		// the boundary-sensitive patterns match without touching the shared
+		// smsmap regexes used by other callers (SMS bodies, spoken transcript
+		// content) that don't have this adjacency problem. This only changes
+		// the Title *value* stored on the document — it does not touch the
+		// on-disk filename or SourceID.
+		title = smsmap.RedactPII(strings.ReplaceAll(item.title, "_", " "))
+	}
 
 	return model.Document{
 		ID:          uuid.New(),
@@ -1368,9 +1382,19 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 //
 // When the sidecar exists and is valid JSON, the function returns a map
 // containing the recording metadata fields present in the file
-// (contact_name, direction, recording_type, duration_seconds) and true.
-// Only non-empty/non-zero values are included so callers do not overwrite
-// existing metadata with zero-value defaults.
+// (contact_name, direction, recording_type, duration_seconds, and — issue
+// #164 policy reversal, additive — number) and true. Only non-empty/non-zero
+// values are included so callers do not overwrite existing metadata with
+// zero-value defaults.
+//
+// number (issue #164 additive improvement): the sidecar's "number" key is
+// only present when the ingest-recording handler wrote it with
+// PIINumberHashingEnabled=false (see recordingSidecar's doc comment in
+// internal/api/ingest_recording.go). When present, it is surfaced here as
+// Metadata["number"] on the call-transcript document, making the phone number
+// searchable/visible — the point of disabling hashing. The sidecar's
+// "number_hash" key is deliberately NOT parsed into metadata: a hash provides
+// no searchability benefit, so surfacing it would add noise without value.
 //
 // When the sidecar is absent, unreadable, or unparseable, the function returns
 // (nil, false) so the caller can proceed with existing metadata unchanged. This
@@ -1385,6 +1409,7 @@ func readRecordingSidecar(audioPath string) (map[string]any, bool) {
 
 	var raw struct {
 		ContactName     string `json:"contact_name"`
+		Number          string `json:"number"`
 		Direction       string `json:"direction"`
 		RecordingType   string `json:"recording_type"`
 		DurationSeconds int    `json:"duration_seconds"`
@@ -1394,9 +1419,12 @@ func readRecordingSidecar(audioPath string) (map[string]any, bool) {
 		return nil, false
 	}
 
-	result := make(map[string]any, 4)
+	result := make(map[string]any, 5)
 	if raw.ContactName != "" {
 		result["contact_name"] = raw.ContactName
+	}
+	if raw.Number != "" {
+		result["number"] = raw.Number
 	}
 	if raw.Direction != "" {
 		result["direction"] = raw.Direction

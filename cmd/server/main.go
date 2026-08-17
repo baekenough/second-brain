@@ -118,6 +118,7 @@ func run() error {
 			reindexStateStore,
 		)).
 		WithIngestFile(docStore, chunkStore, embedClient, cfg.IngestMaxFileBytes).
+		WithPIINumberHashing(cfg.PIINumberHashingEnabled).
 		WithIngestMessages(docStore, chunkStore, embedClient, cfg.IngestMaxBatchMessages, cfg.CollectorCutover).
 		WithIngestRecording(docStore, cfg.IngestRecordingDir, cfg.IngestMaxFileBytes, cfg.CollectorCutover)
 	httpServer := &http.Server{

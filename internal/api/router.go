@@ -87,6 +87,15 @@ type Server struct {
 	// route is registered. Set via WithCollectStatus before calling Handler().
 	collectStatus CollectionStatusProvider
 
+	// piiNumberHashingEnabled mirrors cfg.PIINumberHashingEnabled (issue #164
+	// policy reversal). Zero value (false) is the new default and is used by
+	// both ingestMessagesHandler (smsmap.MapSMS/MapCall) and
+	// ingestRecordingHandler (sidecar/filename/anonymous-title logic): the raw
+	// phone number is written instead of a hash, and (additively) into
+	// Metadata["number"] so it stays searchable. Set via
+	// WithPIINumberHashing before calling Handler().
+	piiNumberHashingEnabled bool
+
 	// handlerOnce ensures buildHandler is called exactly once per Server so
 	// that the graphql-go schema (and its package-level type objects) are
 	// constructed a single time regardless of how many goroutines call Handler.
@@ -113,6 +122,20 @@ func NewServer(
 		filesystemPath: filesystemPath,
 		apiKey:         apiKey,
 	}
+}
+
+// WithPIINumberHashing sets the phone-number hashing policy (issue #164;
+// cfg.PIINumberHashingEnabled) shared by the ingest-messages and
+// ingest-recording handlers. Default false (zero value): the raw number is
+// used instead of smsmap.ShortHash / a hashed label, and is additionally
+// written into the document Metadata under "number" so it is
+// searchable/visible. Pass true to restore the original #164 behaviour
+// byte-for-byte. Must be called before the first call to Handler() (though
+// the value is read per-request, not at wiring time, so ordering relative to
+// the other With* builders does not matter).
+func (s *Server) WithPIINumberHashing(enabled bool) *Server {
+	s.piiNumberHashingEnabled = enabled
+	return s
 }
 
 // Handler returns the root http.Handler for the application. It is safe to
