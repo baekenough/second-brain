@@ -51,17 +51,21 @@ func TestLLMClassifier_Classify_DeterministicDatePhrases(t *testing.T) {
 		wantConfid float64
 	}{
 		{
-			name:       "explicit year and month",
-			question:   "2026년 6월 요약해줘",
-			wantFrom:   time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
-			wantTo:     time.Date(2026, 6, 30, 23, 59, 59, 0, time.UTC),
+			name:     "explicit year and month",
+			question: "2026년 6월 요약해줘",
+			wantFrom: time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+			// Half-open upper bound: the first instant of July, not June's last
+			// second. See the range helpers in intent.go and
+			// TestClassify_LastInstantOfPeriodIsInsideWindow.
+			wantTo:     time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
 			wantConfid: 1.0,
 		},
 		{
-			name:       "last month, relative to fixed now (2026-08-17)",
-			question:   "지난달에 뭐 있었지",
-			wantFrom:   time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
-			wantTo:     time.Date(2026, 7, 31, 23, 59, 59, 0, time.UTC),
+			name:     "last month, relative to fixed now (2026-08-17)",
+			question: "지난달에 뭐 있었지",
+			wantFrom: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
+			// Half-open: July's window closes at the first instant of August.
+			wantTo:     time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
 			wantConfid: 1.0,
 		},
 	}

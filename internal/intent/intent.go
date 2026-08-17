@@ -189,30 +189,52 @@ func extractJSON(s string) string {
 	return s[start : end+1]
 }
 
-// monthRange returns [00:00:00 on day 1, 23:59:59 on the last day] of the
-// given year/month in loc. The last-day computation uses the standard Go
-// idiom: day 0 of the following month is the last day of the given month.
+// The three range helpers below all return a HALF-OPEN interval [from, to):
+// `from` is the first instant of the period and `to` is the first instant of
+// the NEXT period, never the period's own last second.
+//
+// This is not a stylistic choice. Params.OccurredFrom/OccurredTo are bound by
+// internal/store/document.go to `occurred_at >= $from AND occurred_at < $to` in
+// every retrieval lane. An upper bound of 23:59:59 under a strict `<` drops
+// everything in the final second of the period — and, worse, leaves a gap
+// between consecutive periods, so an event stamped in that gap belongs to
+// neither "어제" nor "오늘". Anchoring `to` to the next period's start makes
+// consecutive windows tile exactly: no gap, no overlap.
+//
+// All three resolve calendar boundaries in the caller's own location (the
+// clock's zone, via t.Location() / the loc argument), so "오늘" means today in
+// Seoul for a Seoul-based deployment rather than today in UTC.
+
+// monthRange returns [00:00:00 on day 1 of the given month, 00:00:00 on day 1
+// of the following month) in loc. December is handled by time.Date's own
+// normalisation: month 13 rolls over into January of the next year.
 func monthRange(year, month int, loc *time.Location) (time.Time, time.Time) {
 	from := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, loc)
-	to := time.Date(year, time.Month(month)+1, 0, 23, 59, 59, 0, loc)
+	to := time.Date(year, time.Month(month)+1, 1, 0, 0, 0, 0, loc)
 	return from, to
 }
 
-// dayRange returns [00:00:00, 23:59:59] for the calendar day containing t.
+// dayRange returns [00:00:00 today, 00:00:00 tomorrow) for the calendar day
+// containing t, in t's own location.
 func dayRange(t time.Time) (time.Time, time.Time) {
-	from := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
-	to := time.Date(t.Year(), t.Month(), t.Day(), 23, 59, 59, 0, t.Location())
-	return from, to
+	y, m, d := t.Date()
+	loc := t.Location()
+	// time.Date normalises an out-of-range day (Aug 32 -> Sep 1), and computing
+	// the next midnight directly — rather than adding 24h to `from` — keeps the
+	// bound correct in zones that observe DST, where a calendar day is not
+	// always 24 hours long. Korea has no DST, but the helper should not depend
+	// on that.
+	return time.Date(y, m, d, 0, 0, 0, 0, loc), time.Date(y, m, d+1, 0, 0, 0, 0, loc)
 }
 
-// weekRange returns [Monday 00:00:00, Sunday 23:59:59] of the ISO week
-// containing t.
+// weekRange returns [Monday 00:00:00, next Monday 00:00:00) of the ISO week
+// containing t. The upper bound comes from the day AFTER Sunday, so the week
+// is closed by the start of the next week rather than by Sunday's last second.
 func weekRange(t time.Time) (time.Time, time.Time) {
 	// time.Weekday: Sunday = 0 ... Saturday = 6. Convert to days since Monday.
 	daysSinceMonday := (int(t.Weekday()) + 6) % 7
 	monday := t.AddDate(0, 0, -daysSinceMonday)
 	from, _ := dayRange(monday)
-	sunday := monday.AddDate(0, 0, 6)
-	_, to := dayRange(sunday)
-	return from, to
+	y, m, d := from.Date()
+	return from, time.Date(y, m, d+7, 0, 0, 0, 0, from.Location())
 }

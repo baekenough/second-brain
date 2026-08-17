@@ -195,4 +195,22 @@ type SearchQuery struct {
 	UseHyDE            bool         // when true, expand query via HyDE before retrieval
 	Weights            SearchWeights // zero value uses defaults (k=60, equal weights)
 	UseRerank          bool         `json:"use_rerank,omitempty"` // when true, apply cross-encoder reranking post-retrieval
+
+	// OccurredFrom / OccurredTo constrain results to the half-open event-time
+	// window [OccurredFrom, OccurredTo) on documents.occurred_at. Either bound
+	// may be nil, meaning "unbounded on that side"; both nil disables the
+	// filter entirely.
+	//
+	// This is a CANDIDATE-POOL constraint, not a sort hint: the store applies
+	// it as a WHERE predicate inside every retrieval lane, exactly like
+	// SourceType/ExcludeSourceTypes. Sort="recent" cannot substitute for it —
+	// sorting can only reorder candidates that a lane already retrieved.
+	//
+	// Rows with occurred_at IS NULL are EXCLUDED whenever either bound is set.
+	// The comparison is deliberately made against occurred_at alone rather than
+	// COALESCE(occurred_at, collected_at): a large part of the corpus has a NULL
+	// occurred_at, and coalescing would silently reinterpret "ingested during
+	// the window" as "happened during the window".
+	OccurredFrom *time.Time
+	OccurredTo   *time.Time
 }

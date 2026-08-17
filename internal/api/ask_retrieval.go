@@ -59,8 +59,20 @@ func assembleRetrieval(ctx context.Context, searcher documentSearcher, params in
 		// not a separate field — no such field exists on model.SearchQuery.
 		base.Weights.EntityWeight = 1.5
 	case params.Kind == intent.KindTemporal && params.Confidence >= confidenceThreshold:
-		// Approximation only (spec discrepancy #3): model.SearchQuery has no
-		// date-range field, so recency sort is the best available proxy.
+		// The window intent.Classify computed is passed through to the store,
+		// which applies it as a WHERE predicate inside every retrieval lane.
+		// This is the part that actually retrieves: recency sort alone only
+		// permutes the candidates a lane already selected, so a source that is four
+		// orders of magnitude smaller than the corpus (calendar: ~14 documents
+		// against ~18k SMS) never entered the candidate set to be sorted.
+		//
+		// Sort stays "recent" as a secondary preference — within a window,
+		// newest-first is the sensible reading order.
+		//
+		// Bounds may be nil (LLM-classified temporal intent carries no dates);
+		// nil means "unbounded on that side" and is passed through as-is.
+		base.OccurredFrom = params.OccurredFrom
+		base.OccurredTo = params.OccurredTo
 		base.Sort = "recent"
 	case params.Kind == intent.KindExactToken:
 		// Best-effort nudge toward the bigram-similarity lane; does not fix
