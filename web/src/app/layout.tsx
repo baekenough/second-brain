@@ -48,12 +48,9 @@ export default function RootLayout({ children }: RootLayoutProps) {
               Second Brain
             </Link>
             <nav className="flex items-center gap-1 text-sm">
-              <Link
-                href="/ask"
-                className="rounded-md px-3 py-1.5 text-foreground-muted transition-colors hover:bg-surface-subtle hover:text-foreground"
-              >
-                Ask
-              </Link>
+              {/* Ask nav link removed: /api/v1/ask backend does not exist yet
+                  and was causing 404s in production. Restore once the Ask
+                  backend is implemented. */}
               <Link
                 href="/capture"
                 className="rounded-md px-3 py-1.5 text-foreground-muted transition-colors hover:bg-surface-subtle hover:text-foreground"
