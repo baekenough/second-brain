@@ -5,17 +5,28 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/google/uuid"
 )
 
-// defaultMaxTickDuration is the default hard ceiling for a single summarizer tick.
-// It must be shorter than the drain timeout in cmd/collector/main.go (10 s)
-// so that an in-progress tick can be cancelled before the process exits (#65).
-const defaultMaxTickDuration = 8 * time.Second
+// defaultDocTimeout is the default per-document deadline (LLM call + embed +
+// write). It replaces the old whole-tick maxTickDuration ceiling, which
+// assumed a fast local LLM (gemma3:4b on CPU) and silently truncated
+// multi-document batches once the backend became a remote API — a remote
+// chat-completion call alone can take 1-3s, making a shared 8s budget for an
+// entire BatchSize-document tick impossible to honour.
+const defaultDocTimeout = 30 * time.Second
+
+// defaultConcurrency is the default number of documents processed in
+// parallel per tick. A remote LLM call is latency-bound, not CPU-bound, so
+// running several requests concurrently is the primary throughput lever.
+// Kept conservative to avoid tripping a remote provider's rate limit.
+const defaultConcurrency = 5
 
 // SummaryStore is the persistence interface required by SummarizerWorker.
 //
@@ -31,7 +42,9 @@ type SummaryStore interface {
 	ListUnsummarized(ctx context.Context, limit int) ([]*model.Document, error)
 
 	// UpdateSummary persists the LLM summary for a single document.
-	// Idempotent: a no-op when title_summary is already set.
+	// Idempotent: a no-op when title_summary is already set. Must be safe to
+	// call concurrently for different document IDs — SummarizerWorker calls
+	// it from a bounded worker pool (#170).
 	UpdateSummary(ctx context.Context, id uuid.UUID, titleSummary, bulletSummary string, summaryEmbedding []float32) error
 }
 
@@ -56,17 +69,25 @@ type SummarizerConfig struct {
 	// BatchSize is the number of documents processed per tick.
 	// Defaults to 10 when zero or negative.
 	BatchSize int
-	// MaxTickDuration is the hard ceiling for a single tick (LLM + embed + write).
-	// It must be shorter than the drain timeout in cmd/collector/main.go (10 s).
-	// Defaults to defaultMaxTickDuration (8 s) when zero or negative.
-	MaxTickDuration time.Duration
+	// DocTimeout bounds a single document's summarization work (LLM call +
+	// optional embed + UpdateSummary write). Documents are independently
+	// idempotent (UpdateSummary's WHERE title_summary IS NULL guard), so a
+	// timed-out document simply stays unsummarized and is re-queued by
+	// ListUnsummarized on a later tick.
+	// Defaults to defaultDocTimeout (30 s) when zero or negative.
+	DocTimeout time.Duration
+	// Concurrency is the number of documents processed in parallel within a
+	// single tick via a bounded worker pool. A failure or timeout on one
+	// document never aborts the others.
+	// Defaults to defaultConcurrency (5) when zero or negative.
+	Concurrency int
 	// BackfillEnabled controls whether the worker scans for pre-existing
 	// unsummarized documents (WHERE title_summary IS NULL).
 	// When false, ListUnsummarized is not called and only documents summarized
 	// via an explicit call path are processed (future use).
 	// Defaults to true when not set, preserving existing behaviour.
-	// Set to false when running a slow local LLM (e.g. gemma3:4b on CPU) to
-	// avoid a flood of LLM calls for the pre-existing backlog (SUMMARIZER_BACKFILL_ENABLED=false).
+	// Set to false to skip the pre-existing backlog entirely
+	// (SUMMARIZER_BACKFILL_ENABLED=false).
 	BackfillEnabled *bool
 }
 
@@ -75,8 +96,13 @@ type SummarizerConfig struct {
 // the summary text, and persists the result via UpdateSummary.
 //
 // The worker respects the context lifetime: cancel the context to stop it.
-// An in-progress tick is bounded by maxTickDuration (8 s by default) so that
-// it always completes before the drain timeout in cmd/collector/main.go (#65).
+// Per-tick scheduling (deciding whether to start a NEW document) is governed
+// by the caller-supplied context. Documents already in flight run to
+// completion (or their own docTimeout deadline) on a context detached from
+// parent cancellation, so an in-progress UpdateSummary write is never
+// truncated mid-write — see tick() for the detail. This keeps
+// cmd/collector/main.go's shutdown drain window bounded by docTimeout
+// regardless of BatchSize or Concurrency (#65, #170).
 //
 // Concurrent instance safety relies on two mechanisms:
 //  1. UpdateSummary's idempotency guard (WHERE title_summary IS NULL) prevents
@@ -89,7 +115,8 @@ type SummarizerWorker struct {
 	embedder        Embedder
 	interval        time.Duration
 	batchSize       int
-	maxTickDuration time.Duration
+	docTimeout      time.Duration
+	concurrency     int
 	backfillEnabled bool
 }
 
@@ -110,9 +137,13 @@ func NewSummarizerWorker(cfg SummarizerConfig) *SummarizerWorker {
 	if batchSize <= 0 {
 		batchSize = 10
 	}
-	maxTick := cfg.MaxTickDuration
-	if maxTick <= 0 {
-		maxTick = defaultMaxTickDuration
+	docTimeout := cfg.DocTimeout
+	if docTimeout <= 0 {
+		docTimeout = defaultDocTimeout
+	}
+	concurrency := cfg.Concurrency
+	if concurrency <= 0 {
+		concurrency = defaultConcurrency
 	}
 	// BackfillEnabled defaults to true when not explicitly set (nil), preserving
 	// existing behaviour. Set to false to skip the ListUnsummarized scan.
@@ -126,7 +157,8 @@ func NewSummarizerWorker(cfg SummarizerConfig) *SummarizerWorker {
 		embedder:        cfg.Embedder,
 		interval:        interval,
 		batchSize:       batchSize,
-		maxTickDuration: maxTick,
+		docTimeout:      docTimeout,
+		concurrency:     concurrency,
 		backfillEnabled: backfill,
 	}
 }
@@ -137,13 +169,6 @@ func NewSummarizerWorker(cfg SummarizerConfig) *SummarizerWorker {
 //
 // When the LLM is not configured, a single startup log is emitted and the
 // loop runs without processing any documents (#67).
-//
-// Each tick receives a child context with a maxTickDuration deadline derived
-// from context.WithoutCancel(ctx) so that:
-//   - The tick is not interrupted by the parent SIGTERM (#65 — UpdateSummary
-//     must not be cut mid-write), AND
-//   - The tick is still bounded to maxTickDuration so it finishes well before
-//     the drain window in cmd/collector/main.go (#65).
 func (w *SummarizerWorker) Run(ctx context.Context) {
 	if !w.llm.Enabled() {
 		// #67: emit a single diagnostic log so operators can tell immediately
@@ -153,9 +178,13 @@ func (w *SummarizerWorker) Run(ctx context.Context) {
 		return
 	}
 
-	slog.Info("summarizer worker started", "interval", w.interval, "batch_size", w.batchSize)
-	// Initial tick: detached from parent signal but bounded by maxTickDuration.
-	w.runTick(ctx)
+	slog.Info("summarizer worker started",
+		"interval", w.interval,
+		"batch_size", w.batchSize,
+		"doc_timeout", w.docTimeout,
+		"concurrency", w.concurrency,
+	)
+	w.tick(ctx)
 
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
@@ -166,28 +195,36 @@ func (w *SummarizerWorker) Run(ctx context.Context) {
 			slog.Info("summarizer worker stopped")
 			return
 		case <-ticker.C:
-			w.runTick(ctx)
+			w.tick(ctx)
 		}
 	}
 }
 
-// runTick wraps tick with a bounded context: detached from parent cancellation
-// (so SIGTERM mid-write does not truncate UpdateSummary) but capped at
-// w.maxTickDuration (so the tick always completes before the drain timeout).
-func (w *SummarizerWorker) runTick(ctx context.Context) {
-	tickCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.maxTickDuration)
-	defer cancel()
-	w.tick(tickCtx)
-}
-
-// tick processes one batch of unsummarized documents.
-// It uses a plain ListUnsummarized (no row locks / no long-lived transaction).
-// Concurrent instances may process the same document, but UpdateSummary's
-// idempotency guard (WHERE title_summary IS NULL) prevents double-writes (#64).
+// tick processes one batch of unsummarized documents through a bounded
+// worker pool (size w.concurrency). It uses a plain ListUnsummarized (no row
+// locks / no long-lived transaction). Concurrent instances may process the
+// same document, but UpdateSummary's idempotency guard (WHERE title_summary
+// IS NULL) prevents double-writes (#64).
 //
-// When backfillEnabled is false, the ListUnsummarized scan is skipped entirely.
-// This prevents a flood of LLM calls for the pre-existing backlog when running
-// a slow local LLM (e.g. gemma3:4b on CPU) — set SUMMARIZER_BACKFILL_ENABLED=false.
+// Deadline model (#170 — replaces the old whole-tick maxTickDuration):
+//   - ctx (the caller-supplied, cancellable context) governs whether tick
+//     starts NEW document work. Between documents (and while waiting for a
+//     free worker-pool slot) the loop checks ctx.Done() and stops launching
+//     new work as soon as the parent is cancelled.
+//   - Each document that IS launched runs on docCtx, derived from
+//     context.WithoutCancel(ctx) (so SIGTERM never truncates an in-flight
+//     UpdateSummary write) bounded by w.docTimeout (so a hung remote LLM call
+//     cannot block the worker forever).
+//
+// Because at most w.concurrency documents are ever in flight, and each is
+// bounded by w.docTimeout, tick() always returns within roughly one
+// docTimeout of ctx being cancelled — independent of BatchSize. This is what
+// keeps cmd/collector/main.go's shutdown drain window correct (see the
+// drainTimeout derivation there).
+//
+// When backfillEnabled is false, the ListUnsummarized scan is skipped
+// entirely — set SUMMARIZER_BACKFILL_ENABLED=false to opt out of the
+// pre-existing backlog.
 func (w *SummarizerWorker) tick(ctx context.Context) {
 	if !w.backfillEnabled {
 		slog.Debug("summarizer: backfill disabled — skipping ListUnsummarized scan")
@@ -203,22 +240,60 @@ func (w *SummarizerWorker) tick(ctx context.Context) {
 		return
 	}
 
-	slog.Info("summarizer: processing batch", "count", len(docs))
-	succeeded := 0
+	slog.Info("summarizer: processing batch", "count", len(docs), "concurrency", w.concurrency)
+
+	// detachedBase strips ctx's cancellation/deadline so an in-flight
+	// document's LLM call / embed / write is never cut mid-write by parent
+	// SIGTERM (#65). Each document still gets its own bounded deadline below.
+	detachedBase := context.WithoutCancel(ctx)
+
+	var attempted, succeeded int64
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, w.concurrency)
+
+docLoop:
 	for _, doc := range docs {
-		if err := w.summarizeOne(ctx, doc); err != nil {
-			slog.Warn("summarizer: summarize failed",
-				"doc_id", doc.ID,
-				"source_id", doc.SourceID,
-				"error", err)
-			continue
+		// Stop launching NEW work once the parent context is cancelled.
+		// Already-launched documents keep running on detachedBase, bounded
+		// individually by docTimeout.
+		select {
+		case <-ctx.Done():
+			break docLoop
+		default:
 		}
-		succeeded++
+
+		select {
+		case <-ctx.Done():
+			break docLoop
+		case sem <- struct{}{}:
+		}
+
+		atomic.AddInt64(&attempted, 1)
+		wg.Add(1)
+		go func(doc *model.Document) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			docCtx, cancel := context.WithTimeout(detachedBase, w.docTimeout)
+			defer cancel()
+
+			if err := w.summarizeOne(docCtx, doc); err != nil {
+				slog.Warn("summarizer: summarize failed",
+					"doc_id", doc.ID,
+					"source_id", doc.SourceID,
+					"error", err)
+				return
+			}
+			atomic.AddInt64(&succeeded, 1)
+		}(doc)
 	}
 
+	wg.Wait()
+
 	slog.Info("summarizer: batch complete",
-		"processed", len(docs),
-		"succeeded", succeeded,
+		"listed", len(docs),
+		"attempted", atomic.LoadInt64(&attempted),
+		"succeeded", atomic.LoadInt64(&succeeded),
 	)
 }
 
