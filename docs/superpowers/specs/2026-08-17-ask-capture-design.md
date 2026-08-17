@@ -4,6 +4,8 @@
 **대상**: `web/` (Next.js) + Go API 서버 (`cmd/server`) + 컬렉터 데몬 (`cmd/collector`)
 **상태**: 설계 확정 — 구현 전
 
+> **개정 (2026-08-17)**: §7 프론트엔드 설계의 UI 라이브러리 결정을 뒤집었다. 원래 채택했던 AWS Cloudscape 대신, `DESIGN.md`(https://github.com/VoltAgent/awesome-design-md, linear.app 항목) 토큰 스펙을 `web/`이 이미 쓰고 있는 Tailwind 4 위에 직접 적용한다. §2·§4·§7·§12·§14의 Cloudscape 관련 서술을 모두 이 결정으로 교체했다 — 취소선이나 원문 보존 없이 교체하되, 무엇이 왜 바뀌었는지는 §7.1에 남긴다. **모바일 레이아웃 요구사항(Ask 하단 고정 입력창, Capture 단일 필드+큰 저장 버튼)은 이 개정으로 사라지지 않는다** — 오히려 컴포넌트 라이브러리의 기본값을 거스를 필요가 없어져 구현이 더 쉬워졌다.
+
 ---
 
 ## 1. 개요
@@ -31,7 +33,7 @@ second-brain은 지금까지 SMS·통화·Gmail·Slack·GitHub·파일시스템 
 
 ### 비목표
 
-- `dashboard`, `governance`, `api-docs`, `login`, `documents/[id]` 다섯 개 기존 페이지의 Cloudscape 마이그레이션 — 후속 작업으로 별도 추적.
+- `dashboard`, `governance`, `api-docs`, `login`, `documents/[id]` 다섯 개 기존 페이지에 신규 디자인 토큰(§7.1)을 전면 적용하는 것 — 후속 작업으로 별도 추적. (2026-08-17 개정: 이전에는 "Cloudscape 마이그레이션"이었으나, Cloudscape 자체를 채택하지 않기로 하면서 대상이 바뀌었다. 다섯 페이지는 이미 Tailwind 커스텀 컴포넌트로 되어 있으므로 이번 개정은 오히려 이 비목표의 범위를 좁힌다 — 새 토큰으로 갈아 끼우는 일만 남는다.)
 - 노트가 아닌 다른 소스(SMS, 통화, Gmail 등)로부터의 암묵지 추출 — v1은 노트에서만 추론한다(§10).
 - 기존 `llm-memory` 소스(19,933건, MCP `add_note`로 과거 작성된 문서)의 마이그레이션 — 그대로 둔다(§3.3).
 - `brain.baekenough.com` 경로 변경 — 폰의 유일한 ingest 경로이며 건드리지 않는다(§8).
@@ -94,7 +96,7 @@ const (
 ## 4. 아키텍처 개요
 
 ```
-브라우저 (Cloudscape UI)
+브라우저 (Next.js + Tailwind 4, linear.app 기반 디자인 토큰)
   │  next-auth 세션 쿠키
   ▼
 Next.js route handlers (web/src/app/api/v1/ask, web/src/app/api/v1/notes)
@@ -352,21 +354,35 @@ type NoteEnrichmentLister interface {
 
 ## 7. 프론트엔드 설계
 
-### 7.1 Cloudscape 도입
+### 7.1 디자인 토큰 채택 (2026-08-17 개정 — 원래 결정은 AWS Cloudscape였음)
 
-`web/`(Next.js 16.2.3, React 19.2.5)의 현재 커스텀 UI 컴포넌트는 `web/src/components/ui/`의 `Card`, `Badge`, `Button`, `Spinner` 네 개뿐이다. AWS Cloudscape Design System을 통째로 도입한다. 이번 작업 범위는 Ask·Capture 화면과 앱 셸(내비게이션, 레이아웃 프레임)뿐이다 — 기존 다섯 페이지(`dashboard`, `governance`, `api-docs`, `login`, `documents/[id]`)의 Cloudscape 전환은 하지 않는다(후속 작업).
+**뒤집힌 결정과 사유**. 이 절의 원래 버전은 AWS Cloudscape Design System을 통째로 도입하는 안이었다. 그 결정을 뒤집는다. 대신 [`DESIGN.md` 토큰 스펙](https://github.com/VoltAgent/awesome-design-md)(`design-md/linear.app/DESIGN.md`)을 `web/`에 `web/DESIGN.md`로 벤더링하고, 이를 `web/`이 이미 쓰고 있는 Tailwind 4의 CSS-first `@theme` 설정(`web/src/app/globals.css`)에 직접 반영한다. 새 컴포넌트 라이브러리를 추가하지 않는다.
+
+사유 세 가지:
+
+1. **Cloudscape는 데스크톱 콘솔 지향이고, 원래 명세 자신이 그 약점을 지적했다.** §7.2·§7.3의 원래 버전은 "Cloudscape는 데스크톱 콘솔 지향의 정보 밀도가 높은 시스템이라 기본 컴포지션이 폰 화면에서 그대로 동작하지 않는다"고 명시하며 모바일을 프론트엔드 리스크 1순위로 꼽았다. 토큰 기반 Tailwind는 애초에 컴포넌트가 강요하는 레이아웃이 없으므로, 이 앱이 필요로 하는 모바일 레이아웃(§7.2·§7.3 유지)을 처음부터 완전히 통제할 수 있다.
+2. **Cloudscape는 그 자체로 강한 시각적 정체성을 가진다.** AWS 콘솔류의 정보 밀도·컴포넌트 크롬은 이번에 채택한 linear.app 계열 디자인 언어(§7.1.1)와 정면으로 충돌한다. 두 정체성을 한 앱에 공존시키느니, 처음부터 하나를 선택한다.
+3. **컴포넌트 라이브러리를 정당화할 마이그레이션 비용이 애초에 없었다.** `web/`은 이미 Tailwind 4를 쓰고 있고, 커스텀 UI 컴포넌트는 `web/src/components/ui/`의 `Card`, `Badge`, `Button`, `Spinner` 네 개뿐이다(§7.1 원래 버전이 스스로 이 사실을 언급했다). 컴포넌트 라이브러리 도입은 보통 "밑바닥부터 다시 만들 컴포넌트가 너무 많다"는 이유로 정당화되는데, 이 앱에는 그 이유가 없다.
+
+#### 7.1.1 채택 디자인: linear.app
+
+톤은 linear.app — 거의 검정에 가까운 캔버스(`#010102`), 단일 라벤더-블루 액센트(`#5e6ad2`), 헤어라인 보더를 가진 차콜 서페이스, 밀도 높고 기술적인 인상. 이 앱은 매일 쓰는 개인 도구이고(단일 액센트 원칙이 정보 밀도 높은 UI를 차분하게 유지한다), 야간 캡처가 잦으므로(다크 퍼스트가 유리하다) 이 톤이 맞다.
+
+**주의 — 마케팅 사이트에서 추출된 스펙의 한계**: `DESIGN.md` 계열 저장소는 실제 제품 UI가 아니라 마케팅 랜딩 페이지에서 토큰을 추출한다. 색상·서페이스·헤어라인 보더·단일 액센트 원칙은 그대로 채택하되, **타입 스케일(예: display-xl 80px급)은 애플리케이션 UI에 맞지 않으므로 그대로 쓰지 않는다** — 밀도 높은 앱 UI에 맞게 별도로 재도출한다(구체 값은 프론트엔드 구현 계획 `docs/superpowers/plans/2026-08-17-ask-capture-frontend.md`에 있다). 이 한계는 벤더링된 `web/DESIGN.md` 파일 상단 주석에도 명시한다.
+
+이번 작업 범위는 Ask·Capture 화면과 앱 셸(내비게이션, 레이아웃 프레임)뿐이다 — 기존 다섯 페이지(`dashboard`, `governance`, `api-docs`, `login`, `documents/[id]`)에 새 토큰을 전면 적용하는 일은 하지 않는다(후속 작업, §2 비목표).
 
 ### 7.2 Ask 화면
 
-**데스크톱**: Cloudscape 기본 컴포지션(`AppLayout` + `SpaceBetween` + `Chat`류 패턴) — 질문 입력, 스트리밍 답변, 하단에 출처 카드 목록. 출처 카드는 `source_type`에 따라 시각적으로 구분한다(`insight`는 별도 배지로 "추론" 표시, 클릭 시 원본 노트로 이동 가능하도록 `provenance.source_note_id` 활용).
+**데스크톱**: 질문 입력, 스트리밍 답변, 하단(또는 옆)에 출처 카드 목록 — Tailwind 커스텀 컴포넌트로 직접 구성한다. 출처 카드는 `source_type`에 따라 시각적으로 구분한다(`insight`는 별도 배지로 "추론" 표시, 클릭 시 원본 노트로 이동 가능하도록 `provenance.source_note_id` 활용).
 
-**모바일**: Cloudscape는 데스크톱 콘솔 지향의 정보 밀도가 높은 시스템이라 기본 컴포지션이 폰 화면에서 그대로 동작하지 않는다. 의도적으로 Cloudscape 기본값에서 벗어나, 세로 스택 레이아웃 + 화면 하단 고정 입력창으로 구성한다.
+**모바일**: 세로 스택 레이아웃 + 화면 하단 고정 입력창으로 구성한다. (2026-08-17 개정: 원래 이 요구사항은 "Cloudscape 기본값에서 의도적으로 벗어나는" 구성으로 서술되어 있었다. 토큰 기반 Tailwind로 바뀌면서 벗어나야 할 컴포넌트 기본값 자체가 없어졌다 — 요구사항은 그대로이지만 지금은 유일한 구성이지 예외적 이탈이 아니다.)
 
 ### 7.3 Capture 화면
 
 **데스크톱**: 단일 텍스트 영역 + 저장 버튼. 저장 후 enrichment 상태(`pending`/`done`/`failed`)를 노트 목록에서 확인 가능. 터미널 `failed`(3회 실패) 노트는 실패 사유와 함께 재시도 버튼이 노출되며, 클릭 시 `POST /api/v1/notes/{id}/retry-enrichment`를 호출한다(§6.3).
 
-**모바일**: 입력 마찰을 최소화하기 위해 필드 하나 + 큰 저장 버튼만 노출한다. 이 역시 Cloudscape 기본 데스크톱 폼 컴포지션에서 의도적으로 벗어난 구성이다.
+**모바일**: 입력 마찰을 최소화하기 위해 필드 하나 + 큰 저장 버튼만 노출한다. (2026-08-17 개정: §7.2와 동일한 이유로 "Cloudscape 기본 데스크톱 폼 컴포지션에서 벗어나는" 서술을 제거했다 — 요구사항 자체는 유지된다.)
 
 ### 7.4 인증
 
@@ -475,16 +491,22 @@ second-brain/
 │   ├── mcp/main.go                  # 수정 — internal/note 호출로 교체, SourceLLMMemory 유지
 │   └── collector/main.go            # 수정 — NoteEnrichmentWorker 등록
 └── web/
+    ├── DESIGN.md                                # 신규 — linear.app 디자인 토큰 벤더링본 (2026-08-17 개정, §7.1)
     └── src/
         ├── app/
+        │   ├── globals.css                      # 수정 — @theme을 linear.app 토큰으로 교체 (§7.1)
         │   ├── ask/page.tsx                     # 신규
         │   ├── capture/page.tsx                 # 신규
-        │   └── api/v1/
-        │       ├── ask/route.ts                 # 신규 — SSE pass-through 프록시
-        │       └── notes/route.ts               # 신규 — 프록시
-        └── components/
-            └── cloudscape/                      # 신규 — Cloudscape 기반 앱 셸 + Ask/Capture 전용 컴포넌트
+        │   └── api/                             # 신규 라우트는 /api/v1/* 가 아니라 /api/* 하위에 둔다
+        │       ├── ask/route.ts                 # 신규 — SSE pass-through 프록시 (OAuth 세션 보호, api/search 패턴)
+        │       ├── notes/route.ts               # 신규 — 프록시 (OAuth 세션 보호, api/documents 패턴)
+        │       └── notes/[id]/
+        │           ├── route.ts                 # 신규 — DELETE 프록시
+        │           └── retry-enrichment/route.ts  # 신규 — POST 프록시
+        └── components/                          # 신규 컴포넌트는 기존 components/ui/ 관례를 따른다 (별도 라이브러리 디렉터리 없음, §7.1)
 ```
+
+**(2026-08-17 개정) 라우트 경로 주의**: 원래 명세는 `web/src/app/api/v1/ask/route.ts`, `web/src/app/api/v1/notes/route.ts`를 지정했다. 그러나 `web/src/proxy.ts`(Edge Middleware)는 `/api/v1/*` 전체를 OAuth 세션 검사에서 **제외**한다 — 그 경로는 폰 앱이 자기 자신의 Bearer `API_KEY`를 그대로 전달하는 용도로 예약되어 있다(`web/src/app/api/v1/ingest/*`가 이 패턴). Ask·Capture 신규 라우트를 문자 그대로 `api/v1/` 아래 두면 로그인하지 않은 브라우저도 호출할 수 있게 된다 — 서버가 자체 `API_KEY`로 Go 백엔드를 호출하는 한, 세션 검사가 없으면 인증 자체가 우회된다. 그래서 새 라우트는 `api/v1/` 프리픽스가 아니라 `web/src/app/api/ask/route.ts`, `web/src/app/api/notes/route.ts` 아래 둔다 — 이는 이미 이 계층에 존재하는 `web/src/app/api/search/route.ts`, `web/src/app/api/documents/route.ts`와 동일한 패턴(서버가 `API_KEY`를 직접 들고 있고, `proxy.ts`의 캐치올 매처가 세션을 요구)이다. 상세는 프론트엔드 구현 계획 참조.
 
 ---
 
@@ -511,6 +533,6 @@ second-brain/
 1. **Go 서버 먼저**: `internal/note` 패키지 추출(기존 `add_note` 동작 회귀 없음을 `cmd/mcp` 테스트로 확인) → `SourceNote`/`SourceInsight` 모델 추가 → `LLM_ASK_MODEL`/`ASK_CONTEXT_TOP_K`/`ASK_CONTEXT_INSIGHT_M` config 추가 → `POST /api/v1/notes` 구현 → `llm.Client.StreamWithMessages` 추가 → `POST /api/v1/ask` 구현 → 핸들러 테스트 통과.
 2. **워커**: `NoteEnrichmentWorker` 구현(단일 LLM 호출 + 3회 재시도 정책 + 인사이트 3건 상한, §6.3–§6.4) → `POST /api/v1/notes/{id}/retry-enrichment` 구현 → `cmd/collector`에 등록 → `EntityLinker.UpsertAndLinkEntities` 재사용 검증.
 3. **프롬프트 검증(실측 단계)**: 실제 노트 샘플로 enrichment 프롬프트의 출력 품질(정리 필드 정확도, 암묵지 후보가 §6.4 허용 범위를 벗어나지 않는지)과 노트당 비용·지연을 측정한다 — 결과에 따라 `LLM_ASK_MODEL` 프롬프트 템플릿을 조정한다. `ASK_CONTEXT_TOP_K`/`ASK_CONTEXT_INSIGHT_M`(기본 12/3)도 실제 프롬프트 토큰 사용량을 측정해 튜닝한다(§5.2). 이 단계 전까지는 §13의 세부 사항(백오프 간격, confidence 임계값)도 확정하지 않는다.
-4. **프론트엔드**: Cloudscape 도입(앱 셸만) → Ask/Capture 페이지 구현(데스크톱 우선, 실패 노트 재시도 UI 포함) → 모바일 레이아웃 추가 → route handler 프록시(SSE pass-through 포함) 구현.
+4. **프론트엔드**: `web/DESIGN.md` 벤더링 + Tailwind `@theme` 토큰 반영(§7.1) → 앱 셸(내비게이션) 갱신 → Capture 페이지 구현(데스크톱 우선, 실패 노트 재시도 UI 포함) → Ask 페이지 구현 → 모바일 레이아웃 추가 → route handler 프록시(SSE pass-through 포함) 구현. 상세 태스크 순서는 `docs/superpowers/plans/2026-08-17-ask-capture-frontend.md` 참조 — Ask 관련 태스크는 `POST /api/v1/ask` 백엔드가 별도 계획(LATER)이므로 맨 뒤로 순서가 밀린다.
 5. **배포**: `docker-compose.local.yml`의 `web` 서비스 재기동 → `sb.baekenough.com` cloudflared ingress 추가 → `brain.baekenough.com` 무변경 확인 → Mac mini 배포·검증.
-6. **후속**: 기존 5개 페이지 Cloudscape 마이그레이션(별도 작업), §13 잔여 세부 사항 순차 확정.
+6. **후속**: 기존 5개 페이지에 §7.1 토큰 전면 적용(별도 작업), §13 잔여 세부 사항 순차 확정.

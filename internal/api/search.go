@@ -11,6 +11,15 @@ import (
 	"github.com/baekenough/second-brain/internal/model"
 )
 
+// The insight-exclusion default (spec §3.2 echo-chamber guard 4, §6.5) used to
+// be applied here, in these two handlers. It now lives in
+// search.Service.Search, because three other callers of the same service —
+// the Discord RAG gateway, the GraphQL search resolver and the MCP search tool
+// — went through no handler at all and so got no exclusion. The call sites
+// here are removed rather than left as no-ops: keeping them would imply the
+// handler is where the policy lives, and the next endpoint added would be
+// written to match.
+
 // searchRequest is the JSON body for POST /api/v1/search.
 // It mirrors model.SearchQuery but uses snake_case JSON tags explicitly so that
 // include_deleted is properly decoded from the request body.
@@ -20,10 +29,10 @@ type searchRequest struct {
 	ExcludeSourceTypes []model.SourceType `json:"exclude_source_types"` // source types to exclude
 	Limit              int                `json:"limit"`
 	IncludeDeleted     bool               `json:"include_deleted"`
-	Sort               string             `json:"sort"`              // "relevance" (default) | "recent"
-	UseHyDE            bool               `json:"use_hyde,omitempty"`    // opt-in HyDE query expansion; default false
-	UseRerank          bool               `json:"use_rerank,omitempty"`  // opt-in cross-encoder reranking; default false
-	Curated            bool               `json:"curated,omitempty"`     // opt-in LLM curation and re-ranking; default false
+	Sort               string             `json:"sort"`                 // "relevance" (default) | "recent"
+	UseHyDE            bool               `json:"use_hyde,omitempty"`   // opt-in HyDE query expansion; default false
+	UseRerank          bool               `json:"use_rerank,omitempty"` // opt-in cross-encoder reranking; default false
+	Curated            bool               `json:"curated,omitempty"`    // opt-in LLM curation and re-ranking; default false
 }
 
 // searchHandler handles POST /api/v1/search.

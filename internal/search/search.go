@@ -8,10 +8,10 @@ import (
 	"log/slog"
 	"unicode/utf8"
 
-	"github.com/google/uuid"
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/store"
+	"github.com/google/uuid"
 )
 
 // EntityFetcher retrieves entities linked to a set of documents.
@@ -101,9 +101,65 @@ func (s *Service) WithEntityFetcher(ef EntityFetcher) *Service {
 	return s
 }
 
+// applyInsightExclusionDefault enforces the permanent policy from the Capture
+// spec (§3.2 echo-chamber guard 4, §6.5): model-derived insight documents are
+// excluded from search results by default. The ONLY way to see them is an
+// explicit SourceType == model.SourceInsight request.
+//
+// This lives in the service, not in a handler, because the guard is a property
+// of retrieval rather than of one HTTP endpoint. It previously sat in
+// internal/api's two search handlers, which left three callers of this same
+// service with no exclusion at all — including the Discord gateway, which
+// feeds retrieval results to an LLM that answers users in prose. An unlabelled
+// inference reaching that path is spoken back as fact, which is precisely the
+// echo chamber the guard exists to prevent. Putting it here means every lane
+// and every caller inherits it, and a new caller cannot forget to opt in.
+func applyInsightExclusionDefault(q model.SearchQuery) model.SearchQuery {
+	if q.SourceType != nil && *q.SourceType == model.SourceInsight {
+		return q
+	}
+	for _, st := range q.ExcludeSourceTypes {
+		if st == model.SourceInsight {
+			return q
+		}
+	}
+	q.ExcludeSourceTypes = append(q.ExcludeSourceTypes, model.SourceInsight)
+	return q
+}
+
+// dropExcludedSourceTypes removes results whose SourceType appears in
+// q.ExcludeSourceTypes.
+//
+// The document store applies the exclusion in SQL, but the chunk lanes do not:
+// ChunkSearcher takes only a query/vector and a limit, so chunk hits arrive
+// unfiltered and carry the document's source type alongside them. Filtering
+// them here — before RRF fusion, so ranks are computed over the surviving
+// candidates rather than re-ordered afterwards — closes the gap without
+// changing the ranking of legitimately-included documents.
+func dropExcludedSourceTypes(q model.SearchQuery, results []*model.SearchResult) []*model.SearchResult {
+	if len(q.ExcludeSourceTypes) == 0 || len(results) == 0 {
+		return results
+	}
+	excluded := make(map[model.SourceType]struct{}, len(q.ExcludeSourceTypes))
+	for _, st := range q.ExcludeSourceTypes {
+		excluded[st] = struct{}{}
+	}
+	out := make([]*model.SearchResult, 0, len(results))
+	for _, r := range results {
+		if _, skip := excluded[r.SourceType]; skip {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
 // Search executes a search for the given query. If an embedding client is
 // configured, the query text is embedded and the result is used for hybrid
 // (RRF) search; otherwise only full-text search is performed.
+//
+// Insight documents are excluded by default on every lane; see
+// applyInsightExclusionDefault.
 //
 // When q.UseHyDE is true and an LLM client is configured, the query is
 // expanded via HyDE (Hypothetical Document Embeddings) before retrieval.
@@ -120,6 +176,11 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	if q.Limit <= 0 {
 		q.Limit = 20
 	}
+
+	// Applied before anything else so every downstream lane — the store's SQL
+	// filters, the chunk lanes' post-filter, and the reranker's input set —
+	// sees the same exclusion list.
+	q = applyInsightExclusionDefault(q)
 
 	// Apply service-level weights when the caller has not set explicit weights.
 	// A zero-value Weights field means "use defaults", so we only overwrite
@@ -162,7 +223,7 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 		if cerr != nil {
 			slog.Warn("search: chunk vector search failed, skipping",
 				"error", cerr, "query", q.Query)
-		} else if len(chunkVecResults) > 0 {
+		} else if chunkVecResults = dropExcludedSourceTypes(q, chunkVecResults); len(chunkVecResults) > 0 {
 			results = mergeRRF(results, chunkVecResults, q.Limit)
 		}
 	}
@@ -179,7 +240,7 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 			)
 			return results, nil
 		}
-		results = chunkResults
+		results = dropExcludedSourceTypes(q, chunkResults)
 	}
 
 	// Cross-encoder reranking: opt-in per-request via UseRerank.

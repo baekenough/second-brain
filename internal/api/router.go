@@ -87,6 +87,14 @@ type Server struct {
 	// route is registered. Set via WithCollectStatus before calling Handler().
 	collectStatus CollectionStatusProvider
 
+	// notesUpserter, notesChunks, and notesEmbedder are optional. When
+	// notesUpserter is non-nil, POST /api/v1/notes,
+	// POST /api/v1/notes/{id}/retry-enrichment, and DELETE /api/v1/notes/{id}
+	// are registered. Set via WithNotes before calling Handler().
+	notesUpserter NotesUpserter
+	notesChunks   IngestFileChunkWriter
+	notesEmbedder IngestFileEmbedder
+
 	// piiNumberHashingEnabled mirrors cfg.PIINumberHashingEnabled (issue #164
 	// policy reversal). Zero value (false) is the new default and is used by
 	// both ingestMessagesHandler (smsmap.MapSMS/MapCall) and
@@ -206,6 +214,11 @@ func (s *Server) buildHandler() http.Handler {
 		}
 		if s.recordingUpserter != nil && s.recordingDir != "" {
 			r.Post("/api/v1/ingest/recording", s.ingestRecordingHandler)
+		}
+		if s.notesUpserter != nil {
+			r.Post("/api/v1/notes", s.createNoteHandler)
+			r.Post("/api/v1/notes/{id}/retry-enrichment", s.retryEnrichmentHandler)
+			r.Delete("/api/v1/notes/{id}", s.deleteNoteHandler)
 		}
 	})
 

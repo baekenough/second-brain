@@ -84,29 +84,6 @@ func run() error {
 	// window on SIGTERM before the process exits (#65).
 	var wg sync.WaitGroup
 
-	// drainTimeout is the maximum time to wait for in-flight ticks to finish
-	// after the shutdown signal is received.
-	//
-	// It is derived from cfg.SummarizerDocTimeout (default 30s) rather than a
-	// bare constant: SummarizerWorker detaches an in-flight document's LLM
-	// call + embed + UpdateSummary write from SIGTERM (context.WithoutCancel)
-	// so the write is never truncated mid-write, and bounds that work only by
-	// SummarizerDocTimeout (#170, was a fixed 8s "maxTickDuration" tuned for a
-	// fast local LLM — see summarizer.go doc comments). If drainTimeout were
-	// still a hardcoded value shorter than the configured doc timeout, a
-	// SIGTERM during an in-flight document could be killed by drainTimeout
-	// before the detached UpdateSummary write completes, defeating the whole
-	// point of detaching it. The +10s margin covers goroutine
-	// scheduling/cleanup overhead on top of the LLM/embed/write budget itself.
-	//
-	// The entity-extraction and extraction-retry workers use the raw
-	// (non-detached) shutdown context directly, so they are cancelled
-	// near-instantly and do not drive this timeout.
-	drainTimeout := cfg.SummarizerDocTimeout + 10*time.Second
-	if drainTimeout < 15*time.Second {
-		drainTimeout = 15 * time.Second
-	}
-
 	// --- Extraction retry worker ---
 	// Periodically re-attempts failed file extractions.
 	// Remote-source failures (Discord/Slack attachments) are retried via
@@ -218,6 +195,66 @@ func run() error {
 		}
 		entityWorker.Run(ctx)
 	}()
+
+	// --- Note enrichment worker (Capture backend) ---
+	// Runs unconditionally, like retryWorker and summarizerWorker — unlike
+	// entity extraction, there is no feature-flag gate here because Capture
+	// notes are only created via an explicit user action (POST
+	// /api/v1/notes), not a bulk backfill over the existing 46,000+ document
+	// corpus. The worker itself idles gracefully when llmClient.Enabled() is
+	// false (see NoteEnrichmentWorker.Run), matching EntityWorker's pattern.
+	//
+	// LLMTimeout is passed explicitly rather than left to the worker's own
+	// default: the worker derives its per-note work deadline FROM the LLM
+	// client's timeout (see note_enrichment_worker.go's deadline model), and
+	// passing the same cfg value used to construct llmClient above is what
+	// keeps that relationship a wiring fact instead of two constants that
+	// happen to agree today.
+	noteEnrichmentWorker := worker.NewNoteEnrichmentWorker(worker.NoteEnrichmentWorkerConfig{
+		Store:      docStore,
+		Insights:   worker.NewInsightSaver(docStore, chunkStore, embedClient),
+		Entities:   entityStore,
+		LLM:        llmClient,
+		Interval:   5 * time.Minute,
+		BatchSize:  5,
+		LLMTimeout: time.Duration(cfg.LLMTimeoutSeconds) * time.Second,
+	})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		noteEnrichmentWorker.Run(ctx)
+	}()
+
+	// drainTimeout is the maximum time to wait for in-flight ticks to finish
+	// after the shutdown signal is received.
+	//
+	// It is derived from the workers that DETACH writes from the shutdown
+	// context (context.WithoutCancel) rather than from a bare constant. Those
+	// writes keep running after SIGTERM by design, so the drain window has to
+	// outlast them or the process exits mid-write — defeating the whole point
+	// of detaching them.
+	//
+	//   - SummarizerWorker detaches a whole document (LLM call + embed +
+	//     UpdateSummary) and bounds it by SummarizerDocTimeout (default 30 s;
+	//     #170, was a fixed 8 s "maxTickDuration" tuned for a fast local LLM).
+	//   - NoteEnrichmentWorker detaches only its WRITE phases — its LLM call
+	//     is cancelled by the shutdown context — so it contributes
+	//     MaxDetachedWriteDuration() (persist + two bookkeeping budgets),
+	//     not its much larger LLM work budget. The status write it protects
+	//     is the one that enforces the enrichment retry cap.
+	//
+	// The +10s margin covers goroutine scheduling/cleanup overhead on top of
+	// those budgets. The entity-extraction and extraction-retry workers use
+	// the raw (non-detached) shutdown context directly, so they are cancelled
+	// near-instantly and do not drive this timeout.
+	drainTimeout := cfg.SummarizerDocTimeout
+	if d := noteEnrichmentWorker.MaxDetachedWriteDuration(); d > drainTimeout {
+		drainTimeout = d
+	}
+	drainTimeout += 10 * time.Second
+	if drainTimeout < 15*time.Second {
+		drainTimeout = 15 * time.Second
+	}
 
 	// --- Collectors ---
 	// Discord is intentionally excluded from the collector daemon; it is handled

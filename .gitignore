@@ -53,6 +53,9 @@ node_modules/
 
 # TypeScript build info
 web/tsconfig.tsbuildinfo
+
+# web/ uses bun (web/bun.lock is the tracked lockfile) — never commit npm's lockfile
+web/package-lock.json
 .omx/
 
 temp/

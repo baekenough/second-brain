@@ -10,11 +10,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/baekenough/second-brain/internal/model"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/pgvector/pgvector-go"
-	"github.com/baekenough/second-brain/internal/model"
 )
 
 // summaryCoverageCache is a process-level cache for SummaryCoverageRatio results.
@@ -65,11 +65,11 @@ const callTranscriptDupCheckQuery = `
 // Change detection uses a WITH CTE that captures the pre-update content in the
 // same MVCC snapshot as the INSERT … ON CONFLICT statement, then compares it
 // against the incoming value in RETURNING. This avoids two PostgreSQL pitfalls:
-//   1. EXCLUDED cannot be referenced in the RETURNING clause (only valid inside
-//      ON CONFLICT DO UPDATE SET/WHERE).
-//   2. `documents.col` in RETURNING reflects the post-update value, so a naive
-//      `documents.content IS DISTINCT FROM EXCLUDED.content` would always be
-//      false after the UPDATE overwrites the column.
+//  1. EXCLUDED cannot be referenced in the RETURNING clause (only valid inside
+//     ON CONFLICT DO UPDATE SET/WHERE).
+//  2. `documents.col` in RETURNING reflects the post-update value, so a naive
+//     `documents.content IS DISTINCT FROM EXCLUDED.content` would always be
+//     false after the UPDATE overwrites the column.
 //
 // *DocumentStore satisfies the api.IngestMessagesUpserter interface via this method.
 func (s *DocumentStore) UpsertTracked(ctx context.Context, doc *model.Document) (contentChanged bool, err error) {
@@ -475,20 +475,32 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		query.Limit * 2, // fetch more candidates before RRF merge
 	}
 
-	statusFilter := "AND status = 'active'"
+	// Each filter is built twice: once unqualified for the four CTEs that scan
+	// `documents` directly, and once qualified for the entity CTE, which joins
+	// `documents` rather than scanning it. Same positional parameters, same
+	// semantics — only the column prefix differs. Keeping the pairs adjacent is
+	// deliberate: the entity lane previously applied NONE of these filters and
+	// the outer join re-applied nothing, so a document reachable only through
+	// the entity lane bypassed both the soft-delete filter and every source
+	// type exclusion, insight documents included.
+	statusFilter, entityStatusFilter := "AND status = 'active'", "AND d.status = 'active'"
 	if query.IncludeDeleted {
-		statusFilter = ""
+		statusFilter, entityStatusFilter = "", ""
 	}
 
-	sourceFilter := ""
+	sourceFilter, entitySourceFilter := "", ""
 	if query.SourceType != nil {
-		sourceFilter = fmt.Sprintf("AND source_type = $%d", len(args)+1)
+		p := len(args) + 1
+		sourceFilter = fmt.Sprintf("AND source_type = $%d", p)
+		entitySourceFilter = fmt.Sprintf("AND d.source_type = $%d", p)
 		args = append(args, *query.SourceType)
 	}
 
-	excludeFilter := ""
+	excludeFilter, entityExcludeFilter := "", ""
 	if len(query.ExcludeSourceTypes) > 0 {
-		excludeFilter = fmt.Sprintf("AND source_type <> ALL($%d)", len(args)+1)
+		p := len(args) + 1
+		excludeFilter = fmt.Sprintf("AND source_type <> ALL($%d)", p)
+		entityExcludeFilter = fmt.Sprintf("AND d.source_type <> ALL($%d)", p)
 		args = append(args, query.ExcludeSourceTypes)
 	}
 
@@ -561,17 +573,9 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 
 	// entityCTE is the SQL fragment for the entity lane. When the lane is
 	// disabled (weight=0), we use a trivially-empty CTE to avoid syntax errors.
-	entityCTE := `entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false)`
+	entityCTE := emptyEntityCTE
 	if w.EntityWeight > 0 {
-		entityCTE = fmt.Sprintf(`entity AS (
-			SELECT de.document_id AS id,
-			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
-			FROM document_entities de
-			JOIN entities e ON e.id = de.entity_id
-			WHERE e.normalized_name LIKE '%%%%' || %s || '%%%%'
-			GROUP BY de.document_id
-			LIMIT $3
-		)`, entityFilterParam)
+		entityCTE = buildEntityCTE(entityFilterParam, entityStatusFilter, entitySourceFilter, entityExcludeFilter)
 	}
 
 	q := fmt.Sprintf(`
@@ -673,6 +677,44 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		results = results[:query.Limit]
 	}
 	return results, nil
+}
+
+// emptyEntityCTE is the entity lane when its RRF weight is zero: a
+// trivially-empty CTE, so the FULL OUTER JOIN below stays syntactically valid
+// and contributes nothing to the score.
+const emptyEntityCTE = `entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false)`
+
+// buildEntityCTE renders the entity RRF lane (#139).
+//
+// It joins `documents` purely so the status/source filters can be applied
+// INSIDE the lane. Applying them here rather than at the outer join matters:
+// the CTE is capped by `LIMIT $3`, so filtering afterwards would let excluded
+// documents consume candidate slots and silently shrink the entity lane's
+// contribution.
+//
+// The filter fragments must be `d.`-qualified — they are the entityStatusFilter
+// / entitySourceFilter / entityExcludeFilter variants built in hybridSearch,
+// not the unqualified ones used by the fts/vec/bigm/summvec CTEs. They bind the
+// same positional parameters.
+//
+// Split out of hybridSearch so the filters can be asserted without a database:
+// the lane's previous unfiltered form let soft-deleted and excluded documents
+// (including insights) into results whenever they were reachable by entity
+// name alone, and nothing in the test suite could observe it.
+func buildEntityCTE(entityFilterParam, statusFilter, sourceFilter, excludeFilter string) string {
+	return fmt.Sprintf(`entity AS (
+			SELECT de.document_id AS id,
+			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			FROM document_entities de
+			JOIN entities e ON e.id = de.entity_id
+			JOIN documents d ON d.id = de.document_id
+			WHERE e.normalized_name LIKE '%%%%' || %s || '%%%%'
+			%s
+			%s
+			%s
+			GROUP BY de.document_id
+			LIMIT $3
+		)`, entityFilterParam, statusFilter, sourceFilter, excludeFilter)
 }
 
 // entityExtractionEnabled reports whether entity extraction has been enabled
@@ -852,8 +894,8 @@ type DocumentSourceStats struct {
 
 // BaselineDocumentStats aggregates document-level baseline metrics.
 type BaselineDocumentStats struct {
-	Total      int                            `json:"total"`
-	BySource   map[string]DocumentSourceStats `json:"by_source_type"`
+	Total    int                            `json:"total"`
+	BySource map[string]DocumentSourceStats `json:"by_source_type"`
 }
 
 // BaselineChunkStats aggregates chunk-level baseline metrics.
@@ -872,7 +914,7 @@ type BaselineFailureStats struct {
 
 // BaselineCollectionStats holds the most recent collection timestamps per source.
 type BaselineCollectionStats struct {
-	MostRecentCollectedAt *time.Time         `json:"most_recent_collected_at"`
+	MostRecentCollectedAt *time.Time            `json:"most_recent_collected_at"`
 	BySource              map[string]*time.Time `json:"by_source_type"`
 }
 
@@ -939,10 +981,10 @@ func (s *DocumentStore) queryDocumentStats(ctx context.Context) (BaselineDocumen
 	total := 0
 	for rows.Next() {
 		var (
-			src                      string
-			cnt                      int64
-			meanLen, p50Len, p95Len  float64
-			maxLen                   int64
+			src                     string
+			cnt                     int64
+			meanLen, p50Len, p95Len float64
+			maxLen                  int64
 		)
 		if err := rows.Scan(&src, &cnt, &meanLen, &p50Len, &p95Len, &maxLen); err != nil {
 			return BaselineDocumentStats{}, fmt.Errorf("document stats scan: %w", err)
@@ -1095,6 +1137,26 @@ func (s *DocumentStore) ListUnembedded(ctx context.Context, limit int) ([]*model
 	return collectDocuments(rows)
 }
 
+// listWithoutEntitiesQuery backs ListWithoutEntities.
+//
+// The source_type filter is load-bearing, not cosmetic: without it the
+// EntityWorker picks up every model-derived insight document and spends an LLM
+// call extracting entities from an inference. Those entity links then feed the
+// entity RRF lane in hybridSearch, which is how an unlabelled inference earns
+// its way back into retrieval — the exact loop the insight-exclusion guard in
+// search.Service exists to close. Exclusion is by source_type rather than by
+// metadata so it cannot be undone by an enrichment-status edit.
+const listWithoutEntitiesQuery = `
+		SELECT id, source_type, source_id, title, content, metadata, embedding,
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding
+		FROM documents
+		WHERE status = 'active'
+		  AND entities_processed_at IS NULL
+		  AND source_type <> 'insight'
+		ORDER BY collected_at ASC
+		LIMIT $1`
+
 // ListWithoutEntities returns up to limit active documents whose
 // entities_processed_at column is NULL, ordered by collected_at ASC (oldest
 // first) so that entity-extraction backfill progresses forward in time.
@@ -1105,18 +1167,10 @@ func (s *DocumentStore) ListUnembedded(ctx context.Context, limit int) ([]*model
 //
 // Soft-deleted documents are excluded — there is no value in extracting
 // entities from documents that are not served in search results.
+//
+// Insight documents are excluded too; see listWithoutEntitiesQuery.
 func (s *DocumentStore) ListWithoutEntities(ctx context.Context, limit int) ([]*model.Document, error) {
-	const q = `
-		SELECT id, source_type, source_id, title, content, metadata, embedding,
-		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
-		       title_summary, bullet_summary, summary_embedding
-		FROM documents
-		WHERE status = 'active'
-		  AND entities_processed_at IS NULL
-		ORDER BY collected_at ASC
-		LIMIT $1`
-
-	rows, err := s.pg.pool.Query(ctx, q, limit)
+	rows, err := s.pg.pool.Query(ctx, listWithoutEntitiesQuery, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list without entities: %w", err)
 	}
@@ -1137,23 +1191,201 @@ func (s *DocumentStore) MarkEntitiesProcessed(ctx context.Context, documentID uu
 	return nil
 }
 
-// ListUnsummarized returns up to limit active documents whose title_summary
-// column is NULL, ordered by collected_at ASC (oldest first) so backfill
-// progresses forward in time.
-//
-// Soft-deleted documents are excluded; there is no value in summarizing them.
-func (s *DocumentStore) ListUnsummarized(ctx context.Context, limit int) ([]*model.Document, error) {
+// ListPendingNotes returns up to limit active model.SourceNote documents
+// whose Metadata.enrichment_status is "pending" and whose
+// enrichment_next_retry_at backoff (if any) has elapsed. Used by
+// NoteEnrichmentWorker (spec §6.3). insight documents are never returned —
+// source_type is hard-scoped to 'note', enforcing spec §3.2 gate 1
+// (insight-of-insight is structurally impossible via this query).
+func (s *DocumentStore) ListPendingNotes(ctx context.Context, limit int) ([]*model.Document, error) {
 	const q = `
+		SELECT id, source_type, source_id, title, content, metadata, embedding,
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding
+		FROM documents
+		WHERE source_type = 'note'
+		  AND status = 'active'
+		  AND metadata->>'enrichment_status' = 'pending'
+		  AND (metadata->>'enrichment_next_retry_at' IS NULL
+		       OR (metadata->>'enrichment_next_retry_at')::timestamptz <= now())
+		ORDER BY collected_at ASC
+		LIMIT $1`
+
+	rows, err := s.pg.pool.Query(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list pending notes: %w", err)
+	}
+	defer rows.Close()
+
+	return collectDocuments(rows)
+}
+
+// MarkNoteEnriched merges the Organized-layer fields (spec §3) into a note's
+// Metadata and marks enrichment_status "done". title, when non-empty,
+// overwrites the document's Title column — this is how POST /api/v1/notes'
+// server-left-empty title (spec §6.1) gets filled in. Content is never
+// touched by this method or any caller of it (spec §3.1 write-once
+// guarantee) — there is no content parameter to accidentally pass one.
+func (s *DocumentStore) MarkNoteEnriched(ctx context.Context, documentID uuid.UUID, title string, metadata map[string]any) error {
+	meta, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("mark note enriched: marshal metadata: %w", err)
+	}
+	const q = `
+		UPDATE documents
+		SET title = CASE WHEN $2 <> '' THEN $2 ELSE title END,
+		    metadata = metadata || $3::jsonb,
+		    updated_at = now()
+		WHERE id = $1`
+	if _, err := s.pg.pool.Exec(ctx, q, documentID, title, meta); err != nil {
+		return fmt.Errorf("mark note enriched %s: %w", documentID, err)
+	}
+	return nil
+}
+
+// MarkNoteEnrichmentAttemptFailed records a non-terminal enrichment failure
+// (attempts 1-2 of the 3-attempt cap, spec §6.3): increments the attempt
+// counter, records the failure reason, and schedules the next eligible
+// retry time. enrichment_status is left "pending" so ListPendingNotes will
+// pick the note back up once nextRetryAt elapses.
+func (s *DocumentStore) MarkNoteEnrichmentAttemptFailed(ctx context.Context, documentID uuid.UUID, attempts int, reason string, nextRetryAt time.Time) error {
+	const q = `
+		UPDATE documents
+		SET metadata = metadata || jsonb_build_object(
+		        'enrichment_attempts', $2::int,
+		        'enrichment_last_error', $3::text,
+		        'enrichment_next_retry_at', $4::timestamptz
+		    ),
+		    updated_at = now()
+		WHERE id = $1`
+	if _, err := s.pg.pool.Exec(ctx, q, documentID, attempts, reason, nextRetryAt); err != nil {
+		return fmt.Errorf("mark note enrichment attempt failed %s: %w", documentID, err)
+	}
+	return nil
+}
+
+// MarkNoteEnrichmentTerminal records the 3rd (terminal) enrichment failure
+// (spec §6.3): sets enrichment_status "failed" so ListPendingNotes stops
+// returning the note. Only POST /api/v1/notes/{id}/retry-enrichment
+// (ResetNoteEnrichment) can revive it.
+func (s *DocumentStore) MarkNoteEnrichmentTerminal(ctx context.Context, documentID uuid.UUID, reason string) error {
+	const q = `
+		UPDATE documents
+		SET metadata = metadata || jsonb_build_object(
+		        'enrichment_status', 'failed',
+		        'enrichment_last_error', $2::text
+		    ),
+		    updated_at = now()
+		WHERE id = $1`
+	if _, err := s.pg.pool.Exec(ctx, q, documentID, reason); err != nil {
+		return fmt.Errorf("mark note enrichment terminal %s: %w", documentID, err)
+	}
+	return nil
+}
+
+// ResetNoteEnrichment reverts a terminal "failed" note back to "pending"
+// with a zeroed attempt counter, for manual retry via
+// POST /api/v1/notes/{id}/retry-enrichment (spec §6.3, §9.2). Returns
+// found=false (no error) when documentID does not exist, is not a note, or
+// is not currently in the terminal "failed" state — the caller (Task 7
+// retryEnrichmentHandler) maps found=false to 409 Conflict.
+func (s *DocumentStore) ResetNoteEnrichment(ctx context.Context, documentID uuid.UUID) (bool, error) {
+	const q = `
+		UPDATE documents
+		SET metadata = metadata || jsonb_build_object(
+		        'enrichment_status', 'pending',
+		        'enrichment_attempts', 0,
+		        'enrichment_last_error', NULL,
+		        'enrichment_next_retry_at', NULL
+		    ),
+		    updated_at = now()
+		WHERE id = $1
+		  AND source_type = 'note'
+		  AND metadata->>'enrichment_status' = 'failed'
+		RETURNING id`
+	var returnedID uuid.UUID
+	err := s.pg.pool.QueryRow(ctx, q, documentID).Scan(&returnedID)
+	if err != nil {
+		if isNoRows(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("reset note enrichment %s: %w", documentID, err)
+	}
+	return true, nil
+}
+
+// SoftDeleteByID soft-deletes a single model.SourceNote document (spec §6.5
+// delete path). Scoped to source_type='note' so this method cannot be used
+// to soft-delete arbitrary documents of other source types. Returns nil
+// without effect when the id does not exist or the document is not an
+// active note — callers that need to distinguish "not found" from
+// "not a note" should GetByID first (Task 7 deleteNoteHandler does this).
+func (s *DocumentStore) SoftDeleteByID(ctx context.Context, id uuid.UUID) error {
+	const q = `
+		UPDATE documents
+		SET status = 'deleted', deleted_at = now()
+		WHERE id = $1 AND source_type = 'note' AND status = 'active'`
+	if _, err := s.pg.pool.Exec(ctx, q, id); err != nil {
+		return fmt.Errorf("soft delete note %s: %w", id, err)
+	}
+	return nil
+}
+
+// SoftDeleteInsightsByNoteID cascades a note's soft-delete to every
+// model.SourceInsight document derived from it (spec §6.5 permanent
+// policy): "근거가 사라진 추론은 반증 불가능하고 감사 불가능하다". Matches
+// on the JSONB path Metadata.provenance.source_note_id, which is how
+// insight documents record their origin note (Task 6 EnrichNote). Returns
+// the number of insight documents soft-deleted.
+func (s *DocumentStore) SoftDeleteInsightsByNoteID(ctx context.Context, noteID uuid.UUID) (int, error) {
+	const q = `
+		UPDATE documents
+		SET status = 'deleted', deleted_at = now()
+		WHERE source_type = 'insight'
+		  AND status = 'active'
+		  AND metadata->'provenance'->>'source_note_id' = $1
+		RETURNING id`
+	rows, err := s.pg.pool.Query(ctx, q, noteID.String())
+	if err != nil {
+		return 0, fmt.Errorf("soft delete insights for note %s: %w", noteID, err)
+	}
+	defer rows.Close()
+
+	count := 0
+	for rows.Next() {
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("soft delete insights for note %s: iterate: %w", noteID, err)
+	}
+	return count, nil
+}
+
+// listUnsummarizedQuery backs ListUnsummarized.
+//
+// The source_type filter is load-bearing, not cosmetic: without it the
+// SummarizerWorker picks up every model-derived insight document and pays for
+// an LLM summary of an LLM inference — a document that is already a single
+// sentence. That is unbudgeted spend per note, on output nobody reads.
+const listUnsummarizedQuery = `
 		SELECT id, source_type, source_id, title, content, metadata, embedding,
 		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
 		       title_summary, bullet_summary, summary_embedding
 		FROM documents
 		WHERE title_summary IS NULL
 		  AND status = 'active'
+		  AND source_type <> 'insight'
 		ORDER BY collected_at ASC
 		LIMIT $1`
 
-	rows, err := s.pg.pool.Query(ctx, q, limit)
+// ListUnsummarized returns up to limit active documents whose title_summary
+// column is NULL, ordered by collected_at ASC (oldest first) so backfill
+// progresses forward in time.
+//
+// Soft-deleted documents are excluded; there is no value in summarizing them.
+// Insight documents are excluded too; see listUnsummarizedQuery.
+func (s *DocumentStore) ListUnsummarized(ctx context.Context, limit int) ([]*model.Document, error) {
+	rows, err := s.pg.pool.Query(ctx, listUnsummarizedQuery, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list unsummarized: %w", err)
 	}
@@ -1306,12 +1538,12 @@ type scannable interface {
 
 func scanDocument(row scannable) (*model.Document, error) {
 	var (
-		doc          model.Document
-		metaJSON     []byte
-		vec          *pgvector.Vector
-		titleSum     pgtype.Text
-		bulletSum    pgtype.Text
-		summVec      *pgvector.Vector
+		doc       model.Document
+		metaJSON  []byte
+		vec       *pgvector.Vector
+		titleSum  pgtype.Text
+		bulletSum pgtype.Text
+		summVec   *pgvector.Vector
 	)
 	err := row.Scan(
 		&doc.ID, &doc.SourceType, &doc.SourceID,

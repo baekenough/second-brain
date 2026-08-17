@@ -17,7 +17,9 @@ export type SourceType =
   | "sms"
   | "call-log"
   | "call-transcript"
-  | "upload";
+  | "upload"
+  | "note"
+  | "insight";
 
 export type MatchType = "fulltext" | "vector" | "hybrid";
 
@@ -82,6 +84,51 @@ export interface DocumentDetail {
   updated_at: string;
   metadata: DocumentMetadata;
 }
+
+/**
+ * Metadata shape specific to source_type=note documents (spec §6.1).
+ * Deliberately not extending DocumentMetadata — its index signature
+ * (string | number | boolean | undefined) cannot accommodate
+ * enrichment_last_error's `string | null`, and note metadata does not
+ * overlap with DocumentMetadata's other fields (channel, repo, folder, ...).
+ */
+export interface NoteMetadata {
+  enrichment_status?: "pending" | "done" | "failed";
+  enrichment_attempts?: number;
+  enrichment_last_error?: string | null;
+  [key: string]: unknown;
+}
+
+/** Reads a DocumentDetail's metadata as NoteMetadata in one place, so call
+ * sites never need an inline `as NoteMetadata` cast (spec §6.1). */
+export function getNoteMetadata(doc: DocumentDetail): NoteMetadata {
+  return (doc.metadata ?? {}) as NoteMetadata;
+}
+
+/** Response shape of POST /api/v1/notes (spec §6.1) — the note document
+ * itself is not returned; the caller already has the content it just sent. */
+export interface CreateNoteResponse {
+  id: string;
+  status: "pending";
+}
+
+/** One entry of the `sources` SSE event (spec §5.1). */
+export interface AskSourceItem {
+  id: string;
+  title: string;
+  source_type: SourceType;
+  score: number;
+}
+
+/** Parsed, typed form of the four /api/v1/ask SSE event types (spec §5.1). */
+export type AskStreamEvent =
+  | { type: "sources"; sources: AskSourceItem[] }
+  | { type: "token"; text: string }
+  | { type: "done"; finish_reason: "stop" | "error" | "no_evidence" }
+  | { type: "error"; message: string };
+
+/** Which of the three Ask-answer lanes (spec §5.2, §7.2) a source belongs to. */
+export type AskLayer = "note" | "observed" | "insight";
 
 export interface SearchParams {
   query: string;

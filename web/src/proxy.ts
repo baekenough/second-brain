@@ -2,12 +2,17 @@
  * Next.js Edge Middleware — authentication gate.
  *
  * Protected routes (require GitHub OAuth session):
- *   - All page routes: /, /dashboard, /governance, /documents/*
- *   - Internal API proxy routes: /api/search, /api/documents/*, /api/stats/*, /api/sources
+ *   - All page routes: /, /dashboard, /governance, /documents/*, /ask, /capture
+ *   - Internal API proxy routes: /api/search, /api/documents/*, /api/stats/*,
+ *     /api/sources, /api/ask, /api/notes/*
  *
  * Excluded from auth (pass-through):
  *   - /api/auth/*              — Auth.js sign-in / callback / sign-out
- *   - /api/v1/*                — All mobile proxy routes (Bearer API_KEY, not OAuth)
+ *   - /api/v1/*                — All mobile proxy routes (Bearer API_KEY, not OAuth).
+ *                                 Ask/Capture proxies MUST NOT be added under this
+ *                                 prefix — see docs/superpowers/plans/2026-08-17-ask-capture-frontend.md
+ *                                 Global Constraints for why that would silently
+ *                                 disable session auth on them.
  *   - /_next/static, /_next/image — Next.js static assets
  *   - /favicon.ico, /robots.txt
  */

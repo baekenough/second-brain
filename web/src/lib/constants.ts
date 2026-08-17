@@ -1,4 +1,4 @@
-import type { SourceType } from "./types";
+import type { AskLayer, SourceType } from "./types";
 
 /** Human-readable labels for each source type. */
 export const SOURCE_LABELS: Record<SourceType, string> = {
@@ -17,6 +17,8 @@ export const SOURCE_LABELS: Record<SourceType, string> = {
   "call-log": "통화",
   "call-transcript": "전사",
   upload: "Upload",
+  note: "내 노트",
+  insight: "추론",
 };
 
 /**
@@ -41,6 +43,8 @@ export const SOURCE_BADGE_CLASSES: Record<SourceType, string> = {
   notion: "badge-notion",
   telegram: "badge-telegram",
   discord: "badge-discord",
+  note: "badge-note",
+  insight: "badge-insight",
 };
 
 /** Source types shown as filter options in the search UI. */
@@ -71,3 +75,19 @@ export const DASHBOARD_SOURCES: SourceType[] = [
 
 /** Cutover date boundary (documents collected after this date use new pipeline) */
 export const CUTOVER_DATE = "2026-05-30";
+
+/** Which of the three Ask-answer lanes (spec §5.2, §7.2) a source belongs
+ * to: the user's own raw notes, everything else observed/collected, or
+ * LLM-derived insight documents (always the most visually distinct — they
+ * are inferences, not facts, per spec §3.2's echo-chamber guards). */
+export const ASK_LAYER_LABELS: Record<AskLayer, string> = {
+  note: "내 노트",
+  observed: "관찰 데이터",
+  insight: "추론",
+};
+
+export function getAskLayer(sourceType: SourceType): AskLayer {
+  if (sourceType === "note") return "note";
+  if (sourceType === "insight") return "insight";
+  return "observed";
+}
