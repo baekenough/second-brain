@@ -19,10 +19,25 @@ import (
 // ---------------------------------------------------------------------------
 
 // fakeNoteLister is an in-memory NoteEnrichmentLister for unit testing.
+//
+// Every method can be made to fail, not just ListPendingNotes. That is
+// load-bearing: while only the list call had an error hook, every retry-policy
+// test necessarily ran in a world where bookkeeping always succeeds — the one
+// world in which "bookkeeping runs on an expired context" and "a failed commit
+// write is swallowed" are both invisible. Both bugs shipped through a green
+// suite for exactly that reason.
+//
+// The fake also models the store's state transitions (attempt counters are
+// written back into the document's Metadata; a terminal note leaves the
+// pending list) so multi-tick retry behaviour can be asserted end-to-end
+// rather than one isolated call at a time.
 type fakeNoteLister struct {
 	mu                 sync.Mutex
 	docs               []*model.Document
 	listErr            error
+	enrichedErr        error
+	attemptFailedErr   error
+	terminalErr        error
 	enrichedCalls      []enrichedCall
 	attemptFailedCalls []attemptFailedCall
 	terminalCalls      []terminalCall
@@ -32,16 +47,19 @@ type enrichedCall struct {
 	documentID uuid.UUID
 	title      string
 	metadata   map[string]any
+	ctxErr     error // ctx.Err() observed at call time — nil means a live budget
 }
 type attemptFailedCall struct {
 	documentID  uuid.UUID
 	attempts    int
 	reason      string
 	nextRetryAt time.Time
+	ctxErr      error
 }
 type terminalCall struct {
 	documentID uuid.UUID
 	reason     string
+	ctxErr     error
 }
 
 func (f *fakeNoteLister) ListPendingNotes(_ context.Context, limit int) ([]*model.Document, error) {
@@ -57,25 +75,63 @@ func (f *fakeNoteLister) ListPendingNotes(_ context.Context, limit int) ([]*mode
 	return out, nil
 }
 
-func (f *fakeNoteLister) MarkNoteEnriched(_ context.Context, id uuid.UUID, title string, metadata map[string]any) error {
+func (f *fakeNoteLister) MarkNoteEnriched(ctx context.Context, id uuid.UUID, title string, metadata map[string]any) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.enrichedCalls = append(f.enrichedCalls, enrichedCall{id, title, metadata})
+	f.enrichedCalls = append(f.enrichedCalls, enrichedCall{id, title, metadata, ctx.Err()})
+	return f.enrichedErr
+}
+
+func (f *fakeNoteLister) MarkNoteEnrichmentAttemptFailed(ctx context.Context, id uuid.UUID, attempts int, reason string, nextRetryAt time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.attemptFailedCalls = append(f.attemptFailedCalls, attemptFailedCall{id, attempts, reason, nextRetryAt, ctx.Err()})
+	if f.attemptFailedErr != nil {
+		return f.attemptFailedErr
+	}
+	// Model the store: the counter is durably persisted, so the next tick
+	// sees the incremented value.
+	f.setAttemptsLocked(id, attempts)
 	return nil
 }
 
-func (f *fakeNoteLister) MarkNoteEnrichmentAttemptFailed(_ context.Context, id uuid.UUID, attempts int, reason string, nextRetryAt time.Time) error {
+func (f *fakeNoteLister) MarkNoteEnrichmentTerminal(ctx context.Context, id uuid.UUID, reason string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.attemptFailedCalls = append(f.attemptFailedCalls, attemptFailedCall{id, attempts, reason, nextRetryAt})
+	f.terminalCalls = append(f.terminalCalls, terminalCall{id, reason, ctx.Err()})
+	if f.terminalErr != nil {
+		return f.terminalErr
+	}
+	// Model the store: enrichment_status="failed" drops the note out of
+	// ListPendingNotes until an explicit retry-enrichment call revives it.
+	kept := f.docs[:0]
+	for _, d := range f.docs {
+		if d.ID != id {
+			kept = append(kept, d)
+		}
+	}
+	f.docs = kept
 	return nil
 }
 
-func (f *fakeNoteLister) MarkNoteEnrichmentTerminal(_ context.Context, id uuid.UUID, reason string) error {
+// setAttemptsLocked writes the persisted attempt counter back into the
+// in-memory document. Caller must hold f.mu.
+func (f *fakeNoteLister) setAttemptsLocked(id uuid.UUID, attempts int) {
+	for _, d := range f.docs {
+		if d.ID == id {
+			if d.Metadata == nil {
+				d.Metadata = map[string]any{}
+			}
+			d.Metadata["enrichment_attempts"] = float64(attempts)
+		}
+	}
+}
+
+// pendingCount reports how many notes are still listed as pending.
+func (f *fakeNoteLister) pendingCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.terminalCalls = append(f.terminalCalls, terminalCall{id, reason})
-	return nil
+	return len(f.docs)
 }
 
 // fakeInsightWriter records insight writes performed during a tick.
@@ -139,15 +195,18 @@ func newTestNoteWorker(
 	fn func(context.Context, llm.Completer, *model.Document) (*NoteEnrichmentResult, error),
 ) *NoteEnrichmentWorker {
 	return &NoteEnrichmentWorker{
-		store:        lister,
-		insights:     insights,
-		entities:     entities,
-		llm:          &fakeLLM{},
-		interval:     time.Minute,
-		batchSize:    10,
-		maxAttempts:  3,
-		retryBackoff: []time.Duration{time.Minute, 5 * time.Minute, 30 * time.Minute},
-		enrichFn:     fn,
+		store:               lister,
+		insights:            insights,
+		entities:            entities,
+		llm:                 &fakeLLM{},
+		interval:            time.Minute,
+		batchSize:           10,
+		maxAttempts:         3,
+		retryBackoff:        []time.Duration{time.Minute, 5 * time.Minute, 30 * time.Minute},
+		workTimeoutV:        30 * time.Second,
+		persistTimeoutV:     30 * time.Second,
+		bookkeepingTimeoutV: 30 * time.Second,
+		enrichFn:            fn,
 	}
 }
 
@@ -747,8 +806,12 @@ func TestNewNoteEnrichmentWorker_Defaults(t *testing.T) {
 	if len(w.retryBackoff) != 3 {
 		t.Errorf("retryBackoff = %v, want 3 entries", w.retryBackoff)
 	}
-	if w.batchSize <= 0 || w.interval <= 0 || w.docTimeout <= 0 {
-		t.Errorf("batchSize/interval/docTimeout = %d/%v/%v, want positive defaults", w.batchSize, w.interval, w.docTimeout)
+	if w.batchSize <= 0 || w.interval <= 0 {
+		t.Errorf("batchSize/interval = %d/%v, want positive defaults", w.batchSize, w.interval)
+	}
+	if w.workTimeout() <= 0 || w.persistTimeout() <= 0 || w.bookkeepingTimeout() <= 0 {
+		t.Errorf("work/persist/bookkeeping timeouts = %v/%v/%v, want positive defaults",
+			w.workTimeout(), w.persistTimeout(), w.bookkeepingTimeout())
 	}
 	if w.enrichFn == nil {
 		t.Error("enrichFn must default to EnrichNote")

@@ -23,16 +23,63 @@ import (
 // crowd out real evidence in search results.
 const maxInsightsPerNote = 3
 
-// defaultNoteEnrichmentDocTimeout bounds ONE note's enrichment work (LLM call
-// + entity link + insight writes + status write).
+// Deadline model — three independent budgets, never one shared deadline.
 //
-// This is deliberately a per-document deadline, not a whole-tick one: the
-// summarizer previously used a shared per-tick ceiling sized for a fast local
-// LLM and silently truncated multi-document batches once the backend became a
-// remote API (see summarizer.go defaultDocTimeout). Enrichment asks for more
-// output per call than summarization (title + summary + tags + entities +
-// insights), hence the wider budget.
-const defaultNoteEnrichmentDocTimeout = 60 * time.Second
+// The original single per-document deadline (60 s) covered the LLM call AND
+// every write that followed it. That was wrong in a way that could not be
+// observed from a passing test suite: LLM_TIMEOUT_SECONDS defaults to 120 s
+// (internal/config), i.e. the LLM client was allowed to run for LONGER than
+// the budget that also had to pay for the bookkeeping writes. Any enrichment
+// slower than 60 s had its context killed, and every subsequent write —
+// including MarkNoteEnrichmentAttemptFailed — was handed that already-expired
+// context, so pgx returned ctx.Err() before touching the database. The attempt
+// counter never incremented, enrichment_status stayed "pending", and the note
+// was re-listed and re-billed on every tick, forever. Worse, ListPendingNotes
+// is ORDER BY collected_at ASC LIMIT 5, so five stuck notes permanently occupy
+// the whole batch and starve every note created after them.
+//
+// The three budgets below are therefore derived from separate contexts:
+//
+//	work        — the LLM call. Derived from the CALLER's context so a
+//	              SIGTERM cancels it promptly (nothing is half-written yet;
+//	              the note simply stays pending). Always strictly larger than
+//	              the LLM client's own HTTP timeout, so the client's timeout
+//	              is what fires and produces a real, attributable error.
+//	persist     — insight documents + entity links. Detached from the caller
+//	              so shutdown cannot truncate them mid-sequence.
+//	bookkeeping — a single status write (MarkNoteEnriched /
+//	              MarkNoteEnrichmentAttemptFailed / MarkNoteEnrichmentTerminal).
+//	              Detached AND freshly derived per write, so it can never
+//	              inherit an exhausted work or persist budget. This is the
+//	              budget that makes the retry cap enforceable.
+const (
+	// defaultNoteEnrichmentLLMTimeout mirrors config.LLMTimeoutSeconds'
+	// default (120 s) so a worker constructed without an explicit LLMTimeout
+	// still sizes its work budget against the real client behaviour.
+	defaultNoteEnrichmentLLMTimeout = 120 * time.Second
+
+	// noteEnrichmentWorkMargin is added to the LLM client's own per-request
+	// timeout to derive the work budget. The relationship is deliberate and
+	// one-directional: the LLM client's timeout GOVERNS, the worker's work
+	// deadline is derived from it and is only ever a backstop for a client
+	// that fails to honour its own timeout (e.g. a stalled TLS handshake).
+	// It must never be the tighter of the two — a work deadline that fires
+	// first turns every slow call into a context error whose bookkeeping then
+	// has to race the same dead deadline.
+	noteEnrichmentWorkMargin = 30 * time.Second
+
+	// defaultNoteEnrichmentPersistTimeout bounds the derived-artifact writes
+	// for one note: up to maxInsightsPerNote SaveInsight calls (each an
+	// upsert + chunk write + optional embedding round-trip) plus the entity
+	// link. Insights are single-sentence documents, so this is generous.
+	defaultNoteEnrichmentPersistTimeout = 30 * time.Second
+
+	// defaultNoteEnrichmentBookkeepingTimeout bounds ONE status UPDATE. It is
+	// short on purpose: a status write that cannot complete in 10 s is not
+	// going to complete, and holding the shutdown drain open for it only
+	// delays the restart that would fix it.
+	defaultNoteEnrichmentBookkeepingTimeout = 10 * time.Second
+)
 
 // NoteEnrichmentLister is the read/write side of the document store required
 // by NoteEnrichmentWorker. *store.DocumentStore satisfies this interface
@@ -132,6 +179,27 @@ type NoteEnrichmentWorkerConfig struct {
 	BatchSize    int
 	MaxAttempts  int             // defaults to 3
 	RetryBackoff []time.Duration // defaults to {1m, 5m, 30m}; see spec §13.2 — placeholder values, not final
+
+	// LLMTimeout is the LLM client's OWN per-request HTTP timeout
+	// (config.LLMTimeoutSeconds). Pass the same value used to build the
+	// llm.Completer; the worker derives its work deadline from it
+	// (LLMTimeout + noteEnrichmentWorkMargin) so the two can never drift into
+	// the inverted relationship described above. Defaults to
+	// defaultNoteEnrichmentLLMTimeout (120 s) when zero.
+	LLMTimeout time.Duration
+
+	// WorkTimeout optionally raises the per-note LLM work deadline. It is
+	// clamped UP to LLMTimeout + noteEnrichmentWorkMargin — a caller cannot
+	// configure a work budget tighter than the LLM client's own timeout.
+	WorkTimeout time.Duration
+
+	// PersistTimeout bounds the insight/entity writes for one note.
+	// Defaults to defaultNoteEnrichmentPersistTimeout (30 s) when zero.
+	PersistTimeout time.Duration
+
+	// BookkeepingTimeout bounds a single enrichment-status write.
+	// Defaults to defaultNoteEnrichmentBookkeepingTimeout (10 s) when zero.
+	BookkeepingTimeout time.Duration
 }
 
 // NoteEnrichmentWorker is a background worker that runs a single structured
@@ -158,7 +226,14 @@ type NoteEnrichmentWorker struct {
 	batchSize    int
 	maxAttempts  int
 	retryBackoff []time.Duration
-	docTimeout   time.Duration
+
+	// See the deadline-model comment at the top of this file. These are read
+	// through workTimeout()/persistTimeout()/bookkeepingTimeout(), which
+	// substitute defaults for zero values so a zero-valued struct built
+	// directly (tests) can never produce an instantly-expired context.
+	workTimeoutV        time.Duration
+	persistTimeoutV     time.Duration
+	bookkeepingTimeoutV time.Duration
 
 	// enrichFn defaults to EnrichNote and can be replaced in tests to avoid
 	// live LLM calls (mirrors EntityWorker.extractFn).
@@ -196,18 +271,76 @@ func NewNoteEnrichmentWorker(cfg NoteEnrichmentWorkerConfig) *NoteEnrichmentWork
 	if len(backoff) == 0 {
 		backoff = []time.Duration{time.Minute, 5 * time.Minute, 30 * time.Minute}
 	}
-	return &NoteEnrichmentWorker{
-		store:        cfg.Store,
-		insights:     cfg.Insights,
-		entities:     cfg.Entities,
-		llm:          cfg.LLM,
-		interval:     interval,
-		batchSize:    batchSize,
-		maxAttempts:  maxAttempts,
-		retryBackoff: backoff,
-		docTimeout:   defaultNoteEnrichmentDocTimeout,
-		enrichFn:     EnrichNote,
+	// The LLM client's timeout governs; the work deadline is derived from it
+	// and clamped so it can never be the tighter of the two.
+	llmTimeout := cfg.LLMTimeout
+	if llmTimeout <= 0 {
+		llmTimeout = defaultNoteEnrichmentLLMTimeout
 	}
+	workTimeout := cfg.WorkTimeout
+	if minWork := llmTimeout + noteEnrichmentWorkMargin; workTimeout < minWork {
+		workTimeout = minWork
+	}
+	persistTimeout := cfg.PersistTimeout
+	if persistTimeout <= 0 {
+		persistTimeout = defaultNoteEnrichmentPersistTimeout
+	}
+	bookkeepingTimeout := cfg.BookkeepingTimeout
+	if bookkeepingTimeout <= 0 {
+		bookkeepingTimeout = defaultNoteEnrichmentBookkeepingTimeout
+	}
+	return &NoteEnrichmentWorker{
+		store:               cfg.Store,
+		insights:            cfg.Insights,
+		entities:            cfg.Entities,
+		llm:                 cfg.LLM,
+		interval:            interval,
+		batchSize:           batchSize,
+		maxAttempts:         maxAttempts,
+		retryBackoff:        backoff,
+		workTimeoutV:        workTimeout,
+		persistTimeoutV:     persistTimeout,
+		bookkeepingTimeoutV: bookkeepingTimeout,
+		enrichFn:            EnrichNote,
+	}
+}
+
+// workTimeout returns the per-note LLM work budget.
+func (w *NoteEnrichmentWorker) workTimeout() time.Duration {
+	if w.workTimeoutV > 0 {
+		return w.workTimeoutV
+	}
+	return defaultNoteEnrichmentLLMTimeout + noteEnrichmentWorkMargin
+}
+
+// persistTimeout returns the budget for one note's derived-artifact writes.
+func (w *NoteEnrichmentWorker) persistTimeout() time.Duration {
+	if w.persistTimeoutV > 0 {
+		return w.persistTimeoutV
+	}
+	return defaultNoteEnrichmentPersistTimeout
+}
+
+// bookkeepingTimeout returns the budget for a single enrichment-status write.
+func (w *NoteEnrichmentWorker) bookkeepingTimeout() time.Duration {
+	if w.bookkeepingTimeoutV > 0 {
+		return w.bookkeepingTimeoutV
+	}
+	return defaultNoteEnrichmentBookkeepingTimeout
+}
+
+// MaxDetachedWriteDuration is the longest a single note can keep running AFTER
+// its caller's context has been cancelled. Only the persist and bookkeeping
+// phases are detached (the LLM call is cancelled by the caller), so the bound
+// is: one persist budget, plus the commit write, plus the failure write that a
+// failed commit triggers.
+//
+// cmd/collector/main.go derives its SIGTERM drain window from this value. If
+// the drain were shorter, the process would exit while a detached status write
+// was still in flight — which is precisely the write whose loss re-opens the
+// unbounded-retry hole this worker's deadline model exists to close.
+func (w *NoteEnrichmentWorker) MaxDetachedWriteDuration() time.Duration {
+	return w.persistTimeout() + 2*w.bookkeepingTimeout()
 }
 
 // Run starts the note enrichment loop. It blocks until ctx is cancelled.
@@ -276,27 +409,35 @@ func (w *NoteEnrichmentWorker) tick(ctx context.Context) {
 	slog.Info("note enrichment worker: batch complete", "processed", processed)
 }
 
-// processNote enriches exactly one note under its own deadline.
+// processNote enriches exactly one note. See the deadline-model comment at the
+// top of this file for why the LLM call and the writes run on different
+// contexts rather than one shared per-document deadline.
 //
-// The deadline is derived from context.WithoutCancel(ctx) so a SIGTERM
-// arriving mid-note cannot truncate the note halfway through its writes —
-// leaving, say, insight documents persisted but the note still pending is
-// harmless (they are rewritten idempotently), but a half-applied status write
-// is not. The timeout keeps that detached work bounded.
+// writeBase is detached from ctx (context.WithoutCancel) but carries NO
+// deadline of its own: it is the base every write phase derives its own fresh,
+// independent budget from. Passing an already-started deadline down here is
+// exactly the bug this shape exists to prevent.
+//
+// A caller-cancelled LLM call is NOT a failed attempt. Shutting the process
+// down must not consume one of the note's three retries — otherwise a few
+// restart cycles would drive perfectly healthy notes to terminal "failed".
 func (w *NoteEnrichmentWorker) processNote(ctx context.Context, doc *model.Document) {
-	timeout := w.docTimeout
-	if timeout <= 0 {
-		timeout = defaultNoteEnrichmentDocTimeout
-	}
-	docCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	writeBase := context.WithoutCancel(ctx)
+
+	workCtx, cancel := context.WithTimeout(ctx, w.workTimeout())
 	defer cancel()
 
-	result, err := w.enrichFn(docCtx, w.llm, doc)
+	result, err := w.enrichFn(workCtx, w.llm, doc)
 	if err != nil {
-		w.handleFailure(docCtx, doc, err)
+		if ctx.Err() != nil {
+			slog.Info("note enrichment worker: shutdown during LLM call, note left pending (attempt not consumed)",
+				"doc_id", doc.ID)
+			return
+		}
+		w.handleFailure(writeBase, doc, err)
 		return
 	}
-	w.persistEnrichment(docCtx, doc, result)
+	w.persistEnrichment(writeBase, doc, result)
 }
 
 // persistEnrichment persists everything derived from ONE enrichFn call (spec
@@ -317,7 +458,15 @@ func (w *NoteEnrichmentWorker) processNote(ctx context.Context, doc *model.Docum
 // in the note to show one was ever attempted. Because insight source_ids are
 // stable, replaying them on a later attempt overwrites rather than duplicates,
 // so the retry is safe.
-func (w *NoteEnrichmentWorker) persistEnrichment(ctx context.Context, doc *model.Document, result *NoteEnrichmentResult) {
+//
+// base carries no deadline: the derived-artifact writes get their own persist
+// budget, the commit write gets a separate bookkeeping budget, and a failure
+// on either routes to handleFailure which derives a THIRD, still-live budget
+// from base. No write ever inherits a budget another write already spent.
+func (w *NoteEnrichmentWorker) persistEnrichment(base context.Context, doc *model.Document, result *NoteEnrichmentResult) {
+	persistCtx, cancelPersist := context.WithTimeout(base, w.persistTimeout())
+	defer cancelPersist()
+
 	insights := selectInsights(doc.ID, result.Insights)
 	for i, candidate := range insights {
 		sourceID := insightSourceID(doc.ID, i)
@@ -328,16 +477,16 @@ func (w *NoteEnrichmentWorker) persistEnrichment(ctx context.Context, doc *model
 				"source_note_id": doc.ID.String(),
 			},
 		}
-		if err := w.insights.SaveInsight(ctx, candidate.Content, sourceID, metadata); err != nil {
+		if err := w.insights.SaveInsight(persistCtx, candidate.Content, sourceID, metadata); err != nil {
 			slog.Warn("note enrichment worker: insight write failed, failing the attempt",
 				"doc_id", doc.ID, "index", i, "error", err)
-			w.handleFailure(ctx, doc, fmt.Errorf("persist insight %d: %w", i, err))
+			w.handleFailure(base, doc, fmt.Errorf("persist insight %d: %w", i, err))
 			return
 		}
 	}
 
 	if len(result.Entities) > 0 {
-		if err := w.entities.UpsertAndLinkEntities(ctx, doc.ID, result.Entities); err != nil {
+		if err := w.entities.UpsertAndLinkEntities(persistCtx, doc.ID, result.Entities); err != nil {
 			slog.Warn("note enrichment worker: link entities failed", "doc_id", doc.ID, "error", err)
 		}
 	}
@@ -347,7 +496,9 @@ func (w *NoteEnrichmentWorker) persistEnrichment(ctx context.Context, doc *model
 		"summary":           result.Summary,
 		"tags":              result.Tags,
 	}
-	if err := w.store.MarkNoteEnriched(ctx, doc.ID, result.Title, metadata); err != nil {
+	commitCtx, cancelCommit := context.WithTimeout(base, w.bookkeepingTimeout())
+	defer cancelCommit()
+	if err := w.store.MarkNoteEnriched(commitCtx, doc.ID, result.Title, metadata); err != nil {
 		slog.Warn("note enrichment worker: mark enriched failed", "doc_id", doc.ID, "error", err)
 	}
 }
@@ -393,7 +544,17 @@ func insightSourceID(noteID uuid.UUID, index int) string {
 // The cap is what keeps a permanently unenrichable note from becoming an
 // open-ended LLM bill; the retries are what keep a single transient 429 from
 // costing the note its organization.
-func (w *NoteEnrichmentWorker) handleFailure(ctx context.Context, doc *model.Document, cause error) {
+//
+// base MUST be a context that is still live — it is deliberately not the work
+// or persist context. handleFailure is reached precisely when those budgets
+// have been exhausted or their operation has failed, and a bookkeeping write
+// issued on a dead context is a bookkeeping write that never happens: the
+// counter stays put, the note stays "pending", and the cap it encodes stops
+// existing. See the deadline-model comment at the top of this file.
+func (w *NoteEnrichmentWorker) handleFailure(base context.Context, doc *model.Document, cause error) {
+	ctx, cancel := context.WithTimeout(base, w.bookkeepingTimeout())
+	defer cancel()
+
 	attempts := 0
 	if v, ok := doc.Metadata["enrichment_attempts"]; ok {
 		switch n := v.(type) {
