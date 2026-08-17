@@ -448,9 +448,10 @@ type Config struct {
 	// so an operator who never sets these three env vars sees zero behavior
 	// change (see internal/telemetry doc comment).
 	//
-	// LangfuseOTLPEndpoint is the FULL OTLP traces URL — used verbatim, NOT a
-	// bare host that gets "/v1/traces" appended (see InitOTel's doc comment
-	// for why WithEndpointURL is used over WithEndpoint).
+	// LangfuseOTLPEndpoint is the OTLP *base* URL — InitOTel appends
+	// "/v1/traces" itself (verified against a live Langfuse deployment: the
+	// bare base path 404s, since Langfuse's own web app owns that route;
+	// see internal/telemetry's package doc "Endpoint path contract").
 	//
 	// For this deployment: "http://100.77.20.12:3300/api/public/otel" (the
 	// Tailscale-interface binding of langfuse-web). Do NOT set this to the

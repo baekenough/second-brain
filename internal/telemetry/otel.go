@@ -4,10 +4,23 @@
 //
 // Langfuse does not publish a Go SDK — only Python/JS/TS. The documented
 // integration path for other languages is the standard OpenTelemetry SDK
-// talking OTLP/HTTP directly to Langfuse's OTLP receiver
-// (POST {endpoint}/api/public/otel), authenticated with HTTP Basic Auth
-// (base64(publicKey:secretKey)). This package implements exactly that path;
-// it intentionally does not depend on any Langfuse-specific client library.
+// talking OTLP/HTTP directly to Langfuse's OTLP receiver, authenticated with
+// HTTP Basic Auth (base64(publicKey:secretKey)). This package implements
+// exactly that path; it intentionally does not depend on any
+// Langfuse-specific client library.
+//
+// Endpoint path contract (verified against a live deployment, not just
+// docs): the "endpoint" this package's callers configure (e.g.
+// LANGFUSE_OTLP_ENDPOINT) is Langfuse's OTLP *base* path
+// (".../api/public/otel"), NOT the literal traces-ingestion URL. Langfuse's
+// receiver actually listens at "{base}/v1/traces" — POSTing to the bare base
+// path returns the Langfuse web app's own 404 page (it's a valid route in
+// its Next.js router, just not the OTLP one), which otlptracehttp treats as
+// an ordinary failed export and silently drops the span after retries —
+// no crash, no visible error unless you go looking. This mirrors the
+// standard OTEL_EXPORTER_OTLP_ENDPOINT convention (base URL, "/v1/traces"
+// auto-appended), so InitOTel appends "/v1/traces" itself rather than
+// requiring every caller to remember to include it in the configured value.
 //
 // Non-blocking guarantee: this package NEVER calls
 // sdktrace.WithBlocking(). Spans are exported via a BatchSpanProcessor with
@@ -20,6 +33,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -28,6 +42,12 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 )
+
+// otlpTracesPath is appended to the configured base endpoint to form the
+// actual OTLP traces ingestion URL — see the package doc's "Endpoint path
+// contract" section for why this cannot simply be baked into the endpoint
+// value callers configure.
+const otlpTracesPath = "/v1/traces"
 
 // ServiceName identifies this process in the OTel resource `service.name`
 // attribute and is the value Langfuse groups traces by when multiple
@@ -55,12 +75,10 @@ const (
 //
 // When endpoint is non-empty, spans are batched (sdktrace.BatchSpanProcessor
 // with WithBatchTimeout(5s)/WithExportTimeout(3s) — see package doc for why
-// WithBlocking() is never used) and exported over OTLP/HTTP to endpoint,
-// authenticated via HTTP Basic Auth using publicKey/secretKey (Langfuse's
-// documented OTLP ingestion contract). endpoint is used verbatim as the
-// full OTLP traces URL — it is NOT treated as a bare host that gets
-// "/v1/traces" appended, which is otlptracehttp's default behavior for
-// WithEndpoint (as opposed to WithEndpointURL, which this function uses).
+// WithBlocking() is never used) and exported over OTLP/HTTP, authenticated
+// via HTTP Basic Auth using publicKey/secretKey (Langfuse's documented OTLP
+// ingestion contract). endpoint is the OTLP *base* URL — "/v1/traces" is
+// appended automatically (see the package doc's "Endpoint path contract").
 //
 // Example endpoint for this deployment: "http://100.77.20.12:3300/api/public/otel"
 // (the langfuse-web Tailscale-interface binding, port 3300 — see the ops
@@ -81,8 +99,10 @@ func InitOTel(ctx context.Context, endpoint, publicKey, secretKey string) (func(
 		return func(context.Context) error { return nil }, nil
 	}
 
+	tracesURL := strings.TrimRight(endpoint, "/") + otlpTracesPath
+
 	exp, err := otlptracehttp.New(ctx,
-		otlptracehttp.WithEndpointURL(endpoint),
+		otlptracehttp.WithEndpointURL(tracesURL),
 		otlptracehttp.WithHeaders(map[string]string{
 			"Authorization": basicAuthHeader(publicKey, secretKey),
 		}),
