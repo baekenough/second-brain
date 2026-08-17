@@ -15,8 +15,36 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	oteltrace "go.opentelemetry.io/otel/trace"
+
 	"github.com/baekenough/second-brain/internal/auth"
+	"github.com/baekenough/second-brain/internal/telemetry"
 )
+
+// tracerName is the OTel instrumentation scope name for every span created
+// in this package (span names below distinguish operations within it).
+// otel.Tracer(tracerName) is looked up fresh on every call rather than
+// cached in a package-level var: the global TracerProvider it resolves
+// against is only guaranteed to reflect internal/telemetry.InitOTel's
+// configuration for lookups performed AFTER InitOTel runs (see
+// go.opentelemetry.io/otel's global-provider delegation semantics), and
+// tests reconfigure the global provider per-test.
+const tracerName = "github.com/baekenough/second-brain/internal/llm"
+
+// genAISystem is the value used for the gen_ai.system span attribute on
+// every span in this package. This client speaks the OpenAI-compatible
+// /v1/chat/completions protocol (OpenAI, Azure OpenAI, or a local proxy such
+// as cliproxy — see the Client doc comment) and Client itself has no signal
+// distinguishing which backend a given baseURL actually points at, so
+// "openai" is used uniformly as the protocol-family identifier. This keeps
+// the attribute populated (Langfuse groups/prices by it) rather than
+// omitting it; it does not claim the traffic is literally served by OpenAI.
+const genAISystem = "openai"
+
+func tracer() oteltrace.Tracer { return otel.Tracer(tracerName) }
 
 // Client is an OpenAI-compatible chat completion client.
 // It communicates with any endpoint that speaks the /v1/chat/completions protocol
@@ -139,10 +167,24 @@ type chatResponse struct {
 			Content string `json:"content"`
 		} `json:"message"`
 	} `json:"choices"`
+	// Usage is optional: some OpenAI-compatible proxies omit it. A nil Usage
+	// (or a struct that never unmarshals because the field is entirely
+	// absent) simply means no gen_ai.usage.* span attributes are recorded
+	// for that call — see doRequest.
+	Usage *tokenUsage `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
 	} `json:"error"`
+}
+
+// tokenUsage is the OpenAI chat completions "usage" object, parsed so its
+// fields can be attached to spans as gen_ai.usage.input_tokens /
+// gen_ai.usage.output_tokens (OpenTelemetry GenAI semantic conventions).
+type tokenUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 // Complete sends a single-turn chat completion request.
@@ -158,10 +200,25 @@ func (c *Client) Complete(ctx context.Context, system, user string) (string, err
 // system is the system prompt; messages is the ordered conversation history
 // including the final user turn. The system message is always prepended.
 // 4xx responses are not retried. 5xx and network errors are retried up to 2 times.
+//
+// Tracing: the entire retry loop is wrapped in a single parent span
+// ("llm.complete") so that retry-induced latency and eventual failure are
+// visible as one logical operation, while each individual HTTP attempt gets
+// its own child span ("llm.complete.attempt", attribute llm.retry.attempt).
+// This mirrors the plan's explicit requirement — a lone "one span per call"
+// design would hide how much of the total latency/failure came from
+// retries.
 func (c *Client) CompleteWithMessages(ctx context.Context, system string, messages []Message) (string, error) {
 	if !c.Enabled() {
 		return "", fmt.Errorf("llm: client is not configured (missing base URL or model)")
 	}
+
+	ctx, span := tracer().Start(ctx, "llm.complete", oteltrace.WithAttributes(
+		attribute.String(telemetry.AttrGenAISystem, genAISystem),
+		attribute.String(telemetry.AttrGenAIRequestModel, c.model),
+		attribute.Int(telemetry.AttrGenAIRequestMaxTokens, c.maxTokens),
+	))
+	defer span.End()
 
 	allMessages := make([]Message, 0, len(messages)+1)
 	allMessages = append(allMessages, Message{Role: "system", Content: system})
@@ -177,12 +234,20 @@ func (c *Client) CompleteWithMessages(ctx context.Context, system string, messag
 	const maxRetries = 2
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		result, err := c.doRequest(ctx, reqBody)
+		result, usage, err := c.doRequestTraced(ctx, reqBody, attempt)
 		if err == nil {
+			if usage != nil {
+				span.SetAttributes(
+					attribute.Int(telemetry.AttrGenAIUsageInputTokens, usage.PromptTokens),
+					attribute.Int(telemetry.AttrGenAIUsageOutputTokens, usage.CompletionTokens),
+				)
+			}
 			return result, nil
 		}
 		if isClientError(err) {
 			// 4xx — do not retry.
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return "", err
 		}
 		lastErr = err
@@ -192,7 +257,36 @@ func (c *Client) CompleteWithMessages(ctx context.Context, system string, messag
 			"error", err,
 		)
 	}
-	return "", fmt.Errorf("llm: all retries exhausted: %w", lastErr)
+	finalErr := fmt.Errorf("llm: all retries exhausted: %w", lastErr)
+	span.RecordError(finalErr)
+	span.SetStatus(codes.Error, finalErr.Error())
+	return "", finalErr
+}
+
+// doRequestTraced wraps a single doRequest attempt in a child span, recorded
+// under whatever span is already active in ctx (CompleteWithMessages' parent
+// "llm.complete" span). attempt is the zero-based retry index, recorded as
+// the llm.retry.attempt attribute so a specific attempt's latency/failure
+// can be correlated with its position in the retry sequence.
+func (c *Client) doRequestTraced(ctx context.Context, reqBody chatRequest, attempt int) (string, *tokenUsage, error) {
+	ctx, span := tracer().Start(ctx, "llm.complete.attempt", oteltrace.WithAttributes(
+		attribute.Int(telemetry.AttrLLMRetryAttempt, attempt),
+	))
+	defer span.End()
+
+	result, usage, err := c.doRequest(ctx, reqBody)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return "", nil, err
+	}
+	if usage != nil {
+		span.SetAttributes(
+			attribute.Int(telemetry.AttrGenAIUsageInputTokens, usage.PromptTokens),
+			attribute.Int(telemetry.AttrGenAIUsageOutputTokens, usage.CompletionTokens),
+		)
+	}
+	return result, usage, nil
 }
 
 // StreamWithMessages sends a multi-turn chat completion request with
@@ -203,10 +297,30 @@ func (c *Client) CompleteWithMessages(ctx context.Context, system string, messag
 // tokens to a caller that has already forwarded earlier deltas downstream
 // (e.g. to an SSE client). A 4xx/5xx status returned before any body is
 // read is reported as a plain error with onDelta never called.
-func (c *Client) StreamWithMessages(ctx context.Context, system string, messages []Message, onDelta func(string)) error {
+//
+// Tracing: the whole call is wrapped in a single "llm.stream" span (no
+// retry, so no attempt/parent split is needed — see CompleteWithMessages).
+// err is a named return so the deferred span finalizer can record whatever
+// error value the function ultimately returns, from any of its several
+// return points, without duplicating span.RecordError/SetStatus calls at
+// each one.
+func (c *Client) StreamWithMessages(ctx context.Context, system string, messages []Message, onDelta func(string)) (err error) {
 	if !c.Enabled() {
 		return fmt.Errorf("llm: client is not configured (missing base URL or model)")
 	}
+
+	ctx, span := tracer().Start(ctx, "llm.stream", oteltrace.WithAttributes(
+		attribute.String(telemetry.AttrGenAISystem, genAISystem),
+		attribute.String(telemetry.AttrGenAIRequestModel, c.model),
+		attribute.Int(telemetry.AttrGenAIRequestMaxTokens, c.maxTokens),
+	))
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
 
 	allMessages := make([]Message, 0, len(messages)+1)
 	allMessages = append(allMessages, Message{Role: "system", Content: system})
@@ -312,60 +426,65 @@ func isClientError(err error) bool {
 }
 
 // doRequest performs a single HTTP round-trip to the chat completions endpoint.
-func (c *Client) doRequest(ctx context.Context, reqBody chatRequest) (string, error) {
+// doRequest performs one HTTP round-trip and returns the completion text
+// plus, when the response body includes an OpenAI-format "usage" object, the
+// token counts it reported (nil when absent — some OpenAI-compatible proxies
+// omit it). The usage return value feeds the gen_ai.usage.* span attributes
+// set by doRequestTraced/CompleteWithMessages.
+func (c *Client) doRequest(ctx context.Context, reqBody chatRequest) (string, *tokenUsage, error) {
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", fmt.Errorf("llm: marshal request: %w", err)
+		return "", nil, fmt.Errorf("llm: marshal request: %w", err)
 	}
 
 	url := c.baseURL + "/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
-		return "", fmt.Errorf("llm: build request: %w", err)
+		return "", nil, fmt.Errorf("llm: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if c.tokens != nil {
 		tok, err := c.tokens.Token()
 		if err != nil {
-			return "", fmt.Errorf("llm: token source: %w", err)
+			return "", nil, fmt.Errorf("llm: token source: %w", err)
 		}
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("llm: HTTP request: %w", err)
+		return "", nil, fmt.Errorf("llm: HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("llm: read response body: %w", err)
+		return "", nil, fmt.Errorf("llm: read response body: %w", err)
 	}
 
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-		return "", &clientError{statusCode: resp.StatusCode, body: string(body)}
+		return "", nil, &clientError{statusCode: resp.StatusCode, body: string(body)}
 	}
 	if resp.StatusCode >= 500 {
-		return "", fmt.Errorf("llm: server error %d: %s", resp.StatusCode, string(body))
+		return "", nil, fmt.Errorf("llm: server error %d: %s", resp.StatusCode, string(body))
 	}
 
 	var chatResp chatResponse
 	if err := json.Unmarshal(body, &chatResp); err != nil {
-		return "", fmt.Errorf("llm: unmarshal response: %w", err)
+		return "", nil, fmt.Errorf("llm: unmarshal response: %w", err)
 	}
 
 	// Surface API-level errors embedded in a 200 response (some proxies do this).
 	if chatResp.Error != nil {
-		return "", &clientError{
+		return "", nil, &clientError{
 			statusCode: http.StatusOK,
 			body:       chatResp.Error.Message,
 		}
 	}
 
 	if len(chatResp.Choices) == 0 {
-		return "", fmt.Errorf("llm: response contains no choices")
+		return "", nil, fmt.Errorf("llm: response contains no choices")
 	}
 
-	return chatResp.Choices[0].Message.Content, nil
+	return chatResp.Choices[0].Message.Content, chatResp.Usage, nil
 }

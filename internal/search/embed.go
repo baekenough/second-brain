@@ -14,9 +14,28 @@ import (
 
 	tiktoken "github.com/pkoukk/tiktoken-go"
 	tiktoken_loader "github.com/pkoukk/tiktoken-go-loader"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/baekenough/second-brain/internal/auth"
+	"github.com/baekenough/second-brain/internal/telemetry"
 )
+
+// embedTracerName is the OTel instrumentation scope name for every span
+// created in this file. Looked up fresh via otel.Tracer() on each call
+// rather than cached in a package-level var — see the identical rationale
+// in internal/llm/client.go's tracer() helper.
+const embedTracerName = "github.com/baekenough/second-brain/internal/search"
+
+// embedGenAISystem is the gen_ai.system value for every embedding span:
+// EmbedClient always speaks OpenAI's /v1/embeddings protocol (see the
+// EmbedClient doc comment — embeddings are routed to OpenAI directly, never
+// through the generic chat proxy).
+const embedGenAISystem = "openai"
+
+func embedTracer() oteltrace.Tracer { return otel.Tracer(embedTracerName) }
 
 // embedRetryDelays defines the exponential backoff delays applied between
 // embed request retries. Consistent with the R004 error handling policy and
@@ -188,10 +207,29 @@ func (c *EmbedClient) Enabled() bool { return c.apiURL != "" }
 // When the server returns a Retry-After header with a longer delay, that delay
 // is honoured instead of the default backoff interval.
 // 4xx errors other than 429 are not retried.
-func (c *EmbedClient) Embed(ctx context.Context, text string) ([]float32, error) {
+//
+// Tracing: wrapped in a single "embedding.single" span. No span is created
+// when the client is disabled (Enabled()==false) — that path is a
+// configuration no-op, not an API call. err is a named return so the
+// deferred finalizer can record whichever error value the retry loop's many
+// return points ultimately produces, without repeating
+// span.RecordError/SetStatus at each one.
+func (c *EmbedClient) Embed(ctx context.Context, text string) (vec []float32, err error) {
 	if !c.Enabled() {
 		return nil, nil
 	}
+
+	ctx, span := embedTracer().Start(ctx, "embedding.single", oteltrace.WithAttributes(
+		attribute.String(telemetry.AttrGenAISystem, embedGenAISystem),
+		attribute.String(telemetry.AttrGenAIRequestModel, c.model),
+	))
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
 
 	text = truncateForEmbed(text)
 
@@ -325,10 +363,28 @@ const (
 // A single item whose character count alone exceeds maxBatchChars is sent as
 // its own sub-batch (the existing per-document rune truncation makes this case
 // practically unreachable, but we handle it defensively).
-func (c *EmbedClient) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+//
+// Tracing: wrapped in a top-level "embedding.batch" span, with one child
+// "embedding.batch.subbatch" span per API call dispatched by embedBatchOnce
+// — so a slow or failing sub-batch is attributable within the overall batch
+// operation rather than only visible as aggregate latency. No span is
+// created when the client is disabled.
+func (c *EmbedClient) EmbedBatch(ctx context.Context, texts []string) (_ [][]float32, err error) {
 	if !c.Enabled() {
 		return make([][]float32, len(texts)), nil
 	}
+
+	ctx, span := embedTracer().Start(ctx, "embedding.batch", oteltrace.WithAttributes(
+		attribute.String(telemetry.AttrGenAISystem, embedGenAISystem),
+		attribute.String(telemetry.AttrGenAIRequestModel, c.model),
+	))
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
 
 	truncated := make([]string, len(texts))
 	for i, t := range texts {
@@ -374,7 +430,25 @@ func (c *EmbedClient) EmbedBatch(ctx context.Context, texts []string) ([][]float
 // Transient errors (5xx, network failures) and 429 rate-limit responses are
 // retried up to embedMaxRetries times with exponential backoff (1s/2s/4s),
 // honouring the Retry-After header when present.
-func (c *EmbedClient) embedBatchOnce(ctx context.Context, texts []string) ([][]float32, error) {
+//
+// Tracing: each call is one "embedding.batch.subbatch" child span (nested
+// under whatever span is active in ctx — EmbedBatch's parent "embedding.batch"
+// span when called from there), tagged with embedding.batch_size so a
+// specific sub-batch's size can be correlated with its latency/failure.
+func (c *EmbedClient) embedBatchOnce(ctx context.Context, texts []string) (_ [][]float32, err error) {
+	ctx, span := embedTracer().Start(ctx, "embedding.batch.subbatch", oteltrace.WithAttributes(
+		attribute.String(telemetry.AttrGenAISystem, embedGenAISystem),
+		attribute.String(telemetry.AttrGenAIRequestModel, c.model),
+		attribute.Int(telemetry.AttrEmbeddingBatchSize, len(texts)),
+	))
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+
 	payload := map[string]interface{}{
 		"input": texts,
 		"model": c.model,

@@ -19,12 +19,42 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	oteltrace "go.opentelemetry.io/otel/trace"
+
 	"github.com/baekenough/second-brain/internal/audiovalidate"
 	"github.com/baekenough/second-brain/internal/collector/smsmap"
 	"github.com/baekenough/second-brain/internal/config"
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/baekenough/second-brain/internal/telemetry"
 	"github.com/google/uuid"
 )
+
+// whisperTracerName is the OTel instrumentation scope name for every span
+// created in this file. Looked up fresh via otel.Tracer() on each call
+// rather than cached in a package-level var — see the identical rationale
+// in internal/llm/client.go's tracer() helper.
+const whisperTracerName = "github.com/baekenough/second-brain/internal/collector/whisper"
+
+func whisperTracer() oteltrace.Tracer { return otel.Tracer(whisperTracerName) }
+
+// whisperGenAISystem returns the gen_ai.system span attribute value for a
+// transcription call. Unlike internal/llm and internal/search (which always
+// speak to OpenAI directly), WhisperCollector's endpoint is operator-chosen
+// and commonly a self-hosted whisper.cpp server (see isLocalWhisperEndpoint
+// and the WHISPER_CLOUD_ALLOWED cloud-endpoint guard) — so this distinguishes
+// the two rather than uniformly reporting "openai", letting a Langfuse
+// provider-failure-rate dashboard actually separate "our local whisper.cpp
+// is down" from "OpenAI's endpoint is failing" (see the observability plan's
+// Task 4(a) failure-mode analysis).
+func whisperGenAISystem(isLocal bool) string {
+	if isLocal {
+		return "whisper-self-hosted"
+	}
+	return "openai"
+}
 
 // whisperDefaultHTTPTimeout is the fallback per-request timeout used when the
 // config value is zero (misconfigured). 2 hours covers long audio recordings
@@ -1054,7 +1084,12 @@ func (c *WhisperCollector) CollectStream(ctx context.Context, since time.Time, o
 	//
 	// transcribeFile / diarizeAudio internals are unchanged; only the dispatch is
 	// parallelised and the emit is incremental.
-	emitted, streamErr := c.streamPending(ctx, pending, now, onBatch)
+	//
+	// isLocal (computed once above) is threaded through to buildDocument /
+	// transcribeFile so each transcription span's gen_ai.system attribute
+	// reflects locality without re-running isLocalWhisperEndpoint's DNS
+	// lookup per file.
+	emitted, streamErr := c.streamPending(ctx, pending, now, isLocal, onBatch)
 
 	slog.Info("whisper: collected transcripts", "count", emitted, "audio_dir", c.cfg.WhisperAudioDir)
 	return streamErr
@@ -1100,7 +1135,7 @@ type pendingTranscription struct {
 //
 // When concurrency == 1 a single worker processes the channel, reproducing the
 // original sequential transcription order.
-func (c *WhisperCollector) streamPending(ctx context.Context, pending []pendingTranscription, now time.Time, onBatch func([]model.Document) error) (int, error) {
+func (c *WhisperCollector) streamPending(ctx context.Context, pending []pendingTranscription, now time.Time, isLocal bool, onBatch func([]model.Document) error) (int, error) {
 	if len(pending) == 0 {
 		return 0, nil
 	}
@@ -1131,7 +1166,7 @@ func (c *WhisperCollector) streamPending(ctx context.Context, pending []pendingT
 			if streamCtx.Err() != nil {
 				return
 			}
-			doc, ok := c.buildDocument(streamCtx, item, now)
+			doc, ok := c.buildDocument(streamCtx, item, now, isLocal)
 			if !ok {
 				continue // failure already logged; partial success
 			}
@@ -1225,8 +1260,8 @@ func (c *WhisperCollector) streamPending(ctx context.Context, pending []pendingT
 // inline in the walk; it is unchanged except for being extracted so the worker
 // pool can call it concurrently. transcribeFile / diarizeAudio internals are
 // untouched.
-func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTranscription, now time.Time) (model.Document, bool) {
-	txResult, err := c.transcribeFile(ctx, item.path)
+func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTranscription, now time.Time, isLocal bool) (model.Document, bool) {
+	txResult, err := c.transcribeFile(ctx, item.path, isLocal)
 	if err != nil {
 		slog.Warn("whisper: transcription failed", "path", item.path, "error", err)
 		return model.Document{}, false // partial success — skip
@@ -1536,11 +1571,31 @@ type transcribeFileResult struct {
 //
 // The Authorization header is set only when cfg.WhisperAPIKey is non-empty,
 // enabling use with local whisper.cpp servers that do not require authentication.
-func (c *WhisperCollector) transcribeFile(ctx context.Context, path string) (transcribeFileResult, error) {
+//
+// Tracing: each call (one per worker-pool item — see buildDocument) is
+// wrapped in a single "transcription" span, tagged with gen_ai.system
+// (whisperGenAISystem(isLocal) — distinguishes self-hosted whisper.cpp from
+// OpenAI's cloud endpoint), gen_ai.request.model, and audio.size_bytes. err
+// is a named return so the deferred finalizer can record whichever error
+// this function's several return points ultimately produce.
+func (c *WhisperCollector) transcribeFile(ctx context.Context, path string, isLocal bool) (_ transcribeFileResult, err error) {
 	audioBytes, err := os.ReadFile(path)
 	if err != nil {
 		return transcribeFileResult{}, fmt.Errorf("read audio file: %w", err)
 	}
+
+	ctx, span := whisperTracer().Start(ctx, "transcription", oteltrace.WithAttributes(
+		attribute.String(telemetry.AttrGenAISystem, whisperGenAISystem(isLocal)),
+		attribute.String(telemetry.AttrGenAIRequestModel, c.cfg.WhisperModel),
+		attribute.Int(telemetry.AttrAudioSizeBytes, len(audioBytes)),
+	))
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
 
 	// See doc comment above: native diarization is requested unconditionally
 	// of cfg.DiarizationEnabled, which retains its original meaning only for

@@ -441,6 +441,31 @@ type Config struct {
 	// insight documents are supporting hypotheses, not primary evidence.
 	// ASK_CONTEXT_INSIGHT_M env var, default 3.
 	AskContextInsightM int
+
+	// LLM observability (OpenTelemetry → self-hosted Langfuse, OTLP/HTTP).
+	// All three default to "" (disabled) — internal/telemetry.InitOTel
+	// configures a no-op TracerProvider when LangfuseOTLPEndpoint is empty,
+	// so an operator who never sets these three env vars sees zero behavior
+	// change (see internal/telemetry doc comment).
+	//
+	// LangfuseOTLPEndpoint is the FULL OTLP traces URL — used verbatim, NOT a
+	// bare host that gets "/v1/traces" appended (see InitOTel's doc comment
+	// for why WithEndpointURL is used over WithEndpoint).
+	//
+	// For this deployment: "http://100.77.20.12:3300/api/public/otel" (the
+	// Tailscale-interface binding of langfuse-web). Do NOT set this to the
+	// public https://langfuse.<domain> hostname — that sits behind Cloudflare
+	// Access, and a server-to-server OTLP POST with no browser session gets a
+	// silent 302-to-login instead of a real response, so every span is
+	// dropped with no error anywhere (see InitOTel's doc comment for the
+	// full explanation). LANGFUSE_OTLP_ENDPOINT env var.
+	LangfuseOTLPEndpoint string
+	// LangfusePublicKey / LangfuseSecretKey form the HTTP Basic Auth
+	// credentials Langfuse's OTLP receiver expects
+	// (Authorization: Basic base64(publicKey:secretKey)).
+	// LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY env vars.
+	LangfusePublicKey string
+	LangfuseSecretKey string
 }
 
 // Load reads configuration from environment variables and returns a Config.
@@ -673,6 +698,12 @@ func Load() (*Config, error) {
 		AskTimeoutSeconds:  askTimeoutSeconds(),
 		AskContextTopK:     askContextTopK(),
 		AskContextInsightM: askContextInsightM(),
+
+		// #Langfuse observability — all default "" (disabled); see doc
+		// comment on LangfuseOTLPEndpoint above.
+		LangfuseOTLPEndpoint: os.Getenv("LANGFUSE_OTLP_ENDPOINT"),
+		LangfusePublicKey:    os.Getenv("LANGFUSE_PUBLIC_KEY"),
+		LangfuseSecretKey:    os.Getenv("LANGFUSE_SECRET_KEY"),
 	}, nil
 }
 
