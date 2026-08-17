@@ -49,6 +49,18 @@ export default function RootLayout({ children }: RootLayoutProps) {
             </Link>
             <nav className="flex items-center gap-1 text-sm">
               <Link
+                href="/ask"
+                className="rounded-md px-3 py-1.5 text-foreground-muted transition-colors hover:bg-surface-subtle hover:text-foreground"
+              >
+                Ask
+              </Link>
+              <Link
+                href="/capture"
+                className="rounded-md px-3 py-1.5 text-foreground-muted transition-colors hover:bg-surface-subtle hover:text-foreground"
+              >
+                Capture
+              </Link>
+              <Link
                 href="/"
                 className="rounded-md px-3 py-1.5 text-foreground-muted transition-colors hover:bg-surface-subtle hover:text-foreground"
               >
