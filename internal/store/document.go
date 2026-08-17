@@ -1191,6 +1191,97 @@ func (s *DocumentStore) MarkEntitiesProcessed(ctx context.Context, documentID uu
 	return nil
 }
 
+// ListPendingForExtraction returns up to limit active documents from the 4
+// active sources (gmail, sms, call-log, call-transcript) whose occurred_at
+// falls within the last 30 days AND whose relations_extracted_at is NULL
+// AND whose extraction backoff (if any) has elapsed (spec §5.1, migration
+// 023). The 30-day bound is evaluated live at every call — NOT a one-time
+// snapshot — so newly collected documents (which always have recent
+// occurred_at) are naturally picked up on later ticks without any extra
+// state, satisfying spec §5.1's "이후에는 신규 유입 문서를 증분 처리한다".
+//
+// Deliberately keyed on relations_extracted_at, NOT entities_processed_at:
+// that column belongs to the pre-existing, currently-active EntityWorker
+// (ENTITY_EXTRACTION_ENABLED=true in production), which extracts a
+// different artifact via a different LLM call. See migration 023's header
+// comment for the full rationale.
+func (s *DocumentStore) ListPendingForExtraction(ctx context.Context, limit int) ([]*model.Document, error) {
+	const q = `
+		SELECT id, source_type, source_id, title, content, metadata, embedding,
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding
+		FROM documents
+		WHERE status = 'active'
+		  AND relations_extracted_at IS NULL
+		  AND source_type IN ('gmail', 'sms', 'call-log', 'call-transcript')
+		  AND occurred_at >= now() - interval '30 days'
+		  AND (metadata->>'extraction_next_retry_at' IS NULL
+		       OR (metadata->>'extraction_next_retry_at')::timestamptz <= now())
+		ORDER BY occurred_at ASC
+		LIMIT $1`
+
+	rows, err := s.pg.pool.Query(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list pending for extraction: %w", err)
+	}
+	defer rows.Close()
+
+	return collectDocuments(rows)
+}
+
+// MarkRelationsExtracted sets relations_extracted_at to now() on successful
+// extraction. After this call the document is never returned by
+// ListPendingForExtraction again (migration 023's partial index scopes on
+// this column being NULL).
+func (s *DocumentStore) MarkRelationsExtracted(ctx context.Context, documentID uuid.UUID) error {
+	const q = `UPDATE documents SET relations_extracted_at = now() WHERE id = $1 AND relations_extracted_at IS NULL`
+	if _, err := s.pg.pool.Exec(ctx, q, documentID); err != nil {
+		return fmt.Errorf("mark relations extracted %s: %w", documentID, err)
+	}
+	return nil
+}
+
+// MarkExtractionAttemptFailed records a non-terminal extraction failure
+// (attempts 1-2 of a 3-attempt cap — mirrors NoteEnrichmentWorker's retry
+// model, adopted deliberately over EntityWorker's unbounded-retry model;
+// see plan Global Constraints). relations_extracted_at is left NULL so the
+// document is retried once nextRetryAt elapses.
+func (s *DocumentStore) MarkExtractionAttemptFailed(ctx context.Context, documentID uuid.UUID, attempts int, reason string, nextRetryAt time.Time) error {
+	const q = `
+		UPDATE documents
+		SET metadata = metadata || jsonb_build_object(
+		        'extraction_attempts', $2::int,
+		        'extraction_last_error', $3::text,
+		        'extraction_next_retry_at', $4::timestamptz
+		    ),
+		    updated_at = now()
+		WHERE id = $1`
+	if _, err := s.pg.pool.Exec(ctx, q, documentID, attempts, reason, nextRetryAt); err != nil {
+		return fmt.Errorf("mark extraction attempt failed %s: %w", documentID, err)
+	}
+	return nil
+}
+
+// MarkExtractionTerminal records the 3rd (terminal) extraction failure:
+// relations_extracted_at is set so ListPendingForExtraction stops returning
+// the document (a permanently malformed LLM output must not retry forever
+// — this is the exact failure mode this plan's JSON-decoder defense and
+// retry cap both exist to bound). There is currently no manual-retry
+// endpoint for extraction (unlike POST /api/v1/notes/{id}/retry-enrichment)
+// — out of scope for Part A; add one in Part C if operational need arises.
+func (s *DocumentStore) MarkExtractionTerminal(ctx context.Context, documentID uuid.UUID, reason string) error {
+	const q = `
+		UPDATE documents
+		SET relations_extracted_at = now(),
+		    metadata = metadata || jsonb_build_object('extraction_last_error', $2::text),
+		    updated_at = now()
+		WHERE id = $1`
+	if _, err := s.pg.pool.Exec(ctx, q, documentID, reason); err != nil {
+		return fmt.Errorf("mark extraction terminal %s: %w", documentID, err)
+	}
+	return nil
+}
+
 // ListPendingNotes returns up to limit active model.SourceNote documents
 // whose Metadata.enrichment_status is "pending" and whose
 // enrichment_next_retry_at backoff (if any) has elapsed. Used by
