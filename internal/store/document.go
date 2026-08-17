@@ -632,11 +632,7 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		rrf AS (
 			SELECT
 				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) AS id,
-				COALESCE(%g/(%g + fts.rank),     0)
-				+ COALESCE(%g/(%g + vec.rank),     0)
-				+ COALESCE(%g/(%g + bigm.rank),    0)
-				+ COALESCE(%g/(%g + summvec.rank), 0)
-				+ COALESCE(%g/(%g + entity.rank),  0) AS score
+				%s AS score
 			FROM fts
 			FULL OUTER JOIN vec     ON fts.id = vec.id
 			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
@@ -656,11 +652,7 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		statusFilter, sourceFilter, excludeFilter,
 		statusFilter, sourceFilter, excludeFilter,
 		entityCTE,
-		w.FTSWeight, w.RRFK,
-		w.VecWeight, w.RRFK,
-		w.BigmWeight, w.RRFK,
-		w.SummaryVec, w.RRFK,
-		w.EntityWeight, w.RRFK,
+		buildRRFScoreExpr(w),
 		sortOrder(query.Sort, "d"))
 
 	rows, err := s.pg.pool.Query(ctx, q, args...)
@@ -677,6 +669,34 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		results = results[:query.Limit]
 	}
 	return results, nil
+}
+
+// buildRRFScoreExpr renders the weighted-sum SQL expression that fuses the
+// five per-lane ranks (fts, vec, bigm, summvec, entity) into a single RRF
+// relevance score.
+//
+// Every weight/k value is explicitly cast to ::float8. Go's "%g" verb formats
+// a whole-number float64 without a decimal point (1.0 -> "1", 60.0 -> "60"),
+// and the default weights (FTS/Vec/Bigm=1.0, RRFK=60.0) all format this way.
+// Without the cast, PostgreSQL parses "1/(60 + fts.rank)" as `integer`
+// division: since rank is always >= 1, the denominator is always >= 61,
+// strictly greater than the numerator, so the result truncates to 0 for every
+// row. That collapsed the fts/vec/bigm lanes' contribution to `score` to zero
+// on every hybridSearch call, leaving the final ORDER BY with no real
+// relevance signal for the vast majority of the corpus.
+func buildRRFScoreExpr(w model.SearchWeights) string {
+	return fmt.Sprintf(
+		`COALESCE(%g::float8/(%g::float8 + fts.rank),     0)
+				+ COALESCE(%g::float8/(%g::float8 + vec.rank),     0)
+				+ COALESCE(%g::float8/(%g::float8 + bigm.rank),    0)
+				+ COALESCE(%g::float8/(%g::float8 + summvec.rank), 0)
+				+ COALESCE(%g::float8/(%g::float8 + entity.rank),  0)`,
+		w.FTSWeight, w.RRFK,
+		w.VecWeight, w.RRFK,
+		w.BigmWeight, w.RRFK,
+		w.SummaryVec, w.RRFK,
+		w.EntityWeight, w.RRFK,
+	)
 }
 
 // emptyEntityCTE is the entity lane when its RRF weight is zero: a
