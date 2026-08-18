@@ -161,6 +161,11 @@ func run() error {
 	actionStore := store.NewActionQueryStore(pg)
 	srv = wireActionsAndBriefing(srv, cfg, actionStore, actionStore, llmClient.Enabled())
 
+	// --- Per-evidence feedback (Part D, feature-flagged off) ---
+	// The votes live in the same feedback store as the existing answer-level
+	// feedback, so no new connection or store is introduced here.
+	srv = wireEvidenceFeedback(srv, cfg, feedbackStore)
+
 	// --- Graph read API (Part B, optional) ---
 	// Wired only when both NEO4J_URI and NEO4J_PASSWORD are present. A
 	// connection failure logs a warning and leaves the graph routes
@@ -181,11 +186,27 @@ func run() error {
 		}
 	}
 
+	// WriteTimeout is the slow-client guard, so it stays finite and is NOT
+	// sized for the slowest endpoint. It is sized for the slowest ordinary
+	// one — /ask (ASK_TIMEOUT_SECONDS, default 60s, streamed as SSE) and a
+	// cold-start /search, whose first query after a container restart has been
+	// measured past the previous hardcoded 30s (issue #195, where that
+	// deadline turned a slow search into an empty response). The briefing,
+	// which can legitimately run for minutes, extends its own write deadline
+	// per request instead (internal/api/briefing.go), so this value does not
+	// have to grow with BRIEFING_TIMEOUT_SECONDS.
+	if writeTimeout := cfg.HTTPWriteTimeout; writeTimeout <= time.Duration(cfg.AskTimeoutSeconds)*time.Second {
+		slog.Warn("HTTP_WRITE_TIMEOUT_SECONDS is not above ASK_TIMEOUT_SECONDS — /ask responses may be truncated mid-stream",
+			"http_write_timeout", writeTimeout.String(),
+			"ask_timeout_seconds", cfg.AskTimeoutSeconds,
+		)
+	}
+
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      srv.Handler(),
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		WriteTimeout: cfg.HTTPWriteTimeout,
 		IdleTimeout:  60 * time.Second,
 	}
 
@@ -242,6 +263,30 @@ func wireActionsAndBriefing(srv *api.Server, cfg *config.Config, lister api.Acti
 		return srv
 	}
 	return srv.WithBriefing(briefing.NewCache(briefingCacheSize), cfg.BriefingMaxActions)
+}
+
+// wireEvidenceFeedback conditionally registers POST /api/v1/feedback/evidence
+// (Part D). Like wireActionsAndBriefing it is a pure function so the on/off
+// decision is unit-testable without a live Postgres connection.
+//
+// The flag defaults to false: an unset FEEDBACK_EVIDENCE_ENABLED leaves the
+// route out of the router entirely (404), which is the rollback mechanism.
+// A nil voter is also treated as "off" — turning the flag on without a store
+// must not register a route whose only possible outcome is a nil-pointer
+// panic.
+//
+// The api handler re-checks the same environment variable per request, so
+// this wiring is necessary but not sufficient to expose the endpoint; both
+// layers read the same truthy set (see config.envFlag).
+func wireEvidenceFeedback(srv *api.Server, cfg *config.Config, voter api.EvidenceVoter) *api.Server {
+	if !cfg.FeedbackEvidenceEnabled {
+		return srv
+	}
+	if voter == nil {
+		slog.Warn("evidence feedback disabled — no feedback store available despite FEEDBACK_EVIDENCE_ENABLED=true")
+		return srv
+	}
+	return srv.WithEvidenceFeedback(voter)
 }
 
 // migrationsPath returns the path to the migrations directory.

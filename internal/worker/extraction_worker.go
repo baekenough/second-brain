@@ -345,12 +345,22 @@ func (w *ExtractionWorker) persistAction(ctx context.Context, doc *model.Documen
 
 	var counterpartID *int64
 	var counterpartIdentity string
+	var counterpartName string
+	var counterpartType model.EntityType
 	if a.Kind == string(model.KindAwaitingMyReply) {
 		identity, ok := action.CounterpartIdentity(doc, func(addr string) bool { return action.IsUserAddress(w.userAddrs, addr) })
 		if !ok {
 			return nil // e.g. gmail "from" is the user's own address — not awaiting a reply
 		}
 		counterpartIdentity = identity
+		// The counterpart of an awaiting_my_reply action is fixed by the
+		// document's metadata, not named by the LLM (that is what makes the
+		// structural and LLM candidates converge on one identity_key). It
+		// still deserves an entities row, so the card can name who is
+		// waiting; the store resolves the label.
+		if name, entityType, ok := action.CounterpartDisplay(doc); ok {
+			counterpartName, counterpartType = name, entityType
+		}
 	} else {
 		counterpartIdentity = strings.ToLower(strings.TrimSpace(a.Counterpart))
 		if a.Counterpart != "" {
@@ -371,6 +381,8 @@ func (w *ExtractionWorker) persistAction(ctx context.Context, doc *model.Documen
 		Kind:                model.ActionKind(a.Kind),
 		Summary:             a.Summary,
 		CounterpartEntityID: counterpartID,
+		CounterpartName:     counterpartName,
+		CounterpartType:     counterpartType,
 		DetectedBy:          model.DetectedLLM,
 		Confidence:          a.Confidence,
 		ObservedAt:          time.Now().UTC(),

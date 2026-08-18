@@ -494,6 +494,50 @@ type Config struct {
 	// BRIEFING_MAX_ACTIONS: caps how many open actions feed a single
 	// briefing request. Default 40. Invalid values use the default.
 	BriefingMaxActions int
+
+	// BriefingTimeout bounds one GET /api/v1/briefing request (the open-action
+	// query plus the LLM call). BRIEFING_TIMEOUT_SECONDS env var, default 120s.
+	//
+	// It replaces a hardcoded 30s ceiling in internal/api/briefing.go. In
+	// production that ceiling was below the actual model latency, so every
+	// request hit it and briefing.Generate degraded to the deterministic
+	// aggregate: HTTP 200, degraded=true, a single sentence, dropped_count=0.
+	// The failure was invisible from the status code alone, which is exactly
+	// why the bound must be operator-tunable instead of compiled in.
+	//
+	// The default deliberately matches LLMTimeoutSeconds' own default (120s):
+	// the LLM client's HTTP timeout should be what fails a slow model, not
+	// this outer context, so that a timeout is attributed to the model call.
+	// Invalid, zero, and negative values use the default.
+	BriefingTimeout time.Duration
+
+	// HTTPWriteTimeout is http.Server.WriteTimeout for the API server.
+	// HTTP_WRITE_TIMEOUT_SECONDS env var, default 90s.
+	//
+	// This is a slow-client guard: it bounds how long one connection may hold
+	// a response open, so it must stay finite. The default is sized to cover
+	// the slowest NON-briefing paths — /ask (AskTimeoutSeconds, default 60s,
+	// streamed as SSE) and a cold-start /search whose first query after a
+	// container restart has been measured past 30s (issue #195) — with margin.
+	// The briefing, which may legitimately run far longer, extends its own
+	// write deadline per request instead of forcing this global value up (see
+	// internal/api/briefing.go).
+	//
+	// Invalid, zero, and negative values use the default; there is no
+	// "unlimited" setting on purpose.
+	HTTPWriteTimeout time.Duration
+
+	// FeedbackEvidenceEnabled gates POST /api/v1/feedback/evidence (Part D).
+	// FEEDBACK_EVIDENCE_ENABLED env var, default false.
+	//
+	// As with ActionsAPIEnabled, "off" means the route is never registered in
+	// the router — a 404, not a branch inside the handler — which is the
+	// rollback mechanism. The handler in internal/api/feedback_evidence.go
+	// re-reads the same variable per request, so both layers must agree on
+	// what counts as "on"; envFlag mirrors that handler's truthy set
+	// (1/true/yes/on, case-insensitive, surrounding space ignored) rather
+	// than the plain == "true" used by older flags.
+	FeedbackEvidenceEnabled bool
 }
 
 // Load reads configuration from environment variables and returns a Config.
@@ -757,7 +801,77 @@ func Load() (*Config, error) {
 		ActionsAPIEnabled:  os.Getenv("ACTIONS_API_ENABLED") == "true",
 		BriefingEnabled:    os.Getenv("BRIEFING_ENABLED") == "true",
 		BriefingMaxActions: briefingMaxActions(),
+		BriefingTimeout:    BriefingTimeout(),
+		HTTPWriteTimeout:   httpWriteTimeout(),
+
+		// Part D feedback collection — default false (see doc comment above).
+		FeedbackEvidenceEnabled: envFlag("FEEDBACK_EVIDENCE_ENABLED"),
 	}, nil
+}
+
+// DefaultBriefingTimeout is the fallback for BRIEFING_TIMEOUT_SECONDS.
+const DefaultBriefingTimeout = 120 * time.Second
+
+// BriefingTimeout resolves BRIEFING_TIMEOUT_SECONDS from the environment.
+//
+// Exported, and readable without a *Config, because internal/api's briefing
+// handler needs the value but has nowhere to store it: the api.Server fields
+// it would live in are owned by another change in flight, and the value is
+// read once per briefing request — a low-frequency, cache-protected path — so
+// resolving it from the environment costs nothing measurable. Config.Load
+// calls this too, so `cfg.BriefingTimeout` and this function can never report
+// different numbers.
+//
+// Invalid, zero, and negative values fall back to DefaultBriefingTimeout: a
+// zero timeout would mean "already expired" (context.WithTimeout with a
+// non-positive duration cancels immediately), turning a typo into a briefing
+// that is permanently degraded.
+func BriefingTimeout() time.Duration {
+	return timeoutSeconds("BRIEFING_TIMEOUT_SECONDS", DefaultBriefingTimeout)
+}
+
+// defaultHTTPWriteTimeout is the fallback for HTTP_WRITE_TIMEOUT_SECONDS.
+const defaultHTTPWriteTimeout = 90 * time.Second
+
+// httpWriteTimeout resolves HTTP_WRITE_TIMEOUT_SECONDS from the environment.
+// See Config.HTTPWriteTimeout for why this stays finite.
+func httpWriteTimeout() time.Duration {
+	return timeoutSeconds("HTTP_WRITE_TIMEOUT_SECONDS", defaultHTTPWriteTimeout)
+}
+
+// timeoutSeconds parses an integer-seconds env var into a duration, logging
+// and falling back to def for anything that is not a positive integer.
+func timeoutSeconds(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		slog.Warn("config: timeout is invalid; using default",
+			"key", key,
+			"value", v,
+			"default", def.String(),
+			"error", err,
+		)
+		return def
+	}
+	return time.Duration(n) * time.Second
+}
+
+// envFlag reports whether key holds a truthy value. The accepted set matches
+// the api package's own per-request gate for FEEDBACK_EVIDENCE_ENABLED, so
+// that wiring (this file) and handler (internal/api) cannot disagree about
+// whether a feature is on. Anything else — including the empty string and an
+// unset variable — is false: a deployment that says nothing about a feature
+// does not get it.
+func envFlag(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func calendarLookaheadDays() int {

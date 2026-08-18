@@ -16,11 +16,21 @@ import (
 // ThreadLatestMessage is one row of StructuralSignalLister.ListLatestPerThread's
 // result: the most recent document in a conversation thread, plus what's
 // needed to determine whether it is an "awaiting my reply" candidate (spec
-// §7.1).
+// §7.1) and to describe it on an action card.
+//
+// Title and EventAt exist only for the card: the summary this worker writes
+// used to be a fixed constant, which made every awaiting_my_reply row read
+// identically. They are the two document columns that carry conversation
+// context without carrying the message body.
 type ThreadLatestMessage struct {
 	DocumentID uuid.UUID
 	SourceType string
 	Metadata   map[string]any
+	Title      string
+	// EventAt is COALESCE(occurred_at, collected_at) — occurred_at is
+	// nullable, and ingest order is a serviceable stand-in for event time
+	// when the collector could not determine one.
+	EventAt time.Time
 }
 
 // StructuralSignalLister provides the thread-grouped SQL query consumed by
@@ -59,7 +69,8 @@ func NewPgStructuralSignalLister(pool *pgxpool.Pool) *PgStructuralSignalLister {
 // No LLM call — pure SQL, safe to run far more often than ExtractionWorker.
 const listLatestPerThreadQuery = `
 	WITH ranked AS (
-		SELECT id, source_type, metadata,
+		SELECT id, source_type, metadata, title,
+		       COALESCE(occurred_at, collected_at) AS event_at,
 		       row_number() OVER (
 		           PARTITION BY
 		               CASE
@@ -75,7 +86,7 @@ const listLatestPerThreadQuery = `
 		  AND occurred_at >= now() - interval '30 days'
 		  AND (source_type <> 'sms' OR COALESCE((metadata->>'is_auth_like')::boolean, false) = false)
 	)
-	SELECT id, source_type, metadata FROM ranked WHERE rn = 1
+	SELECT id, source_type, metadata, title, event_at FROM ranked WHERE rn = 1
 	LIMIT $1`
 
 // ListLatestPerThread implements StructuralSignalLister.
@@ -90,7 +101,7 @@ func (l *PgStructuralSignalLister) ListLatestPerThread(ctx context.Context, limi
 	for rows.Next() {
 		var m ThreadLatestMessage
 		var metaJSON []byte
-		if err := rows.Scan(&m.DocumentID, &m.SourceType, &metaJSON); err != nil {
+		if err := rows.Scan(&m.DocumentID, &m.SourceType, &metaJSON, &m.Title, &m.EventAt); err != nil {
 			return nil, fmt.Errorf("scan thread latest message: %w", err)
 		}
 		if len(metaJSON) > 0 {
@@ -118,6 +129,10 @@ type StructuralSignalWorkerConfig struct {
 	// BatchSize is the number of threads inspected per tick. Defaults to 500
 	// (this is cheap SQL-only work, so the default batch is generous).
 	BatchSize int
+	// Now supplies the current instant used to age each thread ("3일째
+	// 미응답"). Defaults to time.Now. Injectable so a test can assert the
+	// rendered card without racing the wall clock.
+	Now func() time.Time
 }
 
 // StructuralSignalWorker computes the "awaiting my reply" candidate action
@@ -131,6 +146,7 @@ type StructuralSignalWorker struct {
 	userAddresses []string
 	interval      time.Duration
 	batchSize     int
+	now           func() time.Time
 }
 
 // NewStructuralSignalWorker constructs a StructuralSignalWorker from cfg.
@@ -150,12 +166,17 @@ func NewStructuralSignalWorker(cfg StructuralSignalWorkerConfig) *StructuralSign
 	if batchSize <= 0 {
 		batchSize = 500
 	}
+	now := cfg.Now
+	if now == nil {
+		now = time.Now
+	}
 	return &StructuralSignalWorker{
 		store:         cfg.Store,
 		actions:       cfg.Actions,
 		userAddresses: cfg.UserAddresses,
 		interval:      interval,
 		batchSize:     batchSize,
+		now:           now,
 	}
 }
 
@@ -191,7 +212,16 @@ func (w *StructuralSignalWorker) Tick(ctx context.Context) {
 }
 
 func (w *StructuralSignalWorker) processMessage(ctx context.Context, m ThreadLatestMessage) {
-	doc := &model.Document{ID: m.DocumentID, SourceType: model.SourceType(m.SourceType), Metadata: m.Metadata}
+	doc := &model.Document{
+		ID:         m.DocumentID,
+		SourceType: model.SourceType(m.SourceType),
+		Metadata:   m.Metadata,
+		Title:      m.Title,
+	}
+	if !m.EventAt.IsZero() {
+		eventAt := m.EventAt
+		doc.OccurredAt = &eventAt
+	}
 
 	// Defense in depth: ListLatestPerThread's SQL already excludes
 	// is_auth_like sms documents at the source (spec §7.4), but this Go-level
@@ -217,19 +247,31 @@ func (w *StructuralSignalWorker) processMessage(ctx context.Context, m ThreadLat
 
 	identityKey := action.BuildIdentityKey(threadKey, string(model.KindAwaitingMyReply), counterpart, "")
 
+	// displayName is the label a human reads; counterpart (above) is the
+	// hash input. They are intentionally different strings — see
+	// action.CounterpartDisplay. An unresolvable display name leaves both the
+	// card label and counterpart_entity_id empty rather than inventing one.
+	displayName, entityType, hasDisplay := action.CounterpartDisplay(doc)
+	if !hasDisplay {
+		displayName, entityType = "", ""
+	}
+
 	if err := w.actions.UpsertAction(ctx, model.Action{
 		IdentityKey: identityKey,
 		DocumentID:  doc.ID,
 		ThreadKey:   threadKey,
 		Kind:        model.KindAwaitingMyReply,
-		// Fixed template summary, not free text — matches NormalizeSummary's
-		// treatment of this kind (the text itself is never hashed, but a
-		// stored summary still needs SOME value for Part C's briefing to
-		// display).
-		Summary:    "마지막 메시지 이후 응답 없음",
-		DetectedBy: model.DetectedStructural,
-		Confidence: 1.0, // deterministic rule, not a probabilistic guess
-		ObservedAt: time.Now().UTC(),
+		// Generated per thread, NOT a fixed template: a constant made all 434
+		// of these rows render as the same card. The text is still never
+		// hashed — NormalizeSummary discards it for this kind — so it may
+		// change on every tick (it reports the thread's age) without moving
+		// identity_key.
+		Summary:         action.AwaitingReplySummary(doc, displayName, w.now()),
+		CounterpartName: displayName,
+		CounterpartType: entityType,
+		DetectedBy:      model.DetectedStructural,
+		Confidence:      1.0, // deterministic rule, not a probabilistic guess
+		ObservedAt:      w.now().UTC(),
 	}); err != nil {
 		slog.Warn("structural signal worker: upsert action failed", "doc_id", doc.ID, "error", err)
 		return

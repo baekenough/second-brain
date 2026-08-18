@@ -67,6 +67,12 @@ export default function RootLayout({ children }: RootLayoutProps) {
                 검색
               </Link>
               <Link
+                href="/actions"
+                className="rounded-md px-3 py-1.5 text-foreground-muted transition-colors hover:bg-surface-subtle hover:text-foreground"
+              >
+                할 일
+              </Link>
+              <Link
                 href="/dashboard"
                 className="rounded-md px-3 py-1.5 text-foreground-muted transition-colors hover:bg-surface-subtle hover:text-foreground"
               >

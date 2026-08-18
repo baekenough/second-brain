@@ -622,3 +622,134 @@ func TestLoad_UserEmailAddresses(t *testing.T) {
 		}
 	}
 }
+
+// TestLoad_BriefingTimeoutSeconds verifies BRIEFING_TIMEOUT_SECONDS parsing.
+// The default must be comfortably above the observed LLM latency: production
+// measurement showed the briefing LLM call exceeding the old hardcoded 30s
+// ceiling on every request, which silently degraded the endpoint to the
+// aggregate-only fallback (degraded=true, one sentence, dropped_count=0).
+func TestLoad_BriefingTimeoutSeconds(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		envVal string
+		unset  bool
+		want   time.Duration
+	}{
+		{name: "default_when_unset", unset: true, want: 120 * time.Second},
+		{name: "explicit_45", envVal: "45", want: 45 * time.Second},
+		{name: "explicit_300", envVal: "300", want: 300 * time.Second},
+		{name: "invalid_string_uses_default", envVal: "notanumber", want: 120 * time.Second},
+		{name: "zero_uses_default", envVal: "0", want: 120 * time.Second},
+		{name: "negative_uses_default", envVal: "-1", want: 120 * time.Second},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unset {
+				unsetenv(t, "BRIEFING_TIMEOUT_SECONDS")
+			} else {
+				setenv(t, "BRIEFING_TIMEOUT_SECONDS", tc.envVal)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.BriefingTimeout != tc.want {
+				t.Errorf("BriefingTimeout = %v, want %v", cfg.BriefingTimeout, tc.want)
+			}
+			// The api package resolves the same value per request through the
+			// exported helper; the two must not drift.
+			if got := BriefingTimeout(); got != tc.want {
+				t.Errorf("BriefingTimeout() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoad_HTTPWriteTimeoutSeconds verifies HTTP_WRITE_TIMEOUT_SECONDS parsing.
+// This is the global http.Server.WriteTimeout — a slow-client guard that must
+// stay bounded, so 0/negative fall back to the default rather than meaning
+// "unlimited".
+func TestLoad_HTTPWriteTimeoutSeconds(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		envVal string
+		unset  bool
+		want   time.Duration
+	}{
+		{name: "default_when_unset", unset: true, want: 90 * time.Second},
+		{name: "explicit_30", envVal: "30", want: 30 * time.Second},
+		{name: "invalid_string_uses_default", envVal: "abc", want: 90 * time.Second},
+		{name: "zero_uses_default", envVal: "0", want: 90 * time.Second},
+		{name: "negative_uses_default", envVal: "-10", want: 90 * time.Second},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unset {
+				unsetenv(t, "HTTP_WRITE_TIMEOUT_SECONDS")
+			} else {
+				setenv(t, "HTTP_WRITE_TIMEOUT_SECONDS", tc.envVal)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.HTTPWriteTimeout != tc.want {
+				t.Errorf("HTTPWriteTimeout = %v, want %v", cfg.HTTPWriteTimeout, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoad_FeedbackEvidenceEnabled verifies FEEDBACK_EVIDENCE_ENABLED parsing.
+// The accepted truthy set deliberately mirrors the api handler's own gate
+// (1/true/yes/on, case-insensitive) so that wiring and handler cannot
+// disagree about whether the feature is on.
+func TestLoad_FeedbackEvidenceEnabled(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		envVal string
+		unset  bool
+		want   bool
+	}{
+		{name: "default_off_when_unset", unset: true, want: false},
+		{name: "empty_is_off", envVal: "", want: false},
+		{name: "true_is_on", envVal: "true", want: true},
+		{name: "TRUE_is_on", envVal: "TRUE", want: true},
+		{name: "one_is_on", envVal: "1", want: true},
+		{name: "yes_is_on", envVal: "yes", want: true},
+		{name: "on_is_on", envVal: " on ", want: true},
+		{name: "false_is_off", envVal: "false", want: false},
+		{name: "garbage_is_off", envVal: "maybe", want: false},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unset {
+				unsetenv(t, "FEEDBACK_EVIDENCE_ENABLED")
+			} else {
+				setenv(t, "FEEDBACK_EVIDENCE_ENABLED", tc.envVal)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.FeedbackEvidenceEnabled != tc.want {
+				t.Errorf("FeedbackEvidenceEnabled = %v, want %v", cfg.FeedbackEvidenceEnabled, tc.want)
+			}
+		})
+	}
+}

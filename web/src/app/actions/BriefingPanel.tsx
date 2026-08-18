@@ -35,11 +35,28 @@ function numberEvidence(data: BriefingResponse): {
   return { sentences };
 }
 
+/** Max footnote markers shown inline before the rest collapse behind an
+ * "외 N건" toggle. A degraded aggregate-only fallback can cite every open
+ * action in one sentence (dozens of ids) — the cap keeps the sentence
+ * readable without ever hiding evidence (plan Task 8's evidence contract). */
+const FOOTNOTE_VISIBLE_CAP = 5;
+
 export function BriefingPanel({ refreshKey }: BriefingPanelProps) {
   const [data, setData] = useState<BriefingResponse | null>(null);
   // React 19 transition rather than a setState in the effect body (project
   // lint rule react-hooks/set-state-in-effect).
   const [loading, startLoad] = useTransition();
+  // Which sentence indices have their full footnote list expanded.
+  const [expanded, setExpanded] = useState<ReadonlySet<number>>(() => new Set());
+
+  const toggleExpanded = (i: number) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(i)) next.delete(i);
+      else next.add(i);
+      return next;
+    });
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -97,22 +114,40 @@ export function BriefingPanel({ refreshKey }: BriefingPanelProps) {
         </div>
 
         <p className="text-sm leading-relaxed text-foreground">
-          {numbered.sentences.map((s, i) => (
-            <span key={i}>
-              {s.text}
-              {s.refs.map((ref) => (
-                <sup key={ref.id} className="ml-0.5">
-                  <Link
-                    href={`/documents/${ref.id}`}
-                    aria-label={`근거 문서 ${ref.n}`}
-                    className="text-text-accent underline-offset-2 hover:underline"
-                  >
-                    [{ref.n}]
-                  </Link>
-                </sup>
-              ))}{" "}
-            </span>
-          ))}
+          {numbered.sentences.map((s, i) => {
+            const isExpanded = expanded.has(i);
+            const overflow = s.refs.length - FOOTNOTE_VISIBLE_CAP;
+            const visibleRefs =
+              overflow > 0 && !isExpanded ? s.refs.slice(0, FOOTNOTE_VISIBLE_CAP) : s.refs;
+            return (
+              <span key={i}>
+                {s.text}
+                {visibleRefs.map((ref) => (
+                  <sup key={ref.id} className="ml-0.5">
+                    <Link
+                      href={`/documents/${ref.id}`}
+                      aria-label={`근거 문서 ${ref.n}`}
+                      className="text-text-accent underline-offset-2 hover:underline"
+                    >
+                      [{ref.n}]
+                    </Link>
+                  </sup>
+                ))}
+                {overflow > 0 && (
+                  <sup className="ml-0.5">
+                    <button
+                      type="button"
+                      onClick={() => toggleExpanded(i)}
+                      aria-expanded={isExpanded}
+                      className="text-text-accent underline-offset-2 hover:underline"
+                    >
+                      {isExpanded ? "접기" : `외 ${overflow}건`}
+                    </button>
+                  </sup>
+                )}{" "}
+              </span>
+            );
+          })}
         </p>
 
         {data.dropped_count > 0 && (

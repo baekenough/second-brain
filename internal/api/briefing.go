@@ -2,19 +2,26 @@ package api
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
 	"time"
 
 	"github.com/baekenough/second-brain/internal/briefing"
+	"github.com/baekenough/second-brain/internal/config"
 	"github.com/baekenough/second-brain/internal/store"
 )
 
-// briefingTimeout bounds one briefing request. On expiry briefing.Generate
-// degrades to the deterministic aggregate rather than failing the request: a
-// slow model must not turn into an error page over data the server already has.
-const briefingTimeout = 30 * time.Second
+// briefingWriteDeadlineMargin is added to the request timeout when this
+// handler extends its own socket write deadline (see briefingHandler).
+//
+// It covers the work that happens AFTER the context expires: briefing.Generate
+// falls back to the deterministic aggregate and the response is JSON-encoded
+// and written. Without the margin the write deadline and the context would
+// expire together and the degraded response — the whole point of the fallback
+// — would be the thing that gets truncated.
+const briefingWriteDeadlineMargin = 15 * time.Second
 
 type briefingResponse struct {
 	Sentences []briefing.Sentence `json:"sentences"`
@@ -57,7 +64,35 @@ const defaultBriefingMaxActions = 40
 // there is no way to know whether a cached briefing is still valid without it.
 // The LLM call is what the cache protects, not the query.
 func (s *Server) briefingHandler(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), briefingTimeout)
+	// Resolved per request from BRIEFING_TIMEOUT_SECONDS. This used to be a
+	// hardcoded 30s, which production latency exceeded on every call: the
+	// context expired mid-LLM-call, Generate degraded, and the endpoint
+	// returned 200 with degraded=true and a single sentence forever.
+	timeout := config.BriefingTimeout()
+
+	// The context bound above is useless on its own: http.Server.WriteTimeout
+	// puts a deadline on the socket that was armed when the request headers
+	// were read, so a briefing that legitimately runs longer than that global
+	// value gets its response cut off at the connection regardless of what
+	// this handler decides. Extending the deadline for THIS response only
+	// keeps the slow-client guard intact for every other route — raising the
+	// global WriteTimeout to fit the slowest endpoint would remove it for all
+	// of them.
+	//
+	// Failure is not fatal: without the extension the request still succeeds
+	// whenever it finishes inside the global WriteTimeout. errors.ErrUnsupported
+	// is the expected result under an httptest recorder and under any
+	// middleware that wraps the ResponseWriter without an Unwrap method, so it
+	// is logged at debug level; anything else is worth an operator's attention.
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(timeout + briefingWriteDeadlineMargin)); err != nil {
+		if errors.Is(err, errors.ErrUnsupported) {
+			slog.Debug("briefing: write deadline not adjustable on this ResponseWriter", "error", err)
+		} else {
+			slog.Warn("briefing: could not extend the write deadline; a slow response may be truncated by the global WriteTimeout", "error", err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
 	items, err := s.actionLister.ListOpenActions(ctx, store.ActionFilter{
