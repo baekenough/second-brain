@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/baekenough/second-brain/internal/briefing"
 	"github.com/baekenough/second-brain/internal/intent"
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
@@ -148,6 +149,24 @@ type Server struct {
 	// Metadata["number"] so it stays searchable. Set via
 	// WithPIINumberHashing before calling Handler().
 	piiNumberHashingEnabled bool
+
+	// actionLister and actionSetter are optional. When actionLister is non-nil
+	// the GET /api/v1/actions route is registered; when actionSetter is non-nil
+	// the POST /api/v1/actions/{identity_key}/status route is. Set via
+	// WithActions before calling Handler(). nil (the default) means the routes
+	// do not exist in the router at all — that missing route, answering 404, is
+	// exactly what the ACTIONS_API_ENABLED rollback switch buys.
+	actionLister ActionLister
+	actionSetter ActionStateSetter
+
+	// briefingCache, briefingMaxActions, and briefingModel are optional. When
+	// briefingCache is non-nil AND both actionLister and llmClient are present,
+	// the GET /api/v1/briefing route is registered. Set via WithBriefing before
+	// calling Handler(). The briefing depends on the actions read path, so
+	// turning the actions feature off turns the briefing off with it.
+	briefingCache      *briefing.Cache
+	briefingMaxActions int
+	briefingModel      string
 
 	// handlerOnce ensures buildHandler is called exactly once per Server so
 	// that the graphql-go schema (and its package-level type objects) are
@@ -324,6 +343,15 @@ func (s *Server) buildHandler() http.Handler {
 			r.Get("/api/v1/graph/expand", s.graphExpandHandler)
 			r.Get("/api/v1/graph/evidence", s.graphEvidenceHandler)
 			r.Get("/api/v1/graph/entities", s.graphEntitiesHandler)
+		}
+		if s.actionLister != nil {
+			r.Get("/api/v1/actions", s.listActionsHandler)
+		}
+		if s.actionSetter != nil {
+			r.Post("/api/v1/actions/{identity_key}/status", s.setActionStateHandler)
+		}
+		if s.briefingCache != nil && s.actionLister != nil && s.llmClient != nil {
+			r.Get("/api/v1/briefing", s.briefingHandler)
 		}
 		if s.notesUpserter != nil {
 			r.Post("/api/v1/notes", s.createNoteHandler)

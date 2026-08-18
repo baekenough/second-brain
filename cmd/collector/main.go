@@ -166,6 +166,7 @@ func run() error {
 		MaxTokens:   cfg.LLMMaxTokens,
 		Temperature: cfg.LLMTemperature,
 		Timeout:     time.Duration(cfg.LLMTimeoutSeconds) * time.Second,
+		Thinking:    cfg.LLMThinking,
 	}, nil)
 
 	// --- Summarizer worker ---

@@ -13,15 +13,22 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/joho/godotenv"
 	"github.com/baekenough/second-brain/internal/api"
+	"github.com/baekenough/second-brain/internal/briefing"
 	"github.com/baekenough/second-brain/internal/config"
 	"github.com/baekenough/second-brain/internal/graph"
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
 	"github.com/baekenough/second-brain/internal/telemetry"
+	"github.com/joho/godotenv"
 )
+
+// briefingCacheSize bounds the in-memory LRU briefing.Cache (plan Task 12).
+// Small on purpose: the cache key is the full open-action set, so a single-
+// user deployment rarely has more than a handful of distinct sets active at
+// once.
+const briefingCacheSize = 8
 
 // otelShutdownTimeout bounds how long the deferred telemetry shutdown may
 // block process exit. A dead/unreachable Langfuse collector must never
@@ -150,6 +157,10 @@ func run() error {
 		WithAskConfig(time.Duration(cfg.AskTimeoutSeconds)*time.Second, cfg.AskContextTopK, cfg.AskContextInsightM).
 		WithAskSessions(askSessionStore)
 
+	// --- Actions & Briefing (Part C, plan Task 12, feature-flagged off) ---
+	actionStore := store.NewActionQueryStore(pg)
+	srv = wireActionsAndBriefing(srv, cfg, actionStore, actionStore, llmClient.Enabled())
+
 	// --- Graph read API (Part B, optional) ---
 	// Wired only when both NEO4J_URI and NEO4J_PASSWORD are present. A
 	// connection failure logs a warning and leaves the graph routes
@@ -203,6 +214,34 @@ func run() error {
 
 	slog.Info("shutdown complete")
 	return nil
+}
+
+// wireActionsAndBriefing conditionally registers the /api/v1/actions and
+// /api/v1/briefing routes (plan Task 12). It is a pure function — no I/O —
+// so the on/off wiring driven by cfg is unit-testable without a live
+// Postgres connection (see main_test.go).
+//
+// Both feature flags default to false: leaving them unset means the routes
+// simply do not exist in the router (404), which IS the rollback mechanism
+// (spec §Rollback). BriefingEnabled only takes effect when ActionsAPIEnabled
+// is also true — the briefing reads through the actions query path — and is
+// additionally skipped when the LLM client is not configured (llmEnabled
+// false), since api.Server's own llmClient != nil guard cannot detect
+// "configured but disabled" (llm.New always returns a non-nil *Client).
+func wireActionsAndBriefing(srv *api.Server, cfg *config.Config, lister api.ActionLister, setter api.ActionStateSetter, llmEnabled bool) *api.Server {
+	if !cfg.ActionsAPIEnabled {
+		return srv
+	}
+	srv = srv.WithActions(lister, setter)
+
+	if !cfg.BriefingEnabled {
+		return srv
+	}
+	if !llmEnabled {
+		slog.Warn("briefing disabled — LLM client not configured despite BRIEFING_ENABLED=true")
+		return srv
+	}
+	return srv.WithBriefing(briefing.NewCache(briefingCacheSize), cfg.BriefingMaxActions)
 }
 
 // migrationsPath returns the path to the migrations directory.

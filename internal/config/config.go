@@ -475,6 +475,25 @@ type Config struct {
 	// LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY env vars.
 	LangfusePublicKey string
 	LangfuseSecretKey string
+
+	// Actions & Briefing feature flags (Part C, plan Task 12). Both default
+	// false so a fresh deploy exposes neither route until explicitly
+	// switched on — the route not existing (404) IS the rollback mechanism,
+	// not a branch inside the handler. See cmd/server/main.go wiring.
+	//
+	// ACTIONS_API_ENABLED: set "true" to register GET /api/v1/actions and
+	// POST /api/v1/actions/{identity_key}/status.
+	ActionsAPIEnabled bool
+	// BRIEFING_ENABLED: set "true" to register GET /api/v1/briefing. Only
+	// takes effect when ActionsAPIEnabled is also true (the briefing reads
+	// through the actions query path); it is also skipped when the LLM
+	// client is not configured, since a briefing without a model has
+	// nothing to summarise with. Both conditions are enforced in
+	// cmd/server/main.go, not here.
+	BriefingEnabled bool
+	// BRIEFING_MAX_ACTIONS: caps how many open actions feed a single
+	// briefing request. Default 40. Invalid values use the default.
+	BriefingMaxActions int
 }
 
 // Load reads configuration from environment variables and returns a Config.
@@ -733,6 +752,11 @@ func Load() (*Config, error) {
 		LangfuseOTLPEndpoint: os.Getenv("LANGFUSE_OTLP_ENDPOINT"),
 		LangfusePublicKey:    os.Getenv("LANGFUSE_PUBLIC_KEY"),
 		LangfuseSecretKey:    os.Getenv("LANGFUSE_SECRET_KEY"),
+
+		// Task 12 feature flags — default false (see doc comments above).
+		ActionsAPIEnabled:  os.Getenv("ACTIONS_API_ENABLED") == "true",
+		BriefingEnabled:    os.Getenv("BRIEFING_ENABLED") == "true",
+		BriefingMaxActions: briefingMaxActions(),
 	}, nil
 }
 
@@ -1206,6 +1230,25 @@ func retiredSources() []string {
 		return []string{"secretary"}
 	}
 	return splitCSV(raw)
+}
+
+// briefingMaxActions parses BRIEFING_MAX_ACTIONS from the environment.
+// Default is 40. Invalid values are ignored and the default is used.
+func briefingMaxActions() int {
+	const defaultMax = 40
+	v := os.Getenv("BRIEFING_MAX_ACTIONS")
+	if v == "" {
+		return defaultMax
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		slog.Warn("config: BRIEFING_MAX_ACTIONS is invalid; using default 40",
+			"value", v,
+			"error", err,
+		)
+		return defaultMax
+	}
+	return n
 }
 
 // normalizeExts ensures every extension starts with a leading dot and is lowercase.

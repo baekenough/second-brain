@@ -302,3 +302,82 @@ export interface GraphEvidenceResponse {
 export interface GraphEntitiesResponse {
   entities: GraphEntityHit[];
 }
+
+// ── Actions & briefing (Part C) ───────────────────────────────────────────
+//
+// The three closed vocabularies below mirror internal/model/action.go. They
+// are written as const tuples so the filter bar can iterate them without a
+// second, drifting list of strings.
+
+export const ACTION_KINDS = [
+  "awaiting_my_reply",
+  "my_commitment",
+  "their_commitment",
+  "scheduled",
+] as const;
+export type ActionKind = (typeof ACTION_KINDS)[number];
+
+export const ACTION_DETECTED_BY = ["structural", "llm", "both"] as const;
+export type ActionDetectedBy = (typeof ACTION_DETECTED_BY)[number];
+
+export type ActionState = "open" | "done" | "ignored";
+
+/** One open action. Carries no document body — only a document_id, so the
+ * amount of personal data sitting in any proxy or cache along this path stays
+ * at a one-line summary (plan Task 8). */
+export interface ActionItem {
+  identity_key: string;
+  document_id: string;
+  thread_key: string;
+  kind: ActionKind;
+  summary: string;
+  counterpart_name: string;
+  due_at: string | null;
+  detected_by: ActionDetectedBy;
+  confidence: number;
+  observed_at: string;
+  state: ActionState;
+}
+
+export interface ActionsResponse {
+  actions: ActionItem[];
+  count: number;
+  /** True when the page came back exactly full — there may be more rows
+   * behind it. Without this a client cannot tell "50 actions" from "at least
+   * 50 actions". */
+  truncated: boolean;
+}
+
+/** Filter arguments for listActions. `counterpart` is a person's name and is
+ * therefore never written into the page URL (see /actions page). */
+export interface ActionListParams {
+  kinds?: ActionKind[];
+  counterpart?: string;
+  dueBefore?: string;
+  minConfidence?: number;
+  sort?: "due" | "confidence";
+  limit?: number;
+  includeArchived?: boolean;
+}
+
+/** One briefing sentence with the evidence that justifies it. document_ids is
+ * never empty: a sentence the server could not tie to a real document is
+ * discarded before it reaches here (spec §7.3). */
+export interface BriefingSentence {
+  text: string;
+  document_ids: string[];
+  identity_keys: string[];
+}
+
+export interface BriefingResponse {
+  sentences: BriefingSentence[];
+  /** True when every model sentence failed validation and the response fell
+   * back to a deterministic aggregate. */
+  degraded: boolean;
+  /** How many model sentences were thrown away for lacking evidence. Shown to
+   * the user as a trust signal, not as debug output. */
+  dropped_count: number;
+  action_count: number;
+  cached: boolean;
+  generated_at: string;
+}

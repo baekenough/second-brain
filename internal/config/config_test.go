@@ -39,10 +39,10 @@ func TestLoad_SummarizerBackfillEnabled(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name    string
-		envVal  string
-		unset   bool
-		want    bool
+		name   string
+		envVal string
+		unset  bool
+		want   bool
 	}{
 		{name: "default_when_unset", unset: true, want: true},
 		{name: "explicit_true", envVal: "true", want: true},
@@ -336,7 +336,7 @@ func TestLoad_CollectorCutover(t *testing.T) {
 		name    string
 		envVal  string
 		unset   bool
-		wantNil bool   // true when we expect zero time
+		wantNil bool // true when we expect zero time
 		want    time.Time
 	}{
 		{name: "unset_returns_zero", unset: true, wantNil: true},
@@ -484,6 +484,119 @@ func TestLoad_PIINumberHashingEnabled(t *testing.T) {
 			}
 			if cfg.PIINumberHashingEnabled != tc.want {
 				t.Errorf("PIINumberHashingEnabled = %v, want %v", cfg.PIINumberHashingEnabled, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoad_ActionsAPIEnabled verifies ACTIONS_API_ENABLED parsing (Task 12 —
+// feature flag default MUST be false, since the missing route (404) IS the
+// rollback mechanism for the actions/briefing feature).
+func TestLoad_ActionsAPIEnabled(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		envVal string
+		unset  bool
+		want   bool
+	}{
+		{name: "default_when_unset", unset: true, want: false},
+		{name: "explicit_true", envVal: "true", want: true},
+		{name: "explicit_false", envVal: "false", want: false},
+		{name: "invalid_value_disabled", envVal: "1", want: false}, // only literal "true" enables
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unset {
+				unsetenv(t, "ACTIONS_API_ENABLED")
+			} else {
+				setenv(t, "ACTIONS_API_ENABLED", tc.envVal)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.ActionsAPIEnabled != tc.want {
+				t.Errorf("ActionsAPIEnabled = %v, want %v", cfg.ActionsAPIEnabled, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoad_BriefingEnabled verifies BRIEFING_ENABLED parsing (Task 12 —
+// default false; whether it takes effect also depends on ActionsAPIEnabled,
+// which is wired in cmd/server/main.go, not here).
+func TestLoad_BriefingEnabled(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		envVal string
+		unset  bool
+		want   bool
+	}{
+		{name: "default_when_unset", unset: true, want: false},
+		{name: "explicit_true", envVal: "true", want: true},
+		{name: "explicit_false", envVal: "false", want: false},
+		{name: "invalid_value_disabled", envVal: "yes", want: false},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unset {
+				unsetenv(t, "BRIEFING_ENABLED")
+			} else {
+				setenv(t, "BRIEFING_ENABLED", tc.envVal)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.BriefingEnabled != tc.want {
+				t.Errorf("BriefingEnabled = %v, want %v", cfg.BriefingEnabled, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoad_BriefingMaxActions verifies BRIEFING_MAX_ACTIONS parsing.
+func TestLoad_BriefingMaxActions(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		envVal string
+		unset  bool
+		want   int
+	}{
+		{name: "default_when_unset", unset: true, want: 40},
+		{name: "explicit_100", envVal: "100", want: 100},
+		{name: "invalid_string_uses_default", envVal: "notanumber", want: 40},
+		{name: "zero_uses_default", envVal: "0", want: 40},
+		{name: "negative_uses_default", envVal: "-1", want: 40},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unset {
+				unsetenv(t, "BRIEFING_MAX_ACTIONS")
+			} else {
+				setenv(t, "BRIEFING_MAX_ACTIONS", tc.envVal)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.BriefingMaxActions != tc.want {
+				t.Errorf("BriefingMaxActions = %d, want %d", cfg.BriefingMaxActions, tc.want)
 			}
 		})
 	}
