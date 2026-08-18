@@ -29,6 +29,20 @@ vendor/
 .env.*.local
 .env.laptop-collector
 
+# Deploy backups (created on every macmini/ubuntu deploy, contain live secrets)
+.env.local.bak.*
+**/.env.local.bak.*
+
+# CI stub-verification leftovers (can contain real values if run against real .env.local)
+.env.local.ci-test-tmp
+**/.env.local.ci-test-tmp
+
+# Generic env backup pattern (defense-in-depth for ad-hoc backups)
+.env.*.bak
+
+# .env.local.example must stay tracked — CI derives compose stubs from it
+!.env.local.example
+
 # IDE and editor files
 .idea/
 .vscode/
