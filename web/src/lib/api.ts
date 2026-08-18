@@ -1,7 +1,11 @@
 import type {
+  ActionListParams,
+  ActionsResponse,
+  ActionState,
   AskConversationSummary,
   AskConversationTurn,
   BaselineStats,
+  BriefingResponse,
   CreateNoteResponse,
   DocumentDetail,
   DocumentsResponse,
@@ -275,6 +279,83 @@ export async function getGraphEvidence(
 export async function searchGraphEntities(q: string): Promise<GraphEntityHit[]> {
   const res = await fetchGraph<GraphEntitiesResponse>("entities", new URLSearchParams({ q }));
   return res.entities ?? [];
+}
+
+// ── Actions & briefing (Part C) ──────────────────────────────────────────
+//
+// Browser-only helpers: they hit the /api/actions and /api/briefing proxy
+// routes (web/src/app/api/actions/*, web/src/app/api/briefing), which forward
+// to the backend's /api/v1/*.
+//
+// No response body is ever logged — an action summary and a counterpart name
+// are personal data (plan Task 8).
+
+/** Thrown when the backend answers 404 for the actions list, which is what the
+ * ACTIONS_API_ENABLED flag being off looks like from here: the route is not
+ * registered at all. The screen says "feature disabled" instead of showing a
+ * generic failure. */
+export class ActionsDisabledError extends Error {
+  constructor() {
+    super("actions feature disabled");
+    this.name = "ActionsDisabledError";
+  }
+}
+
+export async function listActions(params: ActionListParams = {}): Promise<ActionsResponse> {
+  const qs = new URLSearchParams();
+  for (const kind of params.kinds ?? []) qs.append("kind", kind);
+  if (params.counterpart) qs.set("counterpart", params.counterpart);
+  if (params.dueBefore) qs.set("due_before", params.dueBefore);
+  // 0 is the documented "no floor" default; sending it would only add noise.
+  if (params.minConfidence !== undefined && params.minConfidence > 0) {
+    qs.set("min_confidence", String(params.minConfidence));
+  }
+  if (params.sort) qs.set("sort", params.sort);
+  if (params.limit !== undefined) qs.set("limit", String(params.limit));
+  if (params.includeArchived) qs.set("include_archived", "true");
+
+  const search = qs.toString();
+  const response = await fetch(`${getApiBase()}/actions${search ? `?${search}` : ""}`);
+  if (response.status === 404) {
+    throw new ActionsDisabledError();
+  }
+  if (!response.ok) {
+    throw new Error(`API error: ${response.status} ${response.statusText}`);
+  }
+  return response.json() as Promise<ActionsResponse>;
+}
+
+/** Marks one action done or ignored. The backend is idempotent, so replaying
+ * this call after a failed attempt is safe — which is what makes the
+ * optimistic update on the /actions screen recoverable.
+ *
+ * A 404 here is NOT mapped to ActionsDisabledError: the backend answers 404
+ * both for an unregistered route and for an unknown identity_key, and the two
+ * are indistinguishable from the client. */
+export async function setActionState(
+  identityKey: string,
+  state: Extract<ActionState, "done" | "ignored">,
+  note?: string,
+): Promise<void> {
+  const response = await fetch(
+    `${getApiBase()}/actions/${encodeURIComponent(identityKey)}/status`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ state, ...(note ? { note } : {}) }),
+    },
+  );
+  if (!response.ok) {
+    throw new Error(`API error: ${response.status} ${response.statusText}`);
+  }
+}
+
+export async function getBriefing(): Promise<BriefingResponse> {
+  const response = await fetch(`${getApiBase()}/briefing`);
+  if (!response.ok) {
+    throw new Error(`API error: ${response.status} ${response.statusText}`);
+  }
+  return response.json() as Promise<BriefingResponse>;
 }
 
 // ── File upload (Capture) ────────────────────────────────────────────────
