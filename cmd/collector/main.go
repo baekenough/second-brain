@@ -17,6 +17,7 @@ import (
 	"github.com/baekenough/second-brain/internal/collector"
 	"github.com/baekenough/second-brain/internal/collector/extractor"
 	"github.com/baekenough/second-brain/internal/config"
+	"github.com/baekenough/second-brain/internal/graph"
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/scheduler"
 	"github.com/baekenough/second-brain/internal/search"
@@ -309,6 +310,47 @@ func run() error {
 			return
 		}
 		structuralSignalWorker.Run(ctx)
+	}()
+
+	// --- Graph projection worker (Part B) ---
+	// Gated by its OWN flag, not EXTRACTION_ENABLED: extraction is a decision
+	// about LLM spend, projection is not, so folding them into one switch would
+	// remove the ability to turn off just one of them. Default is off.
+	//
+	// Neo4j is a derived projection — a connection failure must never take the
+	// collector down with it. A failure here disables projection for the
+	// lifetime of this process (restart the collector once Neo4j is up); that
+	// is the deliberate counterpart to not declaring depends_on: neo4j in
+	// compose.
+	gv := os.Getenv("GRAPH_PROJECTION_ENABLED")
+	graphEnabled := gv == "true" || gv == "1"
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if !graphEnabled {
+			// Block until shutdown so the WaitGroup stays balanced.
+			slog.Info("graph projection disabled (set GRAPH_PROJECTION_ENABLED=true to enable)")
+			<-ctx.Done()
+			return
+		}
+		gc, err := graph.New(ctx, graph.Config{
+			URI:      os.Getenv("NEO4J_URI"),
+			Username: os.Getenv("NEO4J_USERNAME"),
+			Password: os.Getenv("NEO4J_PASSWORD"),
+		})
+		if err != nil {
+			slog.Error("graph projection disabled — neo4j unavailable", "error", err)
+			<-ctx.Done()
+			return
+		}
+		defer func() { _ = gc.Close(context.Background()) }()
+		worker.NewGraphProjectionWorker(worker.GraphProjectionWorkerConfig{
+			Source:     store.NewGraphSource(pg),
+			Projector:  graph.NewProjector(gc),
+			Interval:   envDuration("GRAPH_PROJECTION_INTERVAL", 5*time.Minute),
+			BatchSize:  envInt("GRAPH_PROJECTION_BATCH_SIZE", 500),
+			ResetToken: os.Getenv("GRAPH_PROJECTION_RESET_TOKEN"),
+		}).Run(ctx)
 	}()
 
 	// --- Note enrichment worker (Capture backend) ---

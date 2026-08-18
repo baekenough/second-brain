@@ -97,6 +97,12 @@ type Server struct {
 	// route is registered. Set via WithCollectStatus before calling Handler().
 	collectStatus CollectionStatusProvider
 
+	// graph is optional. When non-nil, the four read-only GET
+	// /api/v1/graph/* routes are registered. Set via WithGraph before calling
+	// Handler(). nil (the default) means the graph feature does not exist in
+	// the router at all — which is the rollback path for Part B.
+	graph GraphReader
+
 	// notesUpserter, notesChunks, and notesEmbedder are optional. When
 	// notesUpserter is non-nil, POST /api/v1/notes,
 	// POST /api/v1/notes/{id}/retry-enrichment, and DELETE /api/v1/notes/{id}
@@ -310,6 +316,14 @@ func (s *Server) buildHandler() http.Handler {
 		}
 		if s.recordingUpserter != nil && s.recordingDir != "" {
 			r.Post("/api/v1/ingest/recording", s.ingestRecordingHandler)
+		}
+		if s.graph != nil {
+			// GET only — no write route exists, which is the simplest
+			// guarantee that this API cannot change the projection.
+			r.Get("/api/v1/graph/entry", s.graphEntryHandler)
+			r.Get("/api/v1/graph/expand", s.graphExpandHandler)
+			r.Get("/api/v1/graph/evidence", s.graphEvidenceHandler)
+			r.Get("/api/v1/graph/entities", s.graphEntitiesHandler)
 		}
 		if s.notesUpserter != nil {
 			r.Post("/api/v1/notes", s.createNoteHandler)
