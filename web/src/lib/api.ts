@@ -5,6 +5,15 @@ import type {
   CreateNoteResponse,
   DocumentDetail,
   DocumentsResponse,
+  GraphEntitiesResponse,
+  GraphEntityHit,
+  GraphEntryResponse,
+  GraphEvidence,
+  GraphEvidenceResponse,
+  GraphExpandResponse,
+  GraphFilters,
+  GraphNeighbor,
+  GraphNode,
   IngestFileResponse,
   RecentItemsResponse,
   SearchParams,
@@ -186,6 +195,86 @@ export async function getConversation(id: string): Promise<AskConversationTurn[]
   return fetchJson<AskConversationTurn[]>(
     `${getApiBase()}/ask/conversations/${encodeURIComponent(id)}`,
   );
+}
+
+// ── Knowledge graph (Part B) ─────────────────────────────────────────────
+//
+// Browser-only helpers: they hit the /api/graph/* proxy pair
+// (web/src/app/api/graph/*), which forwards to the backend's
+// /api/v1/graph/*. The backend clamps every limit, so anything sent here is
+// a hint, not a guarantee.
+//
+// No response body is ever logged — entity names would leak into the browser
+// console (plan §privacy 4).
+
+/** Thrown when the backend answers 503: Neo4j is a derived store that can be
+ * down while search/ask stay healthy, and the page must say so specifically
+ * instead of showing a generic failure. */
+export class GraphUnavailableError extends Error {
+  constructor() {
+    super("graph temporarily unavailable");
+    this.name = "GraphUnavailableError";
+  }
+}
+
+async function fetchGraph<T>(path: string, params: URLSearchParams): Promise<T> {
+  const qs = params.toString();
+  const response = await fetch(`${getApiBase()}/graph/${path}${qs ? `?${qs}` : ""}`);
+  if (response.status === 503) {
+    throw new GraphUnavailableError();
+  }
+  if (!response.ok) {
+    throw new Error(`API error: ${response.status} ${response.statusText}`);
+  }
+  return response.json() as Promise<T>;
+}
+
+function baseGraphParams(f: GraphFilters): URLSearchParams {
+  const params = new URLSearchParams({
+    days: String(f.days),
+    min_confidence: String(f.minConfidence),
+  });
+  return params;
+}
+
+export async function getGraphEntry(f: GraphFilters, limit?: number): Promise<GraphNode[]> {
+  const params = baseGraphParams(f);
+  if (f.entityTypes.length > 0) params.set("types", f.entityTypes.join(","));
+  if (limit !== undefined) params.set("limit", String(limit));
+  const res = await fetchGraph<GraphEntryResponse>("entry", params);
+  return res.nodes ?? [];
+}
+
+export async function expandGraphNode(
+  entityId: number,
+  f: GraphFilters,
+  limit?: number,
+): Promise<GraphNeighbor[]> {
+  const params = baseGraphParams(f);
+  params.set("entity_id", String(entityId));
+  if (f.relTypes.length > 0) params.set("rel_types", f.relTypes.join(","));
+  if (limit !== undefined) params.set("limit", String(limit));
+  const res = await fetchGraph<GraphExpandResponse>("expand", params);
+  return res.neighbors ?? [];
+}
+
+export async function getGraphEvidence(
+  from: number,
+  to: number,
+  relType: string,
+): Promise<GraphEvidence[]> {
+  const params = new URLSearchParams({
+    from: String(from),
+    to: String(to),
+    rel_type: relType,
+  });
+  const res = await fetchGraph<GraphEvidenceResponse>("evidence", params);
+  return res.evidence ?? [];
+}
+
+export async function searchGraphEntities(q: string): Promise<GraphEntityHit[]> {
+  const res = await fetchGraph<GraphEntitiesResponse>("entities", new URLSearchParams({ q }));
+  return res.entities ?? [];
 }
 
 // ── File upload (Capture) ────────────────────────────────────────────────

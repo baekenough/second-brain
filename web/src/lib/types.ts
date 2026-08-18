@@ -222,3 +222,83 @@ export interface SourcesResponse {
 export interface DocumentsResponse {
   documents: DocumentDetail[];
 }
+
+// ── Knowledge graph (Part B) ─────────────────────────────────────────────
+//
+// Mirrors graph.EntryNode / Neighbor / EvidenceRef / EntityHit in
+// internal/graph/queries.go. The backend normalises nil slices to [], so no
+// response field is ever null except EvidenceRef.occurred_at.
+
+/** Entity types projected as secondary Neo4j labels (internal/model/entity.go). */
+export const GRAPH_ENTITY_TYPES = ["PERSON", "ORG", "CONCEPT", "OTHER"] as const;
+export type GraphEntityType = (typeof GRAPH_ENTITY_TYPES)[number];
+
+/** Closed relation vocabulary (internal/model/relation.go). Values outside
+ * this set are downgraded to `related_to` by the backend. */
+export const GRAPH_REL_TYPES = [
+  "communicated_with",
+  "requested_of",
+  "committed_to",
+  "mentions",
+  "belongs_to",
+  "scheduled_with",
+  "about_topic",
+  "related_to",
+] as const;
+export type GraphRelType = (typeof GRAPH_REL_TYPES)[number];
+
+export interface GraphNode {
+  entity_id: number;
+  name: string;
+  type: string;
+  degree: number;
+}
+
+export interface GraphNeighbor {
+  entity_id: number;
+  name: string;
+  type: string;
+  rel_type: string;
+  direction: "out" | "in";
+  weight: number;
+  last_seen: string;
+}
+
+export interface GraphEvidence {
+  document_id: string;
+  source_type: string;
+  occurred_at: string | null;
+  confidence: number;
+  observed_at: string;
+}
+
+export interface GraphEntityHit {
+  entity_id: number;
+  name: string;
+  type: string;
+}
+
+/** Shared filter state for the /graph screen. `minConfidence` defaults to 0.5
+ * (plan §13); `days` defaults to 30, matching the backend default. */
+export interface GraphFilters {
+  days: number;
+  minConfidence: number;
+  entityTypes: string[];
+  relTypes: string[];
+}
+
+export interface GraphEntryResponse {
+  nodes: GraphNode[];
+}
+
+export interface GraphExpandResponse {
+  neighbors: GraphNeighbor[];
+}
+
+export interface GraphEvidenceResponse {
+  evidence: GraphEvidence[];
+}
+
+export interface GraphEntitiesResponse {
+  entities: GraphEntityHit[];
+}
