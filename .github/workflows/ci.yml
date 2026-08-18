@@ -50,13 +50,33 @@ jobs:
         run: bash scripts/ci-checks.sh
       - name: docker compose config validation
         run: |
-          # Validate compose interpolation / syntax without requiring .env.local.
-          # Create stub env files so docker compose config can parse the file
-          # without failing on missing env_file references. Real secrets are not
-          # needed — only the YAML structure and variable interpolation are checked.
-          touch .env.local web/.env.local
+          # Validate compose interpolation / syntax without requiring real secrets.
+          # compose enforces some variables with ${VAR:?...} guards (e.g. NEO4J_PASSWORD)
+          # to prevent silently starting with an empty secret. A blank .env.local stub
+          # would trip those guards, so instead derive the stub from .env.local.example:
+          # any variable compose requires via :? MUST be documented there, and this step
+          # enforces that invariant — if a required var is missing from the example file,
+          # docker compose config will fail here just as it would with a truly empty env.
+          if [ -f .env.local.example ]; then
+            grep -E '^[A-Za-z_][A-Za-z0-9_]*=' .env.local.example | while IFS='=' read -r key val; do
+              if [ -z "$val" ]; then
+                echo "${key}=ci-stub-value"
+              else
+                echo "${key}=${val}"
+              fi
+            done > .env.local
+          else
+            touch .env.local
+          fi
+          # web/ has no .env.local.example yet; keep it as an empty stub.
+          touch web/.env.local
           set +e
-          ERR_OUTPUT=$(docker compose -f docker-compose.local.yml config --quiet 2>&1 >/dev/null)
+          # docker compose only auto-loads a file literally named ".env" for
+          # ${VAR} interpolation — env_file: entries (which point at .env.local)
+          # are NOT used for interpolation, only for container runtime env.
+          # --env-file must be passed explicitly so the derived stub above is
+          # actually seen by ${NEO4J_PASSWORD:?...}-style required-var guards.
+          ERR_OUTPUT=$(docker compose --env-file .env.local -f docker-compose.local.yml config --quiet 2>&1 >/dev/null)
           CONFIG_EXIT=$?
           set -e
           # Filter out known acceptable warnings (unset optional vars like AUTH_URL)
