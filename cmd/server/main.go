@@ -16,6 +16,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/baekenough/second-brain/internal/api"
 	"github.com/baekenough/second-brain/internal/config"
+	"github.com/baekenough/second-brain/internal/graph"
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
@@ -123,6 +124,7 @@ func run() error {
 		AuthFile:    cfg.LLMAuthFile,
 		MaxTokens:   cfg.LLMMaxTokens,
 		Temperature: cfg.LLMTemperature,
+		Thinking:    cfg.LLMThinking,
 	}, nil)
 	if llmClient.Enabled() {
 		slog.Info("LLM client configured", "url", cfg.LLMAPIURL, "model", cfg.LLMModel)
@@ -147,6 +149,27 @@ func run() error {
 		WithNotes(docStore, chunkStore, embedClient).
 		WithAskConfig(time.Duration(cfg.AskTimeoutSeconds)*time.Second, cfg.AskContextTopK, cfg.AskContextInsightM).
 		WithAskSessions(askSessionStore)
+
+	// --- Graph read API (Part B, optional) ---
+	// Wired only when both NEO4J_URI and NEO4J_PASSWORD are present. A
+	// connection failure logs a warning and leaves the graph routes
+	// unregistered: the API server must never fail to start because a derived
+	// projection is unavailable.
+	if neo4jURI, neo4jPassword := os.Getenv("NEO4J_URI"), os.Getenv("NEO4J_PASSWORD"); neo4jURI != "" && neo4jPassword != "" {
+		graphClient, err := graph.New(ctx, graph.Config{
+			URI:      neo4jURI,
+			Username: os.Getenv("NEO4J_USERNAME"),
+			Password: neo4jPassword,
+		})
+		if err != nil {
+			slog.Warn("graph read API disabled — neo4j unavailable", "error", err)
+		} else {
+			defer func() { _ = graphClient.Close(context.Background()) }()
+			srv = srv.WithGraph(graph.NewReader(graphClient))
+			slog.Info("graph read API enabled")
+		}
+	}
+
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      srv.Handler(),

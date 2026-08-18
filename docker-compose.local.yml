@@ -277,6 +277,49 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
+  # neo4j — 지식 그래프 파생 투영. PostgreSQL이 진실의 원천이므로 이 볼륨은
+  #   버려도 된다(백업 요구사항 없음, 재구축은 GRAPH_PROJECTION_RESET_TOKEN).
+  #   포트는 127.0.0.1 에만 바인딩한다 — Browser(7474)는 인증만 통과하면
+  #   그래프 전체를 조회하므로 cloudflared ingress에 호스트명을 두지 않는다.
+  #   server/collector 에 depends_on 을 걸지 않는다: Neo4j 가 죽어도 수집·
+  #   검색·/ask 는 돌아야 한다(워커는 다음 tick 재시도, API 는 503).
+  # ---------------------------------------------------------------------------
+  neo4j:
+    image: neo4j:5.26-community
+    ports:
+      - "127.0.0.1:7687:7687"
+      - "127.0.0.1:7474:7474"
+    environment:
+      # ${VAR} 치환은 env_file이 아니라 --env-file/셸에서 온다. 그래서
+      # --env-file 없이 기동하면 아래 :? 가 조용한 오작동 대신 즉시 실패시킨다.
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?NEO4J_PASSWORD is required}"
+      # 헬스체크용 사본. 이름이 NEO4J_ 로 시작하면 안 된다: 엔트리포인트가
+      # NEO4J_* 를 전부 neo4j.conf 설정으로 번역하므로 NEO4J_PASSWORD 는
+      # 설정 "PASSWORD" 가 되어 strict validation 이 기동을 거부한다
+      # ("Unrecognized setting. No declared setting with name: PASSWORD").
+      SB_NEO4J_PASSWORD: "${NEO4J_PASSWORD:?NEO4J_PASSWORD is required}"
+      NEO4J_server_memory_heap_initial__size: "512m"   # 관계 수천 개 규모.
+      NEO4J_server_memory_heap_max__size: "512m"       # 과할당은 다른 컨테이너를
+      NEO4J_server_memory_pagecache_size: "256m"       # 밀어낼 뿐이다.
+      # 질의 로그는 파라미터(=실명)를 그대로 남기므로 끈다. 설정 키는
+      # server.* 가 아니라 db.* 다 — server.logs.query.enabled 는 5.26 에
+      # 존재하지 않는 이름이라 strict validation 이 기동을 거부한다
+      # ("Unrecognized setting"). 5.26.29 스크래치 컨테이너로 실측 확인.
+      NEO4J_db_logs_query_enabled: "OFF"
+      # Community 에디션은 질의 로깅 자체가 없어 위 설정만으로도 유출이 없지만,
+      # 이 값의 기본값이 true 라 에디션이 바뀌는 순간 파라미터가 남는다.
+      NEO4J_db_logs_query_parameter__logging__enabled: "false"
+    volumes:
+      - neo4jdata:/data                                # /logs 는 내보내지 않는다
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p \"$${SB_NEO4J_PASSWORD}\" 'RETURN 1' >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 40s
+    restart: unless-stopped
+
 # -----------------------------------------------------------------------------
 # Named volumes
 # -----------------------------------------------------------------------------
@@ -286,3 +329,6 @@ volumes:
     # 파일시스템 권한 충돌이 발생할 수 있으므로 named volume 을 사용한다.
   ollama_models:
     # ollama 모델 파일 영속 볼륨. 컨테이너 재생성 시 재다운로드 방지.
+  neo4jdata:
+    # 지식 그래프 파생 투영 전용 볼륨. PostgreSQL 이 진실의 원천이므로
+    # 삭제해도 투영 워커가 워터마크 0 부터 다시 만들어 낸다(백업 불필요).
