@@ -9,12 +9,17 @@ import (
 )
 
 // confidenceThreshold is the minimum intent.Params.Confidence required for
-// KindEntity/KindTemporal query shaping to apply (spec §4.4 row 4 / §5.2).
-// Below this threshold, Stage 2 treats the classification as unreliable and
-// falls back to an unmodified base query — the same behaviour as
-// intent.KindGeneral. This collapse intentionally lives here (Stage 2), not
-// inside intent.Classify, so the raw classification stays inspectable for
-// logging/tests (see intent.LLMClassifier.classifyWithLLM doc comment).
+// KindEntity query shaping to apply (spec §4.4 row 4 / §5.2). Below this
+// threshold, Stage 2 treats the classification as unreliable and falls back to
+// an unmodified base query — the same behaviour as intent.KindGeneral. This
+// collapse intentionally lives here (Stage 2), not inside intent.Classify, so
+// the raw classification stays inspectable for logging/tests (see
+// intent.LLMClassifier.classifyWithLLM doc comment).
+//
+// It gates RANKING only. It never gates the intent.QueryPlan, which decides
+// which documents are retrievable at all: a low-confidence guess about how to
+// rank is recoverable, a dropped retrieval filter is not (query-planner design
+// §3.2).
 const confidenceThreshold = 0.5
 
 // RetrievalResult keeps the 원문/정리 (Observed) and 추론 (Inferred) layers
@@ -38,67 +43,157 @@ type documentSearcher interface {
 	Search(ctx context.Context, q model.SearchQuery) ([]*model.SearchResult, error)
 }
 
-// assembleRetrieval maps intent.Params to two search calls per the spec
-// §5.2 mapping table, then wraps the results into the Observed/Inferred
-// layers Stage 3 requires.
+// assembleRetrieval composes ONE model.SearchQuery from the two Stage 1
+// outputs, then runs the two search lanes Stage 3 requires.
+//
+// The two inputs answer different questions and are not interchangeable
+// (query-planner design §3.2):
+//
+//   - plan (intent.QueryPlan) decides WHICH documents may enter the candidate
+//     set — the event-time window, the source include set, the limit. These
+//     become WHERE predicates inside every retrieval lane.
+//   - params (intent.Params) decides HOW the candidates that got in are
+//     RANKED — the entity boost and the exact-token nudge.
+//
+// Only the plan writes the window. params.OccurredFrom/OccurredTo, which the
+// former KindTemporal branch used to forward, are ignored here: two components
+// writing one field is exactly how a computed window and the retrieval it was
+// meant to constrain drifted apart before. The planner subsumes that path (it
+// runs the same date regexes) and is the single source of truth.
 //
 // Failure modes (spec §5.4):
 //   - A Search error on either call is returned immediately, wrapped with
 //     which lane failed; the handler converts it to an "error" SSE event.
 //   - 본검색 (Observed) returning 0 results is NOT an error — the caller
 //     (askHandler) decides whether that means "no_evidence", not this
-//     function.
-//   - 인사이트검색 (Inferred) returning 0 results is normal.
-func assembleRetrieval(ctx context.Context, searcher documentSearcher, params intent.Params, topK, insightM int) (RetrievalResult, error) {
-	base := model.SearchQuery{Query: params.RawQuery, Limit: topK}
+//     function. It must NOT be retried with a widened plan: "내일 일정이
+//     없습니다" is an answer, and re-running without the window would replace it
+//     with unrelated documents from other days (design §6.2).
+func assembleRetrieval(ctx context.Context, searcher documentSearcher, params intent.Params, plan intent.QueryPlan, topK, insightM int) (RetrievalResult, error) {
+	limit := plan.Limit
+	if limit <= 0 {
+		// A plan that forgot its limit must not ask the store for nothing.
+		limit = topK
+	}
+	base := model.SearchQuery{Query: params.RawQuery, Limit: limit}
 
+	// --- plan: candidate-set constraints ---
+	base.OccurredFrom = plan.OccurredFrom
+	base.OccurredTo = plan.OccurredTo
+	base.SourceTypes = plan.SourceTypes
+	if plan.OccurredFrom != nil || plan.OccurredTo != nil {
+		// Secondary preference only: within a window, newest-first is the
+		// sensible reading order. Sort can never substitute for the window —
+		// it permutes candidates a lane already selected.
+		//
+		// KNOWN GAP (design §12 R3): Sort="recent" is collected_at DESC. For a
+		// future window ("다음 주 일정") that orders by ingestion time, not by
+		// how soon the event is. The spec leaves the fix (a future-window sort
+		// mode, or reordering in Stage 3) open, so this deliberately keeps the
+		// pre-planner behaviour rather than inventing a third option here.
+		base.Sort = "recent"
+	}
+
+	// --- params: ranking shaping ---
 	switch {
 	case params.Kind == intent.KindEntity && params.Confidence >= confidenceThreshold:
 		// Entity lane must dominate (spec §5.2). Query stays the full
 		// question because the entity RRF lane LIKE-matches against Query,
 		// not a separate field — no such field exists on model.SearchQuery.
 		base.Weights.EntityWeight = 1.5
-	case params.Kind == intent.KindTemporal && params.Confidence >= confidenceThreshold:
-		// The window intent.Classify computed is passed through to the store,
-		// which applies it as a WHERE predicate inside every retrieval lane.
-		// This is the part that actually retrieves: recency sort alone only
-		// permutes the candidates a lane already selected, so a source that is four
-		// orders of magnitude smaller than the corpus (calendar: ~14 documents
-		// against ~18k SMS) never entered the candidate set to be sorted.
-		//
-		// Sort stays "recent" as a secondary preference — within a window,
-		// newest-first is the sensible reading order.
-		//
-		// Bounds may be nil (LLM-classified temporal intent carries no dates);
-		// nil means "unbounded on that side" and is passed through as-is.
-		base.OccurredFrom = params.OccurredFrom
-		base.OccurredTo = params.OccurredTo
-		base.Sort = "recent"
 	case params.Kind == intent.KindExactToken:
 		// Best-effort nudge toward the bigram-similarity lane; does not fix
 		// the underlying tokenization gap (spec §4.3).
 		base.Weights.BigmWeight = 1.5
-	default:
-		// KindGeneral, or confidence below threshold: base query unmodified.
+	case params.Kind == intent.KindTemporal && params.Confidence >= confidenceThreshold:
+		// Kept for the date-less temporal question ("최근에 뭐 있었지"), which
+		// the planner deliberately gives no window (design §12 R5: an invented
+		// window hides documents). Recency ordering is a RANKING preference and
+		// therefore stays on the params side of the §3.2 split — it never
+		// retrieves anything the lanes did not already select.
+		base.Sort = "recent"
 	}
 
+	observedQuery, runObserved, insightQuery := splitInsightLane(base, insightM)
+
 	// 본검색: every source type except insight.
-	observedQuery := base
-	observedQuery.ExcludeSourceTypes = []model.SourceType{model.SourceInsight}
-	observed, err := searcher.Search(ctx, observedQuery)
-	if err != nil {
-		return RetrievalResult{}, fmt.Errorf("assembleRetrieval: observed search: %w", err)
+	var observed []*model.SearchResult
+	if runObserved {
+		var err error
+		observed, err = searcher.Search(ctx, observedQuery)
+		if err != nil {
+			return RetrievalResult{}, fmt.Errorf("assembleRetrieval: observed search: %w", err)
+		}
 	}
 
 	// 인사이트검색: insight-only, with its own (typically smaller) limit.
-	insightSourceType := model.SourceInsight
-	insightQuery := base
-	insightQuery.SourceType = &insightSourceType
-	insightQuery.Limit = insightM
 	inferred, err := searcher.Search(ctx, insightQuery)
 	if err != nil {
 		return RetrievalResult{}, fmt.Errorf("assembleRetrieval: insight search: %w", err)
 	}
 
 	return RetrievalResult{Observed: observed, Inferred: inferred}, nil
+}
+
+// splitInsightLane derives the two lane queries from one base query and reports
+// whether the 본검색 should run at all.
+//
+// The /ask path pins ExcludeSourceTypes=[insight] on the 본검색 and runs a
+// separate insight-only 인사이트검색. Once callers can state an include set
+// (model.SearchQuery.SourceTypes — a query planner will), both filters can name
+// insight at once, and the search layer resolves that in favour of the
+// exclusion: the lane comes back empty. Resolving it HERE instead keeps that
+// contradiction from ever being constructed.
+//
+// The rule (design spec §5.3):
+//
+//   - 본검색 gets the caller's include set MINUS insight. Insight documents are
+//     model-derived inference, not evidence; the echo-chamber guard exists so
+//     they never enter the observed layer, and a caller-supplied include set
+//     does not get to re-open it.
+//   - 인사이트검색 is a FIXED lane: insight only, ignoring the caller's include
+//     and exclude sets. Inheriting either would let a plan that names, say,
+//     gmail turn the inference lane into a second gmail search, or let the
+//     injected exclusion empty it.
+//
+// The case that must not be silent is an include set of exactly [insight].
+// Subtracting insight leaves an empty include set — and an empty include set
+// means "all sources", so a naive subtraction would answer a narrowly-scoped
+// question with the entire corpus. Instead the observed lane is skipped
+// (runObserved=false). The caller sees an empty Observed layer, which askHandler
+// reports as finish_reason="no_evidence": the honest reading of "you asked for
+// no observed material". The insight lane still runs and still populates
+// Inferred.
+func splitInsightLane(base model.SearchQuery, insightM int) (observed model.SearchQuery, runObserved bool, insight model.SearchQuery) {
+	requested := base.IncludeSourceTypes()
+
+	kept := make([]model.SourceType, 0, len(requested))
+	for _, st := range requested {
+		if st == model.SourceInsight {
+			continue
+		}
+		kept = append(kept, st)
+	}
+
+	observed = base
+	// Collapse both include fields into the plural one: the singular field may
+	// have carried the insight request that was just removed, and leaving it in
+	// place would re-add insight through the union in IncludeSourceTypes.
+	observed.SourceType = nil
+	observed.SourceTypes = kept
+	observed.ExcludeSourceTypes = []model.SourceType{model.SourceInsight}
+
+	// An include set that survived subtraction — or was empty to begin with —
+	// is a runnable observed lane. An include set emptied BY the subtraction is
+	// not: "all sources" is not a defensible reading of "insight only".
+	runObserved = len(kept) > 0 || len(requested) == 0
+
+	insightSourceType := model.SourceInsight
+	insight = base
+	insight.SourceType = &insightSourceType
+	insight.SourceTypes = nil
+	insight.ExcludeSourceTypes = nil
+	insight.Limit = insightM
+
+	return observed, runObserved, insight
 }

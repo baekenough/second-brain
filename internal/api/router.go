@@ -124,6 +124,15 @@ type Server struct {
 	askTopK          int
 	askInsightM      int
 
+	// queryPlanner is Stage 1b of /ask: it decides WHICH documents may enter
+	// the candidate set (event-time window, source include set, limit), while
+	// intentClassifier above only decides how they are ranked (query-planner
+	// design §3.2). Like intentClassifier it never fails: a planner error
+	// becomes an unconstrained plan, i.e. the pre-planner behaviour. nil is
+	// tolerated — askHandler.planner() substitutes a deterministic-only
+	// planner — so a Server built by an older call site still answers.
+	queryPlanner intent.Planner
+
 	// askSessions is optional. When non-nil, POST /api/v1/ask persists each
 	// turn and rewrites follow-up questions using prior turns (multi-turn
 	// conversations, ask_history.go), and GET /api/v1/ask/conversations +
@@ -206,9 +215,15 @@ func NewServer(
 		// KindGeneral on any error — spec §4.4), so it is always
 		// constructed here rather than gated behind a nil check.
 		intentClassifier: intent.NewLLMClassifier(llmClient),
-		askTimeout:       defaultAskTimeout,
-		askTopK:          defaultAskTopK,
-		askInsightM:      defaultAskInsightM,
+		// Sized to defaultAskTopK, the same limit the observed lane uses.
+		// REQUIRES LLM_THINKING=disabled: with reasoning enabled the planner's
+		// token budget is consumed by reasoning_content and every call returns
+		// a truncated (empty) body, which silently turns planning off. See
+		// intent.LLMPlanner's doc comment.
+		queryPlanner: intent.NewLLMPlanner(llmClient, defaultAskTopK),
+		askTimeout:   defaultAskTimeout,
+		askTopK:      defaultAskTopK,
+		askInsightM:  defaultAskInsightM,
 	}
 }
 

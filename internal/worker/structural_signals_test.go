@@ -12,11 +12,19 @@ import (
 	"github.com/google/uuid"
 )
 
+// fakeStructuralLister stands in for the SQL query. listErr exists because a
+// double that can only succeed cannot tell a tick that found no work apart
+// from a tick that never received any — the two failure modes this worker
+// reports identically unless the read error is counted.
 type fakeStructuralLister struct {
 	messages []ThreadLatestMessage
+	listErr  error
 }
 
 func (f *fakeStructuralLister) ListLatestPerThread(_ context.Context, _ int) ([]ThreadLatestMessage, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	return f.messages, nil
 }
 
@@ -390,5 +398,196 @@ func TestStructuralSignalWorker_UpsertFailure_SkipsStatusWrite(t *testing.T) {
 
 	if actions.statusCalls != 0 {
 		t.Errorf("EnsureOpenStatus called %d times after a failed UpsertAction, want 0", actions.statusCalls)
+	}
+}
+
+// prodGmailMetadata mirrors the EXACT key set a production gmail document
+// carries, as observed on 2026-08-18 (jsonb_object_keys over every active
+// gmail document inside the worker's 30-day window: from, to, thread_id,
+// label_ids — 453/453 for each). It is spelled out here rather than reduced
+// to the two keys the worker reads, because the incident this test guards
+// against was a REPORTED regression in which every gmail thread was believed
+// to be silently skipped; the accusation could not be settled from the code
+// alone, only by comparing the shape the worker expects against the shape
+// production actually stores. Pinning the real shape makes that comparison a
+// test rather than a database query.
+//
+// Two absences carry as much weight as the four keys present:
+//   - no "direction" key. isOutbound must therefore fall through its default
+//     branch for gmail; a future case that reads doc.Metadata["direction"]
+//     for gmail would skip every real thread while every SMS test still
+//     passed.
+//   - the caller passes NO UserAddresses. USER_EMAIL_ADDRESSES is unset on
+//     the production host, so IsUserAddress is always false and the
+//     "user sent this themself" gate must not fire.
+func prodGmailMetadata(threadID string) map[string]any {
+	return map[string]any{
+		"thread_id": threadID,
+		"from":      "테스트발신자 <sender@example.test>",
+		"to":        "owner@example.test",
+		"label_ids": []any{"INBOX", "CATEGORY_PERSONAL"},
+	}
+}
+
+// TestStructuralSignalWorker_ProductionGmailShape_ConvertsEveryThread locks
+// the invariant the 2026-08-18 investigation ultimately verified in
+// production: for gmail, listed threads and written actions are the SAME
+// number. Every one of the four early returns in processMessage is silent, so
+// a regression in any of them turns this worker into a no-op that logs exactly
+// what a healthy worker logs. This test is the only thing standing between
+// that regression and a deploy.
+func TestStructuralSignalWorker_ProductionGmailShape_ConvertsEveryThread(t *testing.T) {
+	t.Parallel()
+	lister := &fakeStructuralLister{messages: []ThreadLatestMessage{
+		{DocumentID: uuid.New(), SourceType: string(model.SourceGmail), Metadata: prodGmailMetadata("t1"), Title: "제목 하나", EventAt: fixedNow},
+		{DocumentID: uuid.New(), SourceType: string(model.SourceGmail), Metadata: prodGmailMetadata("t2"), Title: "제목 둘", EventAt: fixedNow},
+		{DocumentID: uuid.New(), SourceType: string(model.SourceGmail), Metadata: prodGmailMetadata("t3"), Title: "제목 셋", EventAt: fixedNow},
+	}}
+	actions := &fakeStructuralActionWriter{}
+	w := NewStructuralSignalWorker(StructuralSignalWorkerConfig{
+		Store: lister, Actions: actions, Now: func() time.Time { return fixedNow },
+	})
+
+	stats := w.Tick(context.Background())
+
+	if stats.Listed != 3 || stats.Written != 3 {
+		t.Fatalf("listed=%d written=%d, want 3/3 — a production-shaped gmail thread must always yield an action", stats.Listed, stats.Written)
+	}
+	if len(actions.upserted) != 3 {
+		t.Fatalf("got %d upserts, want 3", len(actions.upserted))
+	}
+	if actions.statusCalls != 3 {
+		t.Errorf("EnsureOpenStatus called %d times, want 3 — an action with no open status is invisible on /actions", actions.statusCalls)
+	}
+	if skipped := stats.SkippedAuthLike + stats.SkippedOutbound + stats.SkippedNoCounterpart + stats.SkippedNoThreadKey; skipped != 0 {
+		t.Errorf("%d gmail threads were skipped, want 0 (auth_like=%d outbound=%d no_counterpart=%d no_thread_key=%d)",
+			skipped, stats.SkippedAuthLike, stats.SkippedOutbound, stats.SkippedNoCounterpart, stats.SkippedNoThreadKey)
+	}
+}
+
+// TestStructuralSignalWorker_TickAccountsForEveryMessage is the observability
+// guard. A tick that writes 419 actions and a tick that silently skips 419
+// threads used to produce byte-identical output: nothing. That is what made a
+// non-existent regression cost hours to disprove and what made a 447-row
+// production DELETE look like a reasonable diagnostic step.
+//
+// The contract is arithmetic, not textual: every listed message lands in
+// exactly one outcome bucket. A future early return added without a bucket
+// breaks this test rather than quietly re-opening the blind spot.
+func TestStructuralSignalWorker_TickAccountsForEveryMessage(t *testing.T) {
+	t.Parallel()
+	lister := &fakeStructuralLister{messages: []ThreadLatestMessage{
+		// writes
+		{DocumentID: uuid.New(), SourceType: string(model.SourceGmail), Metadata: prodGmailMetadata("t1"), Title: "제목", EventAt: fixedNow},
+		// skipped: is_auth_like
+		{DocumentID: uuid.New(), SourceType: string(model.SourceSMS), EventAt: fixedNow, Metadata: map[string]any{
+			"contact_name": "테스트연락처A", "direction": "received", "is_auth_like": true,
+		}},
+		// skipped: outbound
+		{DocumentID: uuid.New(), SourceType: string(model.SourceSMS), EventAt: fixedNow, Metadata: map[string]any{
+			"contact_name": "테스트연락처A", "direction": "sent",
+		}},
+		// skipped: counterpart is the user themself
+		{DocumentID: uuid.New(), SourceType: string(model.SourceGmail), EventAt: fixedNow, Metadata: map[string]any{
+			"thread_id": "t2", "from": "owner@example.test",
+		}},
+		// skipped: no thread key (gmail without thread_id)
+		{DocumentID: uuid.New(), SourceType: string(model.SourceGmail), EventAt: fixedNow, Metadata: map[string]any{
+			"from": "테스트발신자 <sender@example.test>",
+		}},
+	}}
+	actions := &fakeStructuralActionWriter{}
+	w := NewStructuralSignalWorker(StructuralSignalWorkerConfig{
+		Store: lister, Actions: actions, UserAddresses: []string{"owner@example.test"},
+		Now: func() time.Time { return fixedNow },
+	})
+
+	stats := w.Tick(context.Background())
+
+	for _, c := range []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"Listed", stats.Listed, 5},
+		{"Written", stats.Written, 1},
+		{"SkippedAuthLike", stats.SkippedAuthLike, 1},
+		{"SkippedOutbound", stats.SkippedOutbound, 1},
+		{"SkippedNoCounterpart", stats.SkippedNoCounterpart, 1},
+		{"SkippedNoThreadKey", stats.SkippedNoThreadKey, 1},
+		{"Failed", stats.Failed, 0},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s = %d, want %d", c.name, c.got, c.want)
+		}
+	}
+	if sum := stats.accountedFor(); sum != stats.Listed {
+		t.Errorf("outcomes account for %d of %d listed messages — an early return has no bucket", sum, stats.Listed)
+	}
+}
+
+// TestStructuralSignalWorker_TickCountsWriteFailures pins the two failure
+// buckets apart. They are different operational problems: a failed
+// UpsertAction leaves nothing behind, whereas a failed EnsureOpenStatus
+// leaves a row in actions that /actions will never render because it joins
+// action_status — a table full of rows and an empty screen, which is exactly
+// the shape of report this worker's silence made impossible to triage.
+func TestStructuralSignalWorker_TickCountsWriteFailures(t *testing.T) {
+	t.Parallel()
+	msgs := []ThreadLatestMessage{
+		{DocumentID: uuid.New(), SourceType: string(model.SourceGmail), Metadata: prodGmailMetadata("t1"), Title: "제목", EventAt: fixedNow},
+	}
+
+	t.Run("upsert failure", func(t *testing.T) {
+		t.Parallel()
+		actions := &fakeStructuralActionWriter{upsertErr: errors.New("injected write failure")}
+		w := NewStructuralSignalWorker(StructuralSignalWorkerConfig{
+			Store: &fakeStructuralLister{messages: msgs}, Actions: actions, Now: func() time.Time { return fixedNow },
+		})
+		stats := w.Tick(context.Background())
+		if stats.Failed != 1 || stats.Written != 0 {
+			t.Errorf("failed=%d written=%d, want 1/0", stats.Failed, stats.Written)
+		}
+		if stats.accountedFor() != stats.Listed {
+			t.Errorf("outcomes account for %d of %d listed messages", stats.accountedFor(), stats.Listed)
+		}
+	})
+
+	t.Run("status failure", func(t *testing.T) {
+		t.Parallel()
+		actions := &fakeStructuralActionWriter{statusErr: errors.New("injected status failure")}
+		w := NewStructuralSignalWorker(StructuralSignalWorkerConfig{
+			Store: &fakeStructuralLister{messages: msgs}, Actions: actions, Now: func() time.Time { return fixedNow },
+		})
+		stats := w.Tick(context.Background())
+		if stats.Written != 1 {
+			t.Errorf("written=%d, want 1 — the action row itself was persisted", stats.Written)
+		}
+		if stats.StatusFailed != 1 {
+			t.Errorf("statusFailed=%d, want 1 — an action with no open status is invisible on /actions", stats.StatusFailed)
+		}
+	})
+}
+
+// TestStructuralSignalWorker_ListFailureIsCounted keeps the all-or-nothing
+// failure mode distinguishable from a tick that ran and found nothing to do.
+// ListLatestPerThread returns an error for the WHOLE batch on a single bad
+// row, so this bucket answers "did the worker do no work, or did it never get
+// the work?" — two reports with identical symptoms.
+func TestStructuralSignalWorker_ListFailureIsCounted(t *testing.T) {
+	t.Parallel()
+	actions := &fakeStructuralActionWriter{}
+	w := NewStructuralSignalWorker(StructuralSignalWorkerConfig{
+		Store:   &fakeStructuralLister{listErr: errors.New("injected list failure")},
+		Actions: actions, Now: func() time.Time { return fixedNow },
+	})
+
+	stats := w.Tick(context.Background())
+
+	if !stats.ListFailed {
+		t.Error("ListFailed = false, want true")
+	}
+	if stats.Listed != 0 || len(actions.upserted) != 0 {
+		t.Errorf("listed=%d upserts=%d, want 0/0", stats.Listed, len(actions.upserted))
 	}
 }

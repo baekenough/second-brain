@@ -28,8 +28,15 @@ import (
 // answer with unfiltered matches, i.e. it silently widens the window the user
 // asked for.
 //
-// These tests pin the only defensible behaviour available without a schema
-// change: when a window is set, the chunk lanes are skipped entirely.
+// These tests pin the fallback behaviour: with no way to verify chunk
+// candidates against the window, the chunk lanes are skipped entirely. That is
+// the case exercised here — none of the fakes below implement
+// OccurredRangeChecker, so the service takes the conservative path.
+//
+// The verified path (R4), where candidates ARE joined back to `documents` on id
+// and the lanes stay alive under a window, is covered in
+// search_window_chunk_test.go. Both paths must keep working: production wires a
+// verifier, and any caller that does not must still fail closed.
 // ---------------------------------------------------------------------------
 
 var (
