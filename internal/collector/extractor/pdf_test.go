@@ -158,8 +158,8 @@ func TestPDFExtractor_Extract_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
 
-	// Provide a non-existent path so stage1 fails instantly; the important
-	// thing is that Extract returns quickly and does not block.
+	// Provide a non-existent path so every stage fails instantly; the
+	// important thing is that Extract returns quickly and does not block.
 	_, err := e.Extract(ctx, "/nonexistent/path/to/file.pdf")
 	// We only care that it doesn't hang. An error (or empty result) is fine.
 	_ = err
@@ -217,8 +217,15 @@ func TestStage4Metadata_SkipWhenAbsent(t *testing.T) {
 // Integration tests — only run when fixture PDF and binaries are present
 // ---------------------------------------------------------------------------
 
-// testFixturePDF returns the path to a real PDF fixture for integration tests.
-// The test is skipped when no fixture is available.
+// fixtureText is the synthetic sentence embedded in testdata/sample.pdf (see
+// testdata/README.md for provenance and regeneration steps). It contains no
+// personal data — it exists solely to give the pdftotext/pdfinfo fallback
+// chain a regression fixture after the ledongthuc/pdf pure-Go stage was
+// removed (GO-2026-6115).
+const fixtureText = "Synthetic fixture document for second-brain PDF extractor tests."
+
+// testFixturePDF returns the path to the synthetic PDF fixture used by
+// integration tests. The test is skipped when no fixture is available.
 func testFixturePDF(t *testing.T) string {
 	t.Helper()
 	path := "testdata/sample.pdf"
@@ -237,11 +244,10 @@ func TestStage2Pdftotext_Integration(t *testing.T) {
 	e := &PDFExtractor{}
 	text, ok := e.stage2Pdftotext(context.Background(), path)
 	if !ok {
-		t.Log("pdftotext ran but produced insufficient text (image-only PDF?) — this is acceptable")
-		return
+		t.Fatalf("expected pdftotext to extract sufficient text from the fixture, got ok=false")
 	}
-	if !sufficientText(text) {
-		t.Errorf("expected sufficient text from pdftotext, got %q", text[:min(len(text), 80)])
+	if !strings.Contains(text, fixtureText) {
+		t.Errorf("expected fixture text in pdftotext output, got %q", text)
 	}
 }
 
@@ -255,6 +261,12 @@ func TestPDFExtractor_Extract_Integration(t *testing.T) {
 	}
 	if !utf8.ValidString(text) {
 		t.Error("Extract must return valid UTF-8")
+	}
+	// Extract must reach the pdftotext stage (the only remaining full-text
+	// stage now that the vulnerable ledongthuc/pdf pure-Go stage is gone)
+	// and surface the fixture's synthetic sentence, not just metadata.
+	if !strings.Contains(text, fixtureText) {
+		t.Errorf("expected fixture text via pdftotext stage, got %q", text)
 	}
 	t.Logf("Extracted %d bytes from %s", len(text), path)
 }
