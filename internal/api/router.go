@@ -159,6 +159,13 @@ type Server struct {
 	actionLister ActionLister
 	actionSetter ActionStateSetter
 
+	// evidenceVoter is optional. When non-nil the
+	// POST /api/v1/feedback/evidence route is registered; the handler still
+	// gates itself on FEEDBACK_EVIDENCE_ENABLED, so wiring the store is
+	// necessary but not sufficient to expose the endpoint.
+	// Set via WithEvidenceFeedback before calling Handler().
+	evidenceVoter EvidenceVoter
+
 	// briefingCache, briefingMaxActions, and briefingModel are optional. When
 	// briefingCache is non-nil AND both actionLister and llmClient are present,
 	// the GET /api/v1/briefing route is registered. Set via WithBriefing before
@@ -343,6 +350,9 @@ func (s *Server) buildHandler() http.Handler {
 			r.Get("/api/v1/graph/expand", s.graphExpandHandler)
 			r.Get("/api/v1/graph/evidence", s.graphEvidenceHandler)
 			r.Get("/api/v1/graph/entities", s.graphEntitiesHandler)
+		}
+		if s.evidenceVoter != nil {
+			r.Post("/api/v1/feedback/evidence", s.evidenceFeedbackHandler)
 		}
 		if s.actionLister != nil {
 			r.Get("/api/v1/actions", s.listActionsHandler)

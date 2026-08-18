@@ -52,6 +52,18 @@ var validActionKinds = map[ActionKind]bool{
 func IsValidActionKind(k ActionKind) bool { return validActionKinds[k] }
 
 // Action is a row in the actions table (migration 022).
+//
+// CounterpartName/CounterpartType are WRITE-ONLY inputs — they have no column
+// of their own and are never populated when reading. They exist because
+// counterpart_entity_id was NULL for every awaiting_my_reply action ever
+// written: the structural worker has a name for the other party but no way to
+// turn it into an entities.id (it holds no entity store), and the extraction
+// worker's awaiting_my_reply branch never resolved one either. Rather than
+// wiring an entity resolver into each worker, the writers state the label and
+// the store canonicalises it — see ActionStore.UpsertAction.
+//
+// A caller that already knows the entity id sets CounterpartEntityID and
+// leaves these empty; the id always wins.
 type Action struct {
 	ID                  int64
 	IdentityKey         string
@@ -60,6 +72,8 @@ type Action struct {
 	Kind                ActionKind
 	Summary             string
 	CounterpartEntityID *int64
+	CounterpartName     string
+	CounterpartType     EntityType
 	DueAt               *time.Time
 	DetectedBy          DetectedBy
 	Confidence          float64

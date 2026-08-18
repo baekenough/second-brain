@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baekenough/second-brain/internal/action"
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/google/uuid"
@@ -568,5 +569,46 @@ func TestNewExtractionWorker_Defaults(t *testing.T) {
 	}
 	if w.extractFn == nil {
 		t.Error("extractFn must default to ExtractRelationsAndActions")
+	}
+}
+
+// TestExtractionWorker_AwaitingMyReply_CarriesCounterpartLabel closes the
+// second half of the "nameless action card" defect on the LLM path. The
+// counterpart of an awaiting_my_reply action is fixed by document metadata
+// (never named by the LLM, so the structural and LLM candidates converge on
+// one identity_key) — which used to mean it was never resolved to an entity
+// either, leaving counterpart_entity_id NULL. The worker now states the
+// display label and the store resolves it, WITHOUT that label entering the
+// identity_key.
+func TestExtractionWorker_AwaitingMyReply_CarriesCounterpartLabel(t *testing.T) {
+	t.Parallel()
+
+	docID := uuid.New()
+	doc := newExtractionDoc(docID, 0)
+	doc.Metadata["from"] = `"테스트발신자" <counterpart@example.com>`
+	lister := &fakeExtractionLister{docs: []*model.Document{doc}}
+	actions := &fakeActionWriter{}
+
+	w := newTestExtractionWorker(lister, &fakeRelationEntityResolver{}, &fakeRelationWriter{}, actions,
+		func(_ context.Context, _ llm.Completer, _ *model.Document, _ []string) (*ExtractionResult, error) {
+			return &ExtractionResult{
+				Actions: []rawAction{
+					{Kind: string(model.KindAwaitingMyReply), Summary: "dummy llm summary", Confidence: 0.6},
+				},
+			}, nil
+		},
+	)
+	w.tick(context.Background())
+
+	if len(actions.upsertedActions) != 1 {
+		t.Fatalf("UpsertAction called %d times, want 1", len(actions.upsertedActions))
+	}
+	got := actions.upsertedActions[0]
+	if got.CounterpartName != "테스트발신자" || got.CounterpartType != model.EntityTypePerson {
+		t.Errorf("counterpart label = (%q, %q), want (%q, %q)", got.CounterpartName, got.CounterpartType, "테스트발신자", model.EntityTypePerson)
+	}
+	wantKey := action.BuildIdentityKey("gmail:thread-1", string(model.KindAwaitingMyReply), `"테스트발신자" <counterpart@example.com>`, "")
+	if got.IdentityKey != wantKey {
+		t.Errorf("IdentityKey = %q, want %q (the raw From header, not the display label, is hashed)", got.IdentityKey, wantKey)
 	}
 }

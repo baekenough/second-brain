@@ -48,6 +48,33 @@ func NewEvalStore(pg *Postgres) *EvalStore {
 // Results are ordered by the earliest positive feedback creation time (DESC)
 // and capped at 5 000 pairs to bound memory usage.
 func (s *EvalStore) BuildFromFeedback(ctx context.Context) ([]EvalPair, error) {
+	return s.buildFromFeedback(ctx, "")
+}
+
+// EvalPairsBySplit returns the eval pairs belonging to one train/holdout split
+// (see migrations/025_feedback_evidence.sql and internal/dataset).
+//
+// It exists so that internal/dataset can read the two halves with two separate
+// queries. There is deliberately no "read everything and partition afterwards"
+// path: a variable holding both halves is exactly what must not exist outside
+// the dataset package, or the weight optimiser can be handed its own validation
+// set by accident.
+//
+// split must be "train" or "holdout"; anything else is rejected rather than
+// silently widened to "all", because a typo that returns the whole labelled set
+// would be indistinguishable from success right up until the holdout metric
+// stops meaning anything.
+func (s *EvalStore) EvalPairsBySplit(ctx context.Context, split string) ([]EvalPair, error) {
+	if split != "train" && split != "holdout" {
+		return nil, fmt.Errorf("eval: invalid split %q (want \"train\" or \"holdout\")", split)
+	}
+	return s.buildFromFeedback(ctx, split)
+}
+
+// buildFromFeedback is the shared implementation. An empty split means "no
+// split filter" and is reachable only from BuildFromFeedback, whose behaviour
+// is unchanged.
+func (s *EvalStore) buildFromFeedback(ctx context.Context, split string) ([]EvalPair, error) {
 	// --- Step 1: Positive pairs from feedback (thumbs >= 1) ---
 	rows, err := s.pg.Pool().Query(ctx, `
 		SELECT query,
@@ -57,11 +84,12 @@ func (s *EvalStore) BuildFromFeedback(ctx context.Context) ([]EvalPair, error) {
 		WHERE thumbs >= 1
 		  AND query IS NOT NULL
 		  AND query != ''
+		  AND ($1 = '' OR split = $1)
 		GROUP BY query
 		HAVING COUNT(DISTINCT document_id) FILTER (WHERE document_id IS NOT NULL) > 0
 		ORDER BY created_at DESC
 		LIMIT 5000
-	`)
+	`, split)
 	if err != nil {
 		return nil, fmt.Errorf("eval: build from feedback: %w", err)
 	}
@@ -98,9 +126,10 @@ func (s *EvalStore) BuildFromFeedback(ctx context.Context) ([]EvalPair, error) {
 		WHERE thumbs = -1
 		  AND query IS NOT NULL
 		  AND query != ''
+		  AND ($1 = '' OR split = $1)
 		GROUP BY query
 		HAVING COUNT(DISTINCT document_id) FILTER (WHERE document_id IS NOT NULL) > 0
-	`)
+	`, split)
 	if err != nil {
 		return nil, fmt.Errorf("eval: build negative feedback: %w", err)
 	}
@@ -147,11 +176,12 @@ func (s *EvalStore) BuildFromFeedback(ctx context.Context) ([]EvalPair, error) {
 		WHERE source = 'manual'
 		  AND query IS NOT NULL
 		  AND query != ''
+		  AND ($1 = '' OR split = $1)
 		GROUP BY query
 		HAVING COUNT(DISTINCT document_id) FILTER (WHERE document_id IS NOT NULL) > 0
 		ORDER BY created_at DESC
 		LIMIT 1000
-	`)
+	`, split)
 	if err != nil {
 		return nil, fmt.Errorf("eval: build manual pairs: %w", err)
 	}
