@@ -25,9 +25,11 @@ import (
 // consequence (the last instant of the period is inside the window) so the
 // regression cannot come back through a "tidier-looking" 23:59:59.
 //
-// KST is used deliberately: the classifier resolves calendar days in
-// now.Location(), and a UTC-only test would pass even if the day boundary were
-// computed in the wrong zone.
+// KST is used deliberately: the classifier resolves every calendar boundary in
+// Asia/Seoul (see internal/timeutil), so the expected bounds below are KST
+// instants. Whether the classifier HONOURS that regardless of the clock's own
+// zone is pinned separately — see TestClassify_DayBoundaryIsKSTRegardlessOfClockZone
+// below and kst_window_test.go, which inject a UTC clock the way production does.
 // ---------------------------------------------------------------------------
 
 // kst is Asia/Seoul as a fixed +09:00 zone. Korea observes no DST, so a fixed
@@ -217,29 +219,54 @@ func TestClassify_ConsecutiveDayWindowsTile(t *testing.T) {
 	}
 }
 
-// TestClassify_DayBoundaryFollowsCallerTimezone pins that the calendar day is
-// resolved in the clock's own location. The reference instant below is late
-// evening in KST but the PREVIOUS day in UTC, so a classifier that silently
-// normalised to UTC would return the wrong day entirely.
-func TestClassify_DayBoundaryFollowsCallerTimezone(t *testing.T) {
+// TestClassify_DayBoundaryIsKSTRegardlessOfClockZone pins that the calendar day
+// is resolved in Asia/Seoul whatever zone the clock carries.
+//
+// This test previously asserted the opposite contract ("the day boundary
+// follows the CALLER's zone") and passed while production was broken: it only
+// ever injected a KST clock, so it could not distinguish "resolves in KST" from
+// "resolves in whatever zone it was handed". Production hands it UTC — the
+// server and collector containers run as Etc/UTC — and the UTC-resolved day is
+// 9 hours behind the day the user means. Following the caller's zone is no
+// longer the desired behaviour; the window must be a KST day either way, so the
+// same instant is asserted here in both zones.
+//
+// The reference instant is chosen so the two zones disagree about the DATE, not
+// just the offset: a classifier that normalised to the clock's own zone returns
+// a window one whole day off for the UTC case.
+func TestClassify_DayBoundaryIsKSTRegardlessOfClockZone(t *testing.T) {
 	t.Parallel()
 
-	// 2026-08-18 08:00 KST == 2026-08-17 23:00 UTC.
-	now := time.Date(2026, 8, 18, 8, 0, 0, 0, kst)
-
-	fake := &fakeCompleter{err: errors.New("LLM must not be called for a deterministic date match")}
-	got, err := newClassifier(t, fake, now).Classify(context.Background(), "오늘 일정에 대해 알려줘")
-	if err != nil {
-		t.Fatalf("Classify returned non-nil error: %v", err)
-	}
-	if got.OccurredFrom == nil || got.OccurredTo == nil {
-		t.Fatalf("Classify produced no window")
+	// The same instant, twice: 2026-08-18 08:00 KST == 2026-08-17 23:00 UTC.
+	clocks := []struct {
+		name string
+		now  time.Time
+	}{
+		{name: "clock in KST", now: time.Date(2026, 8, 18, 8, 0, 0, 0, kst)},
+		{name: "clock in UTC (production)", now: time.Date(2026, 8, 17, 23, 0, 0, 0, time.UTC)},
 	}
 
 	wantFrom := time.Date(2026, 8, 18, 0, 0, 0, 0, kst)
 	wantTo := time.Date(2026, 8, 19, 0, 0, 0, 0, kst)
-	if !got.OccurredFrom.Equal(wantFrom) || !got.OccurredTo.Equal(wantTo) {
-		t.Errorf("window = [%s, %s), want [%s, %s) — the day boundary must follow the caller's zone, not UTC",
-			*got.OccurredFrom, *got.OccurredTo, wantFrom, wantTo)
+
+	for _, tc := range clocks {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			fake := &fakeCompleter{err: errors.New("LLM must not be called for a deterministic date match")}
+			got, err := newClassifier(t, fake, tc.now).Classify(context.Background(), "오늘 일정에 대해 알려줘")
+			if err != nil {
+				t.Fatalf("Classify returned non-nil error: %v", err)
+			}
+			if got.OccurredFrom == nil || got.OccurredTo == nil {
+				t.Fatalf("Classify produced no window")
+			}
+
+			if !got.OccurredFrom.Equal(wantFrom) || !got.OccurredTo.Equal(wantTo) {
+				t.Errorf("window = [%s, %s), want [%s, %s) — the day boundary must be KST, not the clock's own zone",
+					*got.OccurredFrom, *got.OccurredTo, wantFrom, wantTo)
+			}
+		})
 	}
 }

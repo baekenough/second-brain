@@ -37,8 +37,16 @@ func newClassifier(t *testing.T, c llm.Completer, now time.Time) *intent.LLMClas
 }
 
 // fixedNow anchors all relative date-phrase tests to a stable reference
-// time (2026-08-17, a Monday) so results don't depend on the real clock.
+// time so results don't depend on the real clock. It is expressed in UTC on
+// purpose — that is what the production containers' clock returns — but note
+// that 2026-08-17 15:00 UTC is 2026-08-18 00:00 KST, and the classifier resolves
+// calendar boundaries in KST, so the windows below are KST periods anchored to
+// the 18th.
 var fixedNow = time.Date(2026, 8, 17, 15, 0, 0, 0, time.UTC)
+
+// kstZone mirrors internal/timeutil's location as a fixed +09:00 offset (Korea
+// observes no DST, so this is exact) for stating expected bounds.
+var kstZone = time.FixedZone("KST", 9*60*60)
 
 func TestLLMClassifier_Classify_DeterministicDatePhrases(t *testing.T) {
 	t.Parallel()
@@ -53,19 +61,19 @@ func TestLLMClassifier_Classify_DeterministicDatePhrases(t *testing.T) {
 		{
 			name:     "explicit year and month",
 			question: "2026년 6월 요약해줘",
-			wantFrom: time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+			wantFrom: time.Date(2026, 6, 1, 0, 0, 0, 0, kstZone),
 			// Half-open upper bound: the first instant of July, not June's last
 			// second. See the range helpers in intent.go and
 			// TestClassify_LastInstantOfPeriodIsInsideWindow.
-			wantTo:     time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
+			wantTo:     time.Date(2026, 7, 1, 0, 0, 0, 0, kstZone),
 			wantConfid: 1.0,
 		},
 		{
-			name:     "last month, relative to fixed now (2026-08-17)",
+			name:     "last month, relative to fixed now (2026-08-18 KST)",
 			question: "지난달에 뭐 있었지",
-			wantFrom: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
+			wantFrom: time.Date(2026, 7, 1, 0, 0, 0, 0, kstZone),
 			// Half-open: July's window closes at the first instant of August.
-			wantTo:     time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
+			wantTo:     time.Date(2026, 8, 1, 0, 0, 0, 0, kstZone),
 			wantConfid: 1.0,
 		},
 	}

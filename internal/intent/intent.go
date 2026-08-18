@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/baekenough/second-brain/internal/llm"
+	"github.com/baekenough/second-brain/internal/timeutil"
 )
 
 // Kind describes how Stage 2 should shape the retrieval query for a
@@ -91,7 +92,15 @@ Otherwise use "general".`
 // call when nothing matches. It never returns a non-nil error: every
 // failure path (LLM error, malformed response) degrades to KindGeneral.
 func (c *LLMClassifier) Classify(ctx context.Context, question string) (Params, error) {
-	now := c.nowFunc()
+	// Convert the clock to KST before any calendar arithmetic below reads a
+	// year/month/weekday off it. The server and collector containers run as
+	// Etc/UTC, so nowFunc() hands back a UTC instant whose calendar date is the
+	// PREVIOUS day for the first nine hours of every Korean day — and, at a
+	// month boundary, the previous month. Deriving "지난달" or the ISO week from
+	// the raw UTC value would then name the wrong period. The range helpers
+	// normalise to KST too (see their doc comments); doing it here as well keeps
+	// the month/weekday extracted in this function honest.
+	now := c.nowFunc().In(timeutil.KST())
 
 	if phoneRe.MatchString(question) {
 		return Params{RawQuery: question, Kind: KindExactToken, Confidence: 1.0}, nil
@@ -101,14 +110,14 @@ func (c *LLMClassifier) Classify(ctx context.Context, question string) (Params, 
 		year, errY := strconv.Atoi(m[1])
 		month, errM := strconv.Atoi(m[2])
 		if errY == nil && errM == nil && month >= 1 && month <= 12 {
-			from, to := monthRange(year, month, now.Location())
+			from, to := monthRange(year, month)
 			return Params{RawQuery: question, Kind: KindTemporal, OccurredFrom: &from, OccurredTo: &to, Confidence: 1.0}, nil
 		}
 	}
 
 	if lastMonthRe.MatchString(question) {
 		lm := now.AddDate(0, -1, 0)
-		from, to := monthRange(lm.Year(), int(lm.Month()), now.Location())
+		from, to := monthRange(lm.Year(), int(lm.Month()))
 		return Params{RawQuery: question, Kind: KindTemporal, OccurredFrom: &from, OccurredTo: &to, Confidence: 1.0}, nil
 	}
 
@@ -201,24 +210,37 @@ func extractJSON(s string) string {
 // neither "어제" nor "오늘". Anchoring `to` to the next period's start makes
 // consecutive windows tile exactly: no gap, no overlap.
 //
-// All three resolve calendar boundaries in the caller's own location (the
-// clock's zone, via t.Location() / the loc argument), so "오늘" means today in
-// Seoul for a Seoul-based deployment rather than today in UTC.
+// All three resolve calendar boundaries in timeutil.KST(), NOT in the clock's
+// own location. This is the fix for a production defect: the server and
+// collector containers run as Etc/UTC (docker-compose.local.yml sets
+// TZ: Asia/Seoul only on eval-runner), so t.Location() was UTC there and "오늘"
+// meant the UTC day — a window nine hours behind the Korean day the user and
+// the ingested documents live in. A calendar event at 18:00 KST fell outside
+// the container's "오늘" window and /ask could not retrieve it. Developer
+// machines are KST, so every local test run agreed with the user and only
+// production disagreed.
+//
+// Second Brain's users and data are Korea-based, so KST is the only calendar
+// these windows should ever be expressed in, whatever zone the caller's clock
+// carries. Each helper therefore converts its input rather than trusting it —
+// converting only at the call site would leave the next caller free to
+// reintroduce the bug.
 
-// monthRange returns [00:00:00 on day 1 of the given month, 00:00:00 on day 1
-// of the following month) in loc. December is handled by time.Date's own
+// monthRange returns [00:00:00 KST on day 1 of the given month, 00:00:00 KST on
+// day 1 of the following month). December is handled by time.Date's own
 // normalisation: month 13 rolls over into January of the next year.
-func monthRange(year, month int, loc *time.Location) (time.Time, time.Time) {
+func monthRange(year, month int) (time.Time, time.Time) {
+	loc := timeutil.KST()
 	from := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, loc)
 	to := time.Date(year, time.Month(month)+1, 1, 0, 0, 0, 0, loc)
 	return from, to
 }
 
-// dayRange returns [00:00:00 today, 00:00:00 tomorrow) for the calendar day
-// containing t, in t's own location.
+// dayRange returns [00:00:00 KST, next 00:00:00 KST) for the KST calendar day
+// containing the instant t, regardless of t's own location.
 func dayRange(t time.Time) (time.Time, time.Time) {
-	y, m, d := t.Date()
-	loc := t.Location()
+	loc := timeutil.KST()
+	y, m, d := t.In(loc).Date()
 	// time.Date normalises an out-of-range day (Aug 32 -> Sep 1), and computing
 	// the next midnight directly — rather than adding 24h to `from` — keeps the
 	// bound correct in zones that observe DST, where a calendar day is not
@@ -227,13 +249,16 @@ func dayRange(t time.Time) (time.Time, time.Time) {
 	return time.Date(y, m, d, 0, 0, 0, 0, loc), time.Date(y, m, d+1, 0, 0, 0, 0, loc)
 }
 
-// weekRange returns [Monday 00:00:00, next Monday 00:00:00) of the ISO week
-// containing t. The upper bound comes from the day AFTER Sunday, so the week
-// is closed by the start of the next week rather than by Sunday's last second.
+// weekRange returns [Monday 00:00:00 KST, next Monday 00:00:00 KST) of the ISO
+// week containing the instant t. The upper bound comes from the day AFTER
+// Sunday, so the week is closed by the start of the next week rather than by
+// Sunday's last second. The weekday is read in KST: near the day boundary the
+// UTC weekday can be the previous day, which would shift the whole week.
 func weekRange(t time.Time) (time.Time, time.Time) {
+	kstNow := t.In(timeutil.KST())
 	// time.Weekday: Sunday = 0 ... Saturday = 6. Convert to days since Monday.
-	daysSinceMonday := (int(t.Weekday()) + 6) % 7
-	monday := t.AddDate(0, 0, -daysSinceMonday)
+	daysSinceMonday := (int(kstNow.Weekday()) + 6) % 7
+	monday := kstNow.AddDate(0, 0, -daysSinceMonday)
 	from, _ := dayRange(monday)
 	y, m, d := from.Date()
 	return from, time.Date(y, m, d+7, 0, 0, 0, 0, from.Location())

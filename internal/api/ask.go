@@ -13,6 +13,7 @@ import (
 	"github.com/baekenough/second-brain/internal/intent"
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/baekenough/second-brain/internal/timeutil"
 )
 
 // AskRequest is the JSON body accepted by POST /api/v1/ask. ConversationID
@@ -70,30 +71,19 @@ type askErrorPayload struct {
 	Message string `json:"message"`
 }
 
-// kstLocation is the timezone used to render every date/time shown to the
-// model in the Stage 3 prompt: the current-date line in
-// buildAskSystemPrompt and each document's occurred_at in buildAskMessages.
-// Second Brain's users and ingested data are Korea-based, so dates are
-// always rendered in Asia/Seoul rather than the server process's local
-// timezone (which may be UTC in a container) — otherwise a request served
-// near local midnight could show the model the wrong calendar date and
-// reintroduce the exact bug this file fixes.
+// Every date/time shown to the model in the Stage 3 prompt — the current-date
+// line in buildAskSystemPrompt and each document's occurred_at in
+// buildAskMessages — is rendered in timeutil.KST(), never in the server
+// process's local timezone (which is UTC in the production container).
+// Second Brain's users and ingested data are Korea-based, so a request served
+// near the container's local midnight would otherwise show the model the wrong
+// calendar date and reintroduce the exact bug this file fixes.
 //
-// time.LoadLocation reads the OS tzdata database; the production image
-// (Dockerfile's runtime-base stage) installs the tzdata package for exactly
-// this reason. The time.FixedZone fallback below only matters for an
-// environment without a tzdata database (e.g. a minimal test sandbox) —
-// Korea observes no DST, so a fixed UTC+9 offset is equivalent to the IANA
-// zone at every point in time, not just an approximation.
-var kstLocation = loadKSTLocation()
-
-func loadKSTLocation() *time.Location {
-	loc, err := time.LoadLocation("Asia/Seoul")
-	if err != nil {
-		return time.FixedZone("KST", 9*60*60)
-	}
-	return loc
-}
+// The location is shared with internal/intent, which resolves the
+// "오늘"/"이번 주"/"지난달" retrieval windows in the same zone. One definition is
+// deliberate: a second copy would let the prompt's rendered date and the
+// retrieval window drift into disagreeing about which day "today" is. See
+// internal/timeutil/kst.go for the tzdata/fallback rationale.
 
 // koreanWeekdayNames is indexed by time.Weekday (Sunday=0 ... Saturday=6).
 var koreanWeekdayNames = [...]string{"일", "월", "화", "수", "목", "금", "토"}
@@ -115,7 +105,7 @@ func formatOccurredAt(t *time.Time) string {
 	if t == nil {
 		return "시각 정보 없음"
 	}
-	return formatKoreanDateTime(t.In(kstLocation))
+	return formatKoreanDateTime(t.In(timeutil.KST()))
 }
 
 // askSystemPromptTemplate is buildAskSystemPrompt's format string. It
@@ -143,7 +133,7 @@ const askSystemPromptTemplate = `당신은 사용자의 개인 지식 베이스�
 // so it could not resolve "내일"/"어제" and answered that it didn't know
 // what day it was.
 func buildAskSystemPrompt(now time.Time) string {
-	return fmt.Sprintf(askSystemPromptTemplate, formatKoreanDateTime(now.In(kstLocation)))
+	return fmt.Sprintf(askSystemPromptTemplate, formatKoreanDateTime(now.In(timeutil.KST())))
 }
 
 // writeSSEEvent writes one "event: <name>\ndata: <json>\n\n" frame and
