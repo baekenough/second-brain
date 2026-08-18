@@ -440,10 +440,15 @@ func buildFulltextSearchQuery(query model.SearchQuery) (string, []interface{}) {
 		statusFilter = ""
 	}
 
+	// Include filter: set membership over the effective include set (see
+	// model.SearchQuery.IncludeSourceTypes), bound as ONE parameter. The list
+	// is never interpolated — every fragment in this file is assembled with
+	// fmt.Sprintf, and that mechanism has already caused one production
+	// incident here.
 	sourceFilter := ""
-	if query.SourceType != nil {
-		sourceFilter = fmt.Sprintf("AND source_type = $%d", len(args)+1)
-		args = append(args, *query.SourceType)
+	if include := query.IncludeSourceTypes(); len(include) > 0 {
+		sourceFilter = fmt.Sprintf("AND source_type = ANY($%d)", len(args)+1)
+		args = append(args, include)
 	}
 
 	excludeFilter := ""
@@ -523,6 +528,75 @@ func appendOccurredRangeFilters(args []interface{}, from, to *time.Time) (newArg
 
 	const sep = "\n\t\t\t"
 	return args, strings.Join(plainParts, sep), strings.Join(qualifiedParts, sep)
+}
+
+// buildOccurredRangeIDQuery renders the statement that narrows a candidate set
+// of document IDs to those whose occurred_at falls inside [from, to), and the
+// bound arguments for the window. The ID list itself is bound as $1 by the
+// caller, so the returned args start at $2.
+//
+// Split out for the same reason as the other builders in this file: the WHERE
+// clause is the whole content of the function, and it is the only thing worth
+// asserting without a database.
+//
+// It reuses appendOccurredRangeFilters so the window semantics are defined
+// exactly once. That matters more here than anywhere else: this statement
+// verifies candidates that a DIFFERENT lane produced. If its notion of the
+// window drifted from the lanes' — half-open vs closed, or a COALESCE onto
+// collected_at — the two halves of one result set would be answering different
+// questions, and the difference would be invisible in the response.
+func buildOccurredRangeIDQuery(from, to *time.Time) (string, []interface{}) {
+	// One placeholder is already consumed by the ID list ($1).
+	args, plain, _ := appendOccurredRangeFilters([]interface{}{nil}, from, to)
+	return fmt.Sprintf(`
+		SELECT id
+		FROM documents
+		WHERE id = ANY($1)
+		%s`, plain), args[1:]
+}
+
+// FilterIDsByOccurredRange returns the subset of ids whose documents.occurred_at
+// falls inside the half-open window [from, to). Rows with a NULL occurred_at
+// never survive a window — the SQL comparison gives that for free, and it is
+// the same rule every retrieval lane applies.
+//
+// This exists so that the search service's chunk lanes can honour an event-time
+// window. Chunk rows carry no occurred_at, so before this the only safe
+// behaviour was to switch those lanes off whenever a window was set, which
+// deleted chunk-level recall from every temporal query. Verifying the candidate
+// IDs against the documents table costs one primary-key lookup per windowed
+// request (at most `limit` ids after per-document deduplication) and keeps both
+// properties: chunk recall and a window the result provably satisfies.
+//
+// An empty ids slice short-circuits without touching the database.
+func (s *DocumentStore) FilterIDsByOccurredRange(ctx context.Context, ids []uuid.UUID, from, to *time.Time) (map[uuid.UUID]struct{}, error) {
+	if len(ids) == 0 {
+		return map[uuid.UUID]struct{}{}, nil
+	}
+
+	q, boundArgs := buildOccurredRangeIDQuery(from, to)
+	args := make([]interface{}, 0, len(boundArgs)+1)
+	args = append(args, ids)
+	args = append(args, boundArgs...)
+
+	rows, err := s.pg.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("filter ids by occurred range: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[uuid.UUID]struct{}, len(ids))
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("filter ids by occurred range scan: %w", err)
+		}
+		out[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("filter ids by occurred range iter: %w", err)
+	}
+	return out, nil
 }
 
 // hybridSearch combines full-text and vector search ranks via RRF.
@@ -625,12 +699,16 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 		statusFilter, entityStatusFilter = "", ""
 	}
 
+	// Include filter: set membership over the effective include set (see
+	// model.SearchQuery.IncludeSourceTypes). One bound parameter, referenced by
+	// all five lanes — a lane that omitted it would not merely widen itself, it
+	// would spend candidate slots (LIMIT $3) on documents the caller excluded.
 	sourceFilter, entitySourceFilter := "", ""
-	if query.SourceType != nil {
+	if include := query.IncludeSourceTypes(); len(include) > 0 {
 		p := len(args) + 1
-		sourceFilter = fmt.Sprintf("AND source_type = $%d", p)
-		entitySourceFilter = fmt.Sprintf("AND d.source_type = $%d", p)
-		args = append(args, *query.SourceType)
+		sourceFilter = fmt.Sprintf("AND source_type = ANY($%d)", p)
+		entitySourceFilter = fmt.Sprintf("AND d.source_type = ANY($%d)", p)
+		args = append(args, include)
 	}
 
 	excludeFilter, entityExcludeFilter := "", ""

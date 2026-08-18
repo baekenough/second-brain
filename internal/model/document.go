@@ -185,8 +185,20 @@ func (w SearchWeights) Defaults() SearchWeights {
 
 // SearchQuery describes a search request.
 type SearchQuery struct {
-	Query              string
-	SourceType         *SourceType  // nil means all sources
+	Query string
+
+	// SourceType is the legacy single-source include filter (nil = all
+	// sources). It is NOT deprecated: several callers set exactly one source
+	// and reading a pointer is clearer there than a one-element slice.
+	//
+	// SourceTypes is the multi-source form (empty = no filter). A query planner
+	// emits a list, so both shapes exist.
+	//
+	// The two are ONE filter, and IncludeSourceTypes is its only definition —
+	// see that method for how they combine and why. Nothing downstream may read
+	// either field directly to decide what is included.
+	SourceType         *SourceType
+	SourceTypes        []SourceType
 	ExcludeSourceTypes []SourceType // source types to exclude from results
 	Limit              int
 	Embedding          []float32    // populated by search service when available
@@ -213,4 +225,50 @@ type SearchQuery struct {
 	// the window" as "happened during the window".
 	OccurredFrom *time.Time
 	OccurredTo   *time.Time
+}
+
+// IncludeSourceTypes returns the effective source-type include set: the UNION
+// of the singular SourceType and the plural SourceTypes, deduplicated, with the
+// singular value first. An empty result means "no include filter" — i.e. all
+// sources — never "the empty set".
+//
+// Union, rather than intersection or precedence, because:
+//
+//   - Both fields are include filters, and an include filter is set membership
+//     (source_type = ANY(...)). The union is the natural lift of the one-element
+//     case into the list case; no other rule leaves the singular field meaning
+//     what it has always meant.
+//   - It is monotone. Callers that still set only SourceType
+//     (internal/api/search.go, internal/api/graphql.go, cmd/mcp) cannot lose a
+//     document because some other layer populated SourceTypes. Intersection can
+//     silently produce an empty result when the two disagree; precedence
+//     silently discards whichever field lost. Both failure modes are invisible
+//     at the API boundary, which is the exact shape of the defect (#196) this
+//     field was added to fix.
+//
+// Overlap between the include set and ExcludeSourceTypes is resolved where the
+// filters are applied, not here: exclude wins (see internal/search.Service).
+//
+// The returned slice never aliases the caller's SourceTypes backing array, so
+// filter steps may sort or truncate it freely.
+func (q SearchQuery) IncludeSourceTypes() []SourceType {
+	if q.SourceType == nil && len(q.SourceTypes) == 0 {
+		return nil
+	}
+	out := make([]SourceType, 0, len(q.SourceTypes)+1)
+	seen := make(map[SourceType]struct{}, len(q.SourceTypes)+1)
+	add := func(st SourceType) {
+		if _, dup := seen[st]; dup {
+			return
+		}
+		seen[st] = struct{}{}
+		out = append(out, st)
+	}
+	if q.SourceType != nil {
+		add(*q.SourceType)
+	}
+	for _, st := range q.SourceTypes {
+		add(st)
+	}
+	return out
 }

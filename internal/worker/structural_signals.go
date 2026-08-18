@@ -198,20 +198,117 @@ func (w *StructuralSignalWorker) Run(ctx context.Context) {
 	}
 }
 
-// Tick is exported (unlike ExtractionWorker's unexported tick) so tests can
-// drive one pass deterministically without a ticker.
-func (w *StructuralSignalWorker) Tick(ctx context.Context) {
-	messages, err := w.store.ListLatestPerThread(ctx, w.batchSize)
-	if err != nil {
-		slog.Warn("structural signal worker: list failed", "error", err)
-		return
-	}
-	for _, m := range messages {
-		w.processMessage(ctx, m)
+// tickOutcome is the single bucket one listed message falls into. Every
+// early return in processMessage must name one: the buckets are what make a
+// tick's work visible, and an unnamed return is invisible by construction.
+type tickOutcome int
+
+const (
+	outcomeWritten tickOutcome = iota
+	outcomeSkippedAuthLike
+	outcomeSkippedOutbound
+	outcomeSkippedNoCounterpart
+	outcomeSkippedNoThreadKey
+	outcomeFailed
+	outcomeStatusFailed
+)
+
+// tickStats accounts for one Tick pass.
+//
+// It exists because this worker had exactly two observable states — "started"
+// and "errored" — and a tick that wrote 419 actions logged the same thing as
+// a tick that silently skipped all 419: nothing. When the actions table was
+// found empty after a deploy, no log could say whether the worker had run,
+// had run and skipped everything, or had never listed a row; the question was
+// only settleable by dating rows against the actions_id_seq sequence. That
+// blind spot, not the write path, is what turned a nine-minute wait for the
+// next tick into a production DELETE of 447 rows.
+//
+// Counts only. A message's contents, its document id, its counterpart and its
+// metadata values are all personal data and none of them belong in an
+// operational log line that exists to answer "did the worker do its job?".
+type tickStats struct {
+	// ListFailed reports that the read failed, so no message was ever seen.
+	// Distinct from Listed == 0, which means the query legitimately returned
+	// nothing — identical symptoms, opposite causes.
+	ListFailed           bool
+	Listed               int
+	Written              int
+	SkippedAuthLike      int
+	SkippedOutbound      int
+	SkippedNoCounterpart int
+	SkippedNoThreadKey   int
+	Failed               int
+	// StatusFailed counts actions that were written but left without an
+	// 'open' action_status row. Those rows exist in the table and yet never
+	// reach the /actions screen, which joins action_status — a full table
+	// behind an empty screen.
+	StatusFailed int
+}
+
+// accountedFor totals the outcome buckets. It must equal Listed; a shortfall
+// means some path returns without being counted, which is the exact defect
+// tickStats was introduced to prevent from recurring. StatusFailed is not
+// added: those messages are already counted in Written (the action row was
+// persisted), and StatusFailed is a second, narrower fact about them.
+func (s tickStats) accountedFor() int {
+	return s.Written + s.SkippedAuthLike + s.SkippedOutbound +
+		s.SkippedNoCounterpart + s.SkippedNoThreadKey + s.Failed
+}
+
+func (s *tickStats) record(o tickOutcome) {
+	switch o {
+	case outcomeWritten:
+		s.Written++
+	case outcomeSkippedAuthLike:
+		s.SkippedAuthLike++
+	case outcomeSkippedOutbound:
+		s.SkippedOutbound++
+	case outcomeSkippedNoCounterpart:
+		s.SkippedNoCounterpart++
+	case outcomeSkippedNoThreadKey:
+		s.SkippedNoThreadKey++
+	case outcomeFailed:
+		s.Failed++
+	case outcomeStatusFailed:
+		s.Written++
+		s.StatusFailed++
 	}
 }
 
-func (w *StructuralSignalWorker) processMessage(ctx context.Context, m ThreadLatestMessage) {
+// Tick is exported (unlike ExtractionWorker's unexported tick) so tests can
+// drive one pass deterministically without a ticker. It returns what the pass
+// did so a test can assert the accounting the log line reports.
+func (w *StructuralSignalWorker) Tick(ctx context.Context) tickStats {
+	var stats tickStats
+	messages, err := w.store.ListLatestPerThread(ctx, w.batchSize)
+	if err != nil {
+		stats.ListFailed = true
+		slog.Warn("structural signal worker: list failed", "error", err)
+		return stats
+	}
+	stats.Listed = len(messages)
+	for _, m := range messages {
+		stats.record(w.processMessage(ctx, m))
+	}
+
+	// Logged at INFO on every tick, including the all-zero one: the absence of
+	// work is the observation that was missing, so it cannot be the case that
+	// the quiet tick is also the silent one.
+	slog.Info("structural signal worker: tick complete",
+		"listed", stats.Listed,
+		"written", stats.Written,
+		"failed", stats.Failed,
+		"status_failed", stats.StatusFailed,
+		"skipped_auth_like", stats.SkippedAuthLike,
+		"skipped_outbound", stats.SkippedOutbound,
+		"skipped_no_counterpart", stats.SkippedNoCounterpart,
+		"skipped_no_thread_key", stats.SkippedNoThreadKey,
+	)
+	return stats
+}
+
+func (w *StructuralSignalWorker) processMessage(ctx context.Context, m ThreadLatestMessage) tickOutcome {
 	doc := &model.Document{
 		ID:         m.DocumentID,
 		SourceType: model.SourceType(m.SourceType),
@@ -228,21 +325,21 @@ func (w *StructuralSignalWorker) processMessage(ctx context.Context, m ThreadLat
 	// check protects any future caller of StructuralSignalLister that does
 	// not pre-filter.
 	if authLike, _ := doc.Metadata["is_auth_like"].(bool); authLike {
-		return
+		return outcomeSkippedAuthLike
 	}
 
 	if isOutbound(doc) {
-		return
+		return outcomeSkippedOutbound
 	}
 
 	counterpart, ok := action.CounterpartIdentity(doc, func(addr string) bool { return action.IsUserAddress(w.userAddresses, addr) })
 	if !ok {
-		return
+		return outcomeSkippedNoCounterpart
 	}
 
 	threadKey, ok := threadKeyForDocument(doc)
 	if !ok {
-		return
+		return outcomeSkippedNoThreadKey
 	}
 
 	identityKey := action.BuildIdentityKey(threadKey, string(model.KindAwaitingMyReply), counterpart, "")
@@ -274,11 +371,13 @@ func (w *StructuralSignalWorker) processMessage(ctx context.Context, m ThreadLat
 		ObservedAt:      w.now().UTC(),
 	}); err != nil {
 		slog.Warn("structural signal worker: upsert action failed", "doc_id", doc.ID, "error", err)
-		return
+		return outcomeFailed
 	}
 	if err := w.actions.EnsureOpenStatus(ctx, identityKey); err != nil {
 		slog.Warn("structural signal worker: ensure open status failed", "doc_id", doc.ID, "error", err)
+		return outcomeStatusFailed
 	}
+	return outcomeWritten
 }
 
 // isOutbound reports whether doc's direction indicates the ACCOUNT OWNER

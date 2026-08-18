@@ -237,6 +237,12 @@ func newAskTestServer(searcher documentSearcher, classifier intent.Classifier, l
 	svc := search.NewService(searcher, askDisabledEmbedder{})
 	srv := NewServer(nil, svc, nil, nil, llmClient, "", "test-key")
 	srv.intentClassifier = classifier
+	// Query planning with NO LLM backend: the deterministic date regexes still
+	// run, and anything they miss becomes an unconstrained fallback plan. This
+	// keeps the shared fake LLM dedicated to synthesis/rewrite, so assertions
+	// like "the LLM was never invoked for a 0-evidence question" still mean
+	// what they say. Plan-specific tests override srv.queryPlanner.
+	srv.queryPlanner = intent.NewLLMPlanner(nil, defaultAskTopK)
 	return srv
 }
 

@@ -51,8 +51,66 @@ type askConversationPayload struct {
 }
 
 // askSourcesPayload is the "sources" SSE event body (spec §5.1).
+//
+// Plan is additive and optional. It travels with "sources" rather than in an
+// event of its own because the question it answers — "why these documents, and
+// why so few?" — is only ever asked about this payload, and because an added
+// field is invisible to the already-shipped frontend (which reads .sources)
+// whereas a new event name would need parseAskEvent support to be seen at all.
 type askSourcesPayload struct {
 	Sources []AskSourceItem `json:"sources"`
+	Plan    *askPlanPayload `json:"plan,omitempty"`
+}
+
+// askPlanPayload is the client-visible projection of intent.QueryPlan
+// (query-planner design §3.1).
+//
+// Reason and Origin are the diagnosis channel this pipeline previously
+// lacked: a 0-source answer with no stated scope is indistinguishable from a
+// broken retriever, and a wrong answer gives no clue whether the cause was the
+// filter, the vocabulary, or the ranking. Origin names the path that built the
+// plan (deterministic | llm | fallback) — three causes that require three
+// different repairs.
+//
+// PRIVACY (design §9): Reason may quote the user's question and therefore may
+// contain personal data. It is returned to the asking user over their own
+// authenticated stream and MUST NOT be logged, used as a metric label, or put
+// into an error message.
+type askPlanPayload struct {
+	Origin string `json:"origin"`
+	Reason string `json:"reason"`
+	// OccurredFrom / OccurredTo are KST calendar dates ("YYYY-MM-DD") bounding
+	// the half-open window [from, to); "" means unbounded on that side. Dates,
+	// not timestamps: the window always starts and ends at a KST midnight, and
+	// rendering it in the server's UTC clock would show the user the previous
+	// day.
+	OccurredFrom string   `json:"occurred_from"`
+	OccurredTo   string   `json:"occurred_to"`
+	SourceTypes  []string `json:"source_types"`
+	Limit        int      `json:"limit"`
+}
+
+// newAskPlanPayload projects a plan onto the wire shape, rendering both bounds
+// in KST.
+func newAskPlanPayload(plan intent.QueryPlan) *askPlanPayload {
+	formatBound := func(t *time.Time) string {
+		if t == nil {
+			return ""
+		}
+		return t.In(timeutil.KST()).Format("2006-01-02")
+	}
+	sources := make([]string, 0, len(plan.SourceTypes))
+	for _, st := range plan.SourceTypes {
+		sources = append(sources, string(st))
+	}
+	return &askPlanPayload{
+		Origin:       plan.Origin,
+		Reason:       plan.Reason,
+		OccurredFrom: formatBound(plan.OccurredFrom),
+		OccurredTo:   formatBound(plan.OccurredTo),
+		SourceTypes:  sources,
+		Limit:        plan.Limit,
+	}
 }
 
 // askTokenPayload is the "token" SSE event body (spec §5.1).
@@ -221,8 +279,31 @@ func (s *Server) askHandler(w http.ResponseWriter, r *http.Request) {
 		params = intent.Params{RawQuery: searchQuestion, Kind: intent.KindGeneral}
 	}
 
+	// Stage 1b: query planning. The plan decides WHAT to retrieve (window,
+	// sources, limit); params above only decides how to rank it
+	// (query-planner design §3.2). Plan never returns an error — every
+	// internal failure becomes an unconstrained fallback plan — so a planner
+	// outage degrades to the pre-planner behaviour instead of failing /ask.
+	//
+	// It is given searchQuestion, the standalone rewrite, for the same reason
+	// Stage 1 is: a raw follow-up like "그거 더 자세히" contains no time
+	// expression, and planning it would produce a fallback plan for every
+	// multi-turn question.
+	plan := s.planner().Plan(ctx, searchQuestion)
+	// Structured plan log (design §10). Reason is recorded as a LENGTH only:
+	// it can quote the question and therefore carry personal data (design §9,
+	// same rule as llm.TruncatedError in issue #194).
+	slog.Info("ask: query plan",
+		"origin", plan.Origin,
+		"occurred_from", plan.OccurredFrom,
+		"occurred_to", plan.OccurredTo,
+		"source_types", plan.SourceTypes,
+		"limit", plan.Limit,
+		"reason_len", len(plan.Reason),
+	)
+
 	// Stage 2: retrieval assembly (원문/정리 vs 추론 layers, spec §5.3).
-	result, err := assembleRetrieval(ctx, s.search, params, s.askTopK, s.askInsightM)
+	result, err := assembleRetrieval(ctx, s.search, params, plan, s.askTopK, s.askInsightM)
 	if err != nil {
 		slog.Error("ask: retrieval failed", "error", err)
 		_ = writeSSEEvent(w, flusher, "error", askErrorPayload{Message: "retrieval failed"})
@@ -240,7 +321,10 @@ func (s *Server) askHandler(w http.ResponseWriter, r *http.Request) {
 	sources := make([]AskSourceItem, 0, len(result.Observed)+len(result.Inferred))
 	sources = append(sources, mapAskSources(result.Observed)...)
 	sources = append(sources, mapAskSources(result.Inferred)...)
-	if err := writeSSEEvent(w, flusher, "sources", askSourcesPayload{Sources: sources}); err != nil {
+	if err := writeSSEEvent(w, flusher, "sources", askSourcesPayload{
+		Sources: sources,
+		Plan:    newAskPlanPayload(plan),
+	}); err != nil {
 		slog.Error("ask: failed to write sources event", "error", err)
 		return
 	}
@@ -282,6 +366,17 @@ func (s *Server) askHandler(w http.ResponseWriter, r *http.Request) {
 	// saveAskTurn itself also swallows its own errors (see its doc
 	// comment), this ordering is the second half of that guarantee.
 	s.saveAskTurn(ctx, conversationID, turnIndex, req.Question, answer, finishReason, sources)
+}
+
+// planner returns the configured query planner, defaulting to a planner with
+// no LLM backend. The default is a real LLMPlanner rather than nil so the
+// deterministic path still works (and the LLM path still degrades to a
+// fallback plan) if a Server is constructed without one.
+func (s *Server) planner() intent.Planner {
+	if s.queryPlanner != nil {
+		return s.queryPlanner
+	}
+	return intent.NewLLMPlanner(nil, s.askTopK)
 }
 
 // mapAskSources converts search results into the wire-contract AskSourceItem

@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 	"unicode/utf8"
 
 	"github.com/baekenough/second-brain/internal/llm"
@@ -32,6 +33,20 @@ type ChunkSearcher interface {
 	SearchVector(ctx context.Context, queryVec []float32, limit int) ([]store.ChunkSearchResult, error)
 }
 
+// OccurredRangeChecker verifies that a set of candidate document IDs falls
+// inside an event-time window. It is satisfied by *store.DocumentStore.
+//
+// It exists for the chunk lanes. Those lanes cannot carry the window into their
+// own SQL (ChunkSearcher takes only a query/vector and a limit) and the rows
+// they return carry no occurred_at, so the service used to switch them off
+// entirely whenever a window was set. That was safe but expensive: it deleted
+// chunk-level recall from every temporal query, and a query planner sets a
+// window on most temporal questions. Joining the candidates back to `documents`
+// on id restores the recall while keeping the window a real constraint.
+type OccurredRangeChecker interface {
+	FilterIDsByOccurredRange(ctx context.Context, ids []uuid.UUID, from, to *time.Time) (map[uuid.UUID]struct{}, error)
+}
+
 // Service performs hybrid search: it enriches queries with embeddings when
 // available, then delegates to the document store. When chunks are available,
 // chunk-based FTS is used as a fallback for full-document FTS.
@@ -45,6 +60,13 @@ type Service struct {
 	weights       model.SearchWeights // zero value uses defaults (k=60, equal weights)
 	reranker      Reranker            // nil when reranking is not configured
 	entityFetcher EntityFetcher       // nil when entity surfacing is not configured
+
+	// occurredChecker verifies chunk-lane candidates against an event-time
+	// window. Usually nil: the document store already satisfies
+	// OccurredRangeChecker, and occurredRangeChecker() finds it there without
+	// any wiring. The field exists for callers that inject a different store
+	// (and for tests).
+	occurredChecker OccurredRangeChecker
 }
 
 // NewService returns a search Service.
@@ -101,6 +123,67 @@ func (s *Service) WithEntityFetcher(ef EntityFetcher) *Service {
 	return s
 }
 
+// WithOccurredRangeChecker attaches the verifier used to keep the chunk lanes
+// alive under an event-time window. Callers whose document store already
+// implements OccurredRangeChecker — which *store.DocumentStore does — do not
+// need to call this; occurredRangeChecker() discovers it. Safe to call with nil.
+func (s *Service) WithOccurredRangeChecker(c OccurredRangeChecker) *Service {
+	s.occurredChecker = c
+	return s
+}
+
+// occurredRangeChecker returns the verifier to use for this service, or nil
+// when none is available. Falling back to the document store means the
+// production wiring (cmd/server, cmd/eval, cmd/mcp, cmd/collector) picks the
+// behaviour up without a constructor change, while a test double that
+// implements only DocumentSearcher keeps the conservative skip.
+func (s *Service) occurredRangeChecker() OccurredRangeChecker {
+	if s.occurredChecker != nil {
+		return s.occurredChecker
+	}
+	if c, ok := s.store.(OccurredRangeChecker); ok {
+		return c
+	}
+	return nil
+}
+
+// verifyWindow drops chunk-lane candidates whose parent document does not
+// provably fall inside the requested window.
+//
+// Fail-closed: a verification error drops every candidate rather than admitting
+// them. Under a window, an unverifiable candidate is indistinguishable from an
+// out-of-window one, and admitting it would reintroduce exactly the leak the
+// window exists to prevent — into the slots the (correctly narrowed) store
+// result left empty.
+func (s *Service) verifyWindow(ctx context.Context, q model.SearchQuery, candidates []*model.SearchResult) []*model.SearchResult {
+	if len(candidates) == 0 {
+		return nil
+	}
+	checker := s.occurredRangeChecker()
+	if checker == nil {
+		return nil
+	}
+
+	ids := make([]uuid.UUID, len(candidates))
+	for i, r := range candidates {
+		ids[i] = r.ID
+	}
+	allowed, err := checker.FilterIDsByOccurredRange(ctx, ids, q.OccurredFrom, q.OccurredTo)
+	if err != nil {
+		slog.Warn("search: occurred_at verification failed, dropping chunk candidates",
+			"error", err, "candidates", len(candidates))
+		return nil
+	}
+
+	out := make([]*model.SearchResult, 0, len(candidates))
+	for _, r := range candidates {
+		if _, ok := allowed[r.ID]; ok {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // applyInsightExclusionDefault enforces the permanent policy from the Capture
 // spec (§3.2 echo-chamber guard 4, §6.5): model-derived insight documents are
 // excluded from search results by default. The ONLY way to see them is an
@@ -115,8 +198,13 @@ func (s *Service) WithEntityFetcher(ef EntityFetcher) *Service {
 // echo chamber the guard exists to prevent. Putting it here means every lane
 // and every caller inherits it, and a new caller cannot forget to opt in.
 func applyInsightExclusionDefault(q model.SearchQuery) model.SearchQuery {
-	if q.SourceType != nil && *q.SourceType == model.SourceInsight {
-		return q
+	// "Explicit request" is read off the effective include set, not off the
+	// singular field, so the opt-in works identically whether the caller wrote
+	// SourceType=insight or SourceTypes=[...insight...].
+	for _, st := range q.IncludeSourceTypes() {
+		if st == model.SourceInsight {
+			return q
+		}
 	}
 	for _, st := range q.ExcludeSourceTypes {
 		if st == model.SourceInsight {
@@ -127,31 +215,95 @@ func applyInsightExclusionDefault(q model.SearchQuery) model.SearchQuery {
 	return q
 }
 
-// dropExcludedSourceTypes removes results whose SourceType appears in
-// q.ExcludeSourceTypes.
+// applySourceTypeFilters restricts results to q's effective include set and
+// removes anything named by q.ExcludeSourceTypes.
 //
-// The document store applies the exclusion in SQL, but the chunk lanes do not:
+// The document store applies BOTH filters in SQL; the chunk lanes cannot.
 // ChunkSearcher takes only a query/vector and a limit, so chunk hits arrive
-// unfiltered and carry the document's source type alongside them. Filtering
-// them here — before RRF fusion, so ranks are computed over the surviving
-// candidates rather than re-ordered afterwards — closes the gap without
-// changing the ranking of legitimately-included documents.
-func dropExcludedSourceTypes(q model.SearchQuery, results []*model.SearchResult) []*model.SearchResult {
-	if len(q.ExcludeSourceTypes) == 0 || len(results) == 0 {
+// unfiltered — they merely carry the parent document's source type alongside
+// them. Filtering here, before RRF fusion, closes the gap without changing the
+// ranking of legitimately-included documents.
+//
+// Until #196 this function handled the exclusion only, and the include filter
+// was never applied to the chunk lanes at all. Measured consequence: a
+// source_type=calendar request with limit=20 returned the store's 14 calendar
+// documents plus 6 documents of other source types that the chunk vector lane
+// merged into the free slots. The include filter is not advisory — a caller
+// that names a source and receives four is worse off than one that received
+// nothing, because the answer looks complete.
+//
+// Conflict rule: EXCLUDE WINS. A source type named by both filters is dropped.
+// Excludes in this codebase are policy (the insight echo-chamber guard is
+// injected by the service itself and by /ask, never requested by the user);
+// includes are a request. Letting a request override a policy exclusion would
+// let any caller — including a future query planner — re-open the guard just by
+// naming the excluded source.
+func applySourceTypeFilters(q model.SearchQuery, results []*model.SearchResult) []*model.SearchResult {
+	include := q.IncludeSourceTypes()
+	if (len(include) == 0 && len(q.ExcludeSourceTypes) == 0) || len(results) == 0 {
 		return results
+	}
+
+	var included map[model.SourceType]struct{}
+	if len(include) > 0 {
+		included = make(map[model.SourceType]struct{}, len(include))
+		for _, st := range include {
+			included[st] = struct{}{}
+		}
 	}
 	excluded := make(map[model.SourceType]struct{}, len(q.ExcludeSourceTypes))
 	for _, st := range q.ExcludeSourceTypes {
 		excluded[st] = struct{}{}
 	}
+
 	out := make([]*model.SearchResult, 0, len(results))
 	for _, r := range results {
 		if _, skip := excluded[r.SourceType]; skip {
 			continue
 		}
+		if included != nil {
+			if _, ok := included[r.SourceType]; !ok {
+				continue
+			}
+		}
 		out = append(out, r)
 	}
 	return out
+}
+
+// warnOnSourceFilterConflict logs the include/exclude overlap that
+// applySourceTypeFilters resolves in favour of the exclusion. A query whose
+// entire include set is excluded returns nothing, and "nothing" is the one
+// answer a caller cannot distinguish from "no such documents exist" — so the
+// contradiction is recorded rather than left to be inferred from an empty page.
+func warnOnSourceFilterConflict(q model.SearchQuery) {
+	if len(q.ExcludeSourceTypes) == 0 {
+		return
+	}
+	include := q.IncludeSourceTypes()
+	if len(include) == 0 {
+		return
+	}
+	excluded := make(map[model.SourceType]struct{}, len(q.ExcludeSourceTypes))
+	for _, st := range q.ExcludeSourceTypes {
+		excluded[st] = struct{}{}
+	}
+	var conflicting []model.SourceType
+	var survivors int
+	for _, st := range include {
+		if _, bad := excluded[st]; bad {
+			conflicting = append(conflicting, st)
+			continue
+		}
+		survivors++
+	}
+	if len(conflicting) == 0 {
+		return
+	}
+	slog.Warn("search: source type is both included and excluded; exclusion wins",
+		"conflicting", conflicting,
+		"remaining_included", survivors,
+		"empty_result_guaranteed", survivors == 0)
 }
 
 // Search executes a search for the given query. If an embedding client is
@@ -181,6 +333,7 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	// filters, the chunk lanes' post-filter, and the reranker's input set —
 	// sees the same exclusion list.
 	q = applyInsightExclusionDefault(q)
+	warnOnSourceFilterConflict(q)
 
 	// Apply service-level weights when the caller has not set explicit weights.
 	// A zero-value Weights field means "use defaults", so we only overwrite
@@ -215,37 +368,50 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	}
 
 	// An event-time window is a hard constraint on WHICH documents may be
-	// returned, and only the document store can enforce it: ChunkSearcher takes
-	// no date range, and the rows it returns carry no occurred_at to post-filter
-	// on. Running the chunk lanes under a window would therefore reintroduce
-	// exactly the documents the window excluded — into the slots the (correctly
-	// narrowed) store result left empty. Skipping them keeps a windowed query
-	// answerable only from evidence that provably falls inside the window.
+	// returned. The document store enforces it in SQL inside every lane; the
+	// chunk lanes cannot, because ChunkSearcher takes no date range and the rows
+	// it returns carry no occurred_at.
+	//
+	// Previously the chunk lanes were skipped outright whenever a window was
+	// set. That was correct — an unfiltered lane fills exactly the slots the
+	// narrowed store result left empty, and the FTS fallback would turn
+	// "nothing happened today" into matches from other days — but it also meant
+	// a windowed query lost chunk-level recall entirely. That cost scales with
+	// how often a window is set, and a query planner sets one on most temporal
+	// questions.
+	//
+	// So the lanes now run under a window WHEN their candidates can be verified
+	// against that same window (verifyWindow joins them back to `documents` on
+	// id). With no verifier available the original skip stands: this must fail
+	// closed, never open.
 	windowed := q.OccurredFrom != nil || q.OccurredTo != nil
+	chunkLanesEnabled := !windowed || s.occurredRangeChecker() != nil
 
 	// Chunk vector search: when per-chunk embeddings are available, run a
 	// chunk-level ANN search and merge its results into the candidate set via
 	// RRF. This is an ADDITIVE signal — the full-document path above always
 	// runs first, and chunk results are merged in rather than replacing it.
-	if s.chunkStore != nil && len(queryVec) > 0 && !windowed {
+	if s.chunkStore != nil && len(queryVec) > 0 && chunkLanesEnabled {
 		chunkVecResults, cerr := s.searchChunksVector(ctx, queryVec, q.Limit)
 		if cerr != nil {
 			slog.Warn("search: chunk vector search failed, skipping",
 				"error", cerr, "query", q.Query)
-		} else if chunkVecResults = dropExcludedSourceTypes(q, chunkVecResults); len(chunkVecResults) > 0 {
-			results = mergeRRF(results, chunkVecResults, q.Limit)
+		} else {
+			chunkVecResults = applySourceTypeFilters(q, chunkVecResults)
+			if windowed {
+				chunkVecResults = s.verifyWindow(ctx, q, chunkVecResults)
+			}
+			if len(chunkVecResults) > 0 {
+				results = mergeRRF(results, chunkVecResults, q.Limit)
+			}
 		}
 	}
 
 	// When the primary path (full-document FTS / hybrid) + chunk vector
-	// returned no results, fall back to chunk FTS.
-	//
-	// Not under a window: there, "no results" is the answer. The fallback
-	// cannot filter by date, so firing it here would turn "nothing happened
-	// today" into a list of matches from other days — silently widening the
-	// window the caller asked for, which is the one failure mode a date filter
-	// must never have.
-	if len(results) == 0 && s.chunkStore != nil && !windowed {
+	// returned no results, fall back to chunk FTS. Under a window its hits are
+	// verified like the vector lane's; unverifiable hits are dropped, so an
+	// empty answer stays empty rather than silently widening the window.
+	if len(results) == 0 && s.chunkStore != nil && chunkLanesEnabled {
 		chunkResults, cerr := s.searchChunksFTS(ctx, q.Query, q.Limit)
 		if cerr != nil {
 			// Non-fatal: log and return the empty primary result set.
@@ -255,7 +421,10 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 			)
 			return results, nil
 		}
-		results = dropExcludedSourceTypes(q, chunkResults)
+		results = applySourceTypeFilters(q, chunkResults)
+		if windowed {
+			results = s.verifyWindow(ctx, q, results)
+		}
 	}
 
 	// Cross-encoder reranking: opt-in per-request via UseRerank.
