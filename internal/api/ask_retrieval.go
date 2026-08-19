@@ -82,16 +82,21 @@ func assembleRetrieval(ctx context.Context, searcher documentSearcher, params in
 	base.OccurredTo = plan.OccurredTo
 	base.SourceTypes = plan.SourceTypes
 	if plan.OccurredFrom != nil || plan.OccurredTo != nil {
-		// Secondary preference only: within a window, newest-first is the
+		// Secondary preference only: within a window, newest-first (or, for a
+		// window that lies entirely in the future, soonest-first) is the
 		// sensible reading order. Sort can never substitute for the window —
 		// it permutes candidates a lane already selected.
 		//
-		// KNOWN GAP (design §12 R3): Sort="recent" is collected_at DESC. For a
-		// future window ("다음 주 일정") that orders by ingestion time, not by
-		// how soon the event is. The spec leaves the fix (a future-window sort
-		// mode, or reordering in Stage 3) open, so this deliberately keeps the
-		// pre-planner behaviour rather than inventing a third option here.
-		base.Sort = "recent"
+		// Direction is not decided here. model.SearchQuery.RecencyAscending
+		// (issue #215) inspects OccurredFrom against now and flips to
+		// ascending exactly when the whole window lies in the future, so a
+		// future window ("다음 주 일정") returns soonest-first instead of the
+		// old furthest-future-first. Both the store's SQL ORDER BY and
+		// internal/search's post-merge re-sort derive their direction from
+		// that one function, so this call site only has to ask for
+		// SortRecent — it does not need to know which way it currently
+		// points.
+		base.Sort = model.SortRecent
 	}
 
 	// --- params: ranking shaping ---
@@ -111,7 +116,7 @@ func assembleRetrieval(ctx context.Context, searcher documentSearcher, params in
 		// window hides documents). Recency ordering is a RANKING preference and
 		// therefore stays on the params side of the §3.2 split — it never
 		// retrieves anything the lanes did not already select.
-		base.Sort = "recent"
+		base.Sort = model.SortRecent
 	}
 
 	observedQuery, runObserved, insightQuery := splitInsightLane(base, insightM)
