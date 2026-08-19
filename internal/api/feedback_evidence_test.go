@@ -9,7 +9,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/baekenough/second-brain/internal/dataset"
 	"github.com/baekenough/second-brain/internal/store"
+	"github.com/baekenough/second-brain/internal/telemetry"
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 // The stub keeps these tests off the database on purpose: what is under test
@@ -257,5 +262,121 @@ func TestEvidenceHandler_RejectsMalformedJSON(t *testing.T) {
 	}
 	if voter.calls != 0 {
 		t.Error("malformed body reached the store")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tracing contract (plan Task 9).
+//
+// The span this handler emits is exported to a hosted Langfuse instance, so the
+// tests below are less about observability than about what leaves the machine.
+// ---------------------------------------------------------------------------
+
+// captureSpans installs an in-memory tracer provider for the duration of a test
+// and returns the recorded spans. A simple (synchronous) span processor is used
+// so that a span is visible the moment the handler returns.
+func captureSpans(t *testing.T) func() []sdktrace.ReadOnlySpan {
+	t.Helper()
+	exp := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sdktrace.NewSimpleSpanProcessor(exp)))
+	prev := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() {
+		otel.SetTracerProvider(prev)
+		_ = tp.Shutdown(context.Background())
+	})
+	// The snapshot is taken when the returned function is called, not now:
+	// exp.GetSpans() at this point is an empty batch, and binding its method
+	// value here would make every assertion below inspect that empty batch.
+	return func() []sdktrace.ReadOnlySpan { return exp.GetSpans().Snapshots() }
+}
+
+func TestFeedbackEvidence_EmitsSpan(t *testing.T) {
+	t.Setenv("FEEDBACK_EVIDENCE_ENABLED", "true")
+	spans := captureSpans(t)
+
+	voter := &stubEvidenceVoter{retThumb: 1}
+	rec := postEvidence(t, newEvidenceTestServer(voter), evidenceBody(t, validEvidenceFields()))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	got := spans()
+	if len(got) != 1 {
+		t.Fatalf("recorded %d spans, want exactly 1", len(got))
+	}
+	span := got[0]
+	if span.Name() != telemetry.SpanFeedbackEvidence {
+		t.Errorf("span name = %q, want %q", span.Name(), telemetry.SpanFeedbackEvidence)
+	}
+
+	want := map[string]string{
+		telemetry.AttrFeedbackDocumentID: dummyEvidenceDocID,
+		telemetry.AttrFeedbackThumbs:     "1",
+		telemetry.AttrFeedbackSplit:      dataset.SplitOf("dummy question text"),
+	}
+	if len(span.Attributes()) != len(want) {
+		t.Fatalf("span carries %d attributes (%v), want exactly %d: %v",
+			len(span.Attributes()), span.Attributes(), len(want), want)
+	}
+	for _, kv := range span.Attributes() {
+		expect, ok := want[string(kv.Key)]
+		if !ok {
+			t.Errorf("unexpected span attribute %q", kv.Key)
+			continue
+		}
+		if kv.Value.Emit() != expect {
+			t.Errorf("attribute %q = %q, want %q", kv.Key, kv.Value.Emit(), expect)
+		}
+	}
+}
+
+// A failed write must not produce a span: "recorded" is a claim about the
+// database, and an empty Langfuse timeline is a truthful report of a request
+// that stored nothing. The failure itself is logged locally.
+func TestFeedbackEvidence_NoSpanOnFailure(t *testing.T) {
+	t.Setenv("FEEDBACK_EVIDENCE_ENABLED", "true")
+	spans := captureSpans(t)
+
+	voter := &stubEvidenceVoter{err: errors.New("database unavailable")}
+	rec := postEvidence(t, newEvidenceTestServer(voter), evidenceBody(t, validEvidenceFields()))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500", rec.Code)
+	}
+	if got := spans(); len(got) != 0 {
+		t.Fatalf("recorded %d spans for a failed request, want 0", len(got))
+	}
+}
+
+// TestFeedbackEvidence_SpanHasNoQueryAttribute is the leak test. It looks for
+// the query in both directions: no attribute key mentioning a query, and no
+// attribute value containing the submitted text or its hash.
+func TestFeedbackEvidence_SpanHasNoQueryAttribute(t *testing.T) {
+	t.Setenv("FEEDBACK_EVIDENCE_ENABLED", "true")
+	spans := captureSpans(t)
+
+	fields := validEvidenceFields()
+	const marker = "distinctive dummy phrase"
+	fields["query"] = marker
+	voter := &stubEvidenceVoter{retThumb: -1}
+	if rec := postEvidence(t, newEvidenceTestServer(voter), evidenceBody(t, fields)); rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+
+	got := spans()
+	if len(got) != 1 {
+		t.Fatalf("recorded %d spans, want 1", len(got))
+	}
+	for _, kv := range got[0].Attributes() {
+		if strings.Contains(strings.ToLower(string(kv.Key)), "query") {
+			t.Errorf("span attribute key %q mentions the query", kv.Key)
+		}
+		v := kv.Value.Emit()
+		if strings.Contains(v, marker) {
+			t.Errorf("span attribute %q carries the query text", kv.Key)
+		}
+		if v == dataset.QueryHash(marker) {
+			t.Errorf("span attribute %q carries the query hash; Langfuse gets neither the text nor the hash", kv.Key)
+		}
 	}
 }

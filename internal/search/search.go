@@ -387,6 +387,14 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	windowed := q.OccurredFrom != nil || q.OccurredTo != nil
 	chunkLanesEnabled := !windowed || s.occurredRangeChecker() != nil
 
+	// Set when a chunk lane changed the result set, i.e. when the ORDER the
+	// store applied in SQL no longer describes `results`. See the recency
+	// re-sort below: it deliberately does NOT run when the store is the sole
+	// producer, because there the store's ORDER BY already IS the requested
+	// order and re-sorting would substitute this package's tie-breaking for
+	// the database's over rows it ordered with more information.
+	chunkFused := false
+
 	// Chunk vector search: when per-chunk embeddings are available, run a
 	// chunk-level ANN search and merge its results into the candidate set via
 	// RRF. This is an ADDITIVE signal — the full-document path above always
@@ -403,6 +411,7 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 			}
 			if len(chunkVecResults) > 0 {
 				results = mergeRRF(results, chunkVecResults, q.Limit)
+				chunkFused = true
 			}
 		}
 	}
@@ -425,6 +434,41 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 		if windowed {
 			results = s.verifyWindow(ctx, q, results)
 		}
+		chunkFused = true
+	}
+
+	// Sort="recent" over a set this service assembled.
+	//
+	// RRF decides WHICH documents come back; Sort decides IN WHICH ORDER they
+	// are shown. mergeRRF used to do both — it re-sorts the merged set by fused
+	// score — so a single surviving chunk-vector hit silently discarded the
+	// store's ORDER BY. That was survivable while "recent" meant one clause;
+	// it stopped being so once the direction became window-dependent, because
+	// a forward-looking /ask query ("다음 주 일정") runs the chunk lanes
+	// whenever an OccurredRangeChecker is wired, and production wires one.
+	//
+	// Applied AFTER the fusion truncated to q.Limit, not before: which
+	// documents are returned is fusion's decision, and mergeRRF makes it
+	// deliberately — a chunk-only hit is admitted solely into slots the store
+	// left empty, never in place of a corroborated one. Sorting by time first
+	// and truncating afterwards would re-open exactly that displacement, since
+	// a lone chunk-vector hit that happens to be more recent would evict a
+	// document both lanes agreed on. Reordering after the cut cannot change
+	// membership at all.
+	//
+	// Applied BEFORE reranking, not after: when the caller opted into the
+	// cross-encoder, its order is final today and stays final on both paths.
+	// Making the recency sort the last step would silently change the
+	// rerank+recent combination, which is a different question from this one.
+	//
+	// Chunk-only documents carry no timestamps (the chunk join selects none),
+	// so they sort last — see recencyKey. Their membership is unaffected, and
+	// under a window they are still verified against it; only their position is
+	// approximate. Giving them a real position needs occurred_at back from the
+	// verification lane, which is a store-interface change and out of scope
+	// here.
+	if chunkFused && q.SortsByRecency() {
+		sortByRecency(results, q.RecencyAscending(time.Now()))
 	}
 
 	// Cross-encoder reranking: opt-in per-request via UseRerank.

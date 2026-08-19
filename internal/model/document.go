@@ -201,12 +201,33 @@ type SearchQuery struct {
 	SourceTypes        []SourceType
 	ExcludeSourceTypes []SourceType // source types to exclude from results
 	Limit              int
-	Embedding          []float32    // populated by search service when available
-	IncludeDeleted     bool         // when true, search includes deleted/moved docs
-	Sort               string       // "relevance" (default, score DESC) | "recent" (collected_at DESC)
-	UseHyDE            bool         // when true, expand query via HyDE before retrieval
-	Weights            SearchWeights // zero value uses defaults (k=60, equal weights)
-	UseRerank          bool         `json:"use_rerank,omitempty"` // when true, apply cross-encoder reranking post-retrieval
+	Embedding          []float32 // populated by search service when available
+	IncludeDeleted     bool      // when true, search includes deleted/moved docs
+	// Sort selects the RANKING of the candidate set; it never changes which
+	// documents enter it. Two values are recognised, and only the exact
+	// literal "recent" is special — everything else, including "" and
+	// "relevance", ranks by score DESC.
+	//
+	// "recent" means NEAREST TO NOW FIRST, which is not the same clause in
+	// both directions of time and is resolved by the store from the event-time
+	// window below:
+	//
+	//   - window entirely in the future (OccurredFrom >= now):
+	//     occurred_at ASC — soonest first, so "다음 주 일정" starts with the
+	//     most imminent entry.
+	//   - otherwise (past window, straddling window, or no window):
+	//     COALESCE(occurred_at, collected_at) DESC — most recent first.
+	//
+	// The direction is deliberately NOT a field here. It is a pure function of
+	// OccurredFrom and the current time, both of which the store already has,
+	// and a second writer of a derived value is how this field's documented
+	// behaviour drifted from its actual behaviour in the first place. The rule
+	// itself lives in RecencyAscending below — the store renders it as SQL and
+	// the search service replays it over merged results; neither restates it.
+	Sort      string
+	UseHyDE   bool          // when true, expand query via HyDE before retrieval
+	Weights   SearchWeights // zero value uses defaults (k=60, equal weights)
+	UseRerank bool          `json:"use_rerank,omitempty"` // when true, apply cross-encoder reranking post-retrieval
 
 	// OccurredFrom / OccurredTo constrain results to the half-open event-time
 	// window [OccurredFrom, OccurredTo) on documents.occurred_at. Either bound
@@ -225,6 +246,58 @@ type SearchQuery struct {
 	// the window" as "happened during the window".
 	OccurredFrom *time.Time
 	OccurredTo   *time.Time
+}
+
+// SortRecent is the ONLY value of SearchQuery.Sort that ranks by time. Every
+// other value — including "" and "relevance" — ranks by relevance score. It is
+// a constant because Sort is caller-controlled and reaches an SQL ORDER BY by
+// string concatenation: the comparison against this exact literal is the
+// whitelist that keeps it out of the statement.
+const SortRecent = "recent"
+
+// SortsByRecency reports whether this query asks for the time ranking.
+//
+// Every component that has to honour Sort asks here rather than comparing the
+// string itself, so the whitelist has one definition and cannot be widened by
+// accident in one place only (a case-insensitive or prefix comparison
+// somewhere downstream would re-open the injection surface the literal
+// comparison closes).
+func (q SearchQuery) SortsByRecency() bool { return q.Sort == SortRecent }
+
+// RecencyAscending is THE definition of which way SortRecent points. Both
+// consumers derive their order from this one function:
+//
+//   - internal/store.sortOrder turns it into the SQL ORDER BY clause
+//     (occurred_at ASC vs COALESCE(occurred_at, collected_at) DESC),
+//   - internal/search re-establishes the same order in Go after it has merged
+//     chunk-lane candidates into the store's result set, which the store's
+//     ORDER BY cannot cover because those rows never went through it.
+//
+// "recent" means NEAREST TO NOW FIRST. That is a DESC over event time only
+// while every candidate lies in the past, which stopped being true when the
+// query planner began emitting forward-looking windows: for "다음 주 일정" a
+// plain DESC returns furthest-future-first, the reverse of what was asked.
+//
+// The direction is decided on the narrowest test that is provably safe — the
+// LOWER bound alone:
+//
+//   - OccurredFrom is set and is not before now -> the window lies ENTIRELY in
+//     the future, because every surviving row satisfies occurred_at >= From.
+//     Ascending: soonest first.
+//   - anything else (past window, window straddling now, upper bound only, no
+//     window at all) -> descending, the historical behaviour.
+//
+// A window that merely ENDS in the future may still be mostly historical
+// ("최근 한 달"), and one that straddles now has no unambiguous "nearest"
+// direction, so both stay on the branch they have always been on: the fix must
+// be invisible to every query that already worked.
+//
+// It lives on the model rather than in either consumer because a duplicated
+// copy of this rule is unobservable in the response — a merged result set and
+// a store-only result set are the same shape, so the two orders would differ
+// only for the queries that happen to reach the chunk lanes.
+func (q SearchQuery) RecencyAscending(now time.Time) bool {
+	return q.OccurredFrom != nil && !q.OccurredFrom.Before(now)
 }
 
 // IncludeSourceTypes returns the effective source-type include set: the UNION

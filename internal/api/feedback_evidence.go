@@ -10,6 +10,7 @@ import (
 
 	"github.com/baekenough/second-brain/internal/dataset"
 	"github.com/baekenough/second-brain/internal/store"
+	"github.com/baekenough/second-brain/internal/telemetry"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -126,21 +127,11 @@ func (s *Server) evidenceFeedbackHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// query_hash is for the local log only. It does not go on the span: see
+	// internal/telemetry/feedback_attrs.go — Langfuse outlives these logs.
 	queryHash := dataset.QueryHash(req.Query)
 
-	ctx, span := evidenceTracer().Start(r.Context(), "feedback.evidence",
-		oteltrace.WithAttributes(
-			// query_hash, never the query itself: this span is exported to
-			// Langfuse and would otherwise carry the user's own speech.
-			attribute.String("feedback.query_hash", queryHash),
-			attribute.Int("feedback.thumbs", int(*req.Thumbs)),
-			attribute.Int("feedback.rank", req.Rank),
-			attribute.String("feedback.layer", req.Layer),
-			attribute.String("feedback.split", dataset.SplitOf(req.Query)),
-		))
-	defer span.End()
-
-	id, resolved, err := s.evidenceVoter.UpsertEvidence(ctx, store.EvidenceVote{
+	_, resolved, err := s.evidenceVoter.UpsertEvidence(r.Context(), store.EvidenceVote{
 		SessionID:  req.ConversationID,
 		Query:      req.Query,
 		DocumentID: req.DocumentID,
@@ -151,15 +142,28 @@ func (s *Server) evidenceFeedbackHandler(w http.ResponseWriter, r *http.Request)
 		Metadata: map[string]any{"rank": req.Rank, "layer": req.Layer},
 	})
 	if err != nil {
-		span.RecordError(err)
 		slog.Error("feedback evidence: upsert failed", "error", err, "query_hash", queryHash)
 		writeError(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
-	span.SetAttributes(
-		attribute.Int64("feedback.id", id),
-		attribute.Int("feedback.resolved_thumbs", int(resolved)),
-	)
+
+	// The span is emitted only now, after the row exists. Its name is a claim
+	// about the database ("recorded"), so a request that stored nothing must
+	// not appear on the timeline — a failure is an HTTP-layer concern and is
+	// already in the log above. Counting these spans over time is the
+	// feedback-collection rate.
+	//
+	// Three attributes, and no more: an opaque document UUID, the vote the
+	// database settled on, and which split it landed in. Rank and layer stay in
+	// the row's metadata rather than on the span; they are analysis inputs, not
+	// something worth shipping to a hosted service on every click.
+	_, span := evidenceTracer().Start(r.Context(), telemetry.SpanFeedbackEvidence,
+		oteltrace.WithAttributes(
+			attribute.String(telemetry.AttrFeedbackDocumentID, req.DocumentID),
+			attribute.Int(telemetry.AttrFeedbackThumbs, int(resolved)),
+			attribute.String(telemetry.AttrFeedbackSplit, dataset.SplitOf(req.Query)),
+		))
+	span.End()
 
 	writeJSON(w, http.StatusOK, EvidenceFeedbackResponse{Thumbs: resolved})
 }

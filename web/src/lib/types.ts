@@ -164,6 +164,33 @@ export interface AskConversationTurn {
 /** Which of the three Ask-answer lanes (spec §5.2, §7.2) a source belongs to. */
 export type AskLayer = "note" | "observed" | "insight";
 
+/** A thumbs judgement on one evidence card: +1, -1, or 0 ("no opinion").
+ * Mirrors store.EvidenceVote.Thumbs — the CHECK constraint on feedback.thumbs
+ * allows exactly these three values. */
+export type EvidenceVote = -1 | 0 | 1;
+
+/** Body of POST /api/feedback/evidence (BFF) → POST /api/v1/feedback/evidence
+ * (internal/api/feedback_evidence.go's EvidenceFeedbackRequest).
+ *
+ * `query` travels in the POST body, never in a query string: it is the user's
+ * own words and would otherwise end up in access logs (see issue #208 for the
+ * same mistake made with counterpart names on /actions). */
+export interface EvidenceFeedbackRequest {
+  conversation_id: string;
+  query: string;
+  document_id: string;
+  thumbs: EvidenceVote;
+  /** 0-based position of the card in the answer, before layer grouping. */
+  rank: number;
+  layer: AskLayer;
+}
+
+/** Response of POST /api/v1/feedback/evidence — the value the *server* settled
+ * on, which overrides the client's optimistic guess. */
+export interface EvidenceFeedbackResponse {
+  thumbs: EvidenceVote;
+}
+
 export interface SearchParams {
   query: string;
   source_type?: SourceType | "all";
