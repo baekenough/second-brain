@@ -1,0 +1,65 @@
+# ubuntu1 — second-brain PostgreSQL (pgvector + pg_bigm)
+# Tailscale IP: ${NODE1_TAILSCALE_IP} (see deploy/whisper-lb/README.md for the
+# same pattern used by the whisper LB stack on this node)
+#
+# Deploy:
+#   scp deploy/postgres-ubuntu1/docker-compose.yml ubuntu1:~/second-brain-postgres/docker-compose.yml
+#   ssh ubuntu1 'cd ~/second-brain-postgres && docker compose --env-file .env up -d'
+#
+# Port binding is scoped to the Tailscale IP only — same principle as this
+# project's web service (127.0.0.1-only) and the whisper-lb stack
+# (Tailscale-IP-only): personal data must never be reachable on LAN/public.
+#
+# Image is pre-built natively on ubuntu1 (see docs/superpowers/plans/
+# 2026-08-18-postgres-migration-to-ubuntu1.md Task 5) — no `build:` section
+# here, this compose file only references the tag.
+
+services:
+  postgres:
+    image: second-brain-postgres:ubuntu1
+    container_name: second-brain-postgres
+    environment:
+      POSTGRES_DB: second_brain
+      POSTGRES_USER: brain
+      POSTGRES_PASSWORD: ${PG_SUPERUSER_PASSWORD}
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=6GB"
+      - "-c"
+      - "effective_cache_size=18GB"
+      - "-c"
+      - "work_mem=64MB"
+      - "-c"
+      - "maintenance_work_mem=1GB"
+      - "-c"
+      - "max_worker_processes=16"
+      - "-c"
+      - "max_parallel_workers=12"
+      - "-c"
+      - "max_parallel_maintenance_workers=6"
+      - "-c"
+      - "random_page_cost=1.1"
+    # Default Docker /dev/shm (64MB) is too small for parallel HNSW index
+    # builds with maintenance_work_mem >= 1GB — PostgreSQL's dynamic shared
+    # memory segments for parallel maintenance workers live in /dev/shm, not
+    # shared_buffers. Discovered during the 2026-08-19 macmini->ubuntu1
+    # migration restore: idx_documents_embedding / idx_documents_summary_embedding
+    # / idx_chunks_embedding all failed with "could not resize shared memory
+    # segment ... No space left on device" until this was raised.
+    shm_size: "6gb"
+    volumes:
+      - pgdata_ubuntu1:/var/lib/postgresql/data
+    ports:
+      # Tailscale IP only — never LAN/public. Mirrors deploy/whisper-lb/ubuntu1.
+      - "${NODE1_TAILSCALE_IP}:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U brain -d second_brain"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  pgdata_ubuntu1:
