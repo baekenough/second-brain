@@ -26,13 +26,15 @@ Update the relevant rule rather than just acknowledging the violation.
 
 ## Defect Response Matrix
 
-| Defect Type | Rule Update | Memory | Issue |
-|-------------|:-----------:|:------:|:-----:|
-| Rule violation (agent behavior) | ✅ | — | — |
-| CI/infra defect | — | ✅ | ✅ |
-| Process gap (workflow hole) | ✅ | ✅ | ✅ |
-| Repeatable system bug | — | ✅ | ✅ |
-| Agent selection failure (wrong agent routed) | — | ✅ | — |
+| Defect Type | Rule Update | Memory | Issue | Skill Promotion |
+|-------------|:-----------:|:------:|:-----:|:---------------:|
+| Rule violation (agent behavior) | ✅ | — | — | — |
+| CI/infra defect | — | ✅ | ✅ | — |
+| Process gap (workflow hole) | ✅ | ✅ | ✅ | ⚠️ (패턴 3회 이상 반복 시) |
+| Repeatable system bug | — | ✅ | ✅ | ⚠️ (수정이 구조적일 경우, 일회성 아닐 때) |
+| Agent selection failure (wrong agent routed) | — | ✅ | — | ✅ (라우팅 스킬 업데이트 후보) |
+
+**Skill Promotion**: feedback memory가 동일 패턴으로 3회 이상 반복되면 "failure pattern"으로 승격. skill-extractor의 `--mode failure` 플래그로 스킬 후보 분석 가능 (Skillify 내재화, #972).
 
 When CI failure, process gap, or repeatable system defect is found:
 1. Record feedback memory (defend current session)
@@ -48,18 +50,22 @@ When repeating agent failures or suboptimal routing is detected:
 
 This connects R016's continuous improvement loop with the adaptive-harness skill's learning capability.
 
-## Anti-Patterns
+## Anti-Patterns — 4 patterns: "I'll update later", "one-time exception", "doesn't cover this", "finish task first". See table via Read tool.
 
+<!-- DETAIL: Anti-Patterns
 | Anti-Pattern | Why It's Wrong | Correct Action |
 |-------------|----------------|----------------|
 | "I'll update the rule later" | Deferred fixes are forgotten | Update rule NOW, before continuing |
 | "This is a one-time exception" | Exceptions become patterns | If the rule is wrong, fix it; if it's right, follow it |
 | "The rule doesn't cover this case" | Missing coverage = rule gap | Add the case to the rule immediately |
 | "Let me finish the task first" | Rule violations compound | Fix rule first (5 min), then continue (prevents N future violations) |
+-->
 
-## Timing
+## Timing — Rule updates MUST happen before continuing original task, in the same session.
 
+<!-- DETAIL: Timing
 Rule updates MUST happen:
 - **Before** continuing the original task
 - **In the same session** as the violation
 - **Not** as a separate TODO or follow-up issue
+-->

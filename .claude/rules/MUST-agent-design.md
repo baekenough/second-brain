@@ -23,14 +23,24 @@ tools: [Read, Write, ...]  # Allowed tools
 | `sonnet` | claude-sonnet-4-6 | General tasks, code generation (default) |
 | `opus` | claude-opus-4-6 | Complex reasoning, architecture |
 | `opusplan` | claude-opus-4-6 + plan mode | Architecture planning with approval gates |
+| `opus47` | claude-opus-4-7 | Latest Opus model, supports xhigh effort |
 
 Extended context suffix: `[1m]` (e.g., `claude-opus-4-6[1m]`) — enables 1M token context window.
 
 ### Optional Frontmatter
 
+Key optional fields: `memory`, `effort`, `skills`, `soul`, `isolation`, `background`, `maxTurns`, `maxTokens`, `mcpServers`, `hooks`, `permissionMode`, `disallowedTools`, `limitations`, `domain`, `disableSkillShellExecution`. Supported since CC v2.1.63+. See full optional frontmatter via Read tool.
+
+### Note on `skills:` field
+
+The `skills:` frontmatter field is **advisory metadata** consumed by oh-my-customcode tooling (graph-builder, mgr-sauron) for documentation and validation. It is **NOT a runtime allowlist** — Claude Code does not filter the available skills based on this field, and subagents can invoke any registered skill regardless of what `skills:` declares. Use it to document a subagent's intended skill dependencies; do not rely on it for access control.
+
+Reference: research findings on issue #1055 (closed not-planned).
+
+<!-- DETAIL: Optional Frontmatter (full yaml block)
 ```yaml
 memory: project            # user | project | local
-effort: high               # low | medium | high | default | max
+effort: high               # low | medium | high | xhigh | default | max
 skills: [skill-1, ...]     # Skill name references
 source:                    # For external agents
   type: external
@@ -63,12 +73,19 @@ disableSkillShellExecution: true  # Disable inline shell execution in skills (v2
 ```
 
 > **Note**: When `disableSkillShellExecution` is enabled (v2.1.91+), skills that rely on inline shell execution (e.g., `codex-exec`, `gemini-exec`, `rtk-exec`) will have their shell blocks disabled. This is a security hardening option.
+-->
 
-> **Note**: `isolation`, `background`, `maxTurns`, `maxTokens`, `mcpServers`, `hooks`, `permissionMode`, `disallowedTools`, `limitations` are supported in Claude Code v2.1.63+. Hook types `PostCompact`, `Elicitation`, `ElicitationResult` require v2.1.76+. `CwdChanged`, `FileChanged` hook events and `managed-settings.d/` drop-in directory require v2.1.83+. Conditional `if` field for hooks requires v2.1.85+. `PermissionDenied` hook event requires v2.1.88+. Monitor tool and subprocess sandboxing (`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`, `CLAUDE_CODE_SCRIPT_CAPS`) added in v2.1.98+. Settings resilience (unrecognized hook event names no longer cause settings.json to be ignored) improved in v2.1.101+. PreCompact hook block support (exit 2 / `{"decision":"block"}`) added in v2.1.105+. Skill description listing cap raised from 250 to 1,536 characters in v2.1.105+. Plugin `monitors` manifest key for background monitors added in v2.1.105+.
+<!-- DETAIL: CC Version Compatibility History
+`isolation`, `background`, `maxTurns`, `maxTokens`, `mcpServers`, `hooks`, `permissionMode`, `disallowedTools`, `limitations` are supported in Claude Code v2.1.63+. Hook types `PostCompact`, `Elicitation`, `ElicitationResult` require v2.1.76+. `CwdChanged`, `FileChanged` hook events and `managed-settings.d/` drop-in directory require v2.1.83+. Conditional `if` field for hooks requires v2.1.85+. `PermissionDenied` hook event requires v2.1.88+. `refreshInterval` setting for status line auto-refresh interval added in v2.1.97+. Monitor tool and subprocess sandboxing (`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`, `CLAUDE_CODE_SCRIPT_CAPS`) added in v2.1.98+. Settings resilience (unrecognized hook event names no longer cause settings.json to be ignored) improved in v2.1.101+. PreCompact hook block support (exit 2 / `{"decision":"block"}`) added in v2.1.105+. Skill description listing cap raised from 250 to 1,536 characters in v2.1.105+. Plugin `monitors` manifest key for background monitors added in v2.1.105+. `ENABLE_PROMPT_CACHING_1H` and `FORCE_PROMPT_CACHING_5M` env vars for prompt cache TTL control added in v2.1.108+. Skill tool can now discover and invoke built-in slash commands (`/init`, `/review`, `/security-review`) in v2.1.108+. `/recap` session context feature and `/undo` alias for `/rewind` added in v2.1.108+. `/tui` command and `tui` setting for fullscreen rendering added in v2.1.110+. PushNotification tool for mobile push notifications (Remote Control + config required) added in v2.1.110+. `autoScrollEnabled` config for fullscreen mode added in v2.1.110+. SDK/headless `TRACEPARENT`/`TRACESTATE` distributed trace linking added in v2.1.110+. Bash tool maximum timeout enforcement added in v2.1.110+. Write tool IDE diff feedback (informs model when user edits proposed content) added in v2.1.110+. `--resume`/`--continue` now resurrects unexpired scheduled tasks in v2.1.110+. `/focus` command (separated from Ctrl+O) added in v2.1.110+. `xhigh` effort level for Opus 4.7 (between `high` and `max`; other models fall back to `high`) added in v2.1.111+. `/effort` interactive slider with arrow-key navigation (when called without arguments) added in v2.1.111+. Auto mode no longer requires `--enable-auto-mode` in v2.1.111+. PowerShell tool progressive rollout (`CLAUDE_CODE_USE_POWERSHELL_TOOL` env var) added in v2.1.111+. Read-only bash commands with glob patterns (`ls *.ts`) and `cd <project-dir> &&` prefix no longer trigger permission prompt in v2.1.111+. `/less-permission-prompts` built-in skill for permission allowlist scanning added in v2.1.111+. `/ultrareview` parallel multi-agent cloud code review added in v2.1.111+. `/skills` menu sorting by estimated token count (press `t`) added in v2.1.111+. `OTEL_LOG_RAW_API_BODIES` env var for full API request/response body logging added in v2.1.111+. Plan files named after prompt content (not random words) in v2.1.111+. Plugin error handling improvements (dependency conflict errors, stale version recovery, install recovery) in v2.1.111+.
+`sandbox.network.deniedDomains` setting for domain blocking within `allowedDomains` wildcards added in v2.1.113+. Subagent mid-stream stall detection with auto-fail after 10 minutes added in v2.1.113+. Bash `find -exec`/`-delete` no longer auto-approved under `Bash(find:*)` allow rules in v2.1.113+. Bash deny rules now match exec wrappers (`env`/`sudo`/`watch`/`ionice`/`setsid`) in v2.1.113+. Native binary spawning (per-platform optional dependency) replaces bundled JavaScript in v2.1.113+. `/loop` Esc now cancels pending wakeups in v2.1.113+.
+Agent frontmatter `hooks:` fire when agent runs as main-thread agent via `--agent` flag (previously subagent-only) in v2.1.116+. `/reload-plugins` auto-installs missing plugin dependencies from added marketplaces in v2.1.116+.
+-->
 
 ## Hook Event Types
 
-All supported hook event types in Claude Code. Agents and skills can reference these in `hooks:` frontmatter.
+20 event types supported: PreToolUse, PostToolUse, PreCompact, PostCompact, Stop, SessionStart, SessionEnd, SubagentStart, SubagentStop, UserPromptSubmit, Notification, CwdChanged, FileChanged, Elicitation, ElicitationResult, PostMessage, PermissionDenied, TeammateIdle, TaskCreated, TaskCompleted. 4 handler types: command, prompt, http, agent. See full reference table via Read tool.
+
+<!-- DETAIL: Hook Event Types Full Reference
 
 | Event | Trigger | Data Available | Handler Types | CC Version |
 |-------|---------|---------------|---------------|------------|
@@ -136,14 +153,17 @@ hooks:
 ```
 
 > **v2.1.85+**: `if` field supports permission rule syntax for conditional hook execution. **v2.1.88** extended `if` matching to support compound commands (`ls && git push`) and commands with env-var prefixes (`FOO=bar git push`).
+-->
+
+### Main-Thread Agent Hooks (v2.1.116+)
+
+Agent frontmatter `hooks:` now fire when the agent runs as a main-thread agent via `--agent` flag. Previously, frontmatter hooks only fired when spawned as subagents via the Agent tool.
+
+> **Note**: `/reload-plugins` now auto-installs missing plugin dependencies from added marketplaces (v2.1.116+).
 
 ## Permission Mode Guidance
 
-When spawning agents via the Agent tool, CC applies a default `mode` of `acceptEdits` if not explicitly specified. To maintain consistent permission behavior:
-
-1. **Agent frontmatter `permissionMode`**: Declares the agent's intended permission level. CC respects this when the agent is spawned via Agent tool.
-2. **Agent tool `mode` parameter**: Overrides frontmatter at spawn time. Routing skills should pass this explicitly.
-3. **Recommendation**: For agents that modify files, set `permissionMode: bypassPermissions` in frontmatter if the project uses `bypassPermissions` mode.
+CC defaults `mode` to `acceptEdits` if not specified — always pass `mode: "bypassPermissions"` explicitly in Agent tool calls (see R010). See guidance details via Read tool.
 
 | Mode | Behavior |
 |------|----------|
@@ -153,6 +173,14 @@ When spawning agents via the Agent tool, CC applies a default `mode` of `acceptE
 | `plan` | Require plan approval |
 | `dontAsk` | Non-interactive, deny unapproved |
 | `auto` | AI decides safety |
+
+<!-- DETAIL: Permission Mode Guidance (reasoning)
+When spawning agents via the Agent tool, CC applies a default `mode` of `acceptEdits` if not explicitly specified. To maintain consistent permission behavior:
+
+1. **Agent frontmatter `permissionMode`**: Declares the agent's intended permission level. CC respects this when the agent is spawned via Agent tool.
+2. **Agent tool `mode` parameter**: Overrides frontmatter at spawn time. Routing skills should pass this explicitly.
+3. **Recommendation**: For agents that modify files, set `permissionMode: bypassPermissions` in frontmatter if the project uses `bypassPermissions` mode.
+-->
 
 <!-- DETAIL: Isolation/Token/Limitations/Escalation details
 ### Isolation Modes
@@ -214,9 +242,73 @@ Optional per-agent identity layer. `soul: true` in frontmatter enables personali
 
 Skills persist output to `.claude/outputs/sessions/{YYYY-MM-DD}/{skill-name}-{HHmmss}.md`. Opt-in, git-untracked. Final subagent writes (R010).
 
+### Sensitive Path Handling
+
+> **Status (CC v2.1.121+)**: `.claude/`, `.git/`, `.vscode/` direct Write/Edit/Bash works without prompts under `mode: "bypassPermissions"`. The historical `/tmp/*.sh` bypass pattern is deprecated. See #1101.
+
+Current CC behavior: under `bypassPermissions`, all `.claude/**` paths (including `.claude/outputs/**`, `.claude/agents/**`, `.claude/skills/**`, `.claude/rules/**`, `templates/.claude/**`) accept Write/Edit/Bash directly. Catastrophic shell operations remain blocked by independent safety guards.
+
+**Recommended practice**:
+1. Pass `mode: "bypassPermissions"` on every Agent tool call (R010 Universal bypassPermissions)
+2. Use Write/Edit directly for `.claude/**` paths — no `/tmp/*.sh` wrapping needed
+3. For CC < v2.1.121: see git history of this section (pre-v0.126.0) for the legacy bypass pattern
+
+<!-- DETAIL: Sensitive Path Behavior table and Recommended practice
+#### Sensitive Path Behavior
+
+| Path | Tool | Allow rule | Result |
+|------|------|-----------|--------|
+| `.claude/**` | Bash (`cp`, `mkdir`, `rm`) | `Bash(*)` allowed | Prompt (sensitive-path overrides) |
+| `.claude/**` | Write, Edit | `Write(.claude/**)` allowed | Prompt (sensitive-path overrides) |
+| `templates/.claude/**` | Write, Edit | `Write(templates/.claude/**)` allowed | Prompt (confirmed CC v2.1.116+; see #960, #961, #981) |
+| `.claude/outputs/**` | Write, Edit | `Write(.claude/outputs/**)` | Prompt (sensitive-path overrides — confirmed #1043) |
+| `.claude/outputs/**` | Bash via `/tmp/*.sh` | — | Allowed (bypass pattern) |
+
+#### Recommended practice
+
+1. **Prefer `Write`/`Edit` over `Bash(cp)`/`Bash(mkdir)`** — `Write`/`Edit` provide better auditability and avoid shell injection risk
+2. **Add allow rules defensively** — `Write(.claude/**)`, `Edit(.claude/**)`, `Write(templates/.claude/**)`, `Edit(templates/.claude/**)` in `.claude/settings.local.json`. Rules may not bypass sensitive-path check but document intent and aid future CC behavior changes
+3. **For `.claude/outputs/**` specifically**: Use `Bash via /tmp/*.sh` bypass — Write/Edit on this path triggers sensitive-path prompt despite being the artifact convention path (confirmed v0.111.1+, #1043, #1046)
+-->
+
+<!--
+3. **Accept interactive prompts as a release-pipeline constraint** — `templates/.claude/` sync during release automation requires human approval; plan release windows accordingly
+4. **This is CC design behavior, not a bug** — sensitive-path check is a defense-in-depth layer. File upstream as a documentation request (not bug report) if behavior is unclear
+
+#### Cross-references
+
+- `feedback_sensitive_path.md` — session memory with Bash + Write scope (#960, #961, #981)
+- `feedback_templates_claude_glob.md` — `.claude/**` glob does not cover `templates/.claude/**`, separate allow rules required
+-->
+
+### Artifact Channel Protocol
+
+에이전트 간 결과 핸드오프 시 **아티팩트 파일을 채널로 사용**하는 프로토콜. 기존 Artifact Output Convention의 경로 규약을 에이전트 통신 계약으로 승격합니다.
+
+#### 원칙
+
+| 원칙 | 내용 |
+|------|------|
+| Path-only transfer | 다음 에이전트에 전달할 때 **파일 경로만 전달**, 본문 inline 전달 금지 |
+| Read-write 분리 | 생산 에이전트는 Write, 소비 에이전트는 Read (파일 경쟁 방지) |
+| Session-scoped | 아티팩트는 세션 범위 — `{YYYY-MM-DD}` 디렉토리로 격리 |
+| Single-writer | 한 아티팩트는 하나의 에이전트만 작성. 후속 에이전트는 새 아티팩트 생성 |
+
+#### 사용 맥락
+
+1. **Parallel agents → Aggregator**: N 병렬 에이전트가 각자 `skill-HHmmss.md` 작성 → aggregator가 N개 경로를 받아 단일 요약 생성
+2. **Research → Planner**: research 에이전트가 findings를 아티팩트로 저장 → planner가 경로 참조로 계획 수립
+3. **Pipeline steps**: 단계별 state를 파일 기반으로 체크포인트 (Tracker 패턴의 전단계)
+
+#### 관련 규약
+
+- R013 SHOULD-ecomode.md Deep Insight Context Handoff Pattern (per-agent budget + handoff protocol)
+- `result-aggregation` 스킬 (channel read pattern 구현)
+- R011 SHOULD-memory-integration.md (장기 persistence는 memory, 세션 handoff는 channel)
+
 <!-- DETAIL: Artifact Output full spec
 **Format**: Metadata header with `skill`, `date`, `query` fields, followed by skill output content.
-**Rules**: Opt-in per skill, final subagent writes (R010 compliance), Skills create directory (mkdir -p), .claude/outputs/ is git-untracked, no indexing required.
+**Rules**: Opt-in per skill, final subagent writes (R010 compliance), Write tool auto-creates parent directory (no Bash `mkdir` required — avoids `.claude/` sensitive-path prompt per #960/#961/#978), .claude/outputs/ is git-untracked, no indexing required.
 -->
 
 ## Separation of Concerns
@@ -239,6 +331,9 @@ Fast Mode uses the same model with faster output. Activated via `/fast` toggle o
 | Output speed | Standard | ~2.5x faster |
 | Reasoning depth | Full | Reduced |
 
+See activation, effort interaction, and default effort change details via Read tool.
+
+<!-- DETAIL: Fast Mode Activation, Effort Interaction, Default Effort Change
 ### Activation
 
 - `/fast` — toggle in current session
@@ -254,6 +349,7 @@ When Fast Mode is active, it reduces effective reasoning depth but does NOT over
 Starting with Claude Code v2.1.94, the default effort level changed from `medium` to `high` for API-key, Bedrock/Vertex/Foundry, Team, and Enterprise users. Console (free-tier) users retain `medium` as the default.
 
 This means agents WITHOUT an explicit `effort` field now run at `high` effort by default on paid tiers. To maintain previous behavior, set `effort: medium` explicitly in agent frontmatter.
+-->
 
 ## Skill Frontmatter
 
@@ -268,6 +364,9 @@ description: Brief desc    # One-line summary
 
 ### Optional Fields
 
+Key optional fields: `scope`, `context`, `version`, `effort`, `model`, `agent`, `hooks`, `paths`, `shell`, `allowed-tools`, `keep-coding-instructions`. Skill `effort` takes precedence over agent `effort` when both specified. See full optional fields via Read tool.
+
+<!-- DETAIL: Skill Optional Fields (full yaml block)
 ```yaml
 scope: core                # core | harness | package (default: core)
 context: fork              # Forked context for isolated execution
@@ -289,6 +388,7 @@ keep-coding-instructions: true     # Preserve coding instructions in plugin outp
 ```
 
 When both an agent and its invoked skill specify `effort`, the skill's value takes precedence (more specific invocation-time setting).
+-->
 
 <!-- DETAIL: Skill Effectiveness Tracking
 Skills can optionally track effectiveness metrics via auto-populated fields:
@@ -308,7 +408,7 @@ Default: `core` (when field is omitted)
 
 ### Context Fork Criteria
 
-Use `context: fork` for multi-agent orchestration skills only. Cap: **12 total**. Current: 12/12 (secretary/dev-lead/de-lead/qa-lead-routing, dag-orchestration, task-decomposition, worker-reviewer-pipeline, pipeline-guards, deep-plan, professor-triage, evaluator-optimizer, sauron-watch).
+Use `context: fork` for multi-agent orchestration skills only. Cap: **12 total**. Current: 10/12 (secretary/dev-lead/de-lead/qa-lead-routing, dag-orchestration, task-decomposition, worker-reviewer-pipeline, deep-plan, professor-triage, roundtable-debate).
 
 <!-- DETAIL: Context Fork decision table
 | Use context:fork | Do NOT use context:fork |

@@ -10,22 +10,39 @@ Before declaring any task `[Done]`, verify completion against task-type-specific
 
 | Task Type | REQUIRED Verification Before [Done] |
 |-----------|-------------------------------------|
-| Release | **CI green on the release commit (ALL workflow jobs success)**, all issues closed, version bumped, PR merged, GitHub Release created |
+| Release | All issues closed, version bumped, PR merged, GitHub Release created; **External automation verified**: `.github/workflows/` listed AND `gh run list --limit 10` checked for auto-publish workflows |
 | Implementation | Code compiles/passes lint, tests pass (if exist), no TODO markers left |
 | Documentation | Links valid, counts accurate, cross-references updated |
 | Git Operations | Operation succeeded (check exit code), working tree clean |
 | Code Review | All findings addressed or explicitly deferred with justification |
 | Agent/Skill Creation | Frontmatter valid, referenced skills exist, routing updated |
+| UI/Frontend | Browser render verified (dev server running + page loaded), no console errors, visual output matches intent; **CSS/style changes**: capture before/after visual diff or screenshot; type-check passing alone is NOT sufficient |
 
-### Release CI Gate (MUST)
+## Optional: Quantitative Evidence (advisory, added v0.114.0, #1034)
 
-A release (git tag push `v*` OR `gh release create`) MUST NEVER be cut while CI is failing on the target commit. Before tagging or creating any GitHub Release:
+For complex agent invocations or multi-step workflows, attach 4-metric evidence to [Done] declarations as supplementary evidence (NOT a binary gate):
 
-1. Verify the CI run for the release commit concluded `success` for EVERY job (`gh run list --limit 1`, `gh run view <id>`).
-2. If ANY CI job is failing or the run is still in progress → STOP. Fix all CI failures first, push the fix, wait for the new run to go green, THEN release.
-3. Never tag/release on red or in-progress CI. "Code works locally / in prod" is NOT a substitute for green CI.
+| Metric | Source | Format |
+|--------|--------|--------|
+| correctness | task-type matrix above | pass/fail |
+| step_ratio | observed/ideal step count | ratio (lower better) |
+| tool_call_ratio | observed/ideal tool calls | ratio (lower better) |
+| latency_ratio | observed/ideal latency | ratio (lower better) |
 
-(Session 2026-06-11: v0.19.0–v0.19.2 were released on red CI — the frontend-build job had been failing since the web rebuild. This gate prevents recurrence.)
+### When to Apply
+- Dynamic agent variants comparison (e.g., mgr-creator output validation)
+- Long-running workflows where efficiency regression matters
+- A/B testing of agent prompts or configurations
+
+### Workflow
+1. Run task → collect trajectory (steps, tool_calls, latency)
+2. Compare to ideal trajectory annotation (see `agent-eval-framework` skill)
+3. Attach metric values to [Done] contract as evidence
+
+### Cross-references
+- Skill: `agent-eval-framework` (4-metric framework + ideal trajectory schema)
+- Guide: `guides/agent-eval/README.md` (measurement methodology)
+- Issue: #1034
 
 ## Self-Check (Before Declaring Done)
 
@@ -38,7 +55,25 @@ Before [Done]: (1) Verify ACTUAL outcome not just attempt — "ran command" ≠ 
 4. Would I bet $100 this is truly complete? YES: Declare [Done] / NO: Identify uncertain and verify
 -->
 
-## Common False Completion Patterns
+## Subagent Self-Report Verification — Verify "pre-existing" claims against base branch before acceptance. See details via Read tool.
+
+<!-- DETAIL: Subagent Self-Report Verification
+
+Subagents often report failures as "pre-existing", "baseline", or "unchanged". These claims MUST be verified against the base branch before acceptance.
+
+| Subagent Claim | Required Verification |
+|----------------|----------------------|
+| "X test already failing on base" | `git stash && git checkout {base} && run test X && compare` |
+| "This warning is pre-existing" | `git log -S "warning-text" {base}` or run on clean checkout |
+| "File was unchanged" | `git diff {base}..HEAD -- {file}` |
+| "Dependency issue not from this PR" | `git show {base}:package.json` compare |
+
+Never accept "pre-existing" without direct base-branch evidence. A false "pre-existing" claim can mask a regression introduced by the current change.
+-->
+
+## Common False Completion Patterns — 8 anti-patterns including "Command executed" without exit code check, "Waiting for manual publish" when CI auto-publishes, "UI changes done" without browser render. See full table via Read tool.
+
+<!-- DETAIL: Common False Completion Patterns
 
 | Pattern | Reality | Fix |
 |---------|---------|-----|
@@ -47,20 +82,14 @@ Before [Done]: (1) Verify ACTUAL outcome not just attempt — "ran command" ≠ 
 | "PR created" | CI not checked | Wait for CI, verify green |
 | "Issue closed" | Related issues not updated | Check parent epic, cross-refs |
 | "Tests pass" | Only ran subset | Run full test suite |
+| "Waiting for manual publish" | External CI/CD auto-publishes on merge | Check `.github/workflows/` BEFORE assuming manual step |
+| "Subagent said pre-existing" | Claim not verified against base branch | Run test on base branch, compare directly |
+| "UI changes done" / "CSS updated" | type-check passes but browser render not verified; visual output unknown | Start dev server, open browser, confirm visual output; capture screenshot or describe what was seen |
+-->
 
-### Deploy / User-Facing Verification
+## Completion Contract Format — [Contract] + [Done] with criterion/evidence pairs. See template via Read tool.
 
-For deployments and user-facing changes, an HTTP status code or command exit code is NOT sufficient evidence of success. Verify the actual user-facing OUTCOME end-to-end.
-
-| Checked | Insufficient because | Verify instead |
-|---------|---------------------|----------------|
-| `curl` returns 200/307 | A 307 can be a redirect LOOP; a 200 can be an error page | The target page renders the expected content; the flow (e.g. login → dashboard) completes |
-| Container "Started" | The app inside may bind the wrong port / crash on first request | Hit the real endpoint and confirm the expected body/behavior |
-| "Deploy succeeded" | The change may not be wired end-to-end | Exercise the actual user path (auth, render, data round-trip) before declaring [Done] |
-
-Status codes confirm reachability, not correctness. Never declare a deploy "verified" on status codes alone.
-
-## Completion Contract Format
+<!-- DETAIL: Completion Contract Format
 
 For complex tasks, declare completion contract upfront:
 
@@ -79,6 +108,28 @@ Then at completion:
 ├── ✓ Criterion 2: {evidence}
 └── ✓ Criterion N: {evidence}
 ```
+-->
+
+## Autonomous Mode Entry Checklist — 5-step inventory (workflows, runs, publish targets, manual points, cross-reference). See full checklist via Read tool.
+
+<!-- DETAIL: Autonomous Mode Entry Checklist
+
+When entering autonomous mode (user grants extended execution without per-step confirmation), perform this inventory BEFORE first action:
+
+1. **Workflow inventory**: `ls .github/workflows/` — identify auto-publish, auto-tag, release, docs-sync, CI workflows
+2. **Recent runs**: `gh run list --limit 10` — check success/failure patterns of automated workflows
+3. **External publish targets**: Check if npm/PyPI/Docker Hub/GitHub Releases are auto-triggered on merge
+4. **Manual intervention points**: Identify which steps require human approval vs. fully automated
+5. **Cross-reference with task**: Which workflows will the planned work trigger?
+
+Record findings in session context. Failure to inventory automation is a R020 violation (unknown external state = unverifiable completion).
+
+### Cross-reference
+
+Related memory records:
+- `feedback_github_workflows_inventory.md` — original incident (v0.87.2~v0.88.0 session)
+- `feedback_subagent_pre_existing_claims.md` — subagent false-positive pattern
+-->
 
 ## Integration
 

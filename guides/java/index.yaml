@@ -1,0 +1,29 @@
+# Java Guide
+
+metadata:
+  name: java
+  description: Java 25 LTS language reference and modern feature documentation
+
+source:
+  type: external
+  origin: docs.oracle.com
+  urls:
+    - https://docs.oracle.com/en/java/javase/25/
+    - https://openjdk.org/projects/loom/
+    - https://openjdk.org/jeps/440
+    - https://openjdk.org/jeps/441
+    - https://openjdk.org/jeps/444
+    - https://google.github.io/styleguide/javaguide.html
+  last_fetched: "2026-04-20"
+
+documents:
+  - name: modern-java
+    path: ./modern-java.md
+    description: Java 25 LTS modern features (Virtual Threads, Pattern Matching, Records, Sealed Classes)
+
+  - name: java-style-guide
+    path: ./java-style-guide.md
+    description: Google Java Style Guide conventions
+
+used_by:
+  - lang-java-expert

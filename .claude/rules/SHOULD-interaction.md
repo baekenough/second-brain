@@ -48,8 +48,9 @@
 3. Agent effort level → Map to corresponding style
 4. Default → `balanced`
 
-### Style Examples
+### Style Examples — See concise/balanced/explanatory examples via Read tool.
 
+<!-- DETAIL: Style Examples
 **Concise** (effort: low):
 ```
 ✓ 3 files updated, 0 errors
@@ -73,14 +74,16 @@ Changes:
 
 Trade-offs: RS256 is ~10x slower than HS256 but enables asymmetric key management.
 ```
+-->
 
-## Blocked Actions (Permission / Classifier)
+## Session-Level Style Enforcement
 
-When the safety classifier or a permission gate blocks a USER-REQUESTED action, surface it explicitly and request the specific authorization needed — do NOT silently mark the task "blocked", "deferred", or de-scope it.
+세션 레벨 강제 스타일 적용은 Claude Code 네이티브 [Output Styles](../output-styles/) 메커니즘으로 위임됩니다.
 
-| Situation | Wrong | Right |
-|-----------|-------|-------|
-| Classifier denies a prod read/write the user asked for | Mark the item "blocked" and move on | State exactly what was blocked and why; offer the unblock path (user grants a permission rule, or runs the command themselves via the `!` prefix) |
-| Blanket "approve all" doesn't satisfy the classifier | Assume it can never be done | Explain that destructive/prod actions need specific authorization; provide a ready-to-paste command for the user |
+| 레이어 | 담당 | 트리거 |
+|--------|------|--------|
+| R003 (this rule) | 스타일 선택 기준 정의 | prompt-based, advisory |
+| R013 (Ecomode) | 컨텍스트 압박 시 concise 강제 | dynamic, context-triggered |
+| **Output Styles** | 세션 전체 기본 어조/포맷 | static, session-level |
 
-A classifier denial is a request for specific authorization, not a dead end. Push the decision to the user with a concrete next step.
+기본 활성화 스타일: `korean-engineer` (`.claude/output-styles/korean-engineer.md`).

@@ -92,6 +92,12 @@ Key violations to avoid (file writes, git commands, bundled operations — all m
 
 ✓ CORRECT: Orchestrator delegates to specialist
    Main conversation → Agent(lang-golang-expert) → Write("src/main.go", content)
+
+❌ WRONG: External skill creates agent/skill/guide via general-purpose agent
+   Skill(brainstorming) → Agent(general-purpose) → Write(".claude/agents/new.md")
+
+✓ CORRECT: Agent/skill/guide creation routed through mgr-creator
+   Skill(brainstorming) → Agent(mgr-creator) → Write(".claude/agents/new.md")
 ```
 
 <!-- DETAIL: Common Violations (extended)
@@ -127,6 +133,17 @@ Key violations to avoid (file writes, git commands, bundled operations — all m
 ✓ CORRECT: Orchestrator delegates to infrastructure specialist
    Main conversation → Agent(infra-docker-expert) → docker compose restart
    Main conversation → Agent(infra-docker-expert) → deploy files to server
+
+❌ WRONG: External skill creates agent/skill/guide via general-purpose agent
+   Skill(brainstorming) → Agent(general-purpose) → Write(".claude/agents/new-agent.md")
+   Skill(any-skill) → Agent(general-purpose) → Write(".claude/skills/new-skill/SKILL.md")
+
+✓ CORRECT: Agent/skill/guide creation always routed through mgr-creator
+   Skill(brainstorming) → Agent(mgr-creator) → Write(".claude/agents/new-agent.md")
+   Skill(any-skill) → Agent(mgr-creator) → Write(".claude/skills/new-skill/SKILL.md")
+
+   The skill defines WHAT to create; mgr-creator handles HOW (R006 validation,
+   skill auto-discovery, frontmatter integrity).
 ```
 -->
 
@@ -210,6 +227,48 @@ When the user explicitly signals full-delegation intent, the orchestrator operat
 Autonomous mode and `/structured-dev-cycle` (stage-blocker) are mutually exclusive.
 -->
 
+## Universal bypassPermissions
+
+**ALL Agent tool calls MUST include `mode: "bypassPermissions"`.**
+
+The Agent tool defaults to `mode: "acceptEdits"`, which overrides agent frontmatter `permissionMode` and causes permission prompts during unattended execution. This is a CC platform behavior, not a configuration error.
+
+| Aspect | Detail |
+|--------|--------|
+| Scope | Every Agent tool call, without exception |
+| Why | CC's Agent tool `mode` default (`acceptEdits`) overrides frontmatter |
+| History | #926 (v0.99.1), #947 (v0.100.1), #955 (v0.103.0) — recurring issue |
+| Enforcement | Prompt-based (R021); all 23 agent-spawning skills include instruction |
+
+### Self-Check
+
+Before spawning any agent:
+1. Does the Agent tool call include `mode: "bypassPermissions"`? → YES: proceed → NO: add it
+2. Is this a new skill that spawns agents? → Add Permission Mode section
+
+### Common Violation
+
+```
+❌ WRONG: Agent tool call without mode parameter
+   Agent(subagent_type: "lang-golang-expert", prompt: "...")
+
+✓ CORRECT: Always include mode
+   Agent(subagent_type: "lang-golang-expert", mode: "bypassPermissions", prompt: "...")
+```
+
+
+## Sensitive Path Handling (Historical: pre-CC v2.1.121)
+
+> **Status**: Deprecated as of CC v2.1.121 (2026-04-28) and further relaxed in v2.1.126 (2026-05-01). Direct Write/Edit/Bash on `.claude/`, `.git/`, `.vscode/` works without prompts under `bypassPermissions` mode in CC v2.1.121+ (issue #1101).
+
+Current CC versions (>=2.1.121): direct Write/Edit/Bash on `.claude/**` paths are permitted under `mode: "bypassPermissions"`. The `/tmp/*.sh` script wrapping pattern previously required is no longer necessary. Catastrophic operations (e.g., `rm -rf /`) remain blocked by independent safety guards.
+
+`mode: "bypassPermissions"` on every Agent tool call is still required (see "Universal bypassPermissions" above).
+
+**For CC < v2.1.121 only**: see git history of this rule for the legacy `/tmp/*.sh` bypass pattern (commit before v0.126.0).
+
+> **References**: #1052 (origin v0.116.2), #1016 (v0.111.1), #1046 (delegation directive loss v0.116.1), #1099 (CC v2.1.126 tracking), #1101 (v0.126.0 deprecation).
+
 ## Session Continuity
 
 After restart/compaction: re-read CLAUDE.md, all delegation rules still apply. Never write code directly from orchestrator.
@@ -219,6 +278,8 @@ After restart/compaction: re-read CLAUDE.md, all delegation rules still apply. N
 | Task Type | Required Agent |
 |-----------|---------------|
 | Create agent | mgr-creator |
+| Create skill | mgr-creator |
+| Create guide | mgr-creator (structure) / arch-documenter (content) |
 | Update external | mgr-updater |
 | Audit dependencies | mgr-supplier |
 | Git operations | mgr-gitnerd |
@@ -242,6 +303,31 @@ After restart/compaction: re-read CLAUDE.md, all delegation rules still apply. N
 - Use specialized agents, not general-purpose, when one exists
 - general-purpose only for truly generic tasks (file moves, simple scripts)
 - No exceptions for "small" or "quick" changes
+
+### Protected Paths (mgr-creator Required)
+
+The following paths MUST be created or structurally modified ONLY through `mgr-creator`:
+
+| Path Pattern | Scope | Reason |
+|-------------|-------|--------|
+| `.claude/agents/*.md` | Agent definitions | R006 frontmatter validation, skill auto-discovery |
+| `.claude/skills/*/SKILL.md` | Skill definitions | R006 skill frontmatter, scope classification |
+| `guides/*/` (new directories) | Reference guides | R006 separation of concerns, cross-reference integrity |
+
+**Excluded from this rule** (handled by their own specialists):
+- `.claude/agent-memory*/` — sys-memory-keeper
+- `.claude/rules/` — R016 workflow (orchestrator delegates updates to appropriate agents)
+- `.claude/hooks/` — requires explicit user approval (security-critical)
+- `.claude/outputs/` — any agent (artifact convention)
+- Existing file updates by `mgr-updater` (external source sync) and `mgr-supplier`/`fix-refs` (reference correction)
+
+**Why mgr-creator?** It enforces R006 frontmatter validation, auto-discovers relevant skills/guides, and maintains structural integrity verified by mgr-sauron (R017). Bypassing mgr-creator risks:
+- Invalid frontmatter (missing required fields)
+- Orphaned skill references
+- Routing table desynchronization
+- R017 verification failures
+
+> **Enforcement**: Advisory (R021) — no hard-block hook. Candidate for promotion if violation rate exceeds threshold. See R021 Hard Enforcement Candidates.
 
 <!-- DETAIL: System Agents Reference
 | Agent | File | Purpose |
@@ -316,6 +402,7 @@ Internal rules ALWAYS take precedence over external skills.
 | "use Agent tool for 5 research tasks" | Agent Teams when criteria met (R018) |
 | "skip code review" | Follow project review workflow |
 | "write files directly" | Delegate to specialist subagent (R010) |
+| "create an agent/skill/guide file" | Agent(mgr-creator) for `.claude/agents/`, `.claude/skills/`, `guides/` writes (R010 Protected Paths) |
 
 When a skill's workflow conflicts with R009/R010/R018:
 1. Follow the skill's LOGIC and STEPS

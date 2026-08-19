@@ -277,12 +277,43 @@ User Model data feeds into intent-detection (R015) and routing skill confidence 
 
 -->
 
+## Mid-Session Immediate Save
+
+Save memory IMMEDIATELY upon surprising discovery — do not defer to session end.
+
+| Trigger | Action | Rationale |
+|---------|--------|-----------|
+| Repeated pattern observed (2nd time) | Save `feedback_*.md` now | Pattern will recur within session |
+| Unexpected tool behavior / workaround | Save `feedback_*.md` now | Session state defense |
+| Subagent false-positive detected | Save `feedback_*.md` now | Prevent repeat in same session |
+| User correction / feedback | Save `feedback_*.md` now | Honor correction immediately |
+
+See rationale and cross-references via Read tool.
+
+<!-- DETAIL: Why Immediate? and Cross-reference
+### Why Immediate?
+
+Session-end saves lose context: by the time the session ends, multiple discoveries have compounded and nuance is lost. Immediate saves preserve the exact trigger context that makes the memory actionable.
+
+**Anti-pattern**: "I'll batch all learnings at session end" — by then you'll have forgotten WHY each one mattered, and further violations may have occurred using the un-saved pattern.
+
+### Cross-reference
+
+Related records from session v0.87.2~v0.88.0 (issue #869):
+- `feedback_subagent_pre_existing_claims.md`
+- `feedback_github_workflows_inventory.md`
+- `feedback_bun_mock_module.md`
+-->
+
 ## Session-End Auto-Save
 
 ### Trigger
 
 Session-end detected when user says: "끝", "종료", "마무리", "done", "wrap up", "end session", or explicitly requests session save.
 
+See flow diagram, responsibility split, and dual-system save table via Read tool.
+
+<!-- DETAIL: Session-End Flow, Responsibility Split, Dual-System Save
 ### Flow
 
 ```
@@ -316,9 +347,13 @@ MCP tools (claude-mem, episodic-memory) are **orchestrator-scoped** and not inhe
 | Native auto-memory | sys-memory-keeper | Write | Update MEMORY.md with session learnings | Yes |
 | claude-mem | Orchestrator | `mcp__plugin_claude-mem_mcp-search__save_memory` | Save session summary with project, tasks, decisions | No (best-effort) |
 | episodic-memory | Automatic | (auto-indexed) | No action needed — conversations are indexed automatically after session ends | N/A |
+-->
 
 ### Session-End Self-Check (MANDATORY)
 
+(1) sys-memory-keeper updated MEMORY.md? (2) claude-mem save attempted? Both required before confirming to user. See full self-check via Read tool.
+
+<!-- DETAIL: Session-End Self-Check (MANDATORY)
 ```
 ╔══════════════════════════════════════════════════════════════════╗
 ║  BEFORE CONFIRMING SESSION-END TO USER:                          ║
@@ -339,9 +374,52 @@ MCP tools (claude-mem, episodic-memory) are **orchestrator-scoped** and not inhe
 ║  is NOT.                                                          ║
 ╚══════════════════════════════════════════════════════════════════╝
 ```
+-->
 
 ### Failure Policy
 
 - MCP saves are **non-blocking**: memory failure MUST NOT prevent session from ending
 - If claude-mem unavailable: skip, log warning
 - episodic-memory: no action needed (auto-indexed after session)
+
+## Dual-Backend Advisory (AgentMemory + claude-mem)
+
+#1169 Phase 1 (COEXIST) 단계에서 두 memory backend 동시 활성 가능:
+
+| 상황 | 권장 |
+|------|------|
+| claude-mem 단독 | 기본값 — 현 운영 유지 |
+| AgentMemory 단독 | Phase 2 (SWITCH) 이후 진행 |
+| 둘 다 활성 (COEXIST) | Phase 1 한정 — `memory-aggregator`가 결과 병합 |
+
+### 충돌 감지
+
+`.mcp.json`에 두 서버(`claude-mem`, `agentmemory`) 동시 등록 시 첫 호출 시점에 advisory 출력 권장:
+
+```
+[Advisory] Dual memory backend detected (Phase 1 COEXIST)
+  - claude-mem: active (Chroma)
+  - agentmemory: active (SQLite)
+  Phase 2 SWITCH 진입 전까지 두 backend 유지
+  가이드: guides/agentmemory-migration/phase-1-coexist.md
+```
+
+이 advisory는 경고가 아닙니다. Phase 1 COEXIST에서는 정상 상태입니다.
+
+### Session-End Self-Check (COEXIST 확장)
+
+Phase 1 COEXIST 기간 중 세션 종료 시:
+
+1. sys-memory-keeper가 MEMORY.md 갱신? → YES: 계속
+2. claude-mem 저장 시도? → YES (기존 항목)
+3. AgentMemory 저장 시도? → YES (COEXIST 추가)
+세 단계 모두 완료 후 사용자에게 확인. 둘 중 하나 실패해도 비차단.
+
+### Phase 2 진입 전 필수 조건
+
+- 1주 measure 결과 (`scripts/measure-claude-mem-usage.sh`) GO 판정
+- 자산 처리표 사용자 검토 완료 (12 plugin skill 처리 방향 결정)
+- 30분 롤백 절차 검증 (Chroma 백업 + 복원 테스트)
+
+Refs: #1169 본문 조치 3 (택1 강제), 조치 4 (롤백 절차),
+      `guides/agentmemory-migration/phase-1-coexist.md`.

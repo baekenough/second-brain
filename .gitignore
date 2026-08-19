@@ -73,3 +73,10 @@ web/package-lock.json
 .omx/
 
 temp/
+
+# omcustom harness re-init backups (contain stale copies of live .claude/ config —
+# grep-based verification can false-positive against these)
+.claude-backup-*/
+
+# ontology query cache (regenerated locally, not a source artifact)
+.claude/ontology/.cache/

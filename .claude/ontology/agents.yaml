@@ -6,7 +6,7 @@ generated_at: "2026-02-12T00:00:00Z"
 # Agent class hierarchy
 classes:
   LanguageExpert:
-    agents: [lang-golang-expert, lang-python-expert, lang-rust-expert, lang-kotlin-expert, lang-typescript-expert, lang-java21-expert]
+    agents: [lang-golang-expert, lang-python-expert, lang-rust-expert, lang-kotlin-expert, lang-typescript-expert, lang-java-expert]
     description: "Programming language specialists"
   BackendExpert:
     agents: [be-fastapi-expert, be-springboot-expert, be-go-backend-expert, be-express-expert, be-nestjs-expert]
@@ -18,7 +18,7 @@ classes:
     agents: [de-airflow-expert, de-dbt-expert, de-spark-expert, de-kafka-expert, de-snowflake-expert, de-pipeline-expert]
     description: "Data engineering specialists"
   DatabaseExpert:
-    agents: [db-postgres-expert, db-redis-expert, db-supabase-expert]
+    agents: [db-postgres-expert, db-redis-expert, db-supabase-expert, db-neo4j-expert]
     description: "Database specialists"
   ToolingExpert:
     agents: [tool-npm-expert, tool-optimizer, tool-bun-expert]
@@ -101,7 +101,7 @@ agents:
     keywords: [typescript, type-safety, generics, conditional-types, mapped-types, nodejs]
     file_patterns: ["*.ts", "*.tsx", "tsconfig.json", "package.json"]
 
-  lang-java21-expert:
+  lang-java-expert:
     class: LanguageExpert
     description: "Expert Java 21 developer for modern Java with Virtual Threads, Pattern Matching, Record Patterns, and Sequenced Collections. Use for Java files (*.java, pom.xml, build.gradle), Java-related keywords, high-concurrency systems, data-centric APIs with Records, and migrating from older Java versions."
     model: sonnet
@@ -328,6 +328,18 @@ agents:
     summary: "Supabase expert for PostgreSQL with RLS policies and connection pooling"
     keywords: [supabase, postgresql, rls, row-level-security, pgbouncer, schema-design, migration]
     file_patterns: ["*.sql", "supabase.yml", "migrations/*.sql"]
+
+  db-neo4j-expert:
+    class: DatabaseExpert
+    description: "Expert Neo4j graph database developer. Use for Cypher query writing/review/optimization, graph data modeling (node vs property, relationship design), index and constraint strategy, neo4j-go-driver integration, and safe execution of LLM-generated Cypher (read-only enforcement, parameterization, destructive-clause blocking). Handles .cypher files, Cypher blocks in Go source, and Neo4j configuration."
+    model: sonnet
+    memory: project
+    effort: high
+    skills: [neo4j-best-practices]
+    tools: [Read, Write, Edit, Grep, Glob, Bash]
+    summary: "Neo4j expert for Cypher, graph modeling, Go-driver integration, and safe LLM-generated Cypher execution"
+    keywords: [neo4j, cypher, graph-database, knowledge-graph, node, relationship, index, constraint, text2cypher]
+    file_patterns: ["*.cypher"]
 
   tool-npm-expert:
     class: ToolingExpert

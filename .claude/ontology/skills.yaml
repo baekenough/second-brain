@@ -16,6 +16,7 @@ classes:
       flutter-best-practices, fastapi-best-practices, springboot-best-practices,
       go-backend-best-practices, docker-best-practices, aws-best-practices,
       postgres-best-practices, redis-best-practices, supabase-postgres-best-practices,
+      neo4j-best-practices,
       airflow-best-practices, dbt-best-practices, kafka-best-practices,
       spark-best-practices, snowflake-best-practices, pipeline-architecture-patterns
     ]
@@ -147,11 +148,11 @@ skills:
     keywords: [routing, development, code-review, implementation, refactoring]
     routes_to: [
       lang-golang-expert, lang-python-expert, lang-rust-expert, lang-kotlin-expert,
-      lang-typescript-expert, lang-java21-expert, fe-vercel-agent, fe-vuejs-agent,
+      lang-typescript-expert, lang-java-expert, fe-vercel-agent, fe-vuejs-agent,
       fe-svelte-agent, fe-flutter-agent, be-fastapi-expert, be-springboot-expert,
       be-go-backend-expert, be-nestjs-expert, be-express-expert, tool-npm-expert,
       tool-optimizer, tool-bun-expert, db-supabase-expert, db-postgres-expert,
-      db-redis-expert, arch-documenter, arch-speckit-agent, infra-docker-expert,
+      db-redis-expert, db-neo4j-expert, arch-documenter, arch-speckit-agent, infra-docker-expert,
       infra-aws-expert
     ]
     rule_references: []
@@ -377,6 +378,15 @@ skills:
     model_invocable: true
     summary: "Architecture patterns for ETL/ELT pipelines, orchestration, and data quality"
     keywords: [pipeline, architecture, etl, elt, orchestration, data-quality]
+    rule_references: []
+
+  neo4j-best-practices:
+    class: BestPracticeSkill
+    description: "Neo4j best practices for Cypher query optimization, graph data modeling, indexing, and safe execution of LLM-generated Cypher"
+    user_invocable: false
+    model_invocable: true
+    summary: "Neo4j best practices for Cypher tuning, graph modeling, indexing/constraints, and Go-driver integration"
+    keywords: [neo4j, cypher, graph-database, knowledge-graph, modeling, index, text2cypher]
     rule_references: []
 
   postgres-best-practices:

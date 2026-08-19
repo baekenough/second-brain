@@ -1,92 +1,157 @@
 name: auto-dev
-description: "Automated development pipeline for second-brain — scoped release unit from triage to deploy"
-version: "1.2.1-second-brain"
+description: "Automated development pipeline — from issue triage to release"
+version: "2.1.0"
 
-# Target: baekenough/second-brain (Go backend + Next.js frontend + Postgres/pgvector + k8s)
-# Release artifacts: git tag + GitHub Release + Docker image (no npm publish)
 # Design rule: each pipeline run produces ONE bounded release unit (3-7 issues), not all open issues.
+# This pipeline is a project-agnostic template. Project-specific overrides belong in
+# the project's own workflows/auto-dev.yaml (e.g., AgentNav, second-brain).
 
 steps:
   - name: pre-triage
     prompt: |
-      Scan open GitHub issues on baekenough/second-brain:
-        gh issue list --repo baekenough/second-brain --state open --limit 100 \
-          --json number,title,labels,body,milestone
+      Phase 0 — Sync local with remote.
 
-      Group by label:
-        - priority/P0 — MUST-fix bugs
-        - priority/P1 — deferred bugs
-        - phase/0..4 — roadmap features
-        - chore + blocker — infra/CI/integrations
-        - decision-needed — blocked on human decision (EXCLUDE)
-        - scout — knowledge scout items (see scout handling below)
+      1. Fetch all remote state:
+         git fetch --all --tags --prune
 
-      Scout issue handling (label `scout`) — NEVER blanket-close as out-of-scope:
-        - These are knowledge-internalization candidates from cmd/scout, NOT release
-          work items. EXCLUDE them from release scope selection, but branch on axis:
-        - axis:go-backend, axis:rag-search → PRODUCT-relevant reference. Keep open.
-          Optionally add P2/P3 and link to a roadmap item (EXPANSION.md) if it maps
-          to planned work.
-        - axis:agent-tooling, axis:ai-trend → harness/reference knowledge. May close,
-          but ONLY after leaving a 1-2 line comment stating what was internalized
-          (or why nothing was) — generic boilerplate closures are forbidden.
-        - Issues with `scout` but no axis label: read 분류 in the issue body header
-          and apply the same branching. When in doubt, leave open and tag
-          decision-needed instead of closing.
+      2. Detect behind count vs origin/HEAD branch:
+         current_branch=$(git rev-parse --abbrev-ref HEAD)
+         behind=$(git rev-list --count HEAD..origin/$current_branch)
 
-      For each issue compute:
-        - dependencies: parse "see #N", "depends on #N", "#N 참조" from body
-        - blocked_by_decision: true if body references any decision-needed issue (#25, #26)
-        - effort: XS/S/M/L from scope
-        - order: topological sort over dependencies
+      3. If behind > 0:
+         - Working tree clean (git status --short empty):
+           git pull --ff-only
+           report: "[pre-triage] synced $behind commits"
+         - Working tree dirty:
+           HALT with "[pre-triage] $behind commits behind, working tree dirty — manual reconcile required"
+           exit 1
 
-      Output: dependency-sorted issue table with blocked_by_decision flag.
-    description: "Scan and dependency-analyze all open issues"
+      4. Report current state:
+         - Latest tag: git tag --sort=-v:refname | head -1
+         - Local HEAD: git rev-parse --short HEAD
+         - Behind state: synced or 0
+
+      5. Cross-reference checks (advisory, do NOT halt):
+         a. Memory vs git consistency (G7):
+            - latest_tag=$(git tag --sort=-v:refname | head -1)
+            - Compare with "Last release" or equivalent line in pipeline memory/context
+            - If mismatch: stderr warning "[pre-triage] WARNING: memory says vX.Y.Z but git latest tag is vA.B.C — update memory after pipeline completion"
+            - Do NOT halt (advisory only — memory updates are session-end responsibility)
+
+         b. Issue body stale version references (G5):
+            - Retrieve open issues: gh issue list --state open --limit 100 --json number,body
+            - For each issue body, extract all vX.Y.Z patterns (regex: v\d+\.\d+\.\d+)
+            - Retrieve git tag list: git tag --list
+            - Flag any issue referencing a version not present in git tags:
+              "[pre-triage] WARNING: Issue #N references vX.Y.Z (not in git tags) — body may be stale"
+            - Output all warnings as advisory log; do NOT halt
+
+      Phase 1 — Ensure required labels exist, then scan issues.
+
+      1. Create labels if missing (idempotent):
+         gh label create in-progress --color "FBCA04" --description "Work in progress" --force 2>/dev/null
+         gh label create verify-ready --color "0E8A16" --description "Ready for verification" --force 2>/dev/null
+         gh label create needs-review --color "D93F0B" --description "Needs manual review" --force 2>/dev/null
+
+      2. Scan open GitHub issues:
+         gh issue list --state open --limit 100 --json number,title,labels,body,milestone
+
+      3. Group by label and compute for each issue:
+         - dependencies: parse "see #N", "depends on #N", "#N 참조" from body
+         - blocked_by_decision: true if body references any decision-needed issue
+         - effort: XS/S/M/L from scope
+         - order: topological sort over dependencies
+
+      4. Output: dependency-sorted issue table with blocked_by_decision flag.
+    description: "Sync remote, stale-version check, memory consistency check, scan issues"
 
   - name: scope-selection
     prompt: |
       Select a single bounded release scope (3-7 issues) for THIS pipeline run.
 
-      Selection rules:
+      ## Step 0 — Milestone state pre-check (G3)
+
+      Before creating a milestone for version vX.Y.Z:
+      1. Query all milestones (open and closed):
+         existing=$(gh api 'repos/{owner}/{repo}/milestones?state=all&per_page=100' --jq '.[] | select(.title == "vX.Y.Z") | "\(.number)|\(.state)"')
+      2. Evaluate:
+         - If existing && state=closed:
+           HALT with "[scope-selection] BLOCKED: milestone vX.Y.Z already exists and is closed. Bump version or reopen milestone manually."
+         - If existing && state=open:
+           Use existing milestone as-is (do not create new)
+         - If not existing:
+           Create new milestone: gh api repos/{owner}/{repo}/milestones --method POST --field title="vX.Y.Z"
+
+      ## Step 1 — Label-based filtering (G4)
+
+      Reference label semantics: .claude/skills/pipeline/labels.md
+
+      Apply filter rules:
+      - EXCLUDE: blocked_by_decision == true OR labels ∩ {decision-needed, needs-review, verify-done, manual-action, in-progress} ≠ ∅
+      - INCLUDE (preferred): labels ∩ {verify-ready, claude-code-release, documentation} ≠ ∅
+      - INCLUDE (standard): P1/P2/P3 issues not in excluded set
+      - Tie-break: P1 > P2 > P3 > unclassified
+
+      ## Step 2 — Selection rules
+
       1. Determine release tier:
-         - No tags yet → v0.1.0, P0 bugs only
-         - Otherwise: highest-priority open tier (P1 → phase/1 → phase/2 → ...)
-      2. Exclude:
-         - blocked_by_decision == true (e.g., #2 blocked by #25, #12 blocked by #26)
-         - chore/blocker requiring human action (e.g., #4 JWT rotation, #24 gcloud auth) — these are manual
-      3. Sort by dependency: prerequisites before dependents (#9 chunks before #3 truncation)
-      4. Cap at 7 issues; if P0 count < 7, stop at P0 only (don't mix tiers in one release)
+         - No tags yet → v0.1.0
+         - Otherwise: highest-priority open tier (bug → chore → feature)
+      2. Apply Step 1 filter (label-based exclusion and preference)
+      3. Sort by dependency: prerequisites before dependents
+      4. Cap at 7 issues; if priority issues < 7, stop at that priority (don't mix tiers)
       5. Minimum 1 issue; if 0 eligible, halt with "no eligible issues for auto-dev run"
 
-      Create release milestone:
-        gh api repos/baekenough/second-brain/milestones \
-          -f title="v{X.Y.Z}" \
-          -f description="Auto-dev release unit"
-
-      Assign scoped issues to milestone:
-        for N in scope:
-          gh issue edit $N --milestone "v{X.Y.Z}" --repo baekenough/second-brain
-
+      Assign scoped issues to milestone.
       Output markdown release manifest:
-        | order | # | title | prerequisite | effort |
+        | order | # | title | prerequisite | effort | labels |
 
       Persist manifest as pipeline state for subsequent steps.
-    description: "Pick 3-7 issues as v{X.Y.Z} scope, create milestone, exclude decision-blocked"
+    description: "Milestone state pre-check, label filter, pick 3-7 issues as v{X.Y.Z} scope"
     depends_on: pre-triage
+
+  - name: compression-mode-eval
+    prompt: |
+      Evaluate whether this pipeline run qualifies for docs-only compression mode (G6).
+
+      ## Compression Eligibility Check
+
+      Reference: .claude/skills/pipeline/labels.md — "Compression Eligibility" section
+
+      Conditions for compression_mode=docs-only:
+      1. scope size ≤ 3 (number of issues in release manifest)
+      2. ALL scoped issues have labels ∩ {documentation, automated, claude-code-release, enhancement-yaml-only} ≠ ∅
+
+      ## Decision
+
+      If BOTH conditions met → set compression_mode=docs-only
+        - triage step: skip professor-triage skill; perform direct manifest summary instead
+        - plan step: skip release-plan skill; single-response plan instead
+        - deep-plan step: skip deep-plan skill; single-response implementation notes instead
+        - deep-verify step: skip deep-verify skill; perform self-review checklist instead
+        - Log: "[compression-mode] docs-only compression activated (scope={n}, all docs/yaml labels)"
+
+      Otherwise → set compression_mode=standard
+        - All pipeline steps execute normally with full skill spawns
+        - Log: "[compression-mode] standard mode (scope={n}, mixed labels or large scope)"
+
+      Output: compression_mode value as pipeline state for downstream steps.
+    description: "Evaluate docs-only compression eligibility; set compression_mode state"
+    depends_on: scope-selection
 
   - name: triage
     skill: professor-triage
-    description: "Cross-analysis triage against current Go + Next.js codebase (scoped to release manifest)"
-    depends_on: scope-selection
+    description: "Cross-analysis triage with priority assessment (scoped to release manifest) — skipped if compression_mode=docs-only"
+    depends_on: compression-mode-eval
 
   - name: plan
     skill: release-plan
-    description: "Release unit plan from the scoped manifest"
+    description: "Release unit plan from triaged issues — skipped if compression_mode=docs-only"
     depends_on: triage
 
   - name: deep-plan
     skill: deep-plan
-    description: "Research-validated implementation plan with Go / k8s / Next.js context"
+    description: "Research-validated implementation plan (research → plan → verify) — skipped if compression_mode=docs-only"
     depends_on: plan
 
   - name: implement
@@ -94,190 +159,141 @@ steps:
       Execute the deep-plan output for the scoped release manifest.
 
       Per-issue lifecycle:
-      1. Start: `gh issue edit <N> --add-label in-progress --assignee @me --repo baekenough/second-brain`
-      2. Comment: `gh issue comment <N> --body "Implementation started via auto-dev pipeline (v{X.Y.Z})"`
-      3. Dispatch specialist per file domain:
-         - internal/**/*.go or cmd/**/*.go      → be-go-backend-expert / lang-golang-expert
-         - migrations/*.sql                      → db-postgres-expert
-         - Dockerfile, docker-compose.yml        → infra-docker-expert
-         - deploy/k8s/**.yaml                    → infra-docker-expert
-         - web/src/**                             → fe-vercel-agent
-         - ARCHITECTURE*.md / README*.md         → arch-documenter
+      1. Start: gh issue edit <N> --add-label in-progress --assignee @me
+      2. Comment: gh issue comment <N> --body "Implementation started via auto-dev pipeline"
+      3. Dispatch specialist agents per file domain:
+         - Detect file types in scope and route to matching agent
+         - Use specialized agents (lang-*, be-*, fe-*, infra-*) over general-purpose
       4. TDD via superpowers:test-driven-development when tests apply
       5. Commit via mgr-gitnerd with `Fixes #<N>` trailer in body
-      6. On success: remove `in-progress`, add `verify-ready`
-      7. On failure: remove `in-progress`, add `needs-review`, comment error summary, halt this issue (pipeline continues with others)
+      6. On success: remove in-progress, add verify-ready
+      7. On failure: remove in-progress, add needs-review, comment error summary
 
       Rules:
       - Parallel execution per R009 (max 4 concurrent, respect dependencies)
       - Issues whose prerequisites failed in-run MUST be skipped (log reason)
       - No direct orchestrator writes (R010)
-    description: "Per-issue TDD impl with lifecycle (assign → fix → commit with trailer)"
+      - All Agent tool calls MUST pass mode: "bypassPermissions" to prevent permission prompts during unattended execution
+
+
+      ## Sensitive Path Handling (CC v2.1.121+)
+
+      Direct Write/Edit/Bash on `.claude/**` is permitted under `mode: "bypassPermissions"` as of CC v2.1.121 (#1101). The legacy `/tmp/*.sh` bypass is no longer required. Structural changes (new agents/skills) still go through mgr-creator with R017 verification.
+
+      For CC < v2.1.121 see git history for the legacy bypass pattern.
+
+      ## Local CI-mimic verification (MUST run before marking implement done)
+
+      After all implementation tasks complete, run these scripts in sequence and halt on failure:
+
+      1. bash .github/scripts/verify-template-sync.sh
+      2. bash .github/scripts/verify-wiki-sync.sh
+
+      If either fails:
+      - For wiki-sync failures: delegate to wiki-curator to generate missing pages (`/omcustom:wiki ingest <path>`)
+      - For template-sync failures: delegate to mgr-updater to sync `.claude/` -> `templates/.claude/`
+      - After fixes, re-run the scripts until both pass
+
+      This mirrors CI and prevents the known 1-2 wasted push cycles per release (ref: issue #927, v0.98.0 PR #925).
+    description: "Per-issue implementation with lifecycle, specialist routing, and CI-mimic verification"
     depends_on: deep-plan
 
   - name: verify-build
     prompt: |
-      Build and test verification for second-brain.
+      Project-specific build + test verification.
 
-      Delegate to lang-golang-expert / infra-docker-expert to run in order (halt on first failure):
-        1. go build ./...
-        2. go vet ./...
-        3. go test ./... -count=1 -race
-           # existing tests: internal/collector/extractor/extractor_test.go
-        4. docker build -t second-brain:verify .
-        5. kubectl --dry-run=client apply -k deploy/k8s/
-           # fallback: for f in deploy/k8s/*.yaml; do kubectl --dry-run=client apply -f $f; done
-        6. cd web && pnpm install --frozen-lockfile && pnpm run build
-        7. Migration safety check:
-           - Latest migration file should be forward-only
-           - No DROP/ALTER COLUMN on existing columns without explicit review comment
-           - Delegate: db-postgres-expert reads migrations/*.sql and reports risks
+      For Node/Bun projects (this repo):
+      1. bun install — verify lockfile sync (halt on lockfile drift)
+      2. bun run lint (if package.json has lint script)
+      3. bun run typecheck (if available)
+      4. bun test — MANDATORY, no silent skip
+         - Baseline reference: #1156 historically documented 86 failures; v0.136.2 fixes resolved them → current baseline = 0
+         - Each release: adopt prior version's test result as baseline (dynamic, not hardcoded)
+         - Compute current pass/fail counts
+         - If current FAIL count > baseline → NEW regression detected → halt + report failure list
+         - If current FAIL count <= baseline → continue with advisory log "X failures (baseline {n}, delta {d})"
+      5. Build verification (if package has build script)
 
-      On failure: halt, report exact command + stderr + delegated agent's findings, do NOT proceed to release.
-      Do NOT run sauron-watch — that targets .claude/ harness, not project code.
-    description: "Go build/vet/test/race + Docker + k8s + Next.js + migration safety"
+      For Python/Go/Docker/static-site projects: auto-detect and run equivalent (py_compile + pytest / go build + go vet + go test / docker build / file validation).
+
+      Halt conditions:
+      - Lint errors (exit != 0)
+      - Typecheck errors
+      - NEW test failures (regression from baseline)
+      - Build failure
+      - Lockfile drift
+
+      Halt → report exact command + stderr + delta details. Do NOT proceed to release on any halt.
+    description: "Auto-detected build + test verification (bun test with baseline delta guard)"
     depends_on: implement
 
   - name: deep-verify
     skill: deep-verify
-    description: "Multi-angle release quality review by expert teams (scoped to this release unit)"
+    description: "Multi-angle release quality verification — self-review checklist only if compression_mode=docs-only"
     depends_on: verify-build
 
   - name: release
     prompt: |
-      Create a GitHub Release for second-brain.
+      Create a GitHub Release.
 
-      1. Version:
-         - No existing tags → v0.1.0 (first release)
-         - Otherwise: semver bump (patch for bugfix-only, minor if any feature/enhancement in scope)
-      2. Release notes via omcustom-release-notes skill:
-         - Source: git log since last tag + closed issues in current milestone
-         - Sections: Bug Fixes (P0/P1), Features (phase/*), Chores, Known Issues (deferred)
+      0. Pre-check (mandatory, delegate to mgr-gitnerd per R010): Detect and remove stale local `release` branch if present.
+         The local `release` branch (file ref) conflicts with `release/v*` directory ref namespace.
+         mgr-gitnerd executes (force-delete acceptable in automation context; warns if branch has unpushed commits):
+           if git show-ref --verify --quiet refs/heads/release; then
+             # Check for unpushed commits before force-delete
+             if [ -n "$(git log refs/heads/release ^origin/develop --oneline 2>/dev/null)" ]; then
+               echo "::warning::Local 'release' branch has unpushed commits — force-deleting anyway"
+             fi
+             git branch -D release
+           fi
+         Reference: issue #1141 (v0.135.0 follow-up), mgr-gitnerd MEMORY.md.
+
+      1. Version bump (mandatory):
+         Orchestrator delegates to mgr-updater (R010). mgr-updater executes the following atomic edits:
+         Determine NEW version per semver rules below.
+         npm project (package.json exists):
+           a. package.json: jq '.version = "<NEW>"' package.json > package.json.tmp && mv package.json.tmp package.json
+           b. templates/manifest.json: jq '.version = "<NEW>"' templates/manifest.json > templates/manifest.json.tmp && mv templates/manifest.json.tmp templates/manifest.json
+           c. mgr-gitnerd commit: "chore(release): bump to v<NEW>"
+           d. mgr-gitnerd push develop
+           e. mandatory verification (with existence guard for partial-update safety):
+              [ -f scripts/verify-version-sync.sh ] && bash scripts/verify-version-sync.sh || echo "::warning::verify-version-sync.sh not found, version sync verification skipped"
+              (verify-version-sync.sh 가 exit 1 시 release 단계 halt)
+
+         Version decision (semver):
+         - No existing tags → v0.1.0
+         - Previous tag exists → patch (bugfix) / minor (features) / major (breaking)
+         - Previous tag is ahead of source version (e.g., tag v0.136.1, package.json 0.136.0): use next available skip-version (0.136.2)
+
+      2. Release notes via omcustom-release-notes skill
       3. Delegate to mgr-gitnerd:
-         - git tag -a v{version} -m "Release v{version}"
-         - git push origin v{version}
-         - gh release create v{version} --title "v{version}" --notes-file <path> --repo baekenough/second-brain
-      4. Close the milestone:
-           gh api repos/baekenough/second-brain/milestones/<id> -X PATCH -f state=closed
-      5. Close release-manifest issues:
-           for N in manifest where verify-ready label:
-             gh issue close $N -c "Fixed in v{version}" --repo baekenough/second-brain
-           for N in manifest where needs-review label:
-             gh issue comment $N --body "Deferred from v{version} — requires review"
-
-      NO npm publish — Go + Docker project.
-      NO PR creation — trunk-based direct tagging on main.
-    description: "Git tag + GitHub Release + close milestone/issues with fixed/deferred split"
+         - git tag + push
+         - gh release create
+      4. Close milestone
+      5. Close verify-ready issues with "Fixed in v{version}"
+         Label needs-review issues as "Deferred from v{version}"
+      6. Adapt release mechanism to project:
+         - npm project: PR + merge + npm publish verification
+         - Non-npm: direct tag on main (trunk-based)
+    description: "Git tag + GitHub Release + close milestone/issues (with mandatory version sync verification)"
     depends_on: deep-verify
 
   - name: ci-check
     prompt: |
-      Post-release CI verification (conditional on CI being configured).
+      Post-release CI verification.
 
-      1. Check if .github/workflows/ exists and has any YAML files:
-           test -d .github/workflows && ls .github/workflows/*.yml 2>/dev/null | head -1
-         If NOT found: print "CI not yet configured (tracked in issue #21). Skipping post-release CI verification."
-         Return success and advance.
-
-      2. If CI IS configured:
-         a. gh run list --repo baekenough/second-brain --limit 5 --branch main
-         b. Wait up to 15 min for runs to complete for the new tag
-         c. If failures found:
-            - gh run view <id> --log-failed
-            - Diagnose root cause
-            - Delegate fix to appropriate specialist
-            - Commit fix via mgr-gitnerd (Fixes build, not a new issue)
-            - Re-run verify-build step
-         d. On success: verify Docker image pushed to registry (if configured)
-      3. Report final CI status.
-    description: "Post-release CI fix loop (skip if CI not configured — #21)"
+      1. Check if .github/workflows/ has CI workflows
+         If NOT: skip with "No CI configured. Skipping." and continue.
+      2. If CI exists:
+         - gh run list --limit 5
+         - Wait for runs triggered by the new tag/push
+         - If failures: diagnose, fix, re-verify
+      3. For npm projects: verify npm publish succeeded (npm view <pkg> version)
+      4. Report final CI status.
+    description: "Post-release CI verification and fix loop"
     depends_on: release
 
   - name: post-release-followup
     skill: post-release-followup
-    description: "Register follow-ups from this release as new issues (link to milestone)"
+    description: "Register follow-ups from this release as new issues"
     depends_on: ci-check
-
-  - name: deploy-ubuntu-ext
-    prompt: |
-      Deploy the tagged release to the home server via SSH.
-
-      Target: <SSH_ALIAS> (SSH alias → <HOME_SERVER_IP>:<SSH_PORT>, user <SSH_USER>)
-      Host: <HOSTNAME> (Ubuntu 24, kernel 6.8)
-      Environment: minikube on docker driver (running node container)
-      Fresh deployment: server has no existing ~/second-brain dir, no collected data yet.
-
-      Pre-flight checks (halt on any failure):
-      1. SSH reachable: `ssh <SSH_ALIAS> hostname` (expect: <HOSTNAME>)
-      2. minikube running: `ssh <SSH_ALIAS> 'minikube status'`
-         - If "Stopped": `ssh <SSH_ALIAS> 'minikube start'`
-      3. Git remote HTTPS accessible from server (public repo, no auth needed)
-
-      Known blocker (issue #6):
-      - Current k8s PV (deploy/k8s/second-brain-pv.yaml) requires hostPath `/mnt/drive`
-      - Linux server has no Google Drive sync — Drive Desktop is macOS-only
-      - This step MUST halt with instructions if the release manifest does NOT include #6 fix
-      - Acceptable resolutions:
-        (a) rclone mount gdrive: /mnt/drive (pre-setup on server)
-        (b) PV removed or replaced with emptyDir
-        (c) Drive collector disabled via ConfigMap
-
-      Deployment steps (delegate SSH to infra-docker-expert):
-
-      Step 1 — Clone project (first deploy):
-        ssh <SSH_ALIAS> bash <<'EOF'
-          set -e
-          if [ ! -d ~/second-brain ]; then
-            git clone https://github.com/baekenough/second-brain.git ~/second-brain
-          fi
-          cd ~/second-brain
-          git fetch --all --tags
-          git checkout v{version}
-        EOF
-
-      Step 2 — Secrets file check:
-        ssh <SSH_ALIAS> 'test -f ~/second-brain/.env'
-        - If missing: HALT with instructions — "Create ~/second-brain/.env on server with production secrets (EMBEDDING_API_KEY, API_KEY, SLACK_TOKEN, etc.)"
-        - Do NOT scp .env from local (local .env may contain dev-only values)
-
-      Step 3 — Build image inside minikube docker:
-        ssh <SSH_ALIAS> bash <<'EOF'
-          set -e
-          cd ~/second-brain
-          eval $(minikube docker-env)
-          docker build -t second-brain:{version} -t second-brain:latest .
-          docker images | grep second-brain | head -3
-        EOF
-
-      Step 4 — Apply k8s manifests:
-        ssh <SSH_ALIAS> bash <<'EOF'
-          set -e
-          cd ~/second-brain
-          kubectl apply -k deploy/k8s/ 2>/dev/null || kubectl apply -f deploy/k8s/
-          kubectl -n second-brain rollout status deployment/second-brain --timeout=5m
-        EOF
-
-      Step 5 — Post-deploy verification:
-        ssh <SSH_ALIAS> bash <<'EOF'
-          set -e
-          kubectl -n second-brain get pods -o wide
-          kubectl -n second-brain logs deployment/second-brain --tail=50
-          kubectl -n second-brain get svc,deploy,configmap
-        EOF
-
-      Step 6 — Health endpoint smoke test:
-        ssh <SSH_ALIAS> bash <<'EOF'
-          kubectl -n second-brain port-forward svc/second-brain 9200:9200 &
-          PF_PID=$!
-          sleep 3
-          curl -sf http://localhost:9200/health || echo "HEALTH CHECK FAILED"
-          kill $PF_PID 2>/dev/null || true
-        EOF
-
-      On success: comment on the GitHub Release with "Deployed to <HOSTNAME> at {timestamp}".
-      On failure: collect logs, report, and advise rollback via `kubectl rollout undo`.
-
-      **Rollback plan**: if health check fails, execute
-        ssh <SSH_ALIAS> 'kubectl -n second-brain rollout undo deployment/second-brain'
-    description: "SSH deploy to <SSH_ALIAS> via minikube + k8s rollout (fresh first deploy)"
-    depends_on: post-release-followup

@@ -1,0 +1,125 @@
+=== Step 1: row counts ===
+       tbl        | count  
+------------------+--------
+ documents        |  46603
+ chunks           | 462340
+ entities         |   7836
+ entity_relations |   3181
+ ask_sessions     |     19
+(5 rows)
+
+=== Step 2: by source_type/status ===
+   source_type   | status | count 
+-----------------+--------+-------
+ calendar        | active |    69
+ call-log        | active |   782
+ call-transcript | active |   556
+ gmail           | active |  6479
+ insight         | active |     3
+ llm-memory      | active | 19933
+ note            | active |     1
+ secretary       | active | 18328
+ sms             | active |   451
+ upload          | active |     1
+(10 rows)
+
+=== Step 3: embedding null counts ===
+ doc_embed_null | doc_summ_embed_null | chunk_embed_null 
+----------------+---------------------+------------------
+              0 |                   3 |                0
+(1 row)
+
+=== Step 4: extension versions ===
+  extname  | extversion 
+-----------+------------
+ pg_bigm   | 1.2
+ plpgsql   | 1.0
+ uuid-ossp | 1.1
+ vector    | 0.8.2
+(4 rows)
+
+=== Step 5: index inventory ===
+       tablename        |                            indexname                            
+------------------------+-----------------------------------------------------------------
+ action_status          | action_status_pkey
+ action_status          | idx_action_status_state
+ actions                | actions_identity_key_key
+ actions                | actions_pkey
+ actions                | idx_actions_counterpart
+ actions                | idx_actions_kind
+ actions                | idx_actions_observed_at
+ actions                | idx_actions_thread_key
+ ask_sessions           | ask_sessions_conversation_id_turn_index_key
+ ask_sessions           | ask_sessions_pkey
+ ask_sessions           | idx_ask_sessions_conversation_turn
+ ask_sessions           | idx_ask_sessions_created_at
+ chunks                 | chunks_document_id_chunk_index_key
+ chunks                 | chunks_pkey
+ chunks                 | idx_chunks_content_bigm
+ chunks                 | idx_chunks_document
+ chunks                 | idx_chunks_embedding
+ chunks                 | idx_chunks_tsv
+ collection_log         | collection_log_pkey
+ collector_state        | collector_state_pkey
+ document_entities      | document_entities_pkey
+ document_entities      | idx_document_entities_document_id
+ document_entities      | idx_document_entities_entity_id
+ documents              | documents_pkey
+ documents              | documents_source_type_source_id_key
+ documents              | idx_documents_collected
+ documents              | idx_documents_content_bigm
+ documents              | idx_documents_embedding
+ documents              | idx_documents_occurred
+ documents              | idx_documents_relations_pending
+ documents              | idx_documents_source
+ documents              | idx_documents_status
+ documents              | idx_documents_summary_embedding
+ documents              | idx_documents_title_bigm
+ documents              | idx_documents_tsv
+ documents              | idx_documents_unembedded
+ documents              | idx_documents_unentitied
+ documents              | idx_documents_unsummarized
+ entities               | entities_pkey
+ entities               | idx_entities_normalized_type
+ entity_relations       | entity_relations_from_entity_id_to_entity_id_type_evidence__key
+ entity_relations       | entity_relations_pkey
+ entity_relations       | idx_entity_relations_evidence
+ entity_relations       | idx_entity_relations_from
+ entity_relations       | idx_entity_relations_to
+ eval_metrics           | eval_metrics_pkey
+ eval_metrics           | idx_eval_metrics_run_at
+ extraction_failures    | extraction_failures_pkey
+ extraction_failures    | extraction_failures_source_type_source_id_key
+ extraction_failures    | idx_extraction_failures_next_retry
+ extraction_failures    | idx_extraction_failures_source
+ feedback               | feedback_pkey
+ feedback               | idx_feedback_created
+ feedback               | idx_feedback_document
+ feedback               | idx_feedback_session
+ feedback               | idx_feedback_split
+ feedback               | idx_feedback_user
+ feedback               | uq_feedback_ask_evidence
+ reindex_state          | idx_reindex_state_last
+ reindex_state          | reindex_state_pkey
+ search_weights_history | idx_search_weights_created
+ search_weights_history | search_weights_history_pkey
+ search_weights_history | uq_search_weights_active
+ transcription_ledger   | transcription_ledger_pkey
+(64 rows)
+
+=== Step 6: migration version ===
+no schema_migrations table
+
+NOTE (Step 6 resolution): No schema_migrations table exists by design.
+internal/store/postgres.go RunMigrations() re-applies all *.sql files under
+migrations/ on every server boot (idempotent, advisory-lock guarded), with
+no version ledger table. Source-of-truth "applied version" = highest
+migration file in migrations/ dir at deploy time = 026_search_weights_history.sql
+(latest file present in repo as of 2026-08-19). Baseline fingerprint is
+therefore: index inventory (Step 5, 64 rows) + table list (16 tables) +
+migrations/ directory listing, not a DB-side version number.
+022_actions.sql
+023_relations_extracted_at.sql
+024_ask_sessions.sql
+025_feedback_evidence.sql
+026_search_weights_history.sql
