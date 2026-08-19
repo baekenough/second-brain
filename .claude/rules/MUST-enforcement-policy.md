@@ -12,6 +12,7 @@ oh-my-customcode uses an **advisory-first enforcement model**. Most rules are en
 |------|-----------|-------|----------|
 | Hard Block | PreToolUse hook, exit 2 | stage-blocker, dev-server tmux, rule-deletion-guard | Prevents tool execution |
 | Soft Block | Stop hook prompt | R011 session-end saves | Auto-performs then approves |
+| Conversation Block | PostToolUse hook + `continueOnBlock` (CC v2.1.139+), exit 2 | stuck-detector, context-budget-advisor, cost-cap-advisor | Feeds rejection reason into conversation; Claude continues with awareness |
 | Advisory | PostToolUse hooks | R007, R008, R009, R010, R018 | Warns via stderr, never blocks |
 | Prompt-based | CLAUDE.md + rules/ + PostCompact | All MUST rules | Behavioral guidance in context |
 
@@ -22,14 +23,17 @@ oh-my-customcode uses an **advisory-first enforcement model**. Most rules are en
 3. **Composability**: External skills and internal rules can coexist without deadlocks
 4. **PostCompact reinforcement**: R007/R008/R009/R010/R018 are re-injected after context compaction
 
-## Hard Enforcement Candidates (Future)
+## Hard Enforcement Candidates — R010 git-delegation-guard (conditional), R007/R008 UserPromptSubmit/PreToolUse hook (실제 위반 2회 발생 2026-08-18, multi-turn gap 확정 — 승격 우선순위 상향, #1096). Promoted: rule-deletion-guard.sh (2026-04-08). See details via Read tool.
 
+<!-- DETAIL: Hard Enforcement Candidates (Future)
 If advisory enforcement proves insufficient for specific rules, these are candidates for promotion to hard-block:
 
 | Rule | Candidate Hook | Condition for Promotion |
 |------|---------------|------------------------|
 | R010 | git-delegation-guard.sh | If orchestrator-direct-write violations exceed 3/session |
 | R007/R008 | (new hook) | If identification omission rate exceeds 20% |
+
+2026-08-18 갱신: R007/R008이 동일 세션 내 task-notification 턴 시작 시점에서 2회 실제 누락됨(헤더/접두사 모두). 20% 임계치 도달 여부는 별도 측정 필요하나, 반복 재발 자체가 승격 후보 우선순위를 높이는 근거로 기록.
 
 Promotion requires: (1) measured violation rate data, (2) user approval, (3) rollback plan.
 
@@ -38,6 +42,7 @@ Promotion requires: (1) measured violation rate data, (2) user approval, (3) rol
 | Hook | Date | Justification |
 |------|------|---------------|
 | `rule-deletion-guard.sh` | 2026-04-08 | User-requested: rule files must require individual confirmation before deletion. Prevents accidental bulk deletion of project rules. |
+-->
 
 ## Integration
 
