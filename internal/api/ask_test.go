@@ -229,6 +229,16 @@ func docResult(sourceType model.SourceType, title string) *model.SearchResult {
 	}
 }
 
+// docResultWithOccurredAt is docResult plus a set Document.OccurredAt — used
+// by the occurred_at wire-contract tests (issue #218) to distinguish "this
+// document has a known event time" from docResult's default nil, which
+// exercises the JSON-null branch instead.
+func docResultWithOccurredAt(sourceType model.SourceType, title string, occurredAt time.Time) *model.SearchResult {
+	r := docResult(sourceType, title)
+	r.Document.OccurredAt = &occurredAt
+	return r
+}
+
 // newAskTestServer wires a Server whose *search.Service is backed by fake
 // in-memory searcher + a disabled embedder (no real DB), and whose
 // intentClassifier field is swapped for a fake (unexported-field access is
@@ -551,10 +561,18 @@ func TestAskHandler_SSEFieldNames(t *testing.T) {
 	if err := json.Unmarshal(raw["sources"], &items); err != nil {
 		t.Fatalf("sources[] not valid JSON: %v", err)
 	}
-	for _, want := range []string{"id", "title", "source_type", "score"} {
+	for _, want := range []string{"id", "title", "source_type", "score", "occurred_at"} {
 		if _, ok := items[0][want]; !ok {
-			t.Errorf("AskSourceItem JSON is missing key %q (types.ts:122-127); got keys=%v", want, mapKeys(items[0]))
+			t.Errorf("AskSourceItem JSON is missing key %q (types.ts:132-138); got keys=%v", want, mapKeys(items[0]))
 		}
+	}
+	// occurred_at must be the JSON literal null, not simply absent — a plain
+	// key-presence check above cannot tell "null" apart from a key that
+	// unmarshaled to some other zero value, and the whole point of dropping
+	// omitempty (AskSourceItem's doc comment, issue #218) is that "no event
+	// time" and "field not shipped" must be visibly different on the wire.
+	if got := string(items[0]["occurred_at"]); got != "null" {
+		t.Errorf("occurred_at = %s, want literal null (docResult sets no OccurredAt)", got)
 	}
 
 	if err := json.Unmarshal([]byte(frames[2].data), &raw); err != nil {
@@ -578,6 +596,39 @@ func mapKeys(m map[string]json.RawMessage) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+// TestAskHandler_SourcesOccurredAt_ReflectsDocument is the non-nil
+// counterpart to TestAskHandler_SSEFieldNames' null check: a document with a
+// known event time must have that exact instant on the wire, not just a
+// present key (issue #218 — the deployment check this was written to enable
+// needs occurred_at to actually carry the source's event time, not merely
+// exist).
+func TestAskHandler_SourcesOccurredAt_ReflectsDocument(t *testing.T) {
+	t.Parallel()
+	occurredAt := time.Date(2026, 8, 20, 9, 0, 0, 0, time.UTC)
+	doc := docResultWithOccurredAt(model.SourceSMS, "문자 내용", occurredAt)
+	searcher := &fixedDocSearcher{observed: []*model.SearchResult{doc}}
+	fakeLLM := &fakeAskLLM{enabled: true, chunks: []string{"답변"}}
+	srv := newAskTestServer(searcher, &fakeIntentClassifier{}, fakeLLM)
+
+	rr := doAskRequest(t, srv, nil, map[string]any{"question": "질문"}, "Bearer test-key")
+
+	frames := parseSSEFrames(t, rr.Body.String())
+	var sources askSourcesPayload
+	if err := json.Unmarshal([]byte(frames[1].data), &sources); err != nil {
+		t.Fatalf("unmarshal sources payload: %v; raw=%s", err, frames[1].data)
+	}
+	if len(sources.Sources) != 1 {
+		t.Fatalf("sources = %v, want 1 item", sources.Sources)
+	}
+	got := sources.Sources[0].OccurredAt
+	if got == nil {
+		t.Fatalf("occurred_at = nil, want %s", occurredAt)
+	}
+	if !got.Equal(occurredAt) {
+		t.Errorf("occurred_at = %s, want %s", got, occurredAt)
+	}
 }
 
 // --- date-context fix tests (issue: "내일 일정" produced "현재 시점을 알 수 없다") ---

@@ -10,7 +10,12 @@ import {
   EvidenceFeedbackDisabledError,
 } from "@/lib/api";
 import type { AskSourceItem, AskConversationSummary, AskLayer, EvidenceVote } from "@/lib/types";
-import { buildRankMap, nextVote, EVIDENCE_FEEDBACK_ENABLED } from "./evidenceFeedback";
+import {
+  buildRankMap,
+  nextVote,
+  sourceOccurredAtLabel,
+  EVIDENCE_FEEDBACK_ENABLED,
+} from "./evidenceFeedback";
 import { getAskLayer, ASK_LAYER_LABELS } from "@/lib/constants";
 import { Button } from "@/components/ui";
 import { MarkdownContent } from "@/app/documents/[id]/MarkdownContent";
@@ -98,6 +103,9 @@ function SourceCard({
 }) {
   const layer = getAskLayer(source.source_type);
   const isInsight = layer === "insight";
+  // See evidenceFeedback.ts's sourceOccurredAtLabel for why `null` renders
+  // the same fallback text regardless of *why* it is null (issue #218).
+  const occurredAtLabel = sourceOccurredAtLabel(source.occurred_at);
   return (
     <div
       className={`rounded-md border px-3 py-2 text-xs ${
@@ -128,6 +136,7 @@ function SourceCard({
           </span>
         )}
       </div>
+      <div className="mt-0.5 text-[11px] text-foreground-subtle">{occurredAtLabel}</div>
     </div>
   );
 }

@@ -102,6 +102,7 @@ func toAskSourceItems(sources []store.AskSource) []AskSourceItem {
 	for _, src := range sources {
 		items = append(items, AskSourceItem{
 			ID: src.ID, Title: src.Title, SourceType: src.SourceType, Score: src.Score,
+			OccurredAt: src.OccurredAt,
 		})
 	}
 	return items

@@ -9,6 +9,14 @@
  * the toggle rule and the ranking rule can be pinned by cheap tests.
  */
 import type { AskSourceItem, EvidenceVote } from "@/lib/types";
+// Relative, not "@/lib/dates": this module is imported directly by
+// evidenceFeedback.test.ts, and vitest.config.ts does not resolve the "@"
+// alias (only tsconfig.json's paths do, which webpack/Next honours but
+// vitest does not) — a value import via the alias fails at test time even
+// though `tsc --noEmit` and `next build` both resolve it fine. `import type`
+// from "@/lib/types" above is unaffected because type-only imports are
+// erased before either bundler sees them.
+import { formatDateTime } from "../../lib/dates";
 
 /**
  * Whether the thumbs buttons are rendered at all.
@@ -53,4 +61,24 @@ export function buildRankMap(sources: readonly AskSourceItem[]): Record<string, 
  */
 export function nextVote(current: EvidenceVote | undefined, clicked: 1 | -1): EvidenceVote {
   return current === clicked ? 0 : clicked;
+}
+
+/**
+ * Display label for a source card's `occurred_at` (issue #218).
+ *
+ * `null` covers two cases the wire payload cannot distinguish: the document
+ * genuinely has no recorded occurrence time, and (for a turn restored from
+ * conversation history) the row predates this field's existence and was
+ * stored in ask_sessions JSONB before it was captured. There is no
+ * information in the payload to tell these apart, so this function does not
+ * try — both render identically. Same convention as the graph evidence
+ * panel's identical field (app/graph/EvidencePanel.tsx).
+ *
+ * Uses lib/dates's `formatDateTime`, which formats via the runtime's local
+ * timezone (not pinned to KST) — the same convention every other timestamp
+ * in this app already follows (dashboard, document detail, evidence panel).
+ */
+export function sourceOccurredAtLabel(occurredAt: string | null): string {
+  if (!occurredAt) return "발생 시각 미상";
+  return formatDateTime(occurredAt);
 }

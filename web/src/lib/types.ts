@@ -118,12 +118,23 @@ export interface IngestFileResponse {
   accepted: boolean;
 }
 
-/** One entry of the `sources` SSE event (spec §5.1). */
+/** One entry of the `sources` SSE event (spec §5.1).
+ *
+ * `occurred_at` mirrors internal/api/ask.go's `AskSourceItem.OccurredAt
+ * *time.Time` with no `omitempty` (issue #218) — the key is ALWAYS present
+ * in the wire payload, carrying either an RFC3339 string or `null`. It is
+ * intentionally `string | null` here, not `string | undefined` / optional:
+ * an optional field would let a backend regression that drops the key pass
+ * type-checking silently, defeating the point of fixing the key-vs-value
+ * ambiguity that caused #218 in the first place. See SourceCard's use of
+ * this field in app/ask/page.tsx for why `null` and "not present" are not
+ * the same thing on the wire, even though the UI renders them identically. */
 export interface AskSourceItem {
   id: string;
   title: string;
   source_type: SourceType;
   score: number;
+  occurred_at: string | null;
 }
 
 /** Parsed, typed form of the five /api/v1/ask SSE event types (spec §5.1).
