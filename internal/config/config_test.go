@@ -753,3 +753,50 @@ func TestLoad_FeedbackEvidenceEnabled(t *testing.T) {
 		})
 	}
 }
+
+// TestLoad_SearchActiveWeightsEnabled pins the #214 flag: default OFF, same
+// truthy set as every other envFlag-backed switch.
+//
+// The default is the assertion that matters. An active row in
+// search_weights_history was promoted against a holdout set on whichever
+// deployment ran the tuner; a deployment that has said nothing about the
+// feature must keep the compiled defaults rather than inherit that row.
+func TestLoad_SearchActiveWeightsEnabled(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		envVal string
+		unset  bool
+		want   bool
+	}{
+		{name: "default_off_when_unset", unset: true, want: false},
+		{name: "empty_is_off", envVal: "", want: false},
+		{name: "true_is_on", envVal: "true", want: true},
+		{name: "TRUE_is_on", envVal: "TRUE", want: true},
+		{name: "one_is_on", envVal: "1", want: true},
+		{name: "yes_is_on", envVal: "yes", want: true},
+		{name: "on_is_on", envVal: " on ", want: true},
+		{name: "false_is_off", envVal: "false", want: false},
+		{name: "garbage_is_off", envVal: "maybe", want: false},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unset {
+				unsetenv(t, "SEARCH_ACTIVE_WEIGHTS_ENABLED")
+			} else {
+				setenv(t, "SEARCH_ACTIVE_WEIGHTS_ENABLED", tc.envVal)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.SearchActiveWeightsEnabled != tc.want {
+				t.Errorf("SearchActiveWeightsEnabled = %v, want %v", cfg.SearchActiveWeightsEnabled, tc.want)
+			}
+		})
+	}
+}

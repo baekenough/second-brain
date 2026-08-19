@@ -538,6 +538,25 @@ type Config struct {
 	// (1/true/yes/on, case-insensitive, surrounding space ignored) rather
 	// than the plain == "true" used by older flags.
 	FeedbackEvidenceEnabled bool
+
+	// SearchActiveWeightsEnabled makes the promoted row in
+	// search_weights_history the default RRF weighting for every search
+	// request that does not carry its own (#214).
+	// SEARCH_ACTIVE_WEIGHTS_ENABLED env var, default false.
+	//
+	// Off by default for the same reason ActionsAPIEnabled is: the row is
+	// written by a separate process (cmd/tune -promote) after measuring
+	// candidates against a holdout set, and a deployment that has not opted in
+	// should not start serving a ranking configuration merely because a row
+	// appeared in a table. Production currently has no active row at all, so
+	// turning this on today is a no-op — which is exactly the state in which a
+	// flag should be introduced.
+	//
+	// It is also the outermost rollback: unset the variable and restart, and
+	// the compiled defaults are back whatever the table says. The inner
+	// rollback (cmd/tune -rollback) needs no restart, because the row is read
+	// once per request — see search.Service.defaultWeights.
+	SearchActiveWeightsEnabled bool
 }
 
 // Load reads configuration from environment variables and returns a Config.
@@ -806,6 +825,9 @@ func Load() (*Config, error) {
 
 		// Part D feedback collection — default false (see doc comment above).
 		FeedbackEvidenceEnabled: envFlag("FEEDBACK_EVIDENCE_ENABLED"),
+
+		// Part D weight serving — default false (see doc comment above).
+		SearchActiveWeightsEnabled: envFlag("SEARCH_ACTIVE_WEIGHTS_ENABLED"),
 	}, nil
 }
 

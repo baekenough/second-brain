@@ -65,11 +65,14 @@ func sortByRecency(results []*model.SearchResult, ascending bool) {
 //   - descending: COALESCE(occurred_at, collected_at), so a document with no
 //     event-time concept degrades to ingest order exactly as it does in SQL.
 //
-// Chunk-lane rows are the interesting case for the "no usable timestamp"
-// result: chunkVecToSearchResult / chunkToSearchResult populate neither field
-// (the chunk join carries no timestamps), so a document reachable ONLY through
-// a chunk lane is ordered last. That is a deliberate limitation, not an
-// oversight — see the note in Service.Search.
+// Chunk-lane rows are ordinary inputs here. They used to be the whole reason
+// the "no usable timestamp" branch fired: the chunk join selected no
+// timestamps, so every chunk-only document went last regardless of when it
+// happened (#215). The join now carries the parent's occurred_at/collected_at
+// and chunkVecToSearchResult / chunkToSearchResult copy them across, so a
+// chunk-only hit is placed on the same key as a store hit. The branch below is
+// therefore reached only by a document that genuinely has no event time, on the
+// ascending side — which is what it was written for.
 func recencyKey(r *model.SearchResult, ascending bool) (time.Time, bool) {
 	if r.OccurredAt != nil && !r.OccurredAt.IsZero() {
 		return *r.OccurredAt, true

@@ -118,10 +118,26 @@ func run() error {
 	// --- Search service ---
 	// ChunkStore is attached to enable chunk-based FTS fallback (issue #9).
 	// EntityStore is attached to surface entities in search results (issue #77).
+	//
+	// WeightsHistoryStore closes the tuning loop (#214): cmd/tune -promote
+	// writes the winning configuration to search_weights_history, and this is
+	// the only process that reads it back. The reader is attached
+	// unconditionally and the flag decides whether it is consulted, so that
+	// turning SEARCH_ACTIVE_WEIGHTS_ENABLED on is a restart and not a redeploy.
+	// It is attached HERE and nowhere else on purpose: cmd/tune must keep
+	// measuring against the compiled defaults, or its baseline would drift to
+	// whatever it last promoted and every subsequent run would compare a
+	// configuration against itself.
+	weightsHistoryStore := store.NewWeightsHistoryStore(pg)
 	searchSvc := search.NewService(docStore, embedClient).
 		WithChunkStore(chunkStore).
 		WithReranker(reranker).
-		WithEntityFetcher(entityStore)
+		WithEntityFetcher(entityStore).
+		WithActiveWeights(weightsHistoryStore, cfg.SearchActiveWeightsEnabled)
+	if cfg.SearchActiveWeightsEnabled {
+		slog.Info("search: serving the promoted weights from search_weights_history",
+			"flag", "SEARCH_ACTIVE_WEIGHTS_ENABLED")
+	}
 
 	// --- LLM client (curation) ---
 	llmClient := llm.New(llm.Config{
