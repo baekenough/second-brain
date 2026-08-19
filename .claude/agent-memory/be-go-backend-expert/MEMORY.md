@@ -20,3 +20,4 @@
 - [project_tune_optimizer_task89.md](project_tune_optimizer_task89.md) — Task 8/9: 게이트 사유 enum+Describe 분리, TUNE_ENABLED가 롤백까지 게이트, evidence span은 성공 시 3속성만
 - [project_sort_recent_vs_rrf.md](project_sort_recent_vs_rrf.md) — RRF=선택/Sort=표시순서; recent 방향은 model.RecencyAscending 단일 정의를 store SQL·search Go 정렬이 공유
 - [project_active_weights_serving.md](project_active_weights_serving.md) — #214 승격 가중치 서빙: 캐시 없이 요청마다 읽는 이유(tune=별도 프로세스), 우선순위 3단, SEARCH_ACTIVE_WEIGHTS_ENABLED 기본 off
+- [project_ask_occurred_at_contract.md](project_ask_occurred_at_contract.md) — PR #219: AskSourceItem.OccurredAt 의도적 no-omitempty(키부재 vs null 구분), JSONB라 마이그레이션 불필요, sort는 planner가 날짜창 확정 시에만 적용

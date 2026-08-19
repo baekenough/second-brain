@@ -1,2 +1,3 @@
 - [second-brain retro issues batch](project_retro_second_brain.md) — 2026-04-14 세션 회고 이슈 #28~#37, 재발 방지 패턴 10건
 - [2026-06-14 FSD 회고 #162](project_retro_2026_06_14.md) — deploy-readiness 게이트 부재(High) 포함 찐빠 4건, v0.20.5/v0.20.6/v0.21.0
+- [Dirty worktree staging (2026-08-19)](feedback_dirty_worktree_staging.md) — `git add -A`/`git add .` 금지, 경로 개별 지정 + staged 대조 확인 필수; 스트레이 파일/타 에이전트 동시 작성분 오염 방지
