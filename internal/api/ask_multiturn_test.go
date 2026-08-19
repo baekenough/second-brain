@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/store"
@@ -618,5 +619,84 @@ func TestAskConversationDetailHandler_InvalidID_Returns400(t *testing.T) {
 
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// --- occurred_at wire<->store round trip (issue #218) ---
+
+// TestAskHandler_SaveAskTurn_PreservesOccurredAt covers the wire->store
+// direction of saveAskTurn (ask_history.go): a source's OccurredAt, present
+// in the SSE "sources" payload, must reach the persisted store.AskSession
+// unchanged rather than being dropped during the AskSourceItem ->
+// store.AskSource conversion.
+func TestAskHandler_SaveAskTurn_PreservesOccurredAt(t *testing.T) {
+	t.Parallel()
+	occurredAt := time.Date(2026, 8, 18, 3, 0, 0, 0, time.UTC)
+	doc := docResultWithOccurredAt(model.SourceSMS, "문자 내용", occurredAt)
+	searcher := &fixedDocSearcher{observed: []*model.SearchResult{doc}}
+	fakeLLM := &fakeAskLLM{enabled: true, chunks: []string{"답"}}
+	sessions := newFakeAskSessionStore()
+	srv := newAskTestServerWithSessions(searcher, &fakeIntentClassifier{}, fakeLLM, sessions)
+
+	rr := doAskRequest(t, srv, nil, map[string]any{"question": "질문"}, "Bearer test-key")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+
+	if len(sessions.insertCalls) != 1 {
+		t.Fatalf("Insert called %d times, want exactly 1", len(sessions.insertCalls))
+	}
+	saved := sessions.insertCalls[0]
+	if len(saved.Sources) != 1 {
+		t.Fatalf("saved.Sources = %v, want 1 item", saved.Sources)
+	}
+	got := saved.Sources[0].OccurredAt
+	if got == nil {
+		t.Fatalf("saved source OccurredAt = nil, want %s", occurredAt)
+	}
+	if !got.Equal(occurredAt) {
+		t.Errorf("saved source OccurredAt = %s, want %s", got, occurredAt)
+	}
+}
+
+// TestAskConversationDetailHandler_ReflectsSourceOccurredAt covers the
+// store->wire direction (toAskSourceItems, ask_conversations.go): a
+// pre-seeded store.AskSession with a set source OccurredAt must surface it
+// unchanged through GET /api/v1/ask/conversations/{id}, and a source with no
+// OccurredAt (mirroring a pre-#218 row that never had the key at all — see
+// store.AskSource's doc comment) must surface as nil rather than the zero
+// time.Time, so a page-refresh reload never fabricates a false event time
+// for older turns.
+func TestAskConversationDetailHandler_ReflectsSourceOccurredAt(t *testing.T) {
+	t.Parallel()
+	occurredAt := time.Date(2026, 8, 15, 12, 30, 0, 0, time.UTC)
+	sessions := newFakeAskSessionStore()
+	conv := uuid.New()
+	sessions.seed(conv, store.AskSession{
+		ID: uuid.New(), ConversationID: conv, TurnIndex: 0,
+		Question: "Q0", Answer: "A0", FinishReason: "stop",
+		Sources: []store.AskSource{
+			{ID: "doc-with-time", Title: "t1", SourceType: "sms", Score: 0.9, OccurredAt: &occurredAt},
+			{ID: "doc-without-time", Title: "t2", SourceType: "gmail", Score: 0.5}, // OccurredAt nil, as a pre-#218 row
+		},
+	})
+	srv := newAskTestServerWithSessions(&fixedDocSearcher{}, &fakeIntentClassifier{}, &fakeAskLLM{enabled: true}, sessions)
+
+	rr := doAskGet(t, srv, "/api/v1/ask/conversations/"+conv.String(), "Bearer test-key")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	var out []askConversationTurn
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if len(out) != 1 || len(out[0].Sources) != 2 {
+		t.Fatalf("out = %+v, want 1 turn with 2 sources", out)
+	}
+	if got := out[0].Sources[0].OccurredAt; got == nil || !got.Equal(occurredAt) {
+		t.Errorf("sources[0].OccurredAt = %v, want %s", got, occurredAt)
+	}
+	if got := out[0].Sources[1].OccurredAt; got != nil {
+		t.Errorf("sources[1].OccurredAt = %v, want nil (pre-#218 row has no captured event time)", got)
 	}
 }

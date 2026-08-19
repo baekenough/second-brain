@@ -121,6 +121,7 @@ func (s *Server) saveAskTurn(ctx context.Context, conversationID uuid.UUID, turn
 	for _, src := range sources {
 		storeSources = append(storeSources, store.AskSource{
 			ID: src.ID, Title: src.Title, SourceType: src.SourceType, Score: src.Score,
+			OccurredAt: src.OccurredAt,
 		})
 	}
 

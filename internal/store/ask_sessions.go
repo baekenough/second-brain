@@ -12,15 +12,27 @@ import (
 )
 
 // AskSource mirrors internal/api.AskSourceItem's wire shape (id, title,
-// source_type, score) — that struct lives in internal/api, which this
-// package must not depend on (store is a lower layer than api), so the
-// shape is duplicated here rather than imported. Keep field names/JSON tags
-// in sync with internal/api/ask.go's AskSourceItem if either changes.
+// source_type, score, occurred_at) — that struct lives in internal/api,
+// which this package must not depend on (store is a lower layer than api),
+// so the shape is duplicated here rather than imported. Keep field
+// names/JSON tags in sync with internal/api/ask.go's AskSourceItem if
+// either changes.
+//
+// OccurredAt was added after ask_sessions rows already existed (issue
+// #218); no migration was needed because this struct is marshaled straight
+// into the sources JSONB column (migration 024) rather than its own SQL
+// columns. Rows written before this change have no "occurred_at" key at
+// all, so json.Unmarshal leaves OccurredAt as its zero value, nil — the
+// same value a row written after this change uses for "no known event
+// time". A pre-existing row therefore silently reads back as "no event
+// time" rather than erroring, which is the correct degradation: no
+// backfill can recover a value that was never captured.
 type AskSource struct {
-	ID         string  `json:"id"`
-	Title      string  `json:"title"`
-	SourceType string  `json:"source_type"`
-	Score      float64 `json:"score"`
+	ID         string     `json:"id"`
+	Title      string     `json:"title"`
+	SourceType string     `json:"source_type"`
+	Score      float64    `json:"score"`
+	OccurredAt *time.Time `json:"occurred_at"`
 }
 
 // AskSession represents one row in ask_sessions (migration 024): a single

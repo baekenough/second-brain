@@ -24,16 +24,31 @@ type AskRequest struct {
 	ConversationID string `json:"conversation_id,omitempty"`
 }
 
-// AskSourceItem mirrors web/src/lib/types.ts:122-127 EXACTLY — field names
+// AskSourceItem mirrors web/src/lib/types.ts:132-138 EXACTLY — field names
 // and JSON types are a wire contract with the already-shipped frontend, not
 // free to rename. id is mandatory: it is the only future path to
 // (query, document_id, thumbs) feedback labels (see feedback.go's
-// FeedbackRequest.DocumentID).
+// FeedbackRequest.DocumentID). The line range is a hint for humans, not an
+// enforced contract — it drifts whenever either file is edited independently
+// (it already has once); TestAskHandler_SSEFieldNames is what actually pins
+// the JSON keys.
+//
+// OccurredAt deliberately has NO omitempty. This field exists to let a
+// client verify #215's recency-sort direction against real traffic — a
+// document without a known event time still needs the key present with a
+// JSON null so "no event time" (null) is distinguishable from "the server
+// has not shipped this field yet" (missing key). Before this field existed,
+// a deployment check that expected occurred_at could not tell those two
+// cases apart and misread an absent field as a sort bug (issue #218). Every
+// call site that fills this struct (mapAskSources, toAskSourceItems) must
+// pass through whatever *time.Time it has, nil included, rather than
+// skipping the field.
 type AskSourceItem struct {
-	ID         string  `json:"id"`
-	Title      string  `json:"title"`
-	SourceType string  `json:"source_type"`
-	Score      float64 `json:"score"`
+	ID         string     `json:"id"`
+	Title      string     `json:"title"`
+	SourceType string     `json:"source_type"`
+	Score      float64    `json:"score"`
+	OccurredAt *time.Time `json:"occurred_at"`
 }
 
 // askConversationPayload is the "conversation" SSE event body. It is sent
@@ -391,6 +406,7 @@ func mapAskSources(results []*model.SearchResult) []AskSourceItem {
 			Title:      r.Document.Title,
 			SourceType: string(r.Document.SourceType),
 			Score:      r.Score,
+			OccurredAt: r.Document.OccurredAt,
 		})
 	}
 	return items
