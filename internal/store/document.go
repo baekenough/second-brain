@@ -398,19 +398,48 @@ func (s *DocumentStore) Search(ctx context.Context, query model.SearchQuery) ([]
 // search which aliases documents as d, "" for fulltext search which uses the
 // bare column names). When tableAlias is non-empty a dot-prefix is added.
 //
-// For "recent", we order by the original event time (occurred_at) when
-// available, falling back to collected_at — the same COALESCE strategy used
-// in ListRecent / ListBySource — so that "latest gmail" returns the most
-// recently sent email, not the most recently ingested one.
-func sortOrder(sort string, tableAlias string) string {
+// "recent" means NEAREST TO NOW FIRST, and which SQL clause expresses that
+// depends on the event-time window. This function does NOT decide that: both
+// the whitelist test and the direction come from model.SearchQuery
+// (SortsByRecency / RecencyAscending), which is the single definition of the
+// rule and carries its full rationale.
+//
+// It has to be shared rather than restated because this clause is not the only
+// place the order is applied: internal/search re-establishes the same order in
+// Go over result sets it assembled itself (store results fused with chunk-lane
+// candidates, which never passed through this ORDER BY). Two copies of the rule
+// would order those two result shapes differently, and nothing in the response
+// distinguishes them.
+//
+// The historical DESC branch keeps its COALESCE onto collected_at — the same
+// strategy as ListRecent / ListBySource, so "latest gmail" returns the most
+// recently sent email rather than the most recently ingested one.
+//
+// The ASC branch does not COALESCE. Whenever either bound is set the lanes
+// already exclude occurred_at IS NULL (see appendOccurredRangeFilters), so on
+// this branch occurred_at is non-NULL by construction and coalescing would only
+// re-admit collected_at as a sort key for rows that cannot be in the result.
+//
+// Injection safety is unchanged and must stay that way: `sort` is compared
+// against the exact literal "recent" and never reaches the output, the window
+// is read for its direction only (its values are bound as parameters
+// elsewhere), and every returned clause remains a compile-time constant modulo
+// the caller-supplied alias. A non-whitelisted Sort still collapses to
+// "score DESC" regardless of the window.
+func sortOrder(query model.SearchQuery, now time.Time, tableAlias string) string {
+	if !query.SortsByRecency() {
+		return "score DESC"
+	}
+
 	prefix := ""
 	if tableAlias != "" {
 		prefix = tableAlias + "."
 	}
-	if sort == "recent" {
-		return fmt.Sprintf("COALESCE(%soccurred_at, %scollected_at) DESC", prefix, prefix)
+
+	if query.RecencyAscending(now) {
+		return fmt.Sprintf("%soccurred_at ASC", prefix)
 	}
-	return "score DESC"
+	return fmt.Sprintf("COALESCE(%soccurred_at, %scollected_at) DESC", prefix, prefix)
 }
 
 // fulltextSearch uses PostgreSQL ts_rank against the pre-computed tsvector column.
@@ -484,7 +513,7 @@ func buildFulltextSearchQuery(query model.SearchQuery) (string, []interface{}) {
 		%s
 		%s
 		ORDER BY %s
-		LIMIT $2`, statusFilter, sourceFilter, excludeFilter, occurredFilter, sortOrder(query.Sort, ""))
+		LIMIT $2`, statusFilter, sourceFilter, excludeFilter, occurredFilter, sortOrder(query, time.Now(), ""))
 
 	return q, args
 }
@@ -842,7 +871,7 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 		statusFilter, sourceFilter, excludeFilter, occurredFilter, // summvec
 		entityCTE, // entity lane carries the same filters in d.-qualified form
 		buildRRFScoreExpr(w),
-		sortOrder(query.Sort, "d"))
+		sortOrder(query, time.Now(), "d"))
 
 	return q, args
 }

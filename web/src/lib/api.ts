@@ -9,6 +9,9 @@ import type {
   CreateNoteResponse,
   DocumentDetail,
   DocumentsResponse,
+  EvidenceFeedbackRequest,
+  EvidenceFeedbackResponse,
+  EvidenceVote,
   GraphEntitiesResponse,
   GraphEntityHit,
   GraphEntryResponse,
@@ -370,4 +373,53 @@ export async function uploadFile(file: File): Promise<IngestFileResponse> {
     method: "POST",
     body: formData,
   });
+}
+
+// ── Evidence feedback (Part D) ───────────────────────────────────────────
+//
+// Browser-only. Hits the /api/feedback/evidence proxy route
+// (web/src/app/api/feedback/evidence/route.ts), which forwards to the
+// backend's POST /api/v1/feedback/evidence.
+//
+// Neither the request nor the response is ever logged: the body carries the
+// user's own question and a document id for personal material.
+
+/** Thrown when the endpoint answers 404, which is what FEEDBACK_EVIDENCE_ENABLED
+ * being off looks like from here — the handler returns 404 before reading the
+ * body, precisely so a disabled feature is indistinguishable from an absent
+ * one. The caller hides the thumbs buttons instead of showing an error. */
+export class EvidenceFeedbackDisabledError extends Error {
+  constructor() {
+    super("evidence feedback disabled");
+    this.name = "EvidenceFeedbackDisabledError";
+  }
+}
+
+/** Records one thumbs judgement on one evidence card and returns the value the
+ * *server* settled on.
+ *
+ * The upstream upsert is idempotent per (conversation, normalised query,
+ * document) and toggles a repeated identical vote back to 0, so replaying this
+ * call is safe — which is what makes an optimistic UI update recoverable.
+ *
+ * The question is sent in the POST body, never as a query parameter: it is
+ * personal text and a query string is logged by every hop in between. */
+export async function sendEvidenceFeedback(
+  request: EvidenceFeedbackRequest,
+): Promise<EvidenceVote> {
+  const response = await fetch(`${getApiBase()}/feedback/evidence`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  if (response.status === 404) {
+    throw new EvidenceFeedbackDisabledError();
+  }
+  if (!response.ok) {
+    // The status line only; the body could echo validation detail.
+    throw new Error(`API error: ${response.status} ${response.statusText}`);
+  }
+  const data = (await response.json()) as EvidenceFeedbackResponse;
+  // Defensive: an unexpected value must not become the rendered state.
+  return data.thumbs === 1 || data.thumbs === -1 ? data.thumbs : 0;
 }
