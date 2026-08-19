@@ -40,6 +40,23 @@ type ChunkSearchResult struct {
 	DocumentTitle  string
 	DocumentSource string // source_type value (e.g. "slack", "github")
 	DocumentStatus string
+
+	// DocumentOccurredAt / DocumentCollectedAt are the parent document's event
+	// and ingest times. They are selected here — rather than left to a second
+	// fetch — because internal/search orders a merged result set in Go, and a
+	// document reachable ONLY through a chunk lane never passes through the
+	// document store's ORDER BY.
+	//
+	// Without them such a document has no usable timestamp at all, and
+	// search.recencyKey ranks it LAST in both directions. For a forward-looking
+	// window that is the exact inversion of what Sort="recent" means: the most
+	// imminent entry is shown as the furthest away (#215).
+	//
+	// DocumentOccurredAt stays a pointer, and NULL stays nil: "no event-time
+	// concept" and "the epoch" are different facts, and the COALESCE onto
+	// collected_at belongs to the ordering rule, not to this row.
+	DocumentOccurredAt  *time.Time
+	DocumentCollectedAt time.Time
 }
 
 // ChunkStore provides chunk persistence and FTS search operations.
@@ -141,7 +158,9 @@ func (s *ChunkStore) SearchFTS(ctx context.Context, query string, limit int) ([]
 			) AS rank,
 			d.title          AS document_title,
 			d.source_type    AS document_source,
-			d.status         AS document_status
+			d.status         AS document_status,
+			d.occurred_at    AS document_occurred_at,
+			d.collected_at   AS document_collected_at
 		FROM chunks c
 		JOIN documents d ON d.id = c.document_id
 		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
@@ -170,6 +189,8 @@ func (s *ChunkStore) SearchFTS(ctx context.Context, query string, limit int) ([]
 			&r.DocumentTitle,
 			&r.DocumentSource,
 			&r.DocumentStatus,
+			&r.DocumentOccurredAt,
+			&r.DocumentCollectedAt,
 		); err != nil {
 			return nil, fmt.Errorf("chunks search FTS scan: %w", err)
 		}
@@ -383,7 +404,9 @@ func (s *ChunkStore) SearchVector(ctx context.Context, queryVec []float32, limit
 			1 - (c.embedding <=> $1::vector)  AS score,
 			d.title          AS document_title,
 			d.source_type    AS document_source,
-			d.status         AS document_status
+			d.status         AS document_status,
+			d.occurred_at    AS document_occurred_at,
+			d.collected_at   AS document_collected_at
 		FROM chunks c
 		JOIN documents d ON d.id = c.document_id
 		WHERE c.embedding IS NOT NULL
@@ -411,6 +434,8 @@ func (s *ChunkStore) SearchVector(ctx context.Context, queryVec []float32, limit
 			&r.DocumentTitle,
 			&r.DocumentSource,
 			&r.DocumentStatus,
+			&r.DocumentOccurredAt,
+			&r.DocumentCollectedAt,
 		); err != nil {
 			return nil, fmt.Errorf("chunks search vector scan: %w", err)
 		}

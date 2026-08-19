@@ -37,12 +37,19 @@ type ChunkSearcher interface {
 // inside an event-time window. It is satisfied by *store.DocumentStore.
 //
 // It exists for the chunk lanes. Those lanes cannot carry the window into their
-// own SQL (ChunkSearcher takes only a query/vector and a limit) and the rows
-// they return carry no occurred_at, so the service used to switch them off
-// entirely whenever a window was set. That was safe but expensive: it deleted
-// chunk-level recall from every temporal query, and a query planner sets a
-// window on most temporal questions. Joining the candidates back to `documents`
-// on id restores the recall while keeping the window a real constraint.
+// own SQL (ChunkSearcher takes only a query/vector and a limit), so the service
+// used to switch them off entirely whenever a window was set. That was safe but
+// expensive: it deleted chunk-level recall from every temporal query, and a
+// query planner sets a window on most temporal questions. Joining the
+// candidates back to `documents` on id restores the recall while keeping the
+// window a real constraint.
+//
+// Selecting occurred_at in the chunk join (#215) does NOT make this redundant.
+// The window must be a WHERE predicate: the chunk lanes truncate at their own
+// LIMIT before the service sees a single row, so filtering afterwards on a
+// timestamp the row now carries would shrink the page instead of narrowing the
+// candidate pool. The join gives those rows an ORDER; this interface is what
+// gives them a MEMBERSHIP test.
 type OccurredRangeChecker interface {
 	FilterIDsByOccurredRange(ctx context.Context, ids []uuid.UUID, from, to *time.Time) (map[uuid.UUID]struct{}, error)
 }
@@ -67,6 +74,13 @@ type Service struct {
 	// any wiring. The field exists for callers that inject a different store
 	// (and for tests).
 	occurredChecker OccurredRangeChecker
+
+	// activeWeights supplies the promoted RRF weighting (#214); nil, and
+	// activeWeightsEnabled false, when the deployment has not opted in. See
+	// WithActiveWeights and defaultWeights in active_weights.go.
+	activeWeights        ActiveWeightsReader
+	activeWeightsEnabled bool
+	activeWeightsLog     *activeWeightsFailureLog
 }
 
 // NewService returns a search Service.
@@ -335,11 +349,14 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	q = applyInsightExclusionDefault(q)
 	warnOnSourceFilterConflict(q)
 
-	// Apply service-level weights when the caller has not set explicit weights.
+	// Apply the default weighting when the caller has not set explicit weights.
 	// A zero-value Weights field means "use defaults", so we only overwrite
-	// when the service weights are non-zero (i.e. explicitly configured).
+	// when the resolved default is non-zero (i.e. explicitly configured or
+	// promoted). defaultWeights owns the precedence between the promoted row,
+	// the service-level weights and the compiled defaults, and is the only
+	// thing that reads search_weights_history — see active_weights.go.
 	if q.Weights == (model.SearchWeights{}) {
-		q.Weights = s.weights
+		q.Weights = s.defaultWeights(ctx)
 	}
 
 	// HyDE query expansion: replace the effective query with the original
@@ -369,8 +386,10 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 
 	// An event-time window is a hard constraint on WHICH documents may be
 	// returned. The document store enforces it in SQL inside every lane; the
-	// chunk lanes cannot, because ChunkSearcher takes no date range and the rows
-	// it returns carry no occurred_at.
+	// chunk lanes cannot, because ChunkSearcher takes no date range — the rows
+	// it returns now carry occurred_at (#215), but only after their own LIMIT
+	// has already been applied, so reading it cannot substitute for the
+	// predicate.
 	//
 	// Previously the chunk lanes were skipped outright whenever a window was
 	// set. That was correct — an unfiltered lane fills exactly the slots the
@@ -461,12 +480,14 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	// Making the recency sort the last step would silently change the
 	// rerank+recent combination, which is a different question from this one.
 	//
-	// Chunk-only documents carry no timestamps (the chunk join selects none),
-	// so they sort last — see recencyKey. Their membership is unaffected, and
-	// under a window they are still verified against it; only their position is
-	// approximate. Giving them a real position needs occurred_at back from the
-	// verification lane, which is a store-interface change and out of scope
-	// here.
+	// Chunk-only documents used to carry no timestamps at all, so they sorted
+	// last in BOTH directions — the position was approximate even though the
+	// membership was exact. Since #215 the chunk join selects the parent's
+	// occurred_at/collected_at (see chunkTimestamps), so they are placed on the
+	// same key as every store row. Only a document whose parent genuinely has
+	// no event time still falls to the "unplaceable" branch of recencyKey, and
+	// only on the ascending side, where placing it would mean ordering an
+	// ingest instant among event instants.
 	if chunkFused && q.SortsByRecency() {
 		sortByRecency(results, q.RecencyAscending(time.Now()))
 	}
@@ -688,18 +709,50 @@ func (s *Service) searchChunksFTS(ctx context.Context, query string, limit int) 
 
 // chunkVecToSearchResult converts a vector-search ChunkSearchResult to a
 // model.SearchResult using the Score field (cosine similarity).
+//
+// The timestamps come from the chunk join's `documents` row (#215); see
+// chunkTimestamps for why they are not optional.
 func chunkVecToSearchResult(r store.ChunkSearchResult) *model.SearchResult {
+	occurred, collected := chunkTimestamps(r)
 	return &model.SearchResult{
 		Document: model.Document{
-			ID:         r.Chunk.DocumentID,
-			SourceType: model.SourceType(r.DocumentSource),
-			Title:      r.DocumentTitle,
-			Content:    r.Chunk.Content,
-			Status:     r.DocumentStatus,
+			ID:          r.Chunk.DocumentID,
+			SourceType:  model.SourceType(r.DocumentSource),
+			Title:       r.DocumentTitle,
+			Content:     r.Chunk.Content,
+			Status:      r.DocumentStatus,
+			OccurredAt:  occurred,
+			CollectedAt: collected,
 		},
 		Score:     r.Score,
 		MatchType: "chunk-vector",
 	}
+}
+
+// chunkTimestamps copies the parent document's event and ingest times off a
+// chunk-lane row.
+//
+// A chunk-only document — one no other lane returned — is ordered entirely
+// from these two values: it never passes through the document store's ORDER BY,
+// so search.sortByRecency is the only thing that places it, and recencyKey
+// treats a result with neither timestamp as unplaceable and sends it to the
+// back of the list in BOTH directions. Under a forward-looking window that
+// inverts the answer: the most imminent entry is shown as the furthest away
+// (#215).
+//
+// The pointer is copied rather than dereferenced-with-fallback on purpose. A
+// NULL occurred_at must stay nil so that the descending branch's
+// COALESCE(occurred_at, collected_at) still happens in recencyKey and the
+// ascending branch still refuses to place the row: synthesising an event time
+// out of the ingest time here would make "happened then" and "ingested then"
+// indistinguishable one layer too early, which is the same conflation the
+// window filter deliberately avoids (see SearchQuery.OccurredFrom).
+func chunkTimestamps(r store.ChunkSearchResult) (*time.Time, time.Time) {
+	if r.DocumentOccurredAt == nil {
+		return nil, r.DocumentCollectedAt
+	}
+	occurred := *r.DocumentOccurredAt // copy: never alias the store's row
+	return &occurred, r.DocumentCollectedAt
 }
 
 // chunkToSearchResult converts a ChunkSearchResult to a model.SearchResult.
@@ -708,13 +761,16 @@ func chunkVecToSearchResult(r store.ChunkSearchResult) *model.SearchResult {
 // The full document fetch is deliberately omitted to keep search fast; callers
 // can fetch the full document via GET /api/v1/documents/{id} if needed.
 func chunkToSearchResult(r store.ChunkSearchResult) *model.SearchResult {
+	occurred, collected := chunkTimestamps(r)
 	return &model.SearchResult{
 		Document: model.Document{
-			ID:         r.Chunk.DocumentID,
-			SourceType: model.SourceType(r.DocumentSource),
-			Title:      r.DocumentTitle,
-			Content:    r.Chunk.Content, // snippet: the matching chunk text
-			Status:     r.DocumentStatus,
+			ID:          r.Chunk.DocumentID,
+			SourceType:  model.SourceType(r.DocumentSource),
+			Title:       r.DocumentTitle,
+			Content:     r.Chunk.Content, // snippet: the matching chunk text
+			Status:      r.DocumentStatus,
+			OccurredAt:  occurred,
+			CollectedAt: collected,
 		},
 		Score:     r.Rank,
 		MatchType: "chunk-fts",
