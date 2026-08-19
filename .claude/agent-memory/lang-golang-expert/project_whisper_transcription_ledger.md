@@ -21,4 +21,4 @@ WhisperCollector is now a `StreamingCollector`: `CollectStream(ctx, since, onBat
 
 **Tailscale:** `whisperPrivateCIDRs` includes `100.64.0.0/10` (RFC 6598 CGNAT) so Tailscale 100.x endpoints count as local (issue #100).
 
-**Testing gotcha:** do NOT run `go test ./internal/store/...` — live prod postgres (db `second_brain`) is reachable and store tests open real connections. Run only DB-free store tests by name (TestEmbeddingDimMigrationFilename, TestNeedsEmbeddingDimGUC). Collector/scheduler/config tests are DB-free and safe.
+**Testing gotcha (CORRECTED 2026-08-18):** `go test ./internal/store/...` is safe — verified by inspection (no test in the package reads `DATABASE_URL` or opens a pool; the suite runs in ~0.5 s) and by running the full `go test ./...`. The earlier "store tests open real connections to prod" note in this file was wrong; store tests assert on generated SQL strings, not on a live database. Real SQL semantics still cannot be checked that way — use a throwaway local `postgres:16-alpine` container with a temp table and ROLLBACK (see [[project_temporal_window_retrieval]]).

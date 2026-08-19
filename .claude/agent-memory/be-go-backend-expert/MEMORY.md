@@ -8,3 +8,15 @@
 - [project_cutover_floor.md](project_cutover_floor.md) — COLLECTOR_CUTOVER env var: config-driven floor for IndexAware collectors; CutoverAwareCollector interface; scheduler WithCutover builder
 - [project_sms_streaming_issue102.md](project_sms_streaming_issue102.md) — Issue #102: SMSCollector CollectStream — buffered-read + bounded-batch-emit (smsStreamBatchSize=500); onBatchErr sentinel; FUSE safety preserved
 - [project_whisper_filename_cutover.md](project_whisper_filename_cutover.md) — Issue #110: recordingTime() parses VoiceRecorder/TPhone filename dates for cutover floor; mtime fallback for unparseable names
+- [project_ask_date_context_fix.md](project_ask_date_context_fix.md) — /ask date-context bug: buildAskSystemPrompt(now)+occurred_at in doc lines, KST tz, Server.now mirrors intent.LLMClassifier.now
+- [project_ask_multiturn.md](project_ask_multiturn.md) — /ask multi-turn: query rewrite, "conversation" SSE event, turn persistence (fail-open, save-after-done), GET conversations endpoints
+- [project_graph_projection_partb.md](project_graph_projection_partb.md) — Neo4j 파생 투영: pgId MERGE 멱등성, Cypher 리터럴 화이트리스트, Neo4j 내 워터마크, throwaway 컨테이너 SQL 검증법
+- [project_langfuse_otel_instrumentation.md](project_langfuse_otel_instrumentation.md) — OTel→Langfuse tracing (internal/telemetry, llm/search/whisper spans); literal gen_ai.* keys not semconv; lazy otel.Tracer() calls; test pattern
+- [project_store_sql_test_harness.md](project_store_sql_test_harness.md) — internal/store엔 DB 테스트 하네스 없음; TEST_DATABASE_URL 게이트 + throwaway pgvector 컨테이너(전체 마이그레이션 금지, pg_bigm 때문)
+- [project_partc_actions_briefing.md](project_partc_actions_briefing.md) — Part C 액션·브리핑 백엔드: 근거 강제/폐기, 입력해시 캐시 키에 LLM_MODEL env 사용 이유, resolved_at 멱등 규칙
+- [project_feedback_loop_partd.md](project_feedback_loop_partd.md) — Part D 피드백 루프: store↔dataset 사이클 회피(split을 SQL 계산), PG bit(32)::bigint=unsigned, SearchQuery.Weights per-request, holdout 격리 컴파일 검증
+- [project_briefing_timeout_writedeadline.md](project_briefing_timeout_writedeadline.md) — 브리핑 degraded 원인(30초 2중 절단): BRIEFING_TIMEOUT_SECONDS + 핸들러 단위 write deadline 연장, HTTP_WRITE_TIMEOUT_SECONDS, #195 연관
+- [project_search_source_filter_contract.md](project_search_source_filter_contract.md) — 소스 필터 계약: 단수/복수 union, exclude 우선, /ask insight 사전조정, R4는 OccurredRangeChecker 사후검증(fail-closed)
+- [project_tune_optimizer_task89.md](project_tune_optimizer_task89.md) — Task 8/9: 게이트 사유 enum+Describe 분리, TUNE_ENABLED가 롤백까지 게이트, evidence span은 성공 시 3속성만
+- [project_sort_recent_vs_rrf.md](project_sort_recent_vs_rrf.md) — RRF=선택/Sort=표시순서; recent 방향은 model.RecencyAscending 단일 정의를 store SQL·search Go 정렬이 공유
+- [project_active_weights_serving.md](project_active_weights_serving.md) — #214 승격 가중치 서빙: 캐시 없이 요청마다 읽는 이유(tune=별도 프로세스), 우선순위 3단, SEARCH_ACTIVE_WEIGHTS_ENABLED 기본 off

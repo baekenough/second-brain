@@ -16,8 +16,11 @@ metadata:
 **How to apply:**
 - 정렬/랭킹을 건드릴 때 `q.Sort == "recent"` 문자열 비교를 새로 쓰지 말고 `SortsByRecency()` / `RecencyAscending()` 을 쓴다.
 - 융합 후 정렬은 `chunkFused` 일 때만 적용한다 — 스토어 단독 결과에 다시 정렬을 걸면 DB가 더 많은 정보로 매긴 순서를 덮어쓴다.
-- 청크 전용 문서는 timestamp를 못 들고 온다(청크 조인이 선택하지 않음) → recency 정렬에서 항상 뒤로 간다.
-  제대로 배치하려면 `OccurredRangeChecker` 가 id 집합 대신 occurred_at 을 돌려줘야 하고, 이는 store 인터페이스 변경이다(미착수).
+- **(해결, #215)** 청크 전용 문서가 timestamp를 못 들고 오던 문제는 `OccurredRangeChecker` 를 바꾸는 대신
+  **청크 조인 SELECT 에 `d.occurred_at` / `d.collected_at` 을 추가**해서 닫았다(`store.ChunkSearchResult.DocumentOccurredAt/CollectedAt`
+  → `search.chunkTimestamps`). checker 인터페이스는 그대로다 — 창은 여전히 WHERE 술어여야 하고,
+  청크 레인은 자기 LIMIT 으로 이미 자른 뒤라 사후 필터링은 후보 축소가 아니라 **페이지 축소**가 된다.
+  즉 조인은 ORDER 를, checker 는 MEMBERSHIP 을 담당한다.
 - 동점은 시각 → Score DESC → id ASC 전순서로 깬다(`mergeRRF` 가 map을 평탄화하므로 안정정렬만으로는 비결정적, #191과 같은 부류).
 
-관련: [[project_search_source_filter_contract]]
+관련: [[project_search_source_filter_contract]], [[active-weights-serving]]
