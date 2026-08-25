@@ -13,14 +13,36 @@ import (
 type SourceType string
 
 const (
-	SourceSlack          SourceType = "slack"
-	SourceGitHub         SourceType = "github"
-	SourceGDrive         SourceType = "gdrive"
-	SourceNotion         SourceType = "notion"
-	SourceFilesystem     SourceType = "filesystem"
-	SourceDiscord        SourceType = "discord"
-	SourceTelegram       SourceType = "telegram"
-	SourceSecretary      SourceType = "secretary"
+	SourceSlack      SourceType = "slack"
+	SourceGitHub     SourceType = "github"
+	SourceGDrive     SourceType = "gdrive"
+	SourceNotion     SourceType = "notion"
+	SourceFilesystem SourceType = "filesystem"
+	SourceDiscord    SourceType = "discord"
+	SourceTelegram   SourceType = "telegram"
+	SourceSecretary  SourceType = "secretary"
+	// SourceLLMMemory is DEPRECATED as of 2026-08-25 — DO NOT write new
+	// documents with this source_type.
+	//
+	// 폐기 사유(2026-08-25): memory-collector 데몬이 Claude Code/Codex 세션
+	// 트랜스크립트 전체를 이 source_type 으로 적재하고 있었다. 19,933건
+	// (평균 35,930자, 최대 490,324자, 청크 353,843개 — 코퍼스 청크의 76.5%)이
+	// 쌓여 검색 랭킹을 세션 덤프가 지배하면서 RAG 품질을 잠식했다. 전량
+	// 폐기(삭제)했고, 수집 데몬은 4대 머신(macmini/ubuntu1/ubuntu2 등)에서
+	// 전부 정지·비활성화했다.
+	//
+	// MCP add_note 도구도 과거 이 값을 썼으나(에이전트가 의도적으로 남기는
+	// 짧은 노트 — 세션 덤프와는 성격이 다른 데이터), 같은 이름표를 공유해
+	// 구분이 불가능했던 것이 문제였다. add_note 는 이제 SourceAgentNote 를
+	// 쓴다(cmd/mcp/main.go registerAddNoteTool). 이 상수 자체를 지우지 않는
+	// 이유는 기존에 이미 적재된 레거시 문서(예: secretary 경유 llm-memory
+	// 1건, migrations/027 참고)를 여전히 이 값으로 식별해야 하기 때문이다.
+	//
+	// internal/store의 upsert 가드(checkSourceTypeGuard)가 이 타입으로의
+	// 신규 저장 시도를 감지해 경고 로그를 남긴다 — 이 주석이 없어지면
+	// "왜 막혀 있지?" 하고 나중에 누군가 되살릴 수 있으므로 반드시 유지할 것.
+	// 이 값을 model.KnownSourceTypes()/DeprecatedSourceTypes() 에서 지우거나
+	// 옮기려면 위 배경을 먼저 이해할 것 (internal/model/source_validation.go).
 	SourceLLMMemory      SourceType = "llm-memory"
 	SourceGmail          SourceType = "gmail"
 	SourceCalendar       SourceType = "calendar"
@@ -29,9 +51,13 @@ const (
 	SourceCallTranscript SourceType = "call-transcript"
 	SourceUpload         SourceType = "upload"
 	// SourceNote is a user-authored note captured via POST /api/v1/notes
-	// (Capture). Distinct from SourceLLMMemory (MCP add_note tool,
+	// (Capture). Distinct from SourceAgentNote (MCP add_note tool,
 	// AI-agent-authored) — see spec §3.3. Content is write-once; only
 	// Title/Metadata are ever updated after creation, by NoteEnrichmentWorker.
+	// NoteEnrichmentWorker (and the insight-extraction pipeline it drives) is
+	// scoped to source_type='note' specifically — SourceAgentNote documents
+	// are NOT picked up by it. Keep the two source types separate rather than
+	// merging them; see SourceAgentNote's doc comment for why.
 	SourceNote SourceType = "note"
 	// SourceInsight is an LLM-derived inference extracted from a SourceNote
 	// document by NoteEnrichmentWorker. Never user-authored; always carries
@@ -39,34 +65,48 @@ const (
 	// §6.5). Excluded from default /api/v1/search results (see
 	// internal/api/search.go applyInsightExclusionDefault).
 	SourceInsight SourceType = "insight"
+	// SourceAgentNote is a note deliberately persisted by an AI agent via the
+	// MCP add_note tool (cmd/mcp/main.go registerAddNoteTool). Added
+	// 2026-08-25 as the replacement for SourceLLMMemory, which add_note used
+	// to write to — see SourceLLMMemory's doc comment for the full
+	// background (session-transcript contamination that source_type shared
+	// with these deliberately-authored notes).
+	//
+	// Deliberately NOT merged into SourceNote: SourceNote is scoped by spec
+	// §3.3 to user-authored Capture content and is the sole input to
+	// NoteEnrichmentWorker's insight-extraction pipeline. Writing
+	// agent-authored notes there would silently enroll every MCP add_note
+	// call in that (LLM-cost-bearing) pipeline — an unrequested behavior
+	// change, not just a rename.
+	SourceAgentNote SourceType = "agent-note"
 )
 
 // Document represents a piece of content collected from an external source.
 type Document struct {
-	ID          uuid.UUID      `json:"id"`
-	SourceType  SourceType     `json:"source_type"`
-	SourceID    string         `json:"source_id"`
-	Title       string         `json:"title"`
-	Content     string         `json:"content"`
-	Metadata    map[string]any `json:"metadata"`
-	Embedding   []float32      `json:"-"`                    // omit from REST: large vector
-	Status      string         `json:"status"`               // "active", "deleted", "moved"
-	DeletedAt   *time.Time     `json:"deleted_at,omitempty"` // nil for active documents
+	ID         uuid.UUID      `json:"id"`
+	SourceType SourceType     `json:"source_type"`
+	SourceID   string         `json:"source_id"`
+	Title      string         `json:"title"`
+	Content    string         `json:"content"`
+	Metadata   map[string]any `json:"metadata"`
+	Embedding  []float32      `json:"-"`                    // omit from REST: large vector
+	Status     string         `json:"status"`               // "active", "deleted", "moved"
+	DeletedAt  *time.Time     `json:"deleted_at,omitempty"` // nil for active documents
 	// OccurredAt is the timestamp of the original event: email sent date,
 	// calendar event start time, SMS/call time, etc.  It is distinct from
 	// CollectedAt (when second-brain ingested the document).  Nil when the
 	// collector has no event-time concept or the value could not be parsed.
 	// "Latest" queries sort by COALESCE(occurred_at, collected_at) DESC so
 	// documents without OccurredAt degrade gracefully to ingest order.
-	OccurredAt  *time.Time     `json:"occurred_at,omitempty"`
-	CollectedAt time.Time      `json:"collected_at"`
-	CreatedAt   time.Time      `json:"created_at"`
-	UpdatedAt   time.Time      `json:"updated_at"`
+	OccurredAt  *time.Time `json:"occurred_at,omitempty"`
+	CollectedAt time.Time  `json:"collected_at"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
 
 	// LLM-generated summary fields (populated asynchronously by SummarizerWorker).
 	// NULL in DB until the worker processes the document.
-	TitleSummary    string    `json:"title_summary,omitempty"`
-	BulletSummary   string    `json:"bullet_summary,omitempty"`
+	TitleSummary     string    `json:"title_summary,omitempty"`
+	BulletSummary    string    `json:"bullet_summary,omitempty"`
 	SummaryEmbedding []float32 `json:"-"` // omit from REST: large vector
 }
 
@@ -74,7 +114,7 @@ type Document struct {
 type SearchResult struct {
 	Document
 	Score     float64  `json:"score"`
-	MatchType string   `json:"match_type"`          // "fulltext", "vector", or "hybrid"
+	MatchType string   `json:"match_type"`         // "fulltext", "vector", or "hybrid"
 	Entities  []Entity `json:"entities,omitempty"` // named entities extracted from the document; nil when not populated
 }
 

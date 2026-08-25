@@ -73,11 +73,17 @@ func TestMCPAuthContextFunc_NonBearerScheme_Unauthorized(t *testing.T) {
 // registerAddNoteTool wiring tests
 // ---------------------------------------------------------------------------
 
-// TestRegisterAddNoteTool_ForcesSourceLLMMemory verifies that the MCP
-// add_note tool, after the internal/note extraction, still persists
-// documents with SourceType=model.SourceLLMMemory and still rejects an
-// empty title — the two behaviours that must NOT regress (spec §6.2).
-func TestRegisterAddNoteTool_ForcesSourceLLMMemory(t *testing.T) {
+// TestRegisterAddNoteTool_ForcesSourceAgentNote verifies that the MCP
+// add_note tool, after the internal/note extraction, persists documents with
+// SourceType=model.SourceAgentNote and still rejects an empty title — the two
+// behaviours that must NOT regress (spec §6.2).
+//
+// Renamed 2026-08-25: add_note used to force model.SourceLLMMemory. That
+// source_type was deprecated after session-transcript documents sharing the
+// same label crowded out search results (see model.SourceLLMMemory's doc
+// comment); add_note now writes model.SourceAgentNote instead so
+// agent-authored notes remain distinguishable from that legacy contamination.
+func TestRegisterAddNoteTool_ForcesSourceAgentNote(t *testing.T) {
 	t.Parallel()
 
 	docs := &fakeMCPDocUpserter{}
@@ -94,8 +100,8 @@ func TestRegisterAddNoteTool_ForcesSourceLLMMemory(t *testing.T) {
 	if docs.lastDoc == nil {
 		t.Fatal("expected Upsert to be called")
 	}
-	if docs.lastDoc.SourceType != model.SourceLLMMemory {
-		t.Errorf("SourceType = %q, want %q", docs.lastDoc.SourceType, model.SourceLLMMemory)
+	if docs.lastDoc.SourceType != model.SourceAgentNote {
+		t.Errorf("SourceType = %q, want %q", docs.lastDoc.SourceType, model.SourceAgentNote)
 	}
 }
 
@@ -212,7 +218,9 @@ func (f *fakeStatsProvider) QueryBaselineStats(_ context.Context) (*store.Baseli
 // add_note tool registered, using the provided fakes. searchSvc may be nil
 // when the test never reaches the search execution path (i.e. auth-gate tests).
 func newTestMCPServer(
-	searchSvc interface{ Search(context.Context, model.SearchQuery) ([]model.SearchResult, error) },
+	searchSvc interface {
+		Search(context.Context, model.SearchQuery) ([]model.SearchResult, error)
+	},
 	docGetter DocumentGetter,
 	statsProvider StatsProvider,
 ) *mcpserver.MCPServer {
@@ -426,6 +434,7 @@ func TestAllowedSourceTypes_AllDeclaredTypesAccepted(t *testing.T) {
 		model.SourceCallLog,
 		model.SourceCallTranscript,
 		model.SourceUpload,
+		model.SourceAgentNote,
 	}
 
 	for _, st := range declared {
