@@ -1,0 +1,49 @@
+{
+  "settings": {
+    "index": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "refresh_interval": "30s"
+    },
+    "analysis": {
+      "tokenizer": {
+        "sb_nori_tokenizer": {
+          "type": "nori_tokenizer",
+          "decompound_mode": "mixed"
+        }
+      },
+      "filter": {
+        "sb_pos_filter": {
+          "type": "nori_part_of_speech",
+          "stoptags": ["E","IC","J","MAG","MAJ","MM","SP","SSC","SSO","SC","SE","XPN","XSA","XSN","XSV","UNA","NA","VSV"]
+        }
+      },
+      "analyzer": {
+        "sb_korean": {
+          "type": "custom",
+          "tokenizer": "sb_nori_tokenizer",
+          "filter": ["sb_pos_filter", "nori_readingform", "lowercase"]
+        }
+      }
+    }
+  },
+  "mappings": {
+    "properties": {
+      "chunk_id":     { "type": "long" },
+      "document_id":  { "type": "keyword" },
+      "source_type":  { "type": "keyword" },
+      "kind":         { "type": "keyword" },
+      "chunk_index":  { "type": "integer" },
+      "occurred_at":  { "type": "date" },
+      "title": {
+        "type": "text",
+        "analyzer": "sb_korean",
+        "fields": { "raw": { "type": "keyword", "ignore_above": 512 } }
+      },
+      "content": {
+        "type": "text",
+        "analyzer": "sb_korean"
+      }
+    }
+  }
+}

@@ -33,6 +33,20 @@ type ChunkSearcher interface {
 	SearchVector(ctx context.Context, queryVec []float32, limit int) ([]store.ChunkSearchResult, error)
 }
 
+// OpenSearchSearcher is the subset of the OpenSearch client used for the
+// BM25 (nori-analyzed) full-text lane. It is satisfied by
+// *OpenSearchClient (see opensearch.go).
+//
+// Unlike ChunkSearcher, its Search method takes the full model.SearchQuery
+// rather than a bare query/vector — the client applies the window and
+// source-type filters SERVER-SIDE (see buildOpenSearchRequest), which is why
+// this lane needs neither chunkLanesEnabled's fail-closed skip nor
+// verifyWindow's post-hoc check in Service.Search.
+type OpenSearchSearcher interface {
+	Enabled() bool
+	Search(ctx context.Context, q model.SearchQuery, limit int) ([]*model.SearchResult, error)
+}
+
 // OccurredRangeChecker verifies that a set of candidate document IDs falls
 // inside an event-time window. It is satisfied by *store.DocumentStore.
 //
@@ -67,6 +81,12 @@ type Service struct {
 	weights       model.SearchWeights // zero value uses defaults (k=60, equal weights)
 	reranker      Reranker            // nil when reranking is not configured
 	entityFetcher EntityFetcher       // nil when entity surfacing is not configured
+
+	// opensearch is nil unless OPENSEARCH_URL is configured (see
+	// factory.NewOpenSearchLane / WithOpenSearch). A nil value means this
+	// method's Search() runs the EXACT SAME code path it ran before this
+	// lane existed — see the "s.opensearch != nil" gate in Search().
+	opensearch OpenSearchSearcher
 
 	// occurredChecker verifies chunk-lane candidates against an event-time
 	// window. Usually nil: the document store already satisfies
@@ -134,6 +154,16 @@ func (s *Service) WithReranker(r Reranker) *Service {
 // field is nil. Safe to call with nil — surfacing is silently skipped.
 func (s *Service) WithEntityFetcher(ef EntityFetcher) *Service {
 	s.entityFetcher = ef
+	return s
+}
+
+// WithOpenSearch attaches the BM25 (nori-analyzed) full-text lane. Safe to
+// call with nil — the lane is then simply not run, and Search() behaves
+// exactly as it did before this lane existed. Disabled by DEFAULT: nothing
+// calls this unless OPENSEARCH_URL is set (see factory.NewOpenSearchLane and
+// cmd/server/main.go).
+func (s *Service) WithOpenSearch(c OpenSearchSearcher) *Service {
+	s.opensearch = c
 	return s
 }
 
@@ -430,6 +460,35 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 			}
 			if len(chunkVecResults) > 0 {
 				results = mergeRRF(results, chunkVecResults, q.Limit)
+				chunkFused = true
+			}
+		}
+	}
+
+	// OpenSearch (nori BM25) lane: additive full-text signal fused via RRF,
+	// the same way the chunk vector lane above is. Disabled unless
+	// OPENSEARCH_URL is configured (s.opensearch is nil by default — see
+	// WithOpenSearch), in which case this block is a no-op and the rest of
+	// Search() is byte-for-byte the pre-existing code path.
+	//
+	// The window/source-type filters do not need chunkLanesEnabled's gate
+	// here: OpenSearchSearcher.Search takes the whole query and applies both
+	// filters server-side (see buildOpenSearchRequest in opensearch.go), so
+	// what comes back already satisfies them. applySourceTypeFilters is still
+	// run below as cheap defense in depth, not because the server-side filter
+	// is expected to fail.
+	if s.opensearch != nil && s.opensearch.Enabled() {
+		osResults, oerr := s.opensearch.Search(ctx, q, q.Limit)
+		if oerr != nil {
+			// Non-fatal: an unreachable/erroring OpenSearch node must never
+			// fail the whole search request. Log and drop this lane's
+			// contribution, exactly like the chunk vector lane above.
+			slog.Warn("search: opensearch lane failed, skipping",
+				"error", oerr, "query", q.Query)
+		} else {
+			osResults = applySourceTypeFilters(q, osResults)
+			if len(osResults) > 0 {
+				results = mergeRRF(results, osResults, q.Limit)
 				chunkFused = true
 			}
 		}

@@ -1,0 +1,42 @@
+# ubuntu1 — second-brain 검색 비교용 OpenSearch (실험 스택)
+#
+# 기존 검색 경로(PostgreSQL FTS + pgvector + Neo4j)에는 전혀 손대지 않는다.
+# 이 스택은 같은 청크를 nori 형태소 분석으로 색인해 두어, 동일 질의에 대해
+# 두 방식의 결과를 나란히 비교할 수 있게 하는 것이 목적이다.
+#
+# 기동: docker compose -f opensearch-compose.yml up -d
+# 원복: docker compose -f opensearch-compose.yml down -v
+#
+# 포트는 127.0.0.1 에만 바인딩한다 — 개인 데이터 색인이므로 LAN 노출 금지.
+services:
+  opensearch:
+    build:
+      context: .
+      dockerfile: opensearch.Dockerfile
+    image: second-brain-opensearch:ubuntu1
+    container_name: sb-opensearch
+    environment:
+      discovery.type: single-node
+      # 단일 노드 실험용이라 보안 플러그인을 끈다. 루프백 바인딩이 접근 통제를 맡는다.
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      # 청크 10만 개 규모에는 2GB 힙이면 충분하다. 과할당은 다른 컨테이너를 밀어낸다.
+      OPENSEARCH_JAVA_OPTS: "-Xms2g -Xmx2g"
+      bootstrap.memory_lock: "true"
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile:  { soft: 65536, hard: 65536 }
+    ports:
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - osdata:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+volumes:
+  osdata:

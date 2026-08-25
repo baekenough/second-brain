@@ -116,6 +116,32 @@ type Config struct {
 	RerankAPIKey string // RERANKER_API_KEY — Bearer token for the reranker API
 	RerankModel  string // RERANKER_MODEL — model identifier sent in the request body
 
+	// OpenSearch (optional — BM25 full-text lane with Korean morphological
+	// (nori) tokenization, DISABLED when OPENSEARCH_URL is empty; this is
+	// the default and the only state this repo deploys today).
+	//
+	// Why: the existing Postgres FTS lane is pg_bigm (bigram), which has no
+	// notion of a morpheme boundary — "회의" matches inside "사회의"/"기회의".
+	// Measured against ubuntu1 production data, pg_bigm returned 4.7x more
+	// "회의" hits than an exact morpheme match (865 vs. 184). The excess is
+	// substring noise that dilutes the candidate pool before reranking ever
+	// sees it. See internal/search/opensearch.go for the full comparison and
+	// the fusion strategy (this lane is purely additive, RRF-fused alongside
+	// the existing chunk lanes — it never replaces pg_bigm or pgvector).
+	//
+	// OPENSEARCH_URL: base URL of the OpenSearch node (e.g.
+	// http://localhost:9200). Empty disables the lane entirely — no client
+	// is constructed and search.Service behaves exactly as it did before
+	// this feature existed (see search.NewOpenSearchLane).
+	// OPENSEARCH_INDEX: index name. Default "sb-chunks" (the name used by
+	// deploy/ubuntu1-stack/opensearch/index-settings.json).
+	// OPENSEARCH_TIMEOUT_SECONDS: per-request HTTP timeout. Default 5 — this
+	// lane is one signal among several, so a slow/unreachable node should
+	// degrade the search fast rather than hold up the whole request.
+	OpensearchURL            string
+	OpensearchIndex          string
+	OpensearchTimeoutSeconds int
+
 	// Alerting (optional — Slack/Discord webhook for eval regression alerts)
 	AlertWebhookURL string // ALERT_WEBHOOK_URL — Slack-compatible incoming webhook URL
 
@@ -737,6 +763,10 @@ func Load() (*Config, error) {
 		RerankAPIKey: os.Getenv("RERANKER_API_KEY"),
 		RerankModel:  getenv("RERANKER_MODEL", "jina-reranker-v2-base-multilingual"),
 
+		OpensearchURL:            os.Getenv("OPENSEARCH_URL"),
+		OpensearchIndex:          getenv("OPENSEARCH_INDEX", "sb-chunks"),
+		OpensearchTimeoutSeconds: opensearchTimeoutSeconds(),
+
 		AlertWebhookURL: os.Getenv("ALERT_WEBHOOK_URL"),
 
 		APIKey: os.Getenv("API_KEY"),
@@ -1166,6 +1196,29 @@ func askTimeoutSeconds() int {
 	n, err := strconv.Atoi(v)
 	if err != nil || n <= 0 {
 		slog.Warn("config: ASK_TIMEOUT_SECONDS is invalid; using default 60",
+			"value", v,
+			"error", err,
+		)
+		return defaultSeconds
+	}
+	return n
+}
+
+// opensearchTimeoutSeconds parses OPENSEARCH_TIMEOUT_SECONDS from the
+// environment. Default is 5 — the OpenSearch lane is one additive signal
+// among several (see internal/search/opensearch.go), so a slow/unreachable
+// node should degrade the whole search quickly rather than hold up a request
+// that would otherwise have succeeded on the other lanes alone.
+// Invalid values are ignored and the default is used.
+func opensearchTimeoutSeconds() int {
+	const defaultSeconds = 5
+	v := os.Getenv("OPENSEARCH_TIMEOUT_SECONDS")
+	if v == "" {
+		return defaultSeconds
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		slog.Warn("config: OPENSEARCH_TIMEOUT_SECONDS is invalid; using default 5",
 			"value", v,
 			"error", err,
 		)

@@ -3,6 +3,7 @@ package search
 import (
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/baekenough/second-brain/internal/config"
 )
@@ -60,4 +61,19 @@ func NewEmbeddingEngine(cfg *config.Config) (EmbeddingEngine, error) {
 	}
 
 	return engine, nil
+}
+
+// NewOpenSearchLane constructs the OpenSearch BM25 (nori) lane from cfg, or
+// returns nil when cfg.OpensearchURL is empty — THE DEFAULT. A nil return is
+// a true nil interface (not a typed-nil *OpenSearchClient wrapped in an
+// interface), so Service.WithOpenSearch's "s.opensearch != nil" gate in
+// search.go sees it as absent and runs the exact pre-existing code path.
+//
+// See internal/search/opensearch.go for why this lane exists at all.
+func NewOpenSearchLane(cfg *config.Config) OpenSearchSearcher {
+	if cfg.OpensearchURL == "" {
+		return nil
+	}
+	timeout := time.Duration(cfg.OpensearchTimeoutSeconds) * time.Second
+	return NewOpenSearchClient(cfg.OpensearchURL, cfg.OpensearchIndex, timeout)
 }

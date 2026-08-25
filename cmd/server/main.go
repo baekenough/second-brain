@@ -115,6 +115,16 @@ func run() error {
 		slog.Info("reranker configured", "url", cfg.RerankURL, "model", cfg.RerankModel)
 	}
 
+	// --- OpenSearch BM25 (nori) lane (optional) ---
+	// Disabled unless OPENSEARCH_URL is set — see internal/config.Config
+	// and internal/search/opensearch.go for why this lane exists.
+	osLane := search.NewOpenSearchLane(cfg)
+	if osLane != nil {
+		slog.Info("opensearch BM25 lane enabled", "url", cfg.OpensearchURL, "index", cfg.OpensearchIndex)
+	} else {
+		slog.Info("opensearch BM25 lane disabled — OPENSEARCH_URL not set")
+	}
+
 	// --- Search service ---
 	// ChunkStore is attached to enable chunk-based FTS fallback (issue #9).
 	// EntityStore is attached to surface entities in search results (issue #77).
@@ -133,6 +143,7 @@ func run() error {
 		WithChunkStore(chunkStore).
 		WithReranker(reranker).
 		WithEntityFetcher(entityStore).
+		WithOpenSearch(osLane).
 		WithActiveWeights(weightsHistoryStore, cfg.SearchActiveWeightsEnabled)
 	if cfg.SearchActiveWeightsEnabled {
 		slog.Info("search: serving the promoted weights from search_weights_history",
