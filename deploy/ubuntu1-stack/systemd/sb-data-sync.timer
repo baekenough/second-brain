@@ -1,0 +1,10 @@
+[Unit]
+Description=Run second-brain data sync every 10 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

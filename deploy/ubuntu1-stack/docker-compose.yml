@@ -1,0 +1,161 @@
+# =============================================================================
+# second-brain — ubuntu1 프로덕션 Compose (x86_64)
+# =============================================================================
+# 용도: macmini(arm64)에서 ubuntu1(x86_64)로 이전된 프로덕션 스택.
+#   server / collector / web / neo4j 네 서비스만 포함한다.
+#
+# PostgreSQL은 이 스택에 없다 — 이미 ubuntu1에서 별도 compose 프로젝트로
+# 실행 중이다 (~/second-brain-postgres/docker-compose.yml, 컨테이너명
+# second-brain-postgres). .env.local의 DATABASE_URL이 Tailscale IP
+# (100.68.237.99:5432)로 그 컨테이너를 직접 가리키므로 여기서는 postgres
+# 서비스도 depends_on도 걸지 않는다.
+#
+# 이미지는 이미 ubuntu1에 빌드/pull되어 있다 (build: 섹션 없음, 태그만 참조):
+#   second-brain-server:ubuntu1 / second-brain-collector:ubuntu1 /
+#   second-brain-web:ubuntu1 / neo4j:5.26-community
+#
+# 사전 조건:
+#   - .env.local, web/.env.local 이 이 디렉토리에 존재해야 합니다.
+#
+# 기동 (중요: --env-file 필수):
+#   docker compose --env-file .env.local -f docker-compose.ubuntu1.yml up -d
+#   NEO4J_PASSWORD 는 ${VAR} 치환이라 env_file(컨테이너 내부 주입)이 아니라
+#   --env-file(compose 자체의 변수 치환)로 와야 한다. 이 플래그를 빠뜨리면
+#   변수가 빈 값으로 치환되어 조용히 잘못된 상태로 기동하거나(neo4jdata가
+#   엉뚱한 기본 경로에 생성되는 등) 즉시 실패한다 — 과거 맥미니에서 동일한
+#   실수로 collector가 완전히 멈춘 사고가 있었다.
+#
+# 검증 (기동 전 문법/변수 확인):
+#   docker compose --env-file .env.local -f docker-compose.ubuntu1.yml config
+#
+# 중지/정리:
+#   docker compose --env-file .env.local -f docker-compose.ubuntu1.yml down
+#   docker compose --env-file .env.local -f docker-compose.ubuntu1.yml down -v
+# =============================================================================
+
+name: second-brain-ubuntu1
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # server — API 서버 (포트 8080). DB 마이그레이션을 직접 적용한다.
+  #   127.0.0.1 로만 바인딩한다 — cloudflared 터널이 같은 호스트에서
+  #   접근하므로 충분하며, 개인정보가 LAN에 노출되지 않아야 한다는 이
+  #   프로젝트의 관례(web은 127.0.0.1, postgres는 Tailscale IP 전용)와
+  #   일치한다. 원본(macmini)은 0.0.0.0:8081 이었다.
+  #   postgres는 별도 compose 프로젝트이므로 depends_on을 걸지 않는다.
+  # ---------------------------------------------------------------------------
+  server:
+    image: second-brain-server:ubuntu1
+    ports:
+      - "127.0.0.1:8081:8080"
+    env_file:
+      - .env.local
+    volumes:
+      - /home/baekenough/.second-brain/stage/call:/data/call
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # collector — 소스 데이터 수집 데몬 (포트 없음).
+  #   호스트의 원본 데이터를 ro 마운트한다. llm-memory.sqlite 마운트는
+  #   제거되었다 — 해당 데이터 소스는 이번 이전 작업에서 폐기됐다.
+  #   postgres는 별도 compose 프로젝트이므로 depends_on을 걸지 않는다.
+  # ---------------------------------------------------------------------------
+  collector:
+    image: second-brain-collector:ubuntu1
+    env_file:
+      - .env.local
+    environment:
+      # 레거시 로컬 pyannote 전용 셀렉터. 기본 전사 경로(OpenAI
+      # gpt-4o-transcribe-diarize)는 화자 분리를 자체 내장하며 이 값을
+      # 무시한다.
+      DIARIZATION_API_URL: "http://diarization:8001"
+      DIARIZATION_ENABLED: "${DIARIZATION_ENABLED:-false}"
+    volumes:
+      - /home/baekenough/.second-brain/secretary/gmail:/data/gmail:ro
+      - /home/baekenough/.second-brain/secretary/calendar:/data/calendar:ro
+      - /home/baekenough/.second-brain/stage/sms:/data/sms:ro
+      - /home/baekenough/.second-brain/stage/call:/data/call:ro
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # web — Next.js 프론트엔드 (포트 3000).
+  #   server가 기동된 뒤 시작한다.
+  #   BRAIN_API_URL로 내부 API 서버를 가리켜 ingest 프록시가 올바르게
+  #   포워딩된다.
+  # ---------------------------------------------------------------------------
+  # Cloudflare Access 뒤에서만 접근 가능(next-auth 제거, JWT 검증은
+  # web/src/proxy.ts). 포트는 호스트 localhost에만 바인딩되며, 공개 노출은
+  # 호스트 프로세스인 cloudflared ingress(sb.baekenough.com)를 통해서만
+  # 이루어진다(심층 방어).
+  # ---------------------------------------------------------------------------
+  web:
+    image: second-brain-web:ubuntu1
+    ports:
+      - "127.0.0.1:3000:3000"
+    env_file:
+      - web/.env.local
+      - .env.local
+    environment:
+      BRAIN_API_URL: "http://server:8080"
+      CF_ACCESS_TEAM_DOMAIN: "baekenough.cloudflareaccess.com"
+      CF_ACCESS_AUD: "276c0cbbe67a4044699334ed7ea446eda5fb287f5fc8e194b08bc067847ab272"
+      NEXT_PUBLIC_APP_URL: "${NEXT_PUBLIC_APP_URL:-https://sb.baekenough.com}"
+      NODE_ENV: "production"
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
+    depends_on:
+      server:
+        condition: service_started
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # neo4j — 지식 그래프 파생 투영. PostgreSQL이 진실의 원천이므로 이 볼륨은
+  #   버려도 된다(백업 요구사항 없음, 재구축은 GRAPH_PROJECTION_RESET_TOKEN).
+  #   포트는 127.0.0.1 에만 바인딩한다 — Browser(7474)는 인증만 통과하면
+  #   그래프 전체를 조회하므로 cloudflared ingress에 호스트명을 두지 않는다.
+  #   server/collector 에 depends_on 을 걸지 않는다: Neo4j 가 죽어도 수집·
+  #   검색·/ask 는 돌아야 한다(워커는 다음 tick 재시도, API 는 503).
+  # ---------------------------------------------------------------------------
+  neo4j:
+    image: neo4j:5.26-community
+    ports:
+      - "127.0.0.1:7687:7687"
+      - "127.0.0.1:7474:7474"
+    environment:
+      # ${VAR} 치환은 env_file이 아니라 --env-file/셸에서 온다. 그래서
+      # --env-file 없이 기동하면 아래 :? 가 조용한 오작동 대신 즉시 실패시킨다.
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?NEO4J_PASSWORD is required}"
+      # 헬스체크용 사본. 이름이 NEO4J_ 로 시작하면 안 된다: 엔트리포인트가
+      # NEO4J_* 를 전부 neo4j.conf 설정으로 번역하므로 NEO4J_PASSWORD 는
+      # 설정 "PASSWORD" 가 되어 strict validation 이 기동을 거부한다
+      # ("Unrecognized setting. No declared setting with name: PASSWORD").
+      SB_NEO4J_PASSWORD: "${NEO4J_PASSWORD:?NEO4J_PASSWORD is required}"
+      NEO4J_server_memory_heap_initial__size: "512m"   # 관계 수천 개 규모.
+      NEO4J_server_memory_heap_max__size: "512m"       # 과할당은 다른 컨테이너를
+      NEO4J_server_memory_pagecache_size: "256m"       # 밀어낼 뿐이다.
+      # 질의 로그는 파라미터(=실명)를 그대로 남기므로 끈다. 설정 키는
+      # server.* 가 아니라 db.* 다 — server.logs.query.enabled 는 5.26 에
+      # 존재하지 않는 이름이라 strict validation 이 기동을 거부한다
+      # ("Unrecognized setting"). 5.26.29 스크래치 컨테이너로 실측 확인.
+      NEO4J_db_logs_query_enabled: "OFF"
+      # Community 에디션은 질의 로깅 자체가 없어 위 설정만으로도 유출이 없지만,
+      # 이 값의 기본값이 true 라 에디션이 바뀌는 순간 파라미터가 남는다.
+      NEO4J_db_logs_query_parameter__logging__enabled: "false"
+    volumes:
+      - neo4jdata:/data                                # /logs 는 내보내지 않는다
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p \"$${SB_NEO4J_PASSWORD}\" 'RETURN 1' >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 40s
+    restart: unless-stopped
+
+# -----------------------------------------------------------------------------
+# Named volumes
+# -----------------------------------------------------------------------------
+volumes:
+  neo4jdata:
+    # 지식 그래프 파생 투영 전용 볼륨. PostgreSQL 이 진실의 원천이므로
+    # 삭제해도 투영 워커가 워터마크 0 부터 다시 만들어 낸다(백업 불필요).
