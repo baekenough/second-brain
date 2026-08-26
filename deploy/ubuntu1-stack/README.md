@@ -7,8 +7,11 @@
 
 ## 구성
 
-- ubuntu1에서 도는 것: **server / collector / web / neo4j** — compose 프로젝트
-  이름 `second-brain-ubuntu1`, 작업 디렉토리 `~/second-brain-app`.
+- ubuntu1에서 도는 것: **server / collector / web / neo4j / mcp / eval-runner**
+  — compose 프로젝트 이름 `second-brain-ubuntu1`, 작업 디렉토리
+  `~/second-brain-app`. (이 README는 한동안 mcp/eval-runner를 "미이전"으로
+  적고 있었는데, 실제로는 이미 이전되어 떠 있다 — 2026-08-27 재배포 작업
+  중 `docker ps`로 확인, 아래 TODO 섹션도 정정.)
 - **postgres는 이 스택에 없다.** 별도 compose 프로젝트(`~/second-brain-postgres`,
   자세한 내용은 [`deploy/postgres-ubuntu1/`](../postgres-ubuntu1/))로 이미 운영
   중이며, `.env.local`의 `DATABASE_URL`이 Tailscale IP로 그 컨테이너를 직접
@@ -24,10 +27,18 @@
 |------|-------------------|
 | `docker-compose.yml` | `~/second-brain-app/docker-compose.ubuntu1.yml` |
 | `sync-second-brain-data.sh` | `~/bin/sync-second-brain-data.sh` |
+| `verify-mounts.sh` | `~/bin/verify-mounts.sh` |
 | `systemd/sb-data-sync.service` | `~/.config/systemd/user/sb-data-sync.service` |
 | `systemd/sb-data-sync.timer` | `~/.config/systemd/user/sb-data-sync.timer` |
+| `systemd/sb-permcheck.service` | `~/.config/systemd/user/sb-permcheck.service` |
+| `systemd/sb-permcheck.timer` | `~/.config/systemd/user/sb-permcheck.timer` |
 | `systemd/cloudflared-second-brain.service` | `/etc/systemd/system/cloudflared-second-brain.service` |
 | `cloudflared/config-second-brain.yml` | `~/.cloudflared/config-second-brain.yml` |
+
+`verify-mounts.sh` + `sb-permcheck.timer`는 2026-08-27에 추가됐다 — bind mount
+쓰기 가능 여부를 컨테이너 안에서 직접 실측(touch/rm)해 10분 주기로 검사하고
+실패 시 `journalctl --user -u sb-permcheck` / `systemctl --user status
+sb-permcheck.service`에 남긴다. 자세한 배경은 아래 "함정 1" 참고.
 
 `cloudflared/config-second-brain.yml`은 터널 ID와 credentials **경로**만
 담고 있다. credentials json(`ee3b9a8b-....json`) 자체는 시크릿이라 이 리포에
@@ -46,22 +57,63 @@ docker compose --env-file .env.local -f docker-compose.ubuntu1.yml up -d
 경로에 생성돼 collector가 완전히 멈춘 사고가 있었다
 ([`feedback_macmini_compose_envfile_flag`]).
 
+배포 직후에는 bind mount 쓰기 테스트를 실행해 실제로 쓸 수 있는지 확인한다
+(권한 숫자만으로는 부족하다 — 아래 "함정 1" 참고):
+
+```bash
+~/bin/verify-mounts.sh; echo "exit=$?"
+```
+
+`sb-permcheck.timer`가 10분마다 같은 검사를 자동 반복하므로, 배포를
+깜빡 잊고 이 단계를 건너뛰어도 늦어도 10분 안에 `journalctl --user -u
+sb-permcheck`에 FAIL로 드러난다.
+
 ## 이전 과정에서 실제로 부딪힌 함정 4가지
 
 **재발 방지를 위해 반드시 기록한다.**
 
-### 1. 파일 권한 (macOS → Linux)
+### 1. 파일 권한 (macOS → Linux) — 2026-08-27 근본 해결
 
-컨테이너는 `uid=10001(appuser)`로 실행되는데, rsync로 옮긴 자격증명 파일은
-`uid=1000` 소유의 `600`이라 읽지 못했다. Docker Desktop for Mac은 VirtioFS가
-uid를 매핑해줘서 이 충돌이 드러나지 않지만, Linux bind mount는 호스트 uid를
-그대로 노출한다.
+컨테이너는 원래 `uid=10001(appuser)`로 실행되는데, rsync로 옮긴 자격증명
+파일과 bind mount 소스는 전부 `uid=1000` 소유라 group 비트(setgid+rwx)로
+우회해야 했다. Docker Desktop for Mac은 VirtioFS가 uid를 매핑해줘서 이
+충돌이 드러나지 않지만, Linux bind mount는 호스트 uid를 그대로 노출한다.
 
-해결: 자격증명 4개 파일(`gmail/credentials.json`, `gmail/token.json`,
-`calendar/credentials.json`, `calendar/token.json`)에 `chgrp 10001` +
-`chmod 640`. 일반 사용자는 자신이 속하지 않은 그룹으로 chgrp할 수 없어
-`sudo`가 필요하다. **rsync가 매번 권한을 원복시키므로 동기화 스크립트
-(`sync-second-brain-data.sh`)가 이 단계를 매 실행마다 반복 수행한다.**
+**사고 (2026-08-26)**: 서버 bind mount 권한 장애로 통화 녹음 전송이
+16시간 지연됐다(재시도만 반복, 발현이 느려 늦게 발견). **근본 원인은
+`sb-data-sync.timer`(10분 주기 rsync pull)였다** — rsync -a가 기존
+디렉토리라도 매 실행마다 mode를 원본(macmini, group 비트 없는 `755`)으로
+되돌린다. 수동으로 `chgrp 10001` + `chmod g+rwxs`를 맞춰도 다음 sync
+주기(최대 10분 뒤)에 조용히 원복된다 — **재배포 때문이 아니라 정상 운영
+중에도 상시 재현되는 구조였다.** 2026-08-27 실측으로 확인
+(`systemctl --user start sb-data-sync.service` 전후 `ls -ldn` 비교 →
+매번 `drwxrwsr-x` → `drwxr-xr-x`로 되돌아감).
+
+**근본 해결**: `docker-compose.ubuntu1.yml`의 `server`/`collector` 서비스에
+`user: "1000:1000"`을 추가해 컨테이너 uid를 호스트 `baekenough`(uid=gid=1000,
+bind mount 소유자)와 맞췄다. owner rwx 비트만으로 접근이 성립하므로 group
+비트가 sync에 의해 매번 초기화돼도 더 이상 기능에 영향을 주지 않는다
+(2026-08-27 `sb-data-sync.service`를 강제 실행해 drift를 재현한 뒤에도
+쓰기 테스트가 통과함을 확인). `web`/`neo4j`/`mcp`/`eval-runner`는 이
+bind mount를 쓰지 않아 변경하지 않았다.
+
+부작용 확인: 이미지 내부 `/app`(server 바이너리, migrations)은
+`root:root` 소유지만 world-readable이라 uid 1000 실행에 영향 없음.
+`/data/drive`(GDrive 컬렉터 전용, `appuser:appgroup`=10001 소유)는
+`FILESYSTEM_ENABLED`가 꺼져 있어 미사용 확인 후 변경.
+
+옛 group 우회(자격증명 4개 파일 `chgrp 10001` + `chmod 640`,
+`sync-second-brain-data.sh` 안의 `chmod -R g+rX stage/`)는 방어적으로
+그대로 남겨뒀다 — uid 정렬로 무해해졌지만 group 기반 접근이 필요한 다른
+프로세스가 생기면 여전히 의미가 있다.
+
+**검증 자동화**: 권한 숫자가 맞아 보여도 uid가 다르면 못 쓴다(이번 사고의
+핵심 교훈). `verify-mounts.sh`가 컨테이너 안에서 실제 touch/rm을 실행해
+`sb-permcheck.timer`로 10분마다 검사한다. 배포 직후에도 수동 실행 권장:
+
+```bash
+~/bin/verify-mounts.sh; echo "exit=$?"
+```
 
 ### 2. openrsync 비호환
 
@@ -120,8 +172,12 @@ ubuntu1의 systemd user 타이머 `sb-data-sync.timer`가 10분 주기로 macmin
 
 ## 아직 남은 것 (TODO)
 
-- mcp 서비스 미이전 (`brain-mcp` ingress가 502를 반환한다)
-- eval-runner 미이전
+- ~~mcp 서비스 미이전~~ → 이전 완료, `second-brain-ubuntu1-mcp-1` 컨테이너
+  running (2026-08-27 확인). `brain-mcp` ingress가 여전히 502면 컨테이너가
+  아니라 cloudflared ingress 설정/터널 쪽 문제일 가능성이 높다 — 이번
+  작업 범위 밖이라 별도 확인 필요.
+- ~~eval-runner 미이전~~ → 이전 완료, `second-brain-ubuntu1-eval-runner-1`
+  컨테이너 running (2026-08-27 확인).
 - macmini의 OneDrive 의존을 걷어내면 macmini를 완전히 뺄 수 있다 (rclone
   등으로 ubuntu1이 직접 OneDrive를 받는 방안)
 

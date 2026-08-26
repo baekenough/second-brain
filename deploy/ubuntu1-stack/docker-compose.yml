@@ -47,6 +47,19 @@ services:
   # ---------------------------------------------------------------------------
   server:
     image: second-brain-server:ubuntu1
+    # uid/gid 1000 = 호스트 baekenough 사용자와 일치시킨다. 이미지 기본값은
+    # appuser(10001)인데, bind mount 소스(/home/baekenough/.second-brain/**)가
+    # 전부 호스트 uid 1000 소유라 group 비트(setgid+rwx)로 우회해야 했다.
+    # 문제는 macmini→ubuntu1 데이터 동기화(sb-data-sync.timer, 10분 주기
+    # rsync -a pull)가 매 실행마다 디렉토리 mode를 원본(macmini, group
+    # 비트 없음)으로 되돌려 group 우회가 반복적으로 무효화된다는 것이었다
+    # (2026-08-26 통화 녹음 수집 16시간 정지 사고, 원인 확정 2026-08-27).
+    # uid를 호스트와 맞추면 owner rwx 비트만으로 접근이 성립해 group 비트
+    # 드리프트가 더 이상 기능에 영향을 주지 않는다. /app 내부 파일은
+    # root:root 소유이지만 world-readable(644/755)이라 영향 없고,
+    # /data/drive(GDrive 컬렉터 전용, appuser:appgroup 10001 소유)는
+    # FILESYSTEM_ENABLED=false로 미사용이라 영향 없음(확인 완료).
+    user: "1000:1000"
     ports:
       - "127.0.0.1:8081:8080"
     env_file:
@@ -63,6 +76,12 @@ services:
   # ---------------------------------------------------------------------------
   collector:
     image: second-brain-collector:ubuntu1
+    # server와 동일한 이유로 호스트 uid(1000)와 맞춘다 — 아래 server 블록의
+    # 주석 참고. collector는 gmail/calendar/sms/call을 전부 ro로만 마운트
+    # 하므로 필수는 아니지만, appuser(10001)로는 gmail/calendar 자격증명
+    # (640, group 10001)이 group 비트 드리프트 시 읽기조차 막히므로 동일하게
+    # 맞춘다.
+    user: "1000:1000"
     env_file:
       - .env.local
     environment:

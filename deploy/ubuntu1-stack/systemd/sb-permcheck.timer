@@ -1,0 +1,10 @@
+[Unit]
+Description=Run second-brain bind mount write-check every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
