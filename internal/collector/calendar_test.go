@@ -21,9 +21,9 @@ import (
 // token source so tests bypass file I/O and network calls.
 func newCalendarCollectorWithFakeSource(cfg *config.Config, srv *httptest.Server, ts oauth2.TokenSource) *CalendarCollector {
 	return &CalendarCollector{
-		cfg:        cfg,
-		httpClient: srv.Client(),
-		baseURL:    srv.URL,
+		cfg:         cfg,
+		httpClient:  srv.Client(),
+		baseURL:     srv.URL,
 		tokenSource: ts,
 		cachedToken: &oauth2.Token{
 			AccessToken: "test-token",
@@ -197,7 +197,7 @@ func TestCalendarEventToDocument_TimedEvent(t *testing.T) {
 		},
 	}
 
-	doc, err := calendarEventToDocument(ev, collectAt)
+	doc, err := calendarEventToDocument(ev, "primary", true, collectAt)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -207,6 +207,9 @@ func TestCalendarEventToDocument_TimedEvent(t *testing.T) {
 	}
 	if doc.SourceID != "calendar:evt-001" {
 		t.Errorf("SourceID = %q, want %q", doc.SourceID, "calendar:evt-001")
+	}
+	if doc.Metadata["calendar_id"] != "primary" {
+		t.Errorf("Metadata.calendar_id = %v, want %q", doc.Metadata["calendar_id"], "primary")
 	}
 	if doc.Title != "Team Meeting" {
 		t.Errorf("Title = %q, want %q", doc.Title, "Team Meeting")
@@ -249,7 +252,7 @@ func TestCalendarEventToDocument_AllDayEvent(t *testing.T) {
 		End:     calendarEventDateTime{Date: "2024-07-05"},
 	}
 
-	doc, err := calendarEventToDocument(ev, collectAt)
+	doc, err := calendarEventToDocument(ev, "primary", true, collectAt)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -477,4 +480,363 @@ func TestCalendarCollector_Collect_EmptyItems(t *testing.T) {
 	if len(docs) != 0 {
 		t.Errorf("got %d docs, want 0", len(docs))
 	}
+}
+
+// --- parseCalendarIDs ---
+
+func TestParseCalendarIDs(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		raw  string
+		want []string
+	}{
+		{name: "empty defaults to primary", raw: "", want: []string{"primary"}},
+		{name: "single value backward compat", raw: "primary", want: []string{"primary"}},
+		{name: "single custom value", raw: "team@example.com", want: []string{"team@example.com"}},
+		{
+			name: "comma-separated, trimmed",
+			raw:  "primary, baeksy@agilesoda.ai ,  team@example.com",
+			want: []string{"primary", "baeksy@agilesoda.ai", "team@example.com"},
+		},
+		{
+			name: "empty entries dropped",
+			raw:  "primary,,team@example.com,",
+			want: []string{"primary", "team@example.com"},
+		},
+		{
+			name: "duplicates de-duplicated, first occurrence order kept",
+			raw:  "primary,team@example.com,primary",
+			want: []string{"primary", "team@example.com"},
+		},
+		{name: "only whitespace/commas defaults to primary", raw: " , , ", want: []string{"primary"}},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := parseCalendarIDs(tc.raw)
+			if len(got) != len(tc.want) {
+				t.Fatalf("parseCalendarIDs(%q) = %v, want %v", tc.raw, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("parseCalendarIDs(%q)[%d] = %q, want %q", tc.raw, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// --- calendarEventToDocument source_id namespacing ---
+
+func TestCalendarEventToDocument_NamespacedForNonLegacyCalendar(t *testing.T) {
+	t.Parallel()
+
+	ev := calendarEvent{
+		ID:      "evt-shared",
+		Summary: "Shared Event",
+		Status:  "confirmed",
+		Updated: time.Now().UTC().Format(time.RFC3339),
+		Start:   calendarEventDateTime{Date: "2024-07-04"},
+		End:     calendarEventDateTime{Date: "2024-07-05"},
+	}
+
+	legacyDoc, err := calendarEventToDocument(ev, "primary", true, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if legacyDoc.SourceID != "calendar:evt-shared" {
+		t.Errorf("legacy SourceID = %q, want %q", legacyDoc.SourceID, "calendar:evt-shared")
+	}
+
+	namespacedDoc, err := calendarEventToDocument(ev, "baeksy@agilesoda.ai", false, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	wantID := "calendar:baeksy@agilesoda.ai:evt-shared"
+	if namespacedDoc.SourceID != wantID {
+		t.Errorf("namespaced SourceID = %q, want %q", namespacedDoc.SourceID, wantID)
+	}
+	if namespacedDoc.Metadata["calendar_id"] != "baeksy@agilesoda.ai" {
+		t.Errorf("Metadata.calendar_id = %v, want %q", namespacedDoc.Metadata["calendar_id"], "baeksy@agilesoda.ai")
+	}
+
+	// Same underlying event ID across two calendars must not collide once
+	// namespaced — this is the whole point of the legacy/namespaced split.
+	if legacyDoc.SourceID == namespacedDoc.SourceID {
+		t.Error("legacy and namespaced source_id must differ for the same event ID across calendars")
+	}
+}
+
+// --- Collect: multiple calendars ---
+
+// TestCalendarCollector_Collect_MultipleCalendars verifies that Collect
+// iterates every configured calendar, that the first (primary) calendar keeps
+// its legacy source_id, that additional calendars are namespaced, and that
+// metadata.calendar_id is populated for every document (issue: no way to
+// tell which calendar a document came from before this change).
+func TestCalendarCollector_Collect_MultipleCalendars(t *testing.T) {
+	t.Parallel()
+
+	start := time.Date(2024, 6, 15, 10, 0, 0, 0, time.UTC)
+	end := start.Add(time.Hour)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/calendar/v3/calendars/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "primary"):
+			ev := buildCalendarEventJSON("evt-primary", "Primary Event", "", "", "confirmed", start, end, "", nil)
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{ev}})
+		case strings.Contains(r.URL.Path, "baeksy"):
+			ev := buildCalendarEventJSON("evt-work", "Work Event", "", "", "confirmed", start, end, "", nil)
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{ev}})
+		default:
+			t.Errorf("unexpected calendar path: %q", r.URL.Path)
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": nil})
+		}
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	cfg := validCalendarConfig()
+	cfg.CalendarID = "primary,baeksy@agilesoda.ai"
+	c := newCalendarCollectorWithFakeSource(cfg, srv, nil)
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(docs) != 2 {
+		t.Fatalf("got %d docs, want 2", len(docs))
+	}
+
+	byID := make(map[string]model.Document, len(docs))
+	for _, d := range docs {
+		byID[d.SourceID] = d
+	}
+
+	primaryDoc, ok := byID["calendar:evt-primary"]
+	if !ok {
+		t.Fatalf("missing legacy-keyed primary doc; got source_ids: %v", keysOf(byID))
+	}
+	if primaryDoc.Metadata["calendar_id"] != "primary" {
+		t.Errorf("primary doc calendar_id = %v, want %q", primaryDoc.Metadata["calendar_id"], "primary")
+	}
+
+	workDoc, ok := byID["calendar:baeksy@agilesoda.ai:evt-work"]
+	if !ok {
+		t.Fatalf("missing namespaced work doc; got source_ids: %v", keysOf(byID))
+	}
+	if workDoc.Metadata["calendar_id"] != "baeksy@agilesoda.ai" {
+		t.Errorf("work doc calendar_id = %v, want %q", workDoc.Metadata["calendar_id"], "baeksy@agilesoda.ai")
+	}
+}
+
+// TestCalendarCollector_Collect_SingleValueStillLegacy verifies that a
+// single, non-default CALENDAR_ID value (the pre-multi-calendar shape) still
+// produces the legacy, non-namespaced source_id — i.e. existing deployments
+// with CALENDAR_ID set to one calendar are unaffected by this change.
+func TestCalendarCollector_Collect_SingleValueStillLegacy(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/calendar/v3/calendars/", func(w http.ResponseWriter, r *http.Request) {
+		ev := buildAllDayEventJSON("evt-solo", "Solo Calendar Event", "2024-07-04")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{ev}})
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	cfg := validCalendarConfig()
+	cfg.CalendarID = "team@example.com"
+	c := newCalendarCollectorWithFakeSource(cfg, srv, nil)
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("got %d docs, want 1", len(docs))
+	}
+	if docs[0].SourceID != "calendar:evt-solo" {
+		t.Errorf("SourceID = %q, want %q (legacy scheme for sole configured calendar)", docs[0].SourceID, "calendar:evt-solo")
+	}
+}
+
+// TestCalendarCollector_Collect_OneCalendarFails_OthersContinue verifies that
+// a failing calendar (e.g. 403 due to insufficient scope) does not abort the
+// whole Collect call — the healthy calendar's documents are still returned
+// and Collect returns nil (so the scheduler commits them and advances the
+// watermark).
+func TestCalendarCollector_Collect_OneCalendarFails_OthersContinue(t *testing.T) {
+	t.Parallel()
+
+	start := time.Now().UTC()
+	end := start.Add(time.Hour)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/calendar/v3/calendars/", func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "primary"):
+			w.Header().Set("Content-Type", "application/json")
+			ev := buildCalendarEventJSON("evt-ok", "Healthy Calendar Event", "", "", "confirmed", start, end, "", nil)
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{ev}})
+		case strings.Contains(r.URL.Path, "revoked"):
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error": {"code": 403, "message": "insufficient permission"}}`))
+		default:
+			t.Errorf("unexpected calendar path: %q", r.URL.Path)
+		}
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	cfg := validCalendarConfig()
+	cfg.CalendarID = "primary,revoked@example.com"
+	c := newCalendarCollectorWithFakeSource(cfg, srv, nil)
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect: unexpected error, want nil (partial success): %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("got %d docs, want 1 (only the healthy calendar)", len(docs))
+	}
+	if docs[0].SourceID != "calendar:evt-ok" {
+		t.Errorf("SourceID = %q, want %q", docs[0].SourceID, "calendar:evt-ok")
+	}
+}
+
+// TestCalendarCollector_Collect_AllCalendarsFail verifies that when every
+// configured calendar fails, Collect returns an error (so the scheduler does
+// not advance the shared watermark and retries from the same `since` on the
+// next tick).
+func TestCalendarCollector_Collect_AllCalendarsFail(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/calendar/v3/calendars/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error": {"code": 403, "message": "insufficient permission"}}`))
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	cfg := validCalendarConfig()
+	cfg.CalendarID = "primary,revoked@example.com"
+	c := newCalendarCollectorWithFakeSource(cfg, srv, nil)
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err == nil {
+		t.Fatal("Collect: want error when all calendars fail, got nil")
+	}
+	if docs != nil {
+		t.Errorf("got %d docs, want nil when all calendars fail", len(docs))
+	}
+}
+
+// TestCalendarCollector_Collect_SkipsEmptySummaryEvents verifies the
+// content-empty guard: an event with no summary (the freeBusyReader-only
+// sharing symptom observed in production) is skipped, while a normal event
+// in the same response is still collected.
+func TestCalendarCollector_Collect_SkipsEmptySummaryEvents(t *testing.T) {
+	t.Parallel()
+
+	start := time.Now().UTC()
+	end := start.Add(time.Hour)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/calendar/v3/calendars/primary/events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		empty := buildCalendarEventJSON("evt-empty", "", "", "", "confirmed", start, end, "", nil)
+		whitespaceOnly := buildCalendarEventJSON("evt-whitespace", "   ", "", "", "confirmed", start, end, "", nil)
+		visible := buildCalendarEventJSON("evt-visible", "Visible Meeting", "", "", "confirmed", start, end, "", nil)
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{empty, whitespaceOnly, visible}})
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := newCalendarCollectorWithFakeSource(validCalendarConfig(), srv, nil)
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("got %d docs, want 1 (only the event with a visible summary)", len(docs))
+	}
+	if docs[0].SourceID != "calendar:evt-visible" {
+		t.Errorf("SourceID = %q, want %q", docs[0].SourceID, "calendar:evt-visible")
+	}
+}
+
+// TestCalendarCollector_Collect_NoSourceIDCollisionAcrossCalendars verifies
+// that the same underlying event ID appearing in two different calendars
+// does not collide into a single source_id — the second calendar's copy is
+// namespaced and both documents are collected.
+func TestCalendarCollector_Collect_NoSourceIDCollisionAcrossCalendars(t *testing.T) {
+	t.Parallel()
+
+	start := time.Now().UTC()
+	end := start.Add(time.Hour)
+	const sharedEventID = "evt-collision"
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/calendar/v3/calendars/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "primary"):
+			ev := buildCalendarEventJSON(sharedEventID, "Primary Copy", "", "", "confirmed", start, end, "", nil)
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{ev}})
+		case strings.Contains(r.URL.Path, "secondary"):
+			ev := buildCalendarEventJSON(sharedEventID, "Secondary Copy", "", "", "confirmed", start, end, "", nil)
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{ev}})
+		default:
+			t.Errorf("unexpected calendar path: %q", r.URL.Path)
+		}
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	cfg := validCalendarConfig()
+	cfg.CalendarID = "primary,secondary@example.com"
+	c := newCalendarCollectorWithFakeSource(cfg, srv, nil)
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(docs) != 2 {
+		t.Fatalf("got %d docs, want 2 (no collision — both copies collected)", len(docs))
+	}
+
+	ids := map[string]bool{docs[0].SourceID: true, docs[1].SourceID: true}
+	if len(ids) != 2 {
+		t.Fatalf("source_id collision: both docs got the same source_id %v", ids)
+	}
+	if !ids["calendar:"+sharedEventID] {
+		t.Errorf("missing legacy-keyed primary copy, got: %v", ids)
+	}
+	if !ids["calendar:secondary@example.com:"+sharedEventID] {
+		t.Errorf("missing namespaced secondary copy, got: %v", ids)
+	}
+}
+
+// keysOf returns the keys of a source_id-keyed document map, for test failure messages.
+func keysOf(m map[string]model.Document) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }

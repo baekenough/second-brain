@@ -58,8 +58,56 @@ func (c *CalendarCollector) Enabled() bool {
 	return c.cfg.CalendarCredentialsJSON != "" && c.cfg.CalendarTokenJSON != ""
 }
 
+// parseCalendarIDs parses the (possibly comma-separated) CALENDAR_ID config
+// value into an ordered, de-duplicated list of calendar identifiers.
+//
+// Order is preserved because the FIRST entry keeps the legacy source_id
+// scheme (see calendarEventToDocument) — reordering CALENDAR_ID would
+// therefore change which calendar's documents keep their existing keys.
+// Empty entries are dropped and whitespace trimmed. An empty result defaults
+// to ["primary"], matching the pre-multi-calendar default.
+func parseCalendarIDs(raw string) []string {
+	parts := strings.Split(raw, ",")
+	seen := make(map[string]bool, len(parts))
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		id := strings.TrimSpace(p)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	if len(out) == 0 {
+		out = append(out, "primary")
+	}
+	return out
+}
+
 // Collect fetches Google Calendar events in the window
-// [now - LookbehindDays, now + LookaheadDays] that were updated after since.
+// [now - LookbehindDays, now + LookaheadDays] that were updated after since,
+// across every calendar configured via CALENDAR_ID (comma-separated).
+//
+// A single failing calendar (revoked sharing, insufficient scope, transient
+// 5xx, ...) does not abort the whole run — the remaining calendars keep
+// collecting. Failures are logged and counted; only when EVERY configured
+// calendar fails in the same run does Collect return an error. This matches
+// this repo's "one dependency dying does not take down the rest of the
+// pipeline" convention (e.g. neo4j being optional for search).
+//
+// Known trade-off: collector_state's watermark is keyed by (instance_id,
+// source_type) only — there is no per-calendar column, and adding one would
+// require a migration (out of scope for this change; see
+// internal/store/document.go UpdateCollectorState). So when Collect returns
+// nil (partial or full success), the scheduler advances ONE shared watermark
+// for every configured calendar. A calendar that fails on some ticks and
+// later recovers can therefore have a bounded gap of missed updates from
+// its downtime window, once the shared watermark has moved past it. This is
+// accepted here over the alternative (holding back an already-healthy
+// calendar's documents whenever any other calendar is unhealthy) — the same
+// resilience-over-strict-per-source-correctness trade-off this repo already
+// makes elsewhere. If per-calendar precision becomes necessary, it requires
+// a dedicated collector_state migration, not a workaround here.
 func (c *CalendarCollector) Collect(ctx context.Context, since time.Time) ([]model.Document, error) {
 	token, err := c.getAccessToken(ctx)
 	if err != nil {
@@ -70,40 +118,89 @@ func (c *CalendarCollector) Collect(ctx context.Context, since time.Time) ([]mod
 	timeMin := now.AddDate(0, 0, -c.cfg.CalendarLookbehindDays)
 	timeMax := now.AddDate(0, 0, c.cfg.CalendarLookaheadDays)
 
-	events, err := c.listEvents(ctx, token, timeMin, timeMax, since)
-	if err != nil {
-		return nil, fmt.Errorf("calendar: list events: %w", err)
-	}
-
-	docs := make([]model.Document, 0, len(events))
+	calIDs := parseCalendarIDs(c.cfg.CalendarID)
 	collectAt := time.Now().UTC()
-	for _, ev := range events {
-		doc, err := calendarEventToDocument(ev, collectAt)
+
+	var docs []model.Document
+	var failedCalendars []string
+	totalSkippedEmpty := 0
+
+	for i, calID := range calIDs {
+		// The first configured calendar keeps the legacy (non-namespaced)
+		// source_id scheme so upgrading from a single-calendar config never
+		// re-keys existing documents. See calendarEventToDocument.
+		legacy := i == 0
+
+		events, err := c.listEvents(ctx, token, calID, timeMin, timeMax, since)
 		if err != nil {
-			slog.Warn("calendar: failed to convert event to document", "id", ev.ID, "error", err)
+			slog.Warn("calendar: failed to list events for calendar — skipping this calendar for this run, others continue",
+				"calendar_id", calID, "error", err)
+			failedCalendars = append(failedCalendars, calID)
 			continue
 		}
-		docs = append(docs, doc)
+
+		calSkippedEmpty := 0
+		for _, ev := range events {
+			// A calendar shared at freeBusyReader (rather than "See all event
+			// details") returns HTTP 200 with events that have no summary or
+			// description — busy/free slots only, no identifiable content.
+			// Ingesting these would pollute the corpus with title-less
+			// documents, so they are skipped rather than collected.
+			if strings.TrimSpace(ev.Summary) == "" {
+				calSkippedEmpty++
+				continue
+			}
+			doc, err := calendarEventToDocument(ev, calID, legacy, collectAt)
+			if err != nil {
+				slog.Warn("calendar: failed to convert event to document",
+					"calendar_id", calID, "id", ev.ID, "error", err)
+				continue
+			}
+			docs = append(docs, doc)
+		}
+		if calSkippedEmpty > 0 {
+			// Same tone/pattern as the SMS collector's empty-source-file
+			// warning: this is a permission/sharing signal, not a bug. Once
+			// sharing is upgraded to "See all event details", these events
+			// collect automatically on the next tick with no code change.
+			slog.Warn("calendar: skipped events with no visible content — likely freeBusyReader-only sharing, not an error; will collect automatically once sharing permission is upgraded",
+				"calendar_id", calID, "skipped", calSkippedEmpty, "total", len(events))
+		}
+		totalSkippedEmpty += calSkippedEmpty
 	}
 
-	slog.Info("calendar: collected documents", "count", len(docs))
+	if len(failedCalendars) > 0 {
+		slog.Warn("calendar: one or more calendars failed this run",
+			"failed_calendars", failedCalendars,
+			"failed_count", len(failedCalendars),
+			"configured_count", len(calIDs))
+	}
+	if len(failedCalendars) == len(calIDs) {
+		return nil, fmt.Errorf("calendar: all %d configured calendar(s) failed: %v", len(calIDs), failedCalendars)
+	}
+
+	slog.Info("calendar: collected documents",
+		"count", len(docs),
+		"calendars", len(calIDs),
+		"failed_calendars", len(failedCalendars),
+		"skipped_empty", totalSkippedEmpty)
 	return docs, nil
 }
 
 // --- Calendar API types ---
 
 type calendarEvent struct {
-	ID          string                 `json:"id"`
-	Summary     string                 `json:"summary"`
-	Description string                 `json:"description"`
-	Location    string                 `json:"location"`
-	Status      string                 `json:"status"`
-	HtmlLink    string                 `json:"htmlLink"`
-	Updated     string                 `json:"updated"` // RFC3339
-	Start       calendarEventDateTime  `json:"start"`
-	End         calendarEventDateTime  `json:"end"`
-	Organizer   *calendarPerson        `json:"organizer"`
-	Attendees   []calendarAttendee     `json:"attendees"`
+	ID          string                `json:"id"`
+	Summary     string                `json:"summary"`
+	Description string                `json:"description"`
+	Location    string                `json:"location"`
+	Status      string                `json:"status"`
+	HtmlLink    string                `json:"htmlLink"`
+	Updated     string                `json:"updated"` // RFC3339
+	Start       calendarEventDateTime `json:"start"`
+	End         calendarEventDateTime `json:"end"`
+	Organizer   *calendarPerson       `json:"organizer"`
+	Attendees   []calendarAttendee    `json:"attendees"`
 }
 
 type calendarEventDateTime struct {
@@ -125,18 +222,14 @@ type calendarAttendee struct {
 	Self           bool   `json:"self"`
 }
 
-// listEvents retrieves all events in the given window, filtered by updatedMin=since.
+// listEvents retrieves all events for calID in the given window, filtered by
+// updatedMin=since.
 func (c *CalendarCollector) listEvents(
 	ctx context.Context,
-	token string,
+	token, calID string,
 	timeMin, timeMax time.Time,
 	since time.Time,
 ) ([]calendarEvent, error) {
-	calID := c.cfg.CalendarID
-	if calID == "" {
-		calID = "primary"
-	}
-
 	var all []calendarEvent
 	pageToken := ""
 
@@ -181,7 +274,17 @@ func (c *CalendarCollector) listEvents(
 }
 
 // calendarEventToDocument converts a Calendar API event to a model.Document.
-func calendarEventToDocument(ev calendarEvent, collectAt time.Time) (model.Document, error) {
+//
+// legacy controls the source_id scheme: the first calendar configured via
+// CALENDAR_ID keeps the pre-multi-calendar "calendar:<eventID>" id so
+// upgrading an existing single-calendar deployment never re-keys its
+// existing documents (see the #144 SMS source_id lesson — a source_id
+// re-key without a dedicated migration orphaned existing rows and was
+// rejected twice in review; it was only safe as a one-off migration, not a
+// collector-side change). Any additional calendar is namespaced with its
+// calendar ID ("calendar:<calID>:<eventID>") because event IDs are only
+// guaranteed unique within a single calendar, not across calendars.
+func calendarEventToDocument(ev calendarEvent, calID string, legacy bool, collectAt time.Time) (model.Document, error) {
 	occurredAt, allDay := parseCalendarDateTime(ev.Start)
 
 	// Build content: description + location + attendees summary.
@@ -207,10 +310,11 @@ func calendarEventToDocument(ev calendarEvent, collectAt time.Time) (model.Docum
 
 	// Build metadata.
 	meta := map[string]any{
-		"status":    ev.Status,
-		"updated":   ev.Updated,
-		"html_link": ev.HtmlLink,
-		"all_day":   allDay,
+		"status":      ev.Status,
+		"updated":     ev.Updated,
+		"html_link":   ev.HtmlLink,
+		"all_day":     allDay,
+		"calendar_id": calID,
 	}
 	if ev.Location != "" {
 		meta["location"] = ev.Location
@@ -237,10 +341,15 @@ func calendarEventToDocument(ev calendarEvent, collectAt time.Time) (model.Docum
 		meta["end"] = endTime.Format(time.RFC3339)
 	}
 
+	sourceID := "calendar:" + ev.ID
+	if !legacy {
+		sourceID = "calendar:" + calID + ":" + ev.ID
+	}
+
 	return model.Document{
 		ID:          uuid.New(),
 		SourceType:  model.SourceCalendar,
-		SourceID:    "calendar:" + ev.ID,
+		SourceID:    sourceID,
 		Title:       ev.Summary,
 		Content:     content,
 		Metadata:    meta,

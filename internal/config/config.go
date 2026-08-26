@@ -174,7 +174,14 @@ type Config struct {
 	// Calendar (optional — disabled when both credential fields are empty)
 	// CALENDAR_CREDENTIALS_JSON: OAuth2 client credentials JSON string
 	// CALENDAR_TOKEN_JSON: OAuth2 access/refresh token JSON string
-	// CALENDAR_ID: calendar identifier (default: "primary")
+	// CALENDAR_ID: comma-separated calendar identifiers to collect from
+	// (e.g. "primary,team@example.com"). A single value behaves exactly as
+	// before — this field was extended rather than adding a new env var to
+	// keep deploy config changes minimal. Whitespace is trimmed, empty
+	// entries and duplicates are dropped (see collector.parseCalendarIDs).
+	// The first entry keeps the pre-multi-calendar source_id scheme so
+	// existing documents are never re-keyed on upgrade; see
+	// internal/collector/calendar.go calendarEventToDocument.
 	// CALENDAR_LOOKAHEAD_DAYS: days into the future to collect (default: 90)
 	// CALENDAR_LOOKBEHIND_DAYS: days into the past to collect (default: 365)
 	CalendarCredentialsJSON string
