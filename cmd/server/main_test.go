@@ -198,6 +198,94 @@ func TestWireEvidenceFeedback_NilVoterStaysUnregistered(t *testing.T) {
 	}
 }
 
+// --- buildSearchService wiring regression tests ---
+//
+// These exercise the real chain buildSearchService assembles rather than a
+// hand-rolled one, so they fail again if a future edit drops a .With*() call
+// from it — the way .WithLLM(llmClient) was missing for the HyDE lane.
+
+// fakeSearchDocStore is a minimal search.DocumentSearcher that records the
+// query it was handed, so a test can inspect what the wiring actually
+// delivered downstream (same pattern as internal/search's own wiring tests,
+// e.g. recordingDocSearcher in insight_exclusion_test.go).
+type fakeSearchDocStore struct {
+	gotQuery model.SearchQuery
+}
+
+func (f *fakeSearchDocStore) Search(_ context.Context, q model.SearchQuery) ([]*model.SearchResult, error) {
+	f.gotQuery = q
+	return nil, nil
+}
+
+// disabledSearchEmbedder is a search.EmbeddingEngine that is always off, so
+// the HyDE wiring test stays on the full-text path — the assertion is about
+// query expansion, not vector search.
+type disabledSearchEmbedder struct{}
+
+func (disabledSearchEmbedder) Embed(context.Context, string) ([]float32, error) { return nil, nil }
+func (disabledSearchEmbedder) EmbedBatch(context.Context, []string) ([][]float32, error) {
+	return nil, nil
+}
+func (disabledSearchEmbedder) Enabled() bool  { return false }
+func (disabledSearchEmbedder) Dimension() int { return 0 }
+
+// stubHyDECompleter is a minimal llm.Completer that always returns a fixed
+// hypothetical-document string, so the test can detect whether the wired
+// Service actually called through to it.
+type stubHyDECompleter struct{}
+
+func (stubHyDECompleter) Enabled() bool { return true }
+
+func (stubHyDECompleter) CompleteWithMessages(context.Context, string, []llm.Message) (string, error) {
+	return "hypothetical document text", nil
+}
+
+// TestBuildSearchService_WiresLLMClientForHyDE is the regression test for the
+// defect this file fixes: llmClient used to be constructed AFTER the
+// search.Service .With*() chain ran in run(), so nothing could pass it to
+// WithLLM and every UseHyDE request silently returned unexpanded results with
+// no error and no log line. If buildSearchService's chain ever drops
+// .WithLLM again, this test fails instead of shipping another silent no-op.
+func TestBuildSearchService_WiresLLMClientForHyDE(t *testing.T) {
+	docs := &fakeSearchDocStore{}
+	svc := buildSearchService(
+		docs, disabledSearchEmbedder{}, nil, nil, nil, nil,
+		stubHyDECompleter{}, nil, false,
+	)
+
+	const query = "what changed in the postgres migration?"
+	if _, err := svc.Search(context.Background(), model.SearchQuery{Query: query, UseHyDE: true}); err != nil {
+		t.Fatalf("Search returned unexpected error: %v", err)
+	}
+
+	if !strings.Contains(docs.gotQuery.Query, "hypothetical document text") {
+		t.Fatalf("store received query %q, want it to contain the HyDE-expanded text — WithLLM is not wired", docs.gotQuery.Query)
+	}
+	if !strings.HasPrefix(docs.gotQuery.Query, query) {
+		t.Fatalf("store received query %q, want it to start with the original query %q", docs.gotQuery.Query, query)
+	}
+}
+
+// TestBuildSearchService_UseHyDEWithoutLLMClientIsANoOp pins the documented
+// degrade-safe behaviour when no LLM client is available at all (nil
+// llmClient — e.g. a caller that skips llm.New entirely): UseHyDE must not
+// panic and must fall back to the original, unexpanded query.
+func TestBuildSearchService_UseHyDEWithoutLLMClientIsANoOp(t *testing.T) {
+	docs := &fakeSearchDocStore{}
+	svc := buildSearchService(
+		docs, disabledSearchEmbedder{}, nil, nil, nil, nil,
+		nil, nil, false,
+	)
+
+	const query = "what changed in the postgres migration?"
+	if _, err := svc.Search(context.Background(), model.SearchQuery{Query: query, UseHyDE: true}); err != nil {
+		t.Fatalf("Search returned unexpected error: %v", err)
+	}
+	if docs.gotQuery.Query != query {
+		t.Fatalf("store received query %q, want the unexpanded original %q when no LLM client is wired", docs.gotQuery.Query, query)
+	}
+}
+
 // TestHTTPServerWriteTimeout_CoversAskAndSearch documents the relationship
 // the deployment depends on: the global write deadline must outlast the
 // slowest non-briefing request path (/ask, and a cold-start /search — see

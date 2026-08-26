@@ -223,13 +223,14 @@ var allowedSourceTypes = map[model.SourceType]struct{}{
 	model.SourceDiscord:        {},
 	model.SourceTelegram:       {},
 	model.SourceSecretary:      {},
-	model.SourceLLMMemory:      {},
+	model.SourceLLMMemory:      {}, // deprecated (see model.SourceLLMMemory doc comment); kept so legacy rows remain searchable
 	model.SourceGmail:          {},
 	model.SourceCalendar:       {},
 	model.SourceSMS:            {},
 	model.SourceCallLog:        {},
 	model.SourceCallTranscript: {},
 	model.SourceUpload:         {},
+	model.SourceAgentNote:      {},
 }
 
 // searchResult is the MCP-friendly projection of model.SearchResult.
@@ -260,8 +261,8 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service) {
 		mcp.WithString("source",
 			mcp.Description(
 				"Optional source type filter. One of: slack, github, gdrive, notion, "+
-					"filesystem, discord, telegram, secretary, llm-memory, "+
-					"gmail, calendar, sms, call-log, call-transcript, upload.",
+					"filesystem, discord, telegram, secretary, llm-memory (deprecated), "+
+					"gmail, calendar, sms, call-log, call-transcript, upload, agent-note.",
 			),
 		),
 	)
@@ -295,7 +296,7 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service) {
 			st := model.SourceType(strings.TrimSpace(src))
 			if _, ok := allowedSourceTypes[st]; !ok {
 				return mcp.NewToolResultError(fmt.Sprintf(
-					"unknown source type %q; allowed: slack, github, gdrive, notion, filesystem, discord, telegram, secretary, llm-memory, gmail, calendar, sms, call-log, call-transcript, upload",
+					"unknown source type %q; allowed: slack, github, gdrive, notion, filesystem, discord, telegram, secretary, llm-memory, gmail, calendar, sms, call-log, call-transcript, upload, agent-note",
 					src,
 				)), nil
 			}
@@ -498,7 +499,7 @@ func registerAddNoteTool(
 		"add_note",
 		mcp.WithDescription(
 			"Persist a note or memory into the second-brain knowledge base. "+
-				"The note is stored with source_type=llm-memory and split into searchable "+
+				"The note is stored with source_type=agent-note and split into searchable "+
 				"chunks. Re-using the same source_id updates the existing note (upsert). "+
 				"Requires Bearer token authentication when API_KEY is configured.",
 		),
@@ -550,11 +551,13 @@ func registerAddNoteTool(
 			}
 		}
 
-		// MCP add_note always writes model.SourceLLMMemory (spec §6.2) and
-		// always requires a non-empty title — this is the one deliberate
-		// behavioural difference from POST /api/v1/notes.
+		// MCP add_note always writes model.SourceAgentNote (spec §6.2,
+		// updated 2026-08-25 — see model.SourceLLMMemory's doc comment for
+		// why this is no longer model.SourceLLMMemory) and always requires a
+		// non-empty title — the latter is the one deliberate behavioural
+		// difference from POST /api/v1/notes.
 		result, errMsg := note.Save(ctx, docs, chunks, embed,
-			model.SourceLLMMemory, title, content, sourceID, metadata, doEmbed, true)
+			model.SourceAgentNote, title, content, sourceID, metadata, doEmbed, true)
 		if errMsg != "" {
 			return mcp.NewToolResultError(errMsg), nil
 		}

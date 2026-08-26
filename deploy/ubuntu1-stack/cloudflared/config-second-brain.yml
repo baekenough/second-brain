@@ -1,0 +1,26 @@
+# second-brain cloudflared tunnel — ubuntu1
+#
+# macmini(arm64)에서 ubuntu1(x86_64)로 이전(2026-08-25). 터널 ID와
+# credentials 는 macmini 것을 그대로 승계하므로 DNS 레코드 변경이 필요 없다.
+#
+# ingress 대상은 전부 이 호스트의 루프백이다. 컨테이너 포트를 127.0.0.1 에만
+# 바인딩하고 터널이 같은 호스트에서 접근하는 구조 — 개인 데이터가 LAN/공인망에
+# 노출되지 않는다는 이 프로젝트의 원칙을 유지한다.
+tunnel: ee3b9a8b-8f78-4085-897a-dcf79d70b9c4
+credentials-file: /home/baekenough/.cloudflared/ee3b9a8b-8f78-4085-897a-dcf79d70b9c4.json
+
+ingress:
+  # Go API 서버 (second-brain-ubuntu1-server-1)
+  - hostname: brain.baekenough.com
+    service: http://localhost:8081
+
+  # MCP 서버 — 현재 미기동. macmini 에서도 8090 에 리스너가 없어
+  # 이미 죽어 있던 ingress 다. mcp 컨테이너를 띄우면 즉시 복구되도록 항목만 유지한다.
+  - hostname: brain-mcp.baekenough.com
+    service: http://localhost:8090
+
+  # Next.js 웹 UI (second-brain-ubuntu1-web-1) — Cloudflare Access 뒤에 있다.
+  - hostname: sb.baekenough.com
+    service: http://localhost:3000
+
+  - service: http_status:404

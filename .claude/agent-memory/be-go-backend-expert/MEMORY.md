@@ -21,3 +21,4 @@
 - [project_sort_recent_vs_rrf.md](project_sort_recent_vs_rrf.md) — RRF=선택/Sort=표시순서; recent 방향은 model.RecencyAscending 단일 정의를 store SQL·search Go 정렬이 공유
 - [project_active_weights_serving.md](project_active_weights_serving.md) — #214 승격 가중치 서빙: 캐시 없이 요청마다 읽는 이유(tune=별도 프로세스), 우선순위 3단, SEARCH_ACTIVE_WEIGHTS_ENABLED 기본 off
 - [project_ask_occurred_at_contract.md](project_ask_occurred_at_contract.md) — PR #219: AskSourceItem.OccurredAt 의도적 no-omitempty(키부재 vs null 구분), JSONB라 마이그레이션 불필요, sort는 planner가 날짜창 확정 시에만 적용
+- [project_hyde_wiring_defect.md](project_hyde_wiring_defect.md) — HyDE 영구 no-op(llmClient가 searchSvc 조립보다 뒤에 생성돼 WithLLM 주입 불가); WithOccurredRangeChecker/WithWeights는 미배선이 의도된 것임을 코드로 확인

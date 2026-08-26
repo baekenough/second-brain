@@ -73,6 +73,13 @@ const callTranscriptDupCheckQuery = `
 //
 // *DocumentStore satisfies the api.IngestMessagesUpserter interface via this method.
 func (s *DocumentStore) UpsertTracked(ctx context.Context, doc *model.Document) (contentChanged bool, err error) {
+	// Recurrence guards (migration 027 background): warn on a container or
+	// deprecated source_type, and warn on a possible cross-source duplicate
+	// arrival. Both are non-blocking — see document_source_guard.go package
+	// doc for why neither guard fails the write.
+	checkSourceTypeGuard(doc)
+	s.checkDuplicateArrival(ctx, doc)
+
 	// Duplicate guard: call-transcript content dedup (issue #134).
 	if doc.SourceType == model.SourceCallTranscript {
 		var exists int
@@ -178,6 +185,13 @@ func (s *DocumentStore) UpsertTracked(ctx context.Context, doc *model.Document) 
 // or log it). A same-source_id re-upsert is NOT affected: the ON CONFLICT path
 // handles it normally even when the content is identical.
 func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
+	// Recurrence guards (migration 027 background): warn on a container or
+	// deprecated source_type, and warn on a possible cross-source duplicate
+	// arrival. Both are non-blocking — see document_source_guard.go package
+	// doc for why neither guard fails the write.
+	checkSourceTypeGuard(doc)
+	s.checkDuplicateArrival(ctx, doc)
+
 	// Duplicate guard: call-transcript content dedup (issue #134).
 	// Only applied when source_type is 'call-transcript'. Other source types are
 	// unaffected. Same-source_id re-upserts bypass this check because the query

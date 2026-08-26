@@ -115,31 +115,23 @@ func run() error {
 		slog.Info("reranker configured", "url", cfg.RerankURL, "model", cfg.RerankModel)
 	}
 
-	// --- Search service ---
-	// ChunkStore is attached to enable chunk-based FTS fallback (issue #9).
-	// EntityStore is attached to surface entities in search results (issue #77).
-	//
-	// WeightsHistoryStore closes the tuning loop (#214): cmd/tune -promote
-	// writes the winning configuration to search_weights_history, and this is
-	// the only process that reads it back. The reader is attached
-	// unconditionally and the flag decides whether it is consulted, so that
-	// turning SEARCH_ACTIVE_WEIGHTS_ENABLED on is a restart and not a redeploy.
-	// It is attached HERE and nowhere else on purpose: cmd/tune must keep
-	// measuring against the compiled defaults, or its baseline would drift to
-	// whatever it last promoted and every subsequent run would compare a
-	// configuration against itself.
-	weightsHistoryStore := store.NewWeightsHistoryStore(pg)
-	searchSvc := search.NewService(docStore, embedClient).
-		WithChunkStore(chunkStore).
-		WithReranker(reranker).
-		WithEntityFetcher(entityStore).
-		WithActiveWeights(weightsHistoryStore, cfg.SearchActiveWeightsEnabled)
-	if cfg.SearchActiveWeightsEnabled {
-		slog.Info("search: serving the promoted weights from search_weights_history",
-			"flag", "SEARCH_ACTIVE_WEIGHTS_ENABLED")
+	// --- OpenSearch BM25 (nori) lane (optional) ---
+	// Disabled unless OPENSEARCH_URL is set — see internal/config.Config
+	// and internal/search/opensearch.go for why this lane exists.
+	osLane := search.NewOpenSearchLane(cfg)
+	if osLane != nil {
+		slog.Info("opensearch BM25 lane enabled", "url", cfg.OpensearchURL, "index", cfg.OpensearchIndex)
+	} else {
+		slog.Info("opensearch BM25 lane disabled — OPENSEARCH_URL not set")
 	}
 
-	// --- LLM client (curation) ---
+	// --- LLM client (curation + HyDE query expansion) ---
+	// Constructed BEFORE the search service on purpose. It used to be built
+	// after searchSvc's .With*() chain ran, which meant nothing could pass it
+	// to WithLLM — HyDE (internal/search/hyde.go) was a permanent, silent
+	// no-op in production because Service.llmClient stayed nil forever. See
+	// buildSearchService's doc comment and main_test.go for the regression
+	// test that pins this ordering.
 	llmClient := llm.New(llm.Config{
 		BaseURL:     cfg.LLMAPIURL,
 		Model:       cfg.LLMModel,
@@ -153,6 +145,42 @@ func run() error {
 		slog.Info("LLM client configured", "url", cfg.LLMAPIURL, "model", cfg.LLMModel)
 	} else {
 		slog.Info("LLM client not configured — curation features disabled")
+	}
+
+	// --- Search service ---
+	// ChunkStore is attached to enable chunk-based FTS fallback (issue #9).
+	// EntityStore is attached to surface entities in search results (issue #77).
+	//
+	// WeightsHistoryStore closes the tuning loop (#214): cmd/tune -promote
+	// writes the winning configuration to search_weights_history, and this is
+	// the only process that reads it back. The reader is attached
+	// unconditionally and the flag decides whether it is consulted, so that
+	// turning SEARCH_ACTIVE_WEIGHTS_ENABLED on is a restart and not a redeploy.
+	// It is attached HERE and nowhere else on purpose: cmd/tune must keep
+	// measuring against the compiled defaults, or its baseline would drift to
+	// whatever it last promoted and every subsequent run would compare a
+	// configuration against itself.
+	//
+	// llmClient is attached unconditionally, the same way reranker and osLane
+	// are above/below — llm.New always returns a non-nil *Client (see
+	// internal/llm), and WithLLM/Expand gate on client.Enabled() internally
+	// (internal/search/hyde.go). Gating the wiring itself on Enabled() would
+	// just reproduce the bug this fixes under a different name: the client's
+	// enabled-ness can change with env vars across restarts, but the wiring
+	// must not depend on the state it was in at the moment main() ran.
+	weightsHistoryStore := store.NewWeightsHistoryStore(pg)
+	searchSvc := buildSearchService(
+		docStore, embedClient, chunkStore, reranker, entityStore, osLane,
+		llmClient, weightsHistoryStore, cfg.SearchActiveWeightsEnabled,
+	)
+	if cfg.SearchActiveWeightsEnabled {
+		slog.Info("search: serving the promoted weights from search_weights_history",
+			"flag", "SEARCH_ACTIVE_WEIGHTS_ENABLED")
+	}
+	if llmClient.Enabled() {
+		slog.Info("search: HyDE query expansion available", "model", cfg.LLMModel)
+	} else {
+		slog.Info("search: HyDE query expansion unavailable — LLM client not configured")
 	}
 
 	// --- HTTP server ---
@@ -251,6 +279,39 @@ func run() error {
 
 	slog.Info("shutdown complete")
 	return nil
+}
+
+// buildSearchService assembles the search.Service from its optional
+// dependencies. It is a pure function — no I/O — so the wiring itself (which
+// optional lanes and clients get attached) is unit-testable without a live
+// Postgres connection or embedding/LLM backend (see main_test.go).
+//
+// This exists because a missing .With*() call in the chain does not fail to
+// compile and does not fail to start: search.Service just degrades silently
+// to "that lane/feature is off". That is exactly how the HyDE wiring defect
+// shipped — Service.llmClient stayed nil because llmClient used to be
+// constructed after this chain ran in run(), so no call here could reach it,
+// and every UseHyDE request became a no-op with no error and no log line. A
+// test that only checks "the server starts" cannot catch that; a test that
+// inspects what buildSearchService actually attaches can.
+func buildSearchService(
+	docStore search.DocumentSearcher,
+	embedClient search.EmbeddingEngine,
+	chunkStore search.ChunkSearcher,
+	reranker search.Reranker,
+	entityStore search.EntityFetcher,
+	osLane search.OpenSearchSearcher,
+	llmClient llm.Completer,
+	weightsHistoryStore search.ActiveWeightsReader,
+	activeWeightsEnabled bool,
+) *search.Service {
+	return search.NewService(docStore, embedClient).
+		WithChunkStore(chunkStore).
+		WithReranker(reranker).
+		WithEntityFetcher(entityStore).
+		WithOpenSearch(osLane).
+		WithActiveWeights(weightsHistoryStore, activeWeightsEnabled).
+		WithLLM(llmClient)
 }
 
 // wireActionsAndBriefing conditionally registers the /api/v1/actions and

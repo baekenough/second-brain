@@ -1,0 +1,14 @@
+[Unit]
+Description=cloudflared second-brain tunnel (ubuntu1)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=baekenough
+ExecStart=/usr/local/bin/cloudflared --no-autoupdate --config /home/baekenough/.cloudflared/config-second-brain.yml tunnel run second-brain
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=second-brain data sync from macmini (OneDrive gateway)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/baekenough/bin/sync-second-brain-data.sh

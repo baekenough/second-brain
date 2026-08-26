@@ -8,10 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/baekenough/second-brain/internal/chunker"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/store"
+	"github.com/google/uuid"
 )
 
 // DocumentUpserter is the subset of DocumentStore used by Save.
@@ -44,8 +44,9 @@ type Result struct {
 // handleAddNote, parameterized so both the MCP add_note tool and the
 // POST /api/v1/notes REST handler share identical persistence behaviour.
 //
-// sourceType controls the stored model.SourceType (model.SourceLLMMemory for
-// MCP, model.SourceNote for the REST path — spec §6.2).
+// sourceType controls the stored model.SourceType (model.SourceAgentNote for
+// MCP, model.SourceNote for the REST path — spec §6.2, updated 2026-08-25;
+// MCP add_note previously wrote model.SourceLLMMemory, since deprecated).
 //
 // requireTitle=true rejects an empty title (MCP add_note's pre-extraction
 // behaviour). requireTitle=false allows an empty title, which
