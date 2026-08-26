@@ -345,6 +345,33 @@ Subagent NOT required for:
 
 "Simple" means READ-ONLY operations. If the task involves any file creation, modification, or deletion, it must be delegated. There is no "too small to delegate" exception for write operations.
 
+### Scratchpad and Temporary Files
+
+세션 스크래치패드 디렉토리(`/private/tmp/claude-*/**/scratchpad/`)에 만드는 스크립트·SQL·설정 파일도 R010의 "파일 생성"에 해당한다. "임시 파일이라 작다"는 면제 사유가 아니다 — "too small to delegate" 예외가 없다는 원칙은 위치가 scratchpad여도 그대로 적용된다.
+
+그러나 위임이 항상 필요한 것은 아니다. 산출물의 **최종 소비자가 누구인가**로 갈라라:
+
+| 상황 | 처리 | 이유 |
+|------|------|------|
+| 사용자에게 전달하거나 사용자가 실행할 산출물 (스크립트, SQL, 리포트, 설정) | 위임 | 검토받지 않은 코드를 사용자가 실행하게 됨 |
+| 오케스트레이터가 직접 실행해 결과만 확인하고 버리는 1회성 명령 | 위임 불필요 — Bash 인라인으로 처리, 파일로 만들지 말 것 | 산출물이 아니라 조회/진단 수단일 뿐 |
+| 서브에이전트에 전달할 입력 데이터·프롬프트 파일 | 위임 | 그 자체가 작업 산출물이며 다음 단계 입력이 됨 |
+
+**우회 경로 차단**: "파일로 만들지 않고 Bash heredoc으로 넣으면 위임 대상이 아니다"는 성립하지 않는다. 여러 줄짜리 스크립트를 heredoc으로 실행하는 것은 파일 생성과 동등한 행위이므로 위 표와 같은 기준을 적용한다. 단, `git status`, `ls`, `psql -c "SELECT count(*)"` 같은 단순 조회/진단 명령은 이 규칙의 대상이 아니다 (원래부터 Tier 4 승인 대상 Bash일 뿐, 파일 생성이 아님).
+
+```
+❌ WRONG: Orchestrator writes a scratchpad script directly
+   Main conversation → Write("/tmp/.../scratchpad/migrate.py", content)
+   Main conversation → Write("/tmp/.../scratchpad/backfill.sql", content)
+
+✓ CORRECT: Delegate scratchpad scripts meant for reuse/execution to a specialist
+   Main conversation → Agent(lang-python-expert) → Write("/tmp/.../scratchpad/migrate.py", content)
+   Main conversation → Agent(db-postgres-expert) → Write("/tmp/.../scratchpad/backfill.sql", content)
+
+✓ CORRECT: One-off inspection command run and discarded, no file created
+   Main conversation → Bash("psql -c 'SELECT count(*) FROM documents'")
+```
+
 ## Dynamic Agent Creation (No-Match Fallback)
 
 When routing detects no matching agent for a specialized task:
