@@ -1,0 +1,7 @@
+[Unit]
+Description=second-brain bind mount write-check (early drift detection)
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/baekenough/bin/verify-mounts.sh
