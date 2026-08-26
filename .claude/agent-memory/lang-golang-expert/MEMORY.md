@@ -1,6 +1,7 @@
 # lang-golang-expert Memory Index
 
 - [project_second_brain.md](project_second_brain.md) — second-brain Go server architecture and already-fixed P0 bugs
+- [project_calendar_multi_collector.md](project_calendar_multi_collector.md) — 캘린더 복수 캘린더 지원: freeBusyReader 빈콘텐츠 skip 패턴, source_id 네임스페이스 규칙, 단일 워터마크로 복수 하위소스 다루는 트레이드오프
 - [project_whisper_transcription_ledger.md](project_whisper_transcription_ledger.md) — whisper infinite re-transcription fix: ledger table, authoritative index-skip, worker pool; do-not-run store DB tests
 - [project_note_capture_enrichment.md](project_note_capture_enrichment.md) — note/insight pipeline: the three-budget deadline model + the four insight echo-chamber gates
 - [project_search_rrf_relevance.md](project_search_rrf_relevance.md) — mergeRRF equal-weight fix (fixed) + unfixed HNSW ef_search relevance bug (follow-up needed)
