@@ -210,8 +210,10 @@ func TestWhisperCollector_Cutover_FilenameDate_SkipsHistorical(t *testing.T) {
 	dir := t.TempDir()
 	srv, _ := newWhisperTestServer(t, "should not appear")
 
-	// Cutover: 2026-05-30 00:00:00 Local
-	cutover := time.Date(2026, 5, 30, 0, 0, 0, 0, time.Local)
+	// Cutover: 2026-05-30 00:00:00 UTC (prod cutover is always normalised to
+	// UTC by collectorCutover; constructing it any other way here would make
+	// this test's outcome depend on the host's local timezone).
+	cutover := time.Date(2026, 5, 30, 0, 0, 0, 0, time.UTC)
 
 	// Historical file: filename encodes 2026-01-20 (before cutover),
 	// but mtime is set to "now+1h" (after cutover) — simulating a staging copy.
@@ -260,7 +262,7 @@ func TestWhisperCollector_Cutover_FilenameDate_TPhone_SkipsHistorical(t *testing
 	dir := t.TempDir()
 	srv, _ := newWhisperTestServer(t, "should not appear")
 
-	cutover := time.Date(2026, 5, 30, 0, 0, 0, 0, time.Local)
+	cutover := time.Date(2026, 5, 30, 0, 0, 0, 0, time.UTC) // prod cutover is always normalised to UTC (collectorCutover)
 
 	recentMtime := time.Now().Add(time.Hour)
 
@@ -362,7 +364,7 @@ func TestWhisperCollector_Cutover_FilenameDate_SubdirPath(t *testing.T) {
 	}
 	srv, _ := newWhisperTestServer(t, "subdir transcription")
 
-	cutover := time.Date(2026, 5, 30, 0, 0, 0, 0, time.Local)
+	cutover := time.Date(2026, 5, 30, 0, 0, 0, 0, time.UTC) // prod cutover is always normalised to UTC (collectorCutover)
 	recentMtime := time.Now().Add(time.Hour)
 
 	// Filename date: 2026-06-01 (after cutover) — should pass.
@@ -386,5 +388,98 @@ func TestWhisperCollector_Cutover_FilenameDate_SubdirPath(t *testing.T) {
 
 	if len(docs) != 1 {
 		t.Fatalf("got %d docs, want 1 (file in date-named subdir should be processed by filename date)", len(docs))
+	}
+}
+
+// TestRecordingTime_ParsesUTCNotHostLocal is a direct regression test for the
+// recordingTime time.Local → time.UTC fix. It does not depend on t.Setenv
+// changing the process's actual host timezone (Go's time.Local is captured
+// once at process start from TZ and is not safely mutable mid-test); instead
+// it asserts the parsed instant directly against the UTC-correct value and
+// against what the old Local-parsing bug would have produced, so the
+// assertion is correct regardless of which TZ this test binary happens to
+// run under.
+func TestRecordingTime_ParsesUTCNotHostLocal(t *testing.T) {
+	t.Parallel()
+
+	sentinel := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+	filename := "01025777190_20260826054434.m4a" // 05:44:34 UTC
+
+	got := recordingTime(filename, sentinel)
+
+	wantUTC := time.Date(2026, 8, 26, 5, 44, 34, 0, time.UTC)
+	if !got.Equal(wantUTC) {
+		t.Fatalf("recordingTime() = %v, want %v (parsed as UTC)", got, wantUTC)
+	}
+
+	kst, err := time.LoadLocation("Asia/Seoul")
+	if err != nil {
+		t.Skipf("Asia/Seoul tzdata unavailable in this environment: %v", err)
+	}
+	// What the pre-fix time.Local parse would have produced on a KST host:
+	// the same wall-clock digits interpreted as KST instead of UTC — an
+	// instant 9 hours earlier than the correct one.
+	oldBuggyResult := time.Date(2026, 8, 26, 5, 44, 34, 0, kst)
+	if got.Equal(oldBuggyResult) {
+		t.Fatalf("recordingTime() matched the pre-fix KST-misparse value %v — must parse as UTC", oldBuggyResult.UTC())
+	}
+	if diff := got.Sub(oldBuggyResult); diff != 9*time.Hour {
+		t.Fatalf("sanity check on the test itself failed: expected exactly 9h from the KST-misparse value, got %v", diff)
+	}
+}
+
+// TestWhisperCollector_Cutover_UTCNotLocal_TZIndependent is the key
+// regression test for the recordingTime time.Local → time.UTC fix. It
+// constructs a scenario where the old bug (parsing the filename timestamp as
+// time.Local) and the fix (parsing as time.UTC) produce OPPOSITE cutover
+// verdicts on a non-UTC host — proving the fix, and proving the fix is host
+// timezone independent, since this test must pass identically whether the
+// suite is run under TZ=UTC or TZ=Asia/Seoul (see the go-best-practices skill
+// self-check: "TZ=Asia/Seoul go test ./internal/collector/..." must be green).
+//
+// Setup:
+//   - cutover floor = 2026-08-26 03:00:00 UTC.
+//   - call file's filename encodes 05:44:34 (i.e. 05:44:34 UTC, confirmed by
+//     call-log cross-reference — see the reTPhone var block comment) — that
+//     is AFTER the cutover, so the file must be processed.
+//
+// Under the pre-fix bug, on a host whose time.Local is KST (UTC+9), the same
+// digits would have been parsed as 05:44:34 KST = 2026-08-25 20:44:34 UTC —
+// BEFORE the cutover — incorrectly suppressing the file. The fix parses the
+// digits as UTC regardless of host timezone, so the file is correctly kept
+// on every host.
+func TestWhisperCollector_Cutover_UTCNotLocal_TZIndependent(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	srv, _ := newWhisperTestServer(t, "tz independence transcript")
+
+	cutover := time.Date(2026, 8, 26, 3, 0, 0, 0, time.UTC)
+	recentMtime := time.Now().Add(time.Hour)
+
+	// Filename encodes 05:44:34 UTC — after the 03:00 UTC cutover floor.
+	// Under the pre-fix time.Local bug this would misparse to
+	// 2026-08-25 20:44:34 UTC on a KST host — before the cutover — and be
+	// wrongly suppressed.
+	name := "01025777190_20260826054434.m4a"
+	writeDummyAudio(t, dir, name, recentMtime)
+
+	cfg := &config.Config{
+		WhisperAudioDir: dir,
+		WhisperAPIURL:   srv.URL,
+		WhisperModel:    "whisper-1",
+		WhisperLanguage: "ko",
+	}
+	c := makeWhisperCollector(cfg, srv)
+	c.WithCutover(cutover)
+	c.WithIndexedIDs(map[string]struct{}{})
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+
+	if len(docs) != 1 {
+		t.Fatalf("got %d docs, want 1 — filename timestamp (05:44:34 UTC) is after cutover (03:00 UTC) and must be processed regardless of host timezone", len(docs))
 	}
 }

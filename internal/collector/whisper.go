@@ -396,8 +396,30 @@ func labelTranscript(whisperSegs []whisperSegment, diarSegs []diarSegment) (cont
 //	e.g. 01025777190_20260327202518.m4a     →  2026-03-27 20:25:18
 //	     01025777190_20260327202518-1.m4a   →  2026-03-27 20:25:18  (suffix ignored)
 //
-// Times are parsed in time.Local so that the cutover comparison is meaningful
-// regardless of whether the cutover value was constructed in UTC or Local.
+// Both patterns are parsed as UTC, not time.Local. For Pattern B this is
+// empirically confirmed, not assumed: cross-referencing filename timestamps
+// against the independently-sourced, accurate call time in the matching
+// call-log document, the two agreed to the second across every sample
+// checked (2026-08-26 incident investigation — a delayed upload exposed a
+// filename-vs-mtime skew, and the filename/call-log cross-check is what
+// pinned the filename's UTC offset). Pattern A (Voice Recorder app) is
+// device-clock-sourced the same way but has no call-log counterpart to
+// cross-check against, so its UTC-ness is inferred by symmetry, not
+// independently verified.
+//
+// Parsing with time.Local instead is a latent bug, not a stylistic choice:
+// COLLECTOR_CUTOVER (internal/config/config.go's collectorCutover) is always
+// normalised to UTC via .UTC() before being handed to WithCutover, so
+// recordingTime's result is compared against an absolute UTC instant either
+// way (time.Time.Before/After compare instants, not Locations) — parsing
+// with time.Local silently computes the WRONG instant whenever the host's
+// local zone isn't UTC, shifting the comparison by the zone offset (9h for
+// KST). This shipped unnoticed for the same reason the OccurredAt bug did:
+// production's container runs with TZ unset (== UTC), so time.Local == UTC
+// there and the mistake was invisible until observed on a non-UTC host (a
+// KST dev machine) or exposed by a large enough skew. Do not revert this to
+// time.Local — see callRecordingOccurredAt's regression history for the
+// twin of this exact bug.
 var (
 	// reVoiceRecorder matches the 2-digit-year pattern at the END of the stem
 	// (before the extension), allowing arbitrary label characters before it.
@@ -407,30 +429,52 @@ var (
 	reTPhone = regexp.MustCompile(`_(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:-\d+)?(?:\.\w+)?$`)
 )
 
+// parseTPhoneFilenameUTC extracts and parses the reTPhone timestamp embedded
+// in filename (Pattern B — TPhoneCallRecords: <anything>_YYYYMMDDHHMMSS[-N].<ext>),
+// as UTC (see the UTC rationale on the var block above reTPhone).
+//
+// Returns (zero, false) when the filename does not match reTPhone, or when
+// the matched digits parse to an implausible date (isPlausibleRecordingTime)
+// — the filename is untrusted, device-controlled input, so a malformed or
+// spoofed value must never be reported as a real recording time.
+//
+// This is the single parsing path shared by recordingTime (Pattern B branch,
+// used for the cutover floor comparison) and callRecordingOccurredAt (used
+// for the stored OccurredAt field), so a future fix to the parsing itself
+// only needs to happen once. The two callers still diverge on fallback
+// POLICY — recordingTime falls back silently to mtime (then tries Pattern A),
+// callRecordingOccurredAt falls back to mtime with a log line and an
+// additional future-timestamp check — and that divergence is intentionally
+// left in each caller rather than folded in here.
+func parseTPhoneFilenameUTC(filename string) (time.Time, bool) {
+	m := reTPhone.FindStringSubmatch(filename)
+	if m == nil {
+		return time.Time{}, false
+	}
+	t := time.Date(atoi(m[1]), time.Month(atoi(m[2])), atoi(m[3]),
+		atoi(m[4]), atoi(m[5]), atoi(m[6]), 0, time.UTC)
+	if !isPlausibleRecordingTime(t) {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
 // recordingTime returns the recording timestamp for the given audio filename.
 //
 // It tries two filename patterns in order:
-//  1. TPhoneCallRecords: <anything>_YYYYMMDDHHMMSS[-N].<ext>
+//  1. TPhoneCallRecords: <anything>_YYYYMMDDHHMMSS[-N].<ext>  (via parseTPhoneFilenameUTC)
 //  2. Voice Recorder:   <label>_YYMMDD_HHMMSS.<ext>  (2-digit year, +2000)
 //
 // If neither pattern matches, or if the parsed date is clearly invalid,
 // the file's mtime is returned unchanged. This ensures files with
 // unparseable names continue to use the existing mtime-based cutover check.
 //
-// All parsed times are in time.Local.
+// All parsed times are UTC — see the UTC rationale on the var block above
+// reTPhone/reVoiceRecorder.
 func recordingTime(filename string, mtime time.Time) time.Time {
 	// Pattern B first (14-digit timestamp is unambiguous and more specific).
-	if m := reTPhone.FindStringSubmatch(filename); m != nil {
-		yr := atoi(m[1])
-		mo := atoi(m[2])
-		dy := atoi(m[3])
-		hr := atoi(m[4])
-		mn := atoi(m[5])
-		sc := atoi(m[6])
-		t := time.Date(yr, time.Month(mo), dy, hr, mn, sc, 0, time.Local)
-		if isPlausibleRecordingTime(t) {
-			return t
-		}
+	if t, ok := parseTPhoneFilenameUTC(filename); ok {
+		return t
 	}
 
 	// Pattern A: 2-digit year.
@@ -441,7 +485,7 @@ func recordingTime(filename string, mtime time.Time) time.Time {
 		hr := atoi(m[4])
 		mn := atoi(m[5])
 		sc := atoi(m[6])
-		t := time.Date(yr, time.Month(mo), dy, hr, mn, sc, 0, time.Local)
+		t := time.Date(yr, time.Month(mo), dy, hr, mn, sc, 0, time.UTC)
 		if isPlausibleRecordingTime(t) {
 			return t
 		}
@@ -468,6 +512,51 @@ func isPlausibleRecordingTime(t time.Time) bool {
 	return t.Year() >= 2000 && t.Year() <= 2100 &&
 		t.Month() >= 1 && t.Month() <= 12 &&
 		t.Day() >= 1 && t.Day() <= 31
+}
+
+// callRecordingOccurredAt returns the OccurredAt value for a TPhoneCallRecords
+// audio file: the actual call time, parsed from the filename's embedded
+// timestamp via parseTPhoneFilenameUTC, NOT the audio file's mtime.
+//
+// Bug this fixes: mtime is when the server SAVED the file, not when the call
+// happened. Normally the phone uploads within seconds of the call ending, so
+// the two are close enough that the difference went unnoticed. When upload is
+// delayed (e.g. a server permission outage — see the incident this function
+// was added for), mtime can lag the real call time by hours, producing a
+// wildly wrong OccurredAt (a 14:44 call recorded as 22:16).
+//
+// Parsing must stay UTC (see parseTPhoneFilenameUTC / the reTPhone var block
+// comment for the empirical evidence). Parsing with time.Local would be
+// silently wrong on any host whose local timezone is not UTC (e.g. a KST dev
+// machine) — this is not a hypothetical: recordingTime shipped exactly this
+// mistake for its cutover comparison, invisible in production only because
+// the container's TZ happens to be UTC. Do not reintroduce time.Local here
+// or in recordingTime.
+//
+// filename must be the base name (matches reTPhone usage elsewhere in this
+// file, e.g. isTPhoneCallPath). Falls back to mtime — logging why — when:
+//   - the filename does not match the reTPhone pattern, or the matched
+//     digits fail isPlausibleRecordingTime (legacy/foreign file names, or a
+//     malformed timestamp — both handled by parseTPhoneFilenameUTC),
+//   - the parsed timestamp is in the future relative to now.
+//
+// The filename is attacker/device-controlled input from the phone, not
+// trusted data — the future check exists because a malformed or spoofed
+// filename must never silently produce a bogus OccurredAt.
+func callRecordingOccurredAt(filename string, mtime, now time.Time) time.Time {
+	t, ok := parseTPhoneFilenameUTC(filename)
+	if !ok {
+		slog.Debug("whisper: filename has no usable embedded call timestamp — using mtime for occurred_at",
+			"filename", filename, "mtime", mtime)
+		return mtime
+	}
+	if t.After(now) {
+		slog.Warn("whisper: filename timestamp is in the future — using mtime for occurred_at",
+			"filename", filename, "parsed", t, "now", now, "mtime", mtime)
+		return mtime
+	}
+
+	return t
 }
 
 // WhisperCollector transcribes audio files via an OpenAI-compatible Whisper
@@ -1268,6 +1357,10 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 	}
 
 	mtime := item.info.ModTime().UTC()
+	// occurredAt is the actual call time, parsed from the filename when
+	// possible — NOT mtime (save time). See callRecordingOccurredAt doc
+	// comment for why mtime is unreliable here.
+	occurredAt := callRecordingOccurredAt(filepath.Base(item.path), mtime, now)
 	meta := map[string]any{
 		"relative_path": item.relPath,
 		"language":      c.cfg.WhisperLanguage,
@@ -1407,7 +1500,7 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 		Title:       title,
 		Content:     content,
 		Metadata:    meta,
-		OccurredAt:  &mtime,
+		OccurredAt:  &occurredAt,
 		CollectedAt: now,
 	}, true
 }
