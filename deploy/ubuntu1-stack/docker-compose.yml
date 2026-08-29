@@ -15,7 +15,8 @@
 #   second-brain-web:ubuntu1 / neo4j:5.26-community
 #
 # 사전 조건:
-#   - .env.local, web/.env.local 이 이 디렉토리에 존재해야 합니다.
+#   - .env.local 이 이 디렉토리에 존재해야 합니다. (web 서비스 전용 env 파일은
+#     next-auth 제거로 더 이상 필요하지 않다 — 2026-08-29)
 #
 # 기동 (중요: --env-file 필수):
 #   docker compose --env-file .env.local -f docker-compose.ubuntu1.yml up -d
@@ -113,7 +114,6 @@ services:
     ports:
       - "127.0.0.1:3000:3000"
     env_file:
-      - web/.env.local
       - .env.local
     environment:
       BRAIN_API_URL: "http://server:8080"

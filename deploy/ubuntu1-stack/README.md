@@ -40,7 +40,10 @@
 실패 시 `journalctl --user -u sb-permcheck` / `systemctl --user status
 sb-permcheck.service`에 남긴다. 자세한 배경은 아래 "함정 1" 참고.
 2026-08-29에 compose `env_file:` 목록의 존재·비어있지 않음 점검이
-추가됐다(내용은 읽지 않는다). 자세한 배경은 아래 "함정 5" 참고.
+추가됐다(내용은 읽지 않는다). 자세한 배경은 아래 "함정 5" 참고. 같은 날
+next-auth 제거로 `web/.env.local` 요구사항 자체가 없어졌다(아래 참고) —
+`verify-mounts.sh`는 compose의 `env_file:` 목록을 동적으로 추출하므로
+항목이 빠지면 자동으로 검사 대상에서도 빠져 스크립트 수정은 불필요했다.
 
 `cloudflared/config-second-brain.yml`은 터널 ID와 credentials **경로**만
 담고 있다. credentials json(`ee3b9a8b-....json`) 자체는 시크릿이라 이 리포에
@@ -165,11 +168,20 @@ git 추적 파일만으로 통째 교체했는데, 그 과정에서 gitignore �
 
 **ubuntu1에 존재해야 하지만 git에는 없는 파일**:
 - `~/second-brain-app/.env.local`
-- `~/second-brain-app/web/.env.local`
 
-둘 다 `.gitignore` 대상(시크릿)이라 이 리포에 없는 것이 정상이다 — 문제는
-"리포에 없다"가 아니라 "소스 동기화가 이 파일들까지 지우거나 덮을 수
-있다"는 점이다.
+(사고 당시에는 `~/second-brain-app/web/.env.local`도 여기 있었다. 이
+파일은 next-auth의 `ALLOWED_GITHUB_USERS`/`AUTH_SECRET`/
+`GITHUB_CLIENT_ID`/`GITHUB_CLIENT_SECRET` 4개 변수만 공급했는데,
+2026-08-29에 next-auth를 완전히 제거하면서(인증은 이미 Cloudflare Access
+JWT 검증으로 이관된 상태였다) 그 요구사항 자체가 없어져 compose의
+`env_file:` 목록에서도 `web/.env.local`을 제거했다. web 서비스가 쓰는
+나머지 값은 전부 compose `environment:` 블록이나 루트 `.env.local`에서
+온다.)
+
+`.env.local`은 `.gitignore` 대상(시크릿)이라 이 리포에 없는 것이 정상이다
+— 문제는 "리포에 없다"가 아니라 "소스 동기화가 이 파일을 지우거나 덮을 수
+있다"는 점이다. 이 교훈은 `web/.env.local` 요구사항이 사라진 뒤에도 여전히
+유효하다(`.env.local` 자체에 그대로 적용된다).
 
 **지침**: 소스 동기화(재배포)는 git 추적 대상만 명시적으로 한정할 것 —
 예를 들어 `cmd/ internal/ migrations/ go.mod go.sum Dockerfile`처럼
