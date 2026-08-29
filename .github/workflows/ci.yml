@@ -74,8 +74,6 @@ jobs:
           else
             touch .env.local
           fi
-          # web/ has no .env.local.example yet; keep it as an empty stub.
-          touch web/.env.local
           set +e
           # docker compose only auto-loads a file literally named ".env" for
           # ${VAR} interpolation — env_file: entries (which point at .env.local)
