@@ -434,7 +434,7 @@ func run() error {
 		collector.NewNotionCollector(cfg.NotionToken),
 		collector.NewTelegramCollector(cfg.TelegramBotToken, cfg.TelegramChatIDs),
 		collector.NewGmailCollector(cfg),
-		collector.NewCalendarCollector(cfg),
+		collector.NewCalendarCollector(cfg).WithCancellationStore(docStore),
 		collector.NewSMSCollector(cfg.SMSSourceDir, cfg.SMSMaxFileBytes).
 			WithNumberHashingEnabled(cfg.PIINumberHashingEnabled),
 		collector.NewWhisperCollector(cfg),

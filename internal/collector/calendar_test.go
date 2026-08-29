@@ -832,6 +832,228 @@ func TestCalendarCollector_Collect_NoSourceIDCollisionAcrossCalendars(t *testing
 	}
 }
 
+// --- cancellation handling ---
+
+// fakeCancellationStore is a test double for CalendarCancellationStore.
+// activeSourceIDs simulates the set of source_ids that currently have an
+// active document in the store: SoftDeleteBySourceID returns true and
+// removes the entry (simulating the row's status flipping to 'deleted') the
+// first time it is called for a given id, and false on every subsequent
+// call for the same id — mirroring the real UPDATE ... WHERE status='active'
+// semantics, which is what makes the store method (and therefore the
+// collector's use of it) idempotent.
+type fakeCancellationStore struct {
+	activeSourceIDs map[string]bool
+	err             error
+	calls           []fakeCancellationCall
+}
+
+type fakeCancellationCall struct {
+	sourceType model.SourceType
+	sourceID   string
+}
+
+func (f *fakeCancellationStore) SoftDeleteBySourceID(_ context.Context, sourceType model.SourceType, sourceID string) (bool, error) {
+	f.calls = append(f.calls, fakeCancellationCall{sourceType: sourceType, sourceID: sourceID})
+	if f.err != nil {
+		return false, f.err
+	}
+	if f.activeSourceIDs[sourceID] {
+		delete(f.activeSourceIDs, sourceID)
+		return true, nil
+	}
+	return false, nil
+}
+
+// cancelledEventJSON builds a cancelled-event payload. Matching real Google
+// Calendar API behavior, a cancelled event typically omits summary/
+// description/location entirely — only id, status, and updated survive.
+func cancelledEventJSON(id string) map[string]any {
+	return map[string]any{
+		"id":      id,
+		"status":  "cancelled",
+		"updated": time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
+// TestCalendarCollector_Collect_CancelledEvent_TransitionsExistingDocument
+// covers the exact defect found in production: an event that was previously
+// collected as an active document is later cancelled. The cancellation must
+// soft-delete that existing document, and must NOT produce a new active
+// document for the cancelled event.
+func TestCalendarCollector_Collect_CancelledEvent_TransitionsExistingDocument(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/calendar/v3/calendars/primary/events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		ev := cancelledEventJSON("evt-was-active")
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{ev}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	fake := &fakeCancellationStore{activeSourceIDs: map[string]bool{"calendar:evt-was-active": true}}
+	c := newCalendarCollectorWithFakeSource(validCalendarConfig(), srv, nil).WithCancellationStore(fake)
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(docs) != 0 {
+		t.Fatalf("got %d docs, want 0 — a cancelled event must never become an active document", len(docs))
+	}
+	if len(fake.calls) != 1 {
+		t.Fatalf("SoftDeleteBySourceID called %d times, want 1", len(fake.calls))
+	}
+	if fake.calls[0].sourceType != model.SourceCalendar || fake.calls[0].sourceID != "calendar:evt-was-active" {
+		t.Errorf("SoftDeleteBySourceID called with (%q, %q), want (%q, %q)",
+			fake.calls[0].sourceType, fake.calls[0].sourceID, model.SourceCalendar, "calendar:evt-was-active")
+	}
+	if fake.activeSourceIDs["calendar:evt-was-active"] {
+		t.Error("expected the fake store's active entry to be removed (soft-deleted)")
+	}
+}
+
+// TestCalendarCollector_Collect_CancelledEvent_NeverSeenBefore verifies that
+// a cancellation for an event the collector has never fetched while active
+// does not manufacture a new document — SoftDeleteBySourceID is a no-op in
+// the store for a nonexistent source_id, and Collect must not compensate by
+// building one anyway.
+func TestCalendarCollector_Collect_CancelledEvent_NeverSeenBefore(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/calendar/v3/calendars/primary/events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		ev := cancelledEventJSON("evt-never-active")
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{ev}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	fake := &fakeCancellationStore{activeSourceIDs: map[string]bool{}}
+	c := newCalendarCollectorWithFakeSource(validCalendarConfig(), srv, nil).WithCancellationStore(fake)
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(docs) != 0 {
+		t.Fatalf("got %d docs, want 0", len(docs))
+	}
+	if len(fake.calls) != 1 {
+		t.Fatalf("SoftDeleteBySourceID called %d times, want 1", len(fake.calls))
+	}
+}
+
+// TestCalendarCollector_Collect_ConfirmedEvent_UnaffectedByCancellationHandling
+// is a regression guard: a normal confirmed event must be collected exactly
+// as before, and must never trigger a SoftDeleteBySourceID call.
+func TestCalendarCollector_Collect_ConfirmedEvent_UnaffectedByCancellationHandling(t *testing.T) {
+	t.Parallel()
+
+	start := time.Now().UTC()
+	end := start.Add(time.Hour)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/calendar/v3/calendars/primary/events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		ev := buildCalendarEventJSON("evt-confirmed", "Still Happening", "", "", "confirmed", start, end, "", nil)
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{ev}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	fake := &fakeCancellationStore{activeSourceIDs: map[string]bool{}}
+	c := newCalendarCollectorWithFakeSource(validCalendarConfig(), srv, nil).WithCancellationStore(fake)
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("got %d docs, want 1", len(docs))
+	}
+	if docs[0].SourceID != "calendar:evt-confirmed" {
+		t.Errorf("SourceID = %q, want %q", docs[0].SourceID, "calendar:evt-confirmed")
+	}
+	if len(fake.calls) != 0 {
+		t.Fatalf("SoftDeleteBySourceID called %d times, want 0 for a confirmed event", len(fake.calls))
+	}
+}
+
+// TestCalendarCollector_Collect_CancelledEvent_Idempotent verifies that
+// collecting the same cancellation twice (e.g. the same event still falls
+// inside the updatedMin window on a later tick) produces the same
+// observable result both times: no documents, no error. The second call's
+// SoftDeleteBySourceID invocation reports no row affected (already
+// soft-deleted), which Collect must treat as a normal, non-error outcome.
+func TestCalendarCollector_Collect_CancelledEvent_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/calendar/v3/calendars/primary/events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		ev := cancelledEventJSON("evt-repeat-cancel")
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{ev}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	fake := &fakeCancellationStore{activeSourceIDs: map[string]bool{"calendar:evt-repeat-cancel": true}}
+	c := newCalendarCollectorWithFakeSource(validCalendarConfig(), srv, nil).WithCancellationStore(fake)
+
+	docs1, err1 := c.Collect(context.Background(), time.Time{})
+	if err1 != nil {
+		t.Fatalf("first Collect: %v", err1)
+	}
+	docs2, err2 := c.Collect(context.Background(), time.Time{})
+	if err2 != nil {
+		t.Fatalf("second Collect: %v", err2)
+	}
+
+	if len(docs1) != 0 || len(docs2) != 0 {
+		t.Fatalf("got %d and %d docs, want 0 and 0", len(docs1), len(docs2))
+	}
+	if len(fake.calls) != 2 {
+		t.Fatalf("SoftDeleteBySourceID called %d times, want 2 (once per Collect)", len(fake.calls))
+	}
+	for i, call := range fake.calls {
+		if call.sourceID != "calendar:evt-repeat-cancel" {
+			t.Errorf("call[%d].sourceID = %q, want %q", i, call.sourceID, "calendar:evt-repeat-cancel")
+		}
+	}
+}
+
+// TestCalendarCollector_Collect_CancelledEvent_NoCancellationStoreConfigured
+// verifies backward compatibility: when WithCancellationStore is never
+// called (cancellationStore is nil), a cancelled event is observed and
+// skipped without a nil-pointer dereference, and without producing a
+// document.
+func TestCalendarCollector_Collect_CancelledEvent_NoCancellationStoreConfigured(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/calendar/v3/calendars/primary/events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		ev := cancelledEventJSON("evt-no-store")
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{ev}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := newCalendarCollectorWithFakeSource(validCalendarConfig(), srv, nil) // no WithCancellationStore call
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(docs) != 0 {
+		t.Fatalf("got %d docs, want 0", len(docs))
+	}
+}
+
 // keysOf returns the keys of a source_id-keyed document map, for test failure messages.
 func keysOf(m map[string]model.Document) []string {
 	out := make([]string, 0, len(m))

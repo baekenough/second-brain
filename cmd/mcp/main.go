@@ -38,6 +38,7 @@ import (
 	"github.com/baekenough/second-brain/internal/note"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
+	"github.com/baekenough/second-brain/internal/timeutil"
 )
 
 func main() {
@@ -249,7 +250,9 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service) {
 		"search",
 		mcp.WithDescription(
 			"Hybrid full-text and semantic search over the second-brain knowledge base. "+
-				"Returns matching documents ordered by relevance score.",
+				"Returns matching documents ordered by relevance score. "+
+				"Use occurred_from/occurred_to to restrict results to an event-time window "+
+				"(e.g. \"next week's calendar\", \"messages from yesterday\").",
 		),
 		mcp.WithString("query",
 			mcp.Required(),
@@ -263,6 +266,22 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service) {
 				"Optional source type filter. One of: slack, github, gdrive, notion, "+
 					"filesystem, discord, telegram, secretary, llm-memory (deprecated), "+
 					"gmail, calendar, sms, call-log, call-transcript, upload, agent-note.",
+			),
+		),
+		mcp.WithString("occurred_from",
+			mcp.Description(
+				"Optional start of an event-time window (inclusive) on documents.occurred_at. "+
+					"Together with occurred_to this forms a half-open range [occurred_from, occurred_to) — "+
+					"documents with no occurred_at (e.g. some notes/attachments) are excluded whenever "+
+					"either bound is set. Accepts RFC3339 (\"2026-09-05T00:00:00+09:00\") or a bare "+
+					"date (\"2026-09-05\"); a bare date is interpreted as KST midnight. May be given alone.",
+			),
+		),
+		mcp.WithString("occurred_to",
+			mcp.Description(
+				"Optional end of the event-time window (exclusive) on documents.occurred_at — see "+
+					"occurred_from for the window semantics and accepted formats. Must be strictly "+
+					"after occurred_from when both are given. May be given alone.",
 			),
 		),
 	)
@@ -301,6 +320,26 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service) {
 				)), nil
 			}
 			sq.SourceType = &st
+		}
+
+		if raw := req.GetString("occurred_from", ""); raw != "" {
+			t, err := parseOccurredBound(raw)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("invalid occurred_from %q: %v", raw, err)), nil
+			}
+			sq.OccurredFrom = t
+		}
+		if raw := req.GetString("occurred_to", ""); raw != "" {
+			t, err := parseOccurredBound(raw)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("invalid occurred_to %q: %v", raw, err)), nil
+			}
+			sq.OccurredTo = t
+		}
+		if sq.OccurredFrom != nil && sq.OccurredTo != nil && !sq.OccurredTo.After(*sq.OccurredFrom) {
+			return mcp.NewToolResultError(
+				"occurred_to must be strictly after occurred_from (half-open window [occurred_from, occurred_to))",
+			), nil
 		}
 
 		results, err := svc.Search(ctx, sq)
@@ -573,6 +612,37 @@ func registerAddNoteTool(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// parseOccurredBound parses one occurred_from/occurred_to argument of the
+// search tool. It accepts either a full RFC3339 timestamp
+// (e.g. "2026-09-05T00:00:00+09:00") or a bare date ("2026-09-05").
+//
+// A bare date is interpreted at midnight in KST (UTC+9). This mirrors the
+// convention internal/intent/plan.go's parseWindow already uses for the same
+// documents.occurred_at half-open window: the query planner resolves LLM- and
+// heuristic-produced "YYYY-MM-DD" bounds against timeutil.KST(), and second-
+// brain's users and data are Korea-based, so a bare date given to this MCP
+// tool must resolve to the same instant a planner-produced date would — an
+// MCP client asking for "2026-09-05" should get the same window as /ask
+// asking for "오늘(9/5)".
+//
+// The caller distinguishes "not provided" (empty string, skip the field
+// entirely) from "provided but malformed" (returns an error) — this function
+// only handles the latter; empty-string short-circuiting happens at the call
+// site so a truly optional bound leaves the corresponding model.SearchQuery
+// field nil.
+func parseOccurredBound(s string) (*time.Time, error) {
+	s = strings.TrimSpace(s)
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return &t, nil
+	}
+	t, err := time.ParseInLocation("2006-01-02", s, timeutil.KST())
+	if err != nil {
+		return nil, fmt.Errorf(
+			"must be RFC3339 (e.g. 2026-09-05T00:00:00+09:00) or a date (e.g. 2026-09-05)")
+	}
+	return &t, nil
+}
 
 // truncateRunes returns the first n runes of s.
 // When s is shorter than n runes it is returned unchanged.
