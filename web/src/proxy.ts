@@ -27,12 +27,6 @@
  * Fail-closed: if either env var is missing, ALL requests are rejected
  * with a 503. There is no "pass through when unconfigured" mode — an
  * unconfigured gate must never behave like an open gate.
- *
- * Note: next-auth (Auth.js) wiring — src/auth.ts, src/app/login/,
- * src/app/api/auth/*, and the next-auth dependency — is no longer
- * referenced by this middleware and is now dead code. It is intentionally
- * left in place for this change to keep the diff reviewable; removing it
- * is follow-up cleanup.
  */
 import { jwtVerify, createRemoteJWKSet, type JWTPayload } from "jose";
 import { NextResponse } from "next/server";
@@ -59,10 +53,9 @@ function unauthorized(req: NextRequest, message: string): NextResponse {
   }
   // Non-API page request: return 401 directly rather than redirecting.
   // Cloudflare Access sits in front of this app and already presents its
-  // own login UI for unauthenticated browser requests; issuing our own
-  // redirect here (e.g. to a local /login page that no longer performs
-  // any auth) would either 404 or create a redirect loop back through
-  // Access.
+  // own login UI for unauthenticated browser requests. This app has no
+  // local /login page to redirect to; issuing our own redirect here would
+  // either 404 or create a redirect loop back through Access.
   return NextResponse.json({ error: message }, { status: 401 });
 }
 
