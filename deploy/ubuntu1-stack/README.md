@@ -39,6 +39,8 @@
 쓰기 가능 여부를 컨테이너 안에서 직접 실측(touch/rm)해 10분 주기로 검사하고
 실패 시 `journalctl --user -u sb-permcheck` / `systemctl --user status
 sb-permcheck.service`에 남긴다. 자세한 배경은 아래 "함정 1" 참고.
+2026-08-29에 compose `env_file:` 목록의 존재·비어있지 않음 점검이
+추가됐다(내용은 읽지 않는다). 자세한 배경은 아래 "함정 5" 참고.
 
 `cloudflared/config-second-brain.yml`은 터널 ID와 credentials **경로**만
 담고 있다. credentials json(`ee3b9a8b-....json`) 자체는 시크릿이라 이 리포에
@@ -68,7 +70,7 @@ docker compose --env-file .env.local -f docker-compose.ubuntu1.yml up -d
 깜빡 잊고 이 단계를 건너뛰어도 늦어도 10분 안에 `journalctl --user -u
 sb-permcheck`에 FAIL로 드러난다.
 
-## 이전 과정에서 실제로 부딪힌 함정 4가지
+## 이전 과정에서 실제로 부딪힌 함정 5가지
 
 **재발 방지를 위해 반드시 기록한다.**
 
@@ -143,6 +145,44 @@ macmini의 `stage/sms/*.xml`은 `stat` 크기 0인 파일이다(`du`는 285MB로
 경로로 수집되며 이 파일들은 레거시다. collector 로그의 "sms: source file is
 empty — possible OneDrive materialization/bridge failure" 경고는 정상
 동작이다.
+
+### 5. gitignore 대상 env 파일이 소스 동기화로 유실 — 2026-08-29
+
+**사고**: 2026-08-27 재배포 때 ubuntu1의 `~/second-brain-app/web/` 트리를
+git 추적 파일만으로 통째 교체했는데, 그 과정에서 gitignore 대상인
+`web/.env.local`이 함께 사라졌다(증거: `web/` 안 모든 파일의 mtime이
+`2026-08-27 03:26`로 동일하고 내용물이 추적 파일뿐이었다 —
+`node_modules`·`.next`도 없음).
+
+**왜 즉시 안 드러났는가**: 당시 web 컨테이너는 이미 기동 중이었고, 실행
+중인 프로세스는 시작 시점에 물었던 환경변수를 계속 들고 있다 —
+`docker compose up -d`가 컨테이너를 재생성하지 않는 한 파일 유실은 아무
+증상도 내지 않는다. 이틀 뒤인 2026-08-29, 다음 배포에서 `docker compose
+... up -d`가 프로젝트 전체에 대해 `env file
+/home/baekenough/second-brain-app/web/.env.local not found`로 실패하고
+나서야 발견됐다. **재배포 시점까지 잠복하는 결함이라 사고 당시 로그만
+봐서는 절대 못 잡는다.**
+
+**ubuntu1에 존재해야 하지만 git에는 없는 파일**:
+- `~/second-brain-app/.env.local`
+- `~/second-brain-app/web/.env.local`
+
+둘 다 `.gitignore` 대상(시크릿)이라 이 리포에 없는 것이 정상이다 — 문제는
+"리포에 없다"가 아니라 "소스 동기화가 이 파일들까지 지우거나 덮을 수
+있다"는 점이다.
+
+**지침**: 소스 동기화(재배포)는 git 추적 대상만 명시적으로 한정할 것 —
+예를 들어 `cmd/ internal/ migrations/ go.mod go.sum Dockerfile`처럼
+동기화할 경로를 나열하고, `web/` 트리 전체를 통째로 교체하지 말 것.
+rsync를 쓴다면 `--delete` 사용에 특히 주의(대상 디렉토리에만 국한, 상위
+디렉토리 전체에 걸지 말 것). git 기반으로 교체하는 경우에도 "추적
+파일만 남기고 나머지 삭제" 방식은 gitignore 파일을 함께 날린다는 점을
+명심할 것.
+
+**검증 자동화**: `verify-mounts.sh`가 이제 compose 파일의 `env_file:`
+목록을 추출해 각 파일의 존재·비어있지 않음을 10분마다 점검한다(내용은
+읽지 않는다 — 시크릿이다). `sb-permcheck.timer`로 함정 1의 bind mount
+점검과 같은 주기로 함께 돈다.
 
 ## 데이터 동기화
 
