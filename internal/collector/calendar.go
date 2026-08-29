@@ -24,7 +24,20 @@ import (
 const (
 	calendarScope   = "https://www.googleapis.com/auth/calendar.readonly"
 	calendarBaseURL = "https://www.googleapis.com"
+
+	// calendarStatusCancelled is the Google Calendar API event status value
+	// for a deleted event or a cancelled instance of a recurring series.
+	// See https://developers.google.com/calendar/api/v3/reference/events —
+	// "status: cancelled" events frequently omit summary/description.
+	calendarStatusCancelled = "cancelled"
 )
+
+// CalendarCancellationStore is the document persistence interface used by
+// CalendarCollector to soft-delete documents for calendar events that have
+// been cancelled upstream. It is a subset of store.DocumentStore.
+type CalendarCancellationStore interface {
+	SoftDeleteBySourceID(ctx context.Context, sourceType model.SourceType, sourceID string) (bool, error)
+}
 
 // CalendarCollector collects events from Google Calendar via the Calendar REST API.
 // It is disabled when credentials or token are not configured.
@@ -39,6 +52,11 @@ type CalendarCollector struct {
 	tokenMu     sync.Mutex
 	tokenSource oauth2.TokenSource
 	cachedToken *oauth2.Token
+
+	// cancellationStore soft-deletes documents for cancelled calendar events.
+	// When nil, cancellations are observed but not acted upon (the
+	// corresponding document, if any, is left active) — see Collect.
+	cancellationStore CalendarCancellationStore
 }
 
 // NewCalendarCollector returns a CalendarCollector configured from cfg.
@@ -50,6 +68,14 @@ func NewCalendarCollector(cfg *config.Config) *CalendarCollector {
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		baseURL:    calendarBaseURL,
 	}
+}
+
+// WithCancellationStore configures the store used to soft-delete documents
+// for calendar events that are reported as cancelled. Passing nil disables
+// cancellation handling (matches the pre-existing behavior).
+func (c *CalendarCollector) WithCancellationStore(s CalendarCancellationStore) *CalendarCollector {
+	c.cancellationStore = s
+	return c
 }
 
 func (c *CalendarCollector) Name() string             { return "calendar" }
@@ -124,6 +150,8 @@ func (c *CalendarCollector) Collect(ctx context.Context, since time.Time) ([]mod
 	var docs []model.Document
 	var failedCalendars []string
 	totalSkippedEmpty := 0
+	totalCancelled := 0
+	totalCancelledUnhandled := 0
 
 	for i, calID := range calIDs {
 		// The first configured calendar keeps the legacy (non-namespaced)
@@ -140,7 +168,33 @@ func (c *CalendarCollector) Collect(ctx context.Context, since time.Time) ([]mod
 		}
 
 		calSkippedEmpty := 0
+		calCancelled := 0
+		calCancelledUnhandled := 0
 		for _, ev := range events {
+			// A cancelled event (single deletion, or a cancelled instance of
+			// a recurring series) must never become — or remain — an active
+			// document. Google Calendar frequently omits summary/description
+			// on a cancelled event, so this check MUST run before the
+			// empty-summary skip below: otherwise a cancellation for a
+			// previously-collected active event would silently fall through
+			// the skip and leave its old (still-active, now stale) document
+			// behind forever. Soft-deleting by source_id is a no-op when the
+			// event was never collected while active, so this never
+			// manufactures a new document out of a tombstone.
+			if ev.Status == calendarStatusCancelled {
+				calCancelled++
+				sourceID := calendarSourceID(ev.ID, calID, legacy)
+				if c.cancellationStore == nil {
+					calCancelledUnhandled++
+					continue
+				}
+				if _, err := c.cancellationStore.SoftDeleteBySourceID(ctx, model.SourceCalendar, sourceID); err != nil {
+					slog.Warn("calendar: failed to soft-delete cancelled event",
+						"calendar_id", calID, "id", ev.ID, "error", err)
+				}
+				continue
+			}
+
 			// A calendar shared at freeBusyReader (rather than "See all event
 			// details") returns HTTP 200 with events that have no summary or
 			// description — busy/free slots only, no identifiable content.
@@ -166,7 +220,13 @@ func (c *CalendarCollector) Collect(ctx context.Context, since time.Time) ([]mod
 			slog.Warn("calendar: skipped events with no visible content — likely freeBusyReader-only sharing, not an error; will collect automatically once sharing permission is upgraded",
 				"calendar_id", calID, "skipped", calSkippedEmpty, "total", len(events))
 		}
+		if calCancelledUnhandled > 0 {
+			slog.Warn("calendar: cancellation store not configured — cancelled events observed but not soft-deleted",
+				"calendar_id", calID, "cancelled", calCancelledUnhandled)
+		}
 		totalSkippedEmpty += calSkippedEmpty
+		totalCancelled += calCancelled
+		totalCancelledUnhandled += calCancelledUnhandled
 	}
 
 	if len(failedCalendars) > 0 {
@@ -183,7 +243,9 @@ func (c *CalendarCollector) Collect(ctx context.Context, since time.Time) ([]mod
 		"count", len(docs),
 		"calendars", len(calIDs),
 		"failed_calendars", len(failedCalendars),
-		"skipped_empty", totalSkippedEmpty)
+		"skipped_empty", totalSkippedEmpty,
+		"cancelled", totalCancelled,
+		"cancelled_unhandled", totalCancelledUnhandled)
 	return docs, nil
 }
 
@@ -341,21 +403,27 @@ func calendarEventToDocument(ev calendarEvent, calID string, legacy bool, collec
 		meta["end"] = endTime.Format(time.RFC3339)
 	}
 
-	sourceID := "calendar:" + ev.ID
-	if !legacy {
-		sourceID = "calendar:" + calID + ":" + ev.ID
-	}
-
 	return model.Document{
 		ID:          uuid.New(),
 		SourceType:  model.SourceCalendar,
-		SourceID:    sourceID,
+		SourceID:    calendarSourceID(ev.ID, calID, legacy),
 		Title:       ev.Summary,
 		Content:     content,
 		Metadata:    meta,
 		OccurredAt:  occurredAt,
 		CollectedAt: collectAt,
 	}, nil
+}
+
+// calendarSourceID computes the source_id for a calendar event, matching the
+// legacy-vs-namespaced scheme documented on calendarEventToDocument. It is
+// also used by the cancellation path in Collect, which needs the source_id
+// without building a full document.
+func calendarSourceID(eventID, calID string, legacy bool) string {
+	if legacy {
+		return "calendar:" + eventID
+	}
+	return "calendar:" + calID + ":" + eventID
 }
 
 // parseCalendarDateTime parses a CalendarEventDateTime into a *time.Time.

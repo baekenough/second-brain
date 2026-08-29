@@ -1056,6 +1056,30 @@ func (s *DocumentStore) MarkDeleted(ctx context.Context, sourceType model.Source
 	return int(tag.RowsAffected()), nil
 }
 
+// SoftDeleteBySourceID soft-deletes the active document identified by
+// (source_type, source_id), if one exists, and reports whether a row was
+// affected.
+//
+// Unlike Upsert/UpsertTracked, this method NEVER inserts: when no row with
+// the given (source_type, source_id) exists, it is a pure no-op (false, nil).
+// This is deliberate — it lets a collector that only observes a partial
+// event stream (e.g. a calendar collector that receives a cancellation for
+// an event it may never have fetched while active) signal a deletion
+// without ever manufacturing a new document out of a tombstone event. It is
+// idempotent: calling it again for an already-deleted or never-existing
+// document is a harmless no-op (0 rows affected, no error).
+func (s *DocumentStore) SoftDeleteBySourceID(ctx context.Context, sourceType model.SourceType, sourceID string) (bool, error) {
+	const q = `
+		UPDATE documents
+		SET status = 'deleted', deleted_at = now()
+		WHERE source_type = $1 AND source_id = $2 AND status = 'active'`
+	tag, err := s.pg.pool.Exec(ctx, q, sourceType, sourceID)
+	if err != nil {
+		return false, fmt.Errorf("soft delete %s/%s: %w", sourceType, sourceID, err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // CountActiveDocuments returns the total number of active (non-deleted) documents
 // for the given source type. It is used by the scheduler's deletion-ratio sanity
 // check (issue #135) to detect a suspicious bulk-deletion before calling MarkDeleted.
