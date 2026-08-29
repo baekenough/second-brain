@@ -12,7 +12,9 @@ import (
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
+	"github.com/baekenough/second-brain/internal/timeutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -343,6 +345,295 @@ type fakeSearchSvc struct{}
 
 func (f *fakeSearchSvc) Search(_ context.Context, _ model.SearchQuery) ([]model.SearchResult, error) {
 	return nil, nil
+}
+
+// ---------------------------------------------------------------------------
+// occurred_from / occurred_to wiring tests
+//
+// These exercise registerSearchTool end-to-end through callTool with a real
+// *search.Service (not the inline stub newTestMCPServer registers for the
+// query/source/auth tests above) so that the assertions cover the actual
+// parameter names, the parsing rules, and the exact model.SearchQuery.
+// OccurredFrom/OccurredTo values svc.Search() receives — a stub tool handler
+// could not catch a typo in the argument name or a missing wiring line, since
+// it never touches registerSearchTool's own handler body.
+// ---------------------------------------------------------------------------
+
+// fakeOccurredDocSearcher implements search.DocumentSearcher and records the
+// last model.SearchQuery it was called with, so tests can assert on the
+// OccurredFrom/OccurredTo fields the handler actually built.
+type fakeOccurredDocSearcher struct {
+	called    bool
+	lastQuery model.SearchQuery
+}
+
+func (f *fakeOccurredDocSearcher) Search(_ context.Context, q model.SearchQuery) ([]*model.SearchResult, error) {
+	f.called = true
+	f.lastQuery = q
+	return nil, nil
+}
+
+// disabledEmbeddingEngine implements search.EmbeddingEngine in its
+// permanently-disabled state, so search.Service.Search skips the embedding
+// call entirely and goes straight to the DocumentSearcher.
+type disabledEmbeddingEngine struct{}
+
+func (disabledEmbeddingEngine) Embed(_ context.Context, _ string) ([]float32, error) {
+	return nil, nil
+}
+func (disabledEmbeddingEngine) EmbedBatch(_ context.Context, texts []string) ([][]float32, error) {
+	return make([][]float32, len(texts)), nil
+}
+func (disabledEmbeddingEngine) Enabled() bool  { return false }
+func (disabledEmbeddingEngine) Dimension() int { return 0 }
+
+// newOccurredTestServer builds an *mcpserver.MCPServer with the real
+// registerSearchTool wired to a real *search.Service backed by the given
+// fake document searcher, so occurred_from/occurred_to tests observe the
+// production handler code path, not a test stub.
+func newOccurredTestServer(docs *fakeOccurredDocSearcher) *mcpserver.MCPServer {
+	svc := search.NewService(docs, disabledEmbeddingEngine{})
+	s := mcpserver.NewMCPServer("test", "0.0.0", mcpserver.WithToolCapabilities(false))
+	registerSearchTool(s, svc)
+	return s
+}
+
+func TestSearchTool_OccurredRange_BothBoundsRFC3339(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeOccurredDocSearcher{}
+	s := newOccurredTestServer(docs)
+
+	result := callTool(t, s, "search", authorizedCtx(), map[string]any{
+		"query":         "test",
+		"occurred_from": "2026-09-05T00:00:00+09:00",
+		"occurred_to":   "2026-09-06T00:00:00+09:00",
+	})
+
+	if isErrorResult(result) {
+		t.Fatalf("unexpected error result: %s", resultText(result))
+	}
+	if !docs.called {
+		t.Fatal("expected the document searcher to be called")
+	}
+
+	wantFrom, _ := time.Parse(time.RFC3339, "2026-09-05T00:00:00+09:00")
+	wantTo, _ := time.Parse(time.RFC3339, "2026-09-06T00:00:00+09:00")
+
+	if docs.lastQuery.OccurredFrom == nil || !docs.lastQuery.OccurredFrom.Equal(wantFrom) {
+		t.Errorf("OccurredFrom = %v, want %v", docs.lastQuery.OccurredFrom, wantFrom)
+	}
+	if docs.lastQuery.OccurredTo == nil || !docs.lastQuery.OccurredTo.Equal(wantTo) {
+		t.Errorf("OccurredTo = %v, want %v", docs.lastQuery.OccurredTo, wantTo)
+	}
+}
+
+// TestSearchTool_OccurredRange_DateOnly_ParsedAsKSTMidnight pins the
+// timezone-interpretation decision documented on parseOccurredBound: a bare
+// "YYYY-MM-DD" date must resolve to midnight KST, matching the convention
+// internal/intent/plan.go's parseWindow already uses for the same
+// documents.occurred_at window (see parseOccurredBound's doc comment).
+func TestSearchTool_OccurredRange_DateOnly_ParsedAsKSTMidnight(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeOccurredDocSearcher{}
+	s := newOccurredTestServer(docs)
+
+	result := callTool(t, s, "search", authorizedCtx(), map[string]any{
+		"query":         "test",
+		"occurred_from": "2026-09-05",
+		"occurred_to":   "2026-09-06",
+	})
+
+	if isErrorResult(result) {
+		t.Fatalf("unexpected error result: %s", resultText(result))
+	}
+	if !docs.called {
+		t.Fatal("expected the document searcher to be called")
+	}
+
+	wantFrom := time.Date(2026, 9, 5, 0, 0, 0, 0, timeutil.KST())
+	wantTo := time.Date(2026, 9, 6, 0, 0, 0, 0, timeutil.KST())
+
+	if docs.lastQuery.OccurredFrom == nil || !docs.lastQuery.OccurredFrom.Equal(wantFrom) {
+		t.Errorf("OccurredFrom = %v, want %v (KST midnight)", docs.lastQuery.OccurredFrom, wantFrom)
+	}
+	if docs.lastQuery.OccurredTo == nil || !docs.lastQuery.OccurredTo.Equal(wantTo) {
+		t.Errorf("OccurredTo = %v, want %v (KST midnight)", docs.lastQuery.OccurredTo, wantTo)
+	}
+}
+
+func TestSearchTool_OccurredRange_OnlyFromGiven_ToStaysNil(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeOccurredDocSearcher{}
+	s := newOccurredTestServer(docs)
+
+	result := callTool(t, s, "search", authorizedCtx(), map[string]any{
+		"query":         "test",
+		"occurred_from": "2026-09-05",
+	})
+
+	if isErrorResult(result) {
+		t.Fatalf("unexpected error result: %s", resultText(result))
+	}
+	if docs.lastQuery.OccurredFrom == nil {
+		t.Error("expected OccurredFrom to be set")
+	}
+	if docs.lastQuery.OccurredTo != nil {
+		t.Errorf("expected OccurredTo to remain nil, got %v", docs.lastQuery.OccurredTo)
+	}
+}
+
+func TestSearchTool_OccurredRange_OnlyToGiven_FromStaysNil(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeOccurredDocSearcher{}
+	s := newOccurredTestServer(docs)
+
+	result := callTool(t, s, "search", authorizedCtx(), map[string]any{
+		"query":       "test",
+		"occurred_to": "2026-09-06",
+	})
+
+	if isErrorResult(result) {
+		t.Fatalf("unexpected error result: %s", resultText(result))
+	}
+	if docs.lastQuery.OccurredFrom != nil {
+		t.Errorf("expected OccurredFrom to remain nil, got %v", docs.lastQuery.OccurredFrom)
+	}
+	if docs.lastQuery.OccurredTo == nil {
+		t.Error("expected OccurredTo to be set")
+	}
+}
+
+// TestSearchTool_OccurredRange_BothOmitted_NoRegression guards the existing
+// caller path (no occurred_from/occurred_to given at all): both bounds must
+// remain nil so the query behaves exactly as it did before this feature —
+// an unfiltered search — rather than picking up a stray zero-value window.
+func TestSearchTool_OccurredRange_BothOmitted_NoRegression(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeOccurredDocSearcher{}
+	s := newOccurredTestServer(docs)
+
+	result := callTool(t, s, "search", authorizedCtx(), map[string]any{
+		"query": "test",
+	})
+
+	if isErrorResult(result) {
+		t.Fatalf("unexpected error result: %s", resultText(result))
+	}
+	if docs.lastQuery.OccurredFrom != nil {
+		t.Errorf("expected OccurredFrom to be nil, got %v", docs.lastQuery.OccurredFrom)
+	}
+	if docs.lastQuery.OccurredTo != nil {
+		t.Errorf("expected OccurredTo to be nil, got %v", docs.lastQuery.OccurredTo)
+	}
+}
+
+func TestSearchTool_OccurredRange_InvalidFormat_Rejected(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]map[string]any{
+		"invalid occurred_from": {"query": "test", "occurred_from": "not-a-date"},
+		"invalid occurred_to":   {"query": "test", "occurred_to": "2026/09/06"},
+	}
+
+	for name, args := range cases {
+		args := args
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			docs := &fakeOccurredDocSearcher{}
+			s := newOccurredTestServer(docs)
+
+			result := callTool(t, s, "search", authorizedCtx(), args)
+
+			if !isErrorResult(result) {
+				t.Fatalf("expected an error result for malformed date, got success: %s", resultText(result))
+			}
+			if docs.called {
+				t.Error("the document searcher must not be called when parsing fails")
+			}
+		})
+	}
+}
+
+func TestSearchTool_OccurredRange_ToNotAfterFrom_Rejected(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]map[string]any{
+		"to before from": {
+			"query":         "test",
+			"occurred_from": "2026-09-06",
+			"occurred_to":   "2026-09-05",
+		},
+		"to equal from": {
+			"query":         "test",
+			"occurred_from": "2026-09-05",
+			"occurred_to":   "2026-09-05",
+		},
+	}
+
+	for name, args := range cases {
+		args := args
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			docs := &fakeOccurredDocSearcher{}
+			s := newOccurredTestServer(docs)
+
+			result := callTool(t, s, "search", authorizedCtx(), args)
+
+			if !isErrorResult(result) {
+				t.Fatalf("expected an error result for a non-positive window, got success: %s", resultText(result))
+			}
+			if docs.called {
+				t.Error("the document searcher must not be called when the window is invalid")
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// parseOccurredBound unit tests
+// ---------------------------------------------------------------------------
+
+func TestParseOccurredBound_RFC3339(t *testing.T) {
+	t.Parallel()
+
+	got, err := parseOccurredBound("2026-09-05T12:30:00+09:00")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want, _ := time.Parse(time.RFC3339, "2026-09-05T12:30:00+09:00")
+	if got == nil || !got.Equal(want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestParseOccurredBound_DateOnly_KST(t *testing.T) {
+	t.Parallel()
+
+	got, err := parseOccurredBound("2026-09-05")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := time.Date(2026, 9, 5, 0, 0, 0, 0, timeutil.KST())
+	if got == nil || !got.Equal(want) {
+		t.Errorf("got %v, want %v (KST midnight)", got, want)
+	}
+}
+
+func TestParseOccurredBound_Invalid_ReturnsError(t *testing.T) {
+	t.Parallel()
+
+	for _, in := range []string{"not-a-date", "2026/09/05", "", "2026-13-40"} {
+		if _, err := parseOccurredBound(in); err == nil {
+			t.Errorf("parseOccurredBound(%q): expected error, got nil", in)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
