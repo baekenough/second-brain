@@ -1,20 +1,20 @@
 ---
 # Wiki Index — second-brain project knowledge base
-# Generated: 2026-04-12
-# Total pages: 207
+# Generated: 2026-09-20
+# Total pages: 208
 # Format: structured catalog for wiki-rag skill and human navigation
 ---
 
 meta:
   project: second-brain
-  generated: "2026-04-12"
+  generated: "2026-09-20"
   generator: wiki-curator
-  total_pages: 207
+  total_pages: 208
   categories:
     agents: 48
     rules: 22
     guides: 33
-    skills: 104
+    skills: 105
 
 agents:
   - { name: arch-documenter, path: agents/arch-documenter.md, type: agent, description: "Architecture documentation from code analysis" }
@@ -222,6 +222,7 @@ skills:
   - { name: systematic-debugging, path: skills/systematic-debugging.md, type: skill, description: "Reproduce-first, root-cause-first debugging discipline" }
   - { name: task-decomposition, path: skills/task-decomposition.md, type: skill, description: "Large task decomposition into DAG-compatible subtasks" }
   - { name: typescript-best-practices, path: skills/typescript-best-practices.md, type: skill, description: "Strict TypeScript patterns — discriminated unions, branded types" }
+  - { name: ubuntu1-deploy, path: skills/ubuntu1-deploy.md, type: skill, description: "ubuntu1 image build, Compose rollout, and image-ID verification checklist" }
   - { name: update-docs, path: skills/update-docs.md, type: skill, description: "Sync documentation with project structure" }
   - { name: update-external, path: skills/update-external.md, type: skill, description: "Update agents/skills from external GitHub sources" }
   - { name: vercel-deploy, path: skills/vercel-deploy.md, type: skill, description: "Deploy to Vercel with auto-framework detection" }
