@@ -15,7 +15,11 @@ import {
   allJudged,
   applyJudgment,
   buildJudgmentInputs,
+  formatAskedAtLabel,
+  formatMonthDay,
+  formatWindowLabel,
   goldenSourceLabel,
+  goldenStreamLabel,
   isSkipKey,
   judgmentForKey,
   nextFocusIndex,
@@ -114,8 +118,15 @@ function CandidateCard({ candidate, focused, selected, onSelect, onFocus }: Cand
         <div className="flex flex-wrap items-center gap-1.5 text-xs text-foreground-subtle">
           <span className="font-mono">#{candidate.rank + 1}</span>
           <SourceBadge sourceType={candidate.source_type} size="sm" />
+          <Badge variant={candidate.stream === "recent" ? "default" : "accent"} size="sm">
+            {goldenStreamLabel(candidate.stream)}
+          </Badge>
           <RetentionBadge retention={candidate.retention} />
-          <span>{candidate.occurred_at ? formatRelative(candidate.occurred_at) : "시각 미상"}</span>
+          <span>
+            {candidate.occurred_at
+              ? `${formatRelative(candidate.occurred_at)} (${formatMonthDay(candidate.occurred_at)})`
+              : "시각 미상"}
+          </span>
         </div>
 
         <div>
@@ -318,8 +329,8 @@ export default function GoldenPage() {
         <div>
           <h1 className="font-serif text-xl font-semibold text-foreground">골든셋 라벨링</h1>
           <p className="mt-1 text-sm text-foreground-muted">
-            질의당 후보 문서를 관련(1) / 무관(2) / 잡음(3)으로 판정하세요. Enter로 제출 후 다음
-            질의로, S로 건너뛰기.
+            질의당 후보 문서를 관련(1) / 무관(2) / 잡음(3)으로 판정하세요. 질문한 시점을 기준으로
+            관련 여부를 판단해 주세요. Enter로 제출 후 다음 질의로, S로 건너뛰기.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -388,6 +399,10 @@ export default function GoldenPage() {
               질의 출처 · {goldenSourceLabel(query.source)}
             </p>
             <p className="mt-1 text-base font-semibold text-foreground">{query.text}</p>
+            <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-foreground-muted">
+              <span>질문 시점: {formatAskedAtLabel(query.asked_at)}</span>
+              <span>{formatWindowLabel(query.window)}</span>
+            </div>
           </Card>
 
           <p className="text-xs text-foreground-subtle">
