@@ -36,9 +36,32 @@ func TestListUnclassifiedQuery_RespectsAttemptCapAndBackfillWindow(t *testing.T)
 	}
 }
 
-func TestListLegacyForRecheckQuery_ExcludesOwnAndUserClassifiers(t *testing.T) {
-	if !strings.Contains(listLegacyForRecheckQuery, "metadata->>'classifier' NOT IN ('rule', 'jev-latest', 'user')") {
-		t.Errorf("listLegacyForRecheckQuery does not exclude rule/jev-latest/user classifiers:\n%s", listLegacyForRecheckQuery)
+// TestListLegacyForRecheckQuery_ScopesToRetentionTaggedNonUserRows pins the
+// fix for the "worker sat idle since 12:57" bug: the queue must select on
+// `metadata ? 'retention'` (any retention-tagged row), not a bare
+// `metadata ? 'classifier'` requirement — the ox-alpha mail segmentation
+// pass tags 11,965 legacy gmail documents with retention/segment but never
+// writes a classifier key at all, so the old predicate silently excluded
+// all of them, leaving the queue permanently empty. The classifier
+// exclusion is narrowed to "not user" (golden-set) rather than
+// "not rule/jev-latest/user" — a NOT IN list would also permanently skip
+// the 3,387 sms + 4,050 call-transcript documents an old backfill script
+// tagged classifier="jev-latest"/"rule" without ever running them through
+// the deterministic Gate.
+func TestListLegacyForRecheckQuery_ScopesToRetentionTaggedNonUserRows(t *testing.T) {
+	for _, want := range []string{
+		"metadata ? 'retention'",
+		"COALESCE(metadata->>'classifier', '') <> 'user'",
+	} {
+		if !strings.Contains(listLegacyForRecheckQuery, want) {
+			t.Errorf("listLegacyForRecheckQuery missing %q:\n%s", want, listLegacyForRecheckQuery)
+		}
+	}
+	if strings.Contains(listLegacyForRecheckQuery, "metadata ? 'classifier'") {
+		t.Errorf("listLegacyForRecheckQuery must not require a bare 'classifier' key — that excludes ox-alpha-tagged docs which only set retention/segment:\n%s", listLegacyForRecheckQuery)
+	}
+	if strings.Contains(listLegacyForRecheckQuery, "NOT IN ('rule', 'jev-latest', 'user')") {
+		t.Errorf("listLegacyForRecheckQuery must not blanket-exclude rule/jev-latest classifiers — legacy backfill-tagged docs with those values may still be un-audited:\n%s", listLegacyForRecheckQuery)
 	}
 }
 

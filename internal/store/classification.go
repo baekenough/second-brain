@@ -59,22 +59,34 @@ func (s *DocumentStore) ListUnclassified(ctx context.Context, limit int, backfil
 }
 
 // ListLegacyForRecheck returns up to limit active SMS/Gmail/call-transcript
-// documents that already carry a retention tag from a classifier OTHER than
-// this package's own "rule"/"jev-latest" outputs or a human-authored
-// "user" (golden-set) label — i.e. legacy tags such as the ox-alpha mail
-// segmentation pass — and that have not yet been gate-audited
-// (classifier_gate_checked_at is unset).
+// documents that already carry ANY retention tag and have not yet been
+// gate-audited (classifier_gate_checked_at is unset) — i.e. every
+// retention-tagged document except a human-authored "user" (golden-set)
+// label. The scope is deliberately "any retention tag", not "tagged by a
+// classifier OTHER than this package's own rule/jev-latest outputs": legacy
+// tagging sources disagree on which metadata keys they set —
+//   - the ox-alpha mail segmentation pass writes retention/segment but
+//     never writes a classifier key at all, so a `metadata ? 'classifier'`
+//     predicate silently excludes it entirely;
+//   - old sms/call-transcript backfill scripts DO write
+//     classifier="jev-latest"/"rule", but never ran the deterministic Gate,
+//     so excluding those two values by name would also permanently skip
+//     documents that still need their one-shot audit.
 //
-// classifier_gate_checked_at is a one-shot marker, not a re-check interval:
-// once ClassificationWorker.tick has run Evaluator.Evaluate against a legacy
-// document (whether or not that produced a contradiction worth fixing), the
-// document is never returned by this query again. Without this marker the
-// same head-of-queue rows (ORDER BY collected_at ASC) would be re-fetched on
-// every tick forever whenever the batch is larger than the fraction of
-// legacy rows Evaluate actually finds a contradiction in, starving the rest
-// of the backlog of any progress — the SenderLookup-derived signals this
-// package checks (bulk-sender number shape, CATEGORY_* labels, contact_name)
-// are near-static properties of a sender, so "checked once" is an acceptable
+// classifier_gate_checked_at — not "who tagged it" — is the sole marker of
+// "has this document ever been audited against the Gate", regardless of
+// which classifier produced the existing tag. It is a one-shot marker, not
+// a re-check interval: once ClassificationWorker.tick has run
+// Evaluator.Evaluate against a legacy document (whether or not that
+// produced a contradiction worth fixing) and written this key back (see
+// classification_worker.go's apply/recheckOne), the document is never
+// returned by this query again. Without this marker the same head-of-queue
+// rows (ORDER BY collected_at ASC) would be re-fetched on every tick
+// forever whenever the batch is larger than the fraction of legacy rows
+// Evaluate actually finds a contradiction in, starving the rest of the
+// backlog of any progress — the SenderLookup-derived signals this package
+// checks (bulk-sender number shape, CATEGORY_* labels, contact_name) are
+// near-static properties of a sender, so "checked once" is an acceptable
 // trade for "never audited again": to add an outstanding contradiction
 // review, use golden-set labeling (classifier="user") instead of clearing
 // this column, since that is the one path this worker never overwrites (see
@@ -88,8 +100,8 @@ const listLegacyForRecheckQuery = `
 	FROM documents
 	WHERE status = 'active'
 	  AND source_type IN (` + classifiableSourceTypesSQL + `)
-	  AND metadata ? 'classifier'
-	  AND metadata->>'classifier' NOT IN ('rule', 'jev-latest', 'user')
+	  AND metadata ? 'retention'
+	  AND COALESCE(metadata->>'classifier', '') <> 'user'
 	  AND NOT (metadata ? 'classifier_gate_checked_at')
 	  AND COALESCE((metadata->>'classifier_attempts')::int, 0) < 3
 	ORDER BY collected_at ASC

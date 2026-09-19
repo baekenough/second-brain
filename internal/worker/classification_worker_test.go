@@ -214,6 +214,56 @@ func TestTick_Unclassified_RuleDecided_NoJevCall(t *testing.T) {
 	}
 }
 
+// TestTick_Unclassified_RuleDecided_SetsGateCheckedMarker pins the other
+// half of the "worker sat idle" fix: classifyOne's own writes must stamp
+// classifier_gate_checked_at (same key/format recheckOne already uses for
+// its no-contradiction branch — see classification_worker.go's apply), or a
+// freshly-tagged document would immediately re-enter ListLegacyForRecheck on
+// the very next tick once that query no longer excludes classifier="rule"/
+// "jev-latest" by name.
+func TestTick_Unclassified_RuleDecided_SetsGateCheckedMarker(t *testing.T) {
+	doc := classDoc("sms-1b", model.SourceSMS, nil)
+	store := &fakeClassificationStore{unclassified: []*model.Document{doc}}
+	evaluator := &fakeGateEvaluator{gates: map[string]classify.Gate{
+		"sms-1b": {Decided: &classify.Tag{Segment: "auth_transient", Retention: model.RetentionDisposable}},
+	}}
+	classifier := &fakeClassifier{jevEnabled: true}
+	w := newTestClassificationWorker(store, classifier, evaluator, false, 200)
+
+	w.tick(context.Background())
+
+	updates, ok := store.mergeFor(doc.ID)
+	if !ok {
+		t.Fatal("MergeClassificationMetadata was not called for the rule-decided document")
+	}
+	if _, hasMarker := updates["classifier_gate_checked_at"]; !hasMarker {
+		t.Errorf("updates = %+v, want classifier_gate_checked_at so this document is not immediately re-queued by ListLegacyForRecheck", updates)
+	}
+}
+
+// TestTick_Unclassified_JevRequired_SetsGateCheckedMarker is the Jev-path
+// counterpart of the rule-decided marker test above.
+func TestTick_Unclassified_JevRequired_SetsGateCheckedMarker(t *testing.T) {
+	doc := classDoc("sms-2b", model.SourceSMS, nil)
+	store := &fakeClassificationStore{unclassified: []*model.Document{doc}}
+	evaluator := &fakeGateEvaluator{gates: map[string]classify.Gate{"sms-2b": {}}}
+	classifier := &fakeClassifier{
+		jevEnabled: true,
+		jevResult:  &classify.Result{Segment: "personal_comm", Retention: model.RetentionKeep, Classifier: "jev-latest", ClassifierP: 0.8},
+	}
+	w := newTestClassificationWorker(store, classifier, evaluator, false, 200)
+
+	w.tick(context.Background())
+
+	updates, ok := store.mergeFor(doc.ID)
+	if !ok {
+		t.Fatal("MergeClassificationMetadata was not called after a successful Jev classification")
+	}
+	if _, hasMarker := updates["classifier_gate_checked_at"]; !hasMarker {
+		t.Errorf("updates = %+v, want classifier_gate_checked_at so this document is not immediately re-queued by ListLegacyForRecheck", updates)
+	}
+}
+
 func TestTick_Unclassified_JevRequired_CallsJevAndTags(t *testing.T) {
 	doc := classDoc("sms-2", model.SourceSMS, nil)
 	store := &fakeClassificationStore{unclassified: []*model.Document{doc}}
