@@ -124,6 +124,17 @@ type Server struct {
 	askTopK          int
 	askInsightM      int
 
+	// askRerankDefault mirrors cfg.RerankDefault (SEARCH_RERANK_DEFAULT):
+	// whether /api/v1/ask requests opt into cross-encoder reranking
+	// (model.SearchQuery.UseRerank) by default. Zero value (false) keeps a
+	// Server built without WithAskRerankDefault opted OUT — the same
+	// fail-closed default /api/v1/search and GraphQL already have — so this
+	// field, unlike askTimeout/askTopK/askInsightM above, is deliberately
+	// NOT defaulted to true inside NewServer. It is inert regardless of its
+	// value when the reranker itself is unconfigured (search.HTTPReranker
+	// .Enabled() gates on RERANKER_URL).
+	askRerankDefault bool
+
 	// queryPlanner is Stage 1b of /ask: it decides WHICH documents may enter
 	// the candidate set (event-time window, source include set, limit), while
 	// intentClassifier above only decides how they are ranked (query-planner
@@ -252,6 +263,18 @@ func (s *Server) WithAskConfig(timeout time.Duration, topK, insightM int) *Serve
 	if insightM > 0 {
 		s.askInsightM = insightM
 	}
+	return s
+}
+
+// WithAskRerankDefault sets whether /api/v1/ask opts into cross-encoder
+// reranking (model.SearchQuery.UseRerank) by default, mirroring
+// cfg.RerankDefault (SEARCH_RERANK_DEFAULT). Optional — a Server that never
+// calls this keeps /api/v1/ask opted OUT (the zero value), same as
+// /api/v1/search and GraphQL. Kept as its own builder rather than folded
+// into WithAskConfig because it toggles a search behaviour, not a
+// pipeline-timing knob.
+func (s *Server) WithAskRerankDefault(enabled bool) *Server {
+	s.askRerankDefault = enabled
 	return s
 }
 

@@ -800,3 +800,84 @@ func TestLoad_SearchActiveWeightsEnabled(t *testing.T) {
 		})
 	}
 }
+
+// TestLoad_RerankDefault verifies SEARCH_RERANK_DEFAULT parsing: default true,
+// same "false"/"0"-only-disables convention as SUMMARIZER_BACKFILL_ENABLED
+// (TestLoad_SummarizerBackfillEnabled above), NOT the fail-closed
+// SEARCH_ACTIVE_WEIGHTS_ENABLED convention — RerankDefault only affects
+// internal callers (/ask, MCP search) and is inert without RERANKER_URL, so
+// a deployment that says nothing about it gets the feature once a reranker
+// is configured.
+func TestLoad_RerankDefault(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		envVal string
+		unset  bool
+		want   bool
+	}{
+		{name: "default_when_unset", unset: true, want: true},
+		{name: "explicit_true", envVal: "true", want: true},
+		{name: "explicit_false", envVal: "false", want: false},
+		{name: "numeric_0", envVal: "0", want: false},
+		{name: "numeric_1", envVal: "1", want: true}, // only "false"/"0" → disable
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unset {
+				unsetenv(t, "SEARCH_RERANK_DEFAULT")
+			} else {
+				setenv(t, "SEARCH_RERANK_DEFAULT", tc.envVal)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.RerankDefault != tc.want {
+				t.Errorf("RerankDefault = %v, want %v", cfg.RerankDefault, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoad_RerankTopN verifies RERANKER_TOP_N parsing: default 10, invalid
+// values fall back to the default (same pattern as TestLoad_SummarizerBatchSize).
+func TestLoad_RerankTopN(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		envVal string
+		unset  bool
+		want   int
+	}{
+		{name: "default_when_unset", unset: true, want: 10},
+		{name: "explicit_20", envVal: "20", want: 20},
+		{name: "invalid_string_uses_default", envVal: "notanumber", want: 10},
+		{name: "zero_uses_default", envVal: "0", want: 10},
+		{name: "negative_uses_default", envVal: "-1", want: 10},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unset {
+				unsetenv(t, "RERANKER_TOP_N")
+			} else {
+				setenv(t, "RERANKER_TOP_N", tc.envVal)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.RerankTopN != tc.want {
+				t.Errorf("RerankTopN = %d, want %d", cfg.RerankTopN, tc.want)
+			}
+		})
+	}
+}

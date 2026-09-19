@@ -91,9 +91,17 @@ func run() error {
 		slog.Info("embedding engine not configured — full-text search only")
 	}
 
+	// --- Reranker (optional — same assembly as cmd/server). Enabled() gates
+	// on RerankURL being non-empty, so this is a no-op when unconfigured.
+	reranker := search.NewHTTPReranker(cfg.RerankURL, cfg.RerankAPIKey, cfg.RerankModel, cfg.RerankTopN)
+	if reranker.Enabled() {
+		slog.Info("reranker configured", "url", cfg.RerankURL, "model", cfg.RerankModel)
+	}
+
 	// --- Search service (same assembly as cmd/server) ---
 	searchSvc := search.NewService(docStore, embedClient).
-		WithChunkStore(chunkStore)
+		WithChunkStore(chunkStore).
+		WithReranker(reranker)
 
 	// --- MCP server ---
 	mcpPort := os.Getenv("MCP_PORT")
@@ -112,7 +120,7 @@ func run() error {
 	)
 
 	// Register tools.
-	registerSearchTool(s, searchSvc)
+	registerSearchTool(s, searchSvc, cfg.RerankDefault)
 	registerGetDocumentTool(s, docStore)
 	registerStatsTool(s, docStore)
 	registerAddNoteTool(s, docStore, chunkStore, embedClient, cfg.APIKey)
@@ -243,16 +251,49 @@ type searchResult struct {
 	Score      float64 `json:"score"`
 	MatchType  string  `json:"match_type"`
 	Snippet    string  `json:"snippet"` // first 500 runes of content
+	// OccurredAt is the original event time (RFC3339), nil when the document
+	// carries no occurred_at (see model.Document.OccurredAt doc comment).
+	OccurredAt *string `json:"occurred_at"`
+	// Retention is documents.metadata["retention"] ("keep"/"low"/"disposable",
+	// see model.RetentionTag* constants), nil when untagged. "low" and
+	// "disposable" mark lower-confidence evidence — see the tool description.
+	Retention *string `json:"retention"`
+	// Segment is documents.metadata["segment"], nil when absent. No collector
+	// in this codebase writes this key yet (as of 2026-09-19, segmentation
+	// tagging is done out-of-band and only populates "retention") — exposed
+	// pre-emptively so callers do not need a schema change once one does.
+	Segment *string `json:"segment"`
 }
 
-func registerSearchTool(s *server.MCPServer, svc *search.Service) {
+// metadataString reads a string value out of a document's Metadata map,
+// returning nil when the key is absent, the map is nil, or the value is not
+// a non-empty string. Mirrors model.Document.RetentionTag's nil-safety but
+// stays generic (segment metadata has no dedicated helper/constants yet).
+func metadataString(m map[string]any, key string) *string {
+	if m == nil {
+		return nil
+	}
+	v, ok := m[key]
+	if !ok {
+		return nil
+	}
+	s, ok := v.(string)
+	if !ok || s == "" {
+		return nil
+	}
+	return &s
+}
+
+func registerSearchTool(s *server.MCPServer, svc *search.Service, rerankDefault bool) {
 	tool := mcp.NewTool(
 		"search",
 		mcp.WithDescription(
 			"Hybrid full-text and semantic search over the second-brain knowledge base. "+
 				"Returns matching documents ordered by relevance score. "+
 				"Use occurred_from/occurred_to to restrict results to an event-time window "+
-				"(e.g. \"next week's calendar\", \"messages from yesterday\").",
+				"(e.g. \"next week's calendar\", \"messages from yesterday\"). "+
+				"retention=low/disposable results are lower-confidence evidence — "+
+				"see the retention field on each result.",
 		),
 		mcp.WithString("query",
 			mcp.Required(),
@@ -284,11 +325,33 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service) {
 					"after occurred_from when both are given. May be given alone.",
 			),
 		),
+		mcp.WithString("sort",
+			mcp.Enum("relevance", "recent"),
+			mcp.Description(
+				"Result ordering. \"relevance\" (default) ranks by search score; \"recent\" "+
+					"ranks by documents.occurred_at (soonest-first when occurred_from lies "+
+					"entirely in the future, newest-first otherwise). When occurred_from or "+
+					"occurred_to is given and sort is omitted, \"recent\" is applied "+
+					"automatically — the same default /api/v1/ask uses for windowed queries — "+
+					"so a caller must pass sort=\"relevance\" explicitly to keep relevance "+
+					"ordering inside a time window.",
+			),
+		),
 		mcp.WithBoolean("include_retention",
 			mcp.Description(
 				"When true, disables the default exclusion of retention=disposable documents "+
 					"(gmail newsletters/notifications/transactional noise tagged by the segmentation "+
 					"pass). Default false — most callers want that noise filtered out.",
+			),
+		),
+		mcp.WithBoolean("use_rerank",
+			mcp.Description(
+				"Whether to apply cross-encoder reranking to the results. When omitted, "+
+					"falls back to the server's SEARCH_RERANK_DEFAULT setting — EXCEPT when "+
+					"sort resolves to \"recent\" (explicitly or auto-applied for a time "+
+					"window), in which case the default is skipped so recency order is not "+
+					"silently overridden; set use_rerank=true explicitly to rerank anyway. "+
+					"Has no effect when the server has no RERANKER_URL configured.",
 			),
 		),
 	)
@@ -349,7 +412,43 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service) {
 			), nil
 		}
 
+		// sort: "relevance" (default) | "recent". Mirrors internal/api/
+		// ask_retrieval.go's windowed-plan default — when an event-time
+		// window is given and sort is left unspecified, recency ordering is
+		// applied automatically, because relevance order inside an
+		// already-narrowed time window is rarely what a temporal query
+		// wants. An explicit sort=relevance still wins inside a window.
+		switch sortRaw := strings.TrimSpace(strings.ToLower(req.GetString("sort", ""))); sortRaw {
+		case "":
+			if sq.OccurredFrom != nil || sq.OccurredTo != nil {
+				sq.Sort = model.SortRecent
+			}
+		case "relevance":
+			// explicit request for the default ordering — nothing to set
+		case model.SortRecent:
+			sq.Sort = model.SortRecent
+		default:
+			return mcp.NewToolResultError(fmt.Sprintf(
+				"unknown sort %q; allowed: relevance, recent", sortRaw,
+			)), nil
+		}
+
 		sq.IncludeRetention = req.GetBool("include_retention", false)
+
+		// use_rerank: falls back to the server default, EXCEPT when the
+		// query resolved to recency ordering (explicitly or via the
+		// auto-apply above) and the caller did not explicitly ask for
+		// reranking. search.Service applies the cross-encoder AFTER the
+		// recency sort and its output order is final (internal/search/
+		// search.go's applyRerank ordering comment) — silently defaulting
+		// rerank on would silently undo the recency order this tool just
+		// promised. An explicit use_rerank=true is still honored: that is a
+		// deliberate caller choice, not a silent default.
+		_, useRerankExplicit := req.GetArguments()["use_rerank"]
+		sq.UseRerank = req.GetBool("use_rerank", rerankDefault)
+		if !useRerankExplicit && sq.SortsByRecency() {
+			sq.UseRerank = false
+		}
 
 		results, err := svc.Search(ctx, sq)
 		if err != nil {
@@ -359,6 +458,15 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service) {
 
 		out := make([]searchResult, 0, len(results))
 		for _, r := range results {
+			var occurredAt *string
+			if r.OccurredAt != nil {
+				s := r.OccurredAt.Format(time.RFC3339)
+				occurredAt = &s
+			}
+			var retention *string
+			if tag, ok := r.RetentionTag(); ok {
+				retention = &tag
+			}
 			out = append(out, searchResult{
 				DocumentID: r.ID.String(),
 				Title:      r.Title,
@@ -366,6 +474,9 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service) {
 				Score:      r.Score,
 				MatchType:  r.MatchType,
 				Snippet:    truncateRunes(r.Content, 500),
+				OccurredAt: occurredAt,
+				Retention:  retention,
+				Segment:    metadataString(r.Metadata, "segment"),
 			})
 		}
 

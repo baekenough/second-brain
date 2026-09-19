@@ -110,7 +110,7 @@ func run() error {
 	}
 
 	// --- Reranker (optional) ---
-	reranker := search.NewHTTPReranker(cfg.RerankURL, cfg.RerankAPIKey, cfg.RerankModel, 0)
+	reranker := search.NewHTTPReranker(cfg.RerankURL, cfg.RerankAPIKey, cfg.RerankModel, cfg.RerankTopN)
 	if reranker.Enabled() {
 		slog.Info("reranker configured", "url", cfg.RerankURL, "model", cfg.RerankModel)
 	}
@@ -199,6 +199,7 @@ func run() error {
 		WithIngestRecording(docStore, cfg.IngestRecordingDir, cfg.IngestMaxFileBytes, cfg.CollectorCutover).
 		WithNotes(docStore, chunkStore, embedClient).
 		WithAskConfig(time.Duration(cfg.AskTimeoutSeconds)*time.Second, cfg.AskContextTopK, cfg.AskContextInsightM).
+		WithAskRerankDefault(cfg.RerankDefault).
 		WithAskSessions(askSessionStore).
 		WithGolden(store.NewGoldenStore(pg))
 

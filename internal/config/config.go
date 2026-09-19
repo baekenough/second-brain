@@ -116,6 +116,20 @@ type Config struct {
 	RerankAPIKey string // RERANKER_API_KEY — Bearer token for the reranker API
 	RerankModel  string // RERANKER_MODEL — model identifier sent in the request body
 
+	// RerankDefault decides whether internal callers (/ask, MCP search) opt
+	// into cross-encoder reranking (model.SearchQuery.UseRerank) unless the
+	// caller explicitly overrides it. Default true, matching the
+	// SUMMARIZER_BACKFILL_ENABLED convention (unset/anything-but-false/"0" is
+	// on). This flag is inert whenever RerankURL is empty: search.HTTPReranker
+	// .Enabled() gates on the endpoint, not on this flag, so flipping
+	// RerankDefault on without a configured RERANKER_URL is a no-op rather
+	// than an error.
+	RerankDefault bool // SEARCH_RERANK_DEFAULT, default true
+
+	// RerankTopN bounds how many candidates are sent to the reranker per
+	// request (search.NewHTTPReranker's topN argument). Default 10.
+	RerankTopN int // RERANKER_TOP_N, default 10
+
 	// OpenSearch (optional — BM25 full-text lane with Korean morphological
 	// (nori) tokenization, DISABLED when OPENSEARCH_URL is empty; this is
 	// the default and the only state this repo deploys today).
@@ -690,6 +704,15 @@ func Load() (*Config, error) {
 		summarizerBackfill = false
 	}
 
+	// SEARCH_RERANK_DEFAULT: default true. Set =false to keep /ask and the MCP
+	// search tool opted out of cross-encoder reranking by default (individual
+	// callers can still override per-request). Mirrors the
+	// SUMMARIZER_BACKFILL_ENABLED convention above.
+	rerankDefault := true
+	if v := os.Getenv("SEARCH_RERANK_DEFAULT"); v == "false" || v == "0" {
+		rerankDefault = false
+	}
+
 	collectorInstance := os.Getenv("COLLECTOR_INSTANCE")
 	if collectorInstance == "" {
 		if hn, err := os.Hostname(); err == nil && hn != "" {
@@ -766,9 +789,11 @@ func Load() (*Config, error) {
 
 		UserEmailAddresses: splitCSV(os.Getenv("USER_EMAIL_ADDRESSES")),
 
-		RerankURL:    os.Getenv("RERANKER_URL"),
-		RerankAPIKey: os.Getenv("RERANKER_API_KEY"),
-		RerankModel:  getenv("RERANKER_MODEL", "jina-reranker-v2-base-multilingual"),
+		RerankURL:     os.Getenv("RERANKER_URL"),
+		RerankAPIKey:  os.Getenv("RERANKER_API_KEY"),
+		RerankModel:   getenv("RERANKER_MODEL", "jina-reranker-v2-base-multilingual"),
+		RerankDefault: rerankDefault,
+		RerankTopN:    rerankTopN(),
 
 		OpensearchURL:            os.Getenv("OPENSEARCH_URL"),
 		OpensearchIndex:          getenv("OPENSEARCH_INDEX", "sb-chunks"),
@@ -1230,6 +1255,27 @@ func opensearchTimeoutSeconds() int {
 			"error", err,
 		)
 		return defaultSeconds
+	}
+	return n
+}
+
+// rerankTopN parses RERANKER_TOP_N from the environment: how many candidates
+// are sent to the reranker per request (search.NewHTTPReranker's topN
+// argument). Default is 10. Invalid values are ignored and the default is
+// used.
+func rerankTopN() int {
+	const defaultTopN = 10
+	v := os.Getenv("RERANKER_TOP_N")
+	if v == "" {
+		return defaultTopN
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		slog.Warn("config: RERANKER_TOP_N is invalid; using default 10",
+			"value", v,
+			"error", err,
+		)
+		return defaultTopN
 	}
 	return n
 }
