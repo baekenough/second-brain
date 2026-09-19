@@ -500,6 +500,13 @@ func buildFulltextSearchQuery(query model.SearchQuery) (string, []interface{}) {
 		args = append(args, query.ExcludeSourceTypes)
 	}
 
+	// Retention filter (documents.metadata->>'retention'). NULL-safe via
+	// COALESCE so a document with no "retention" key at all — most of the
+	// corpus — is never excluded; see appendRetentionFilter's doc comment for
+	// the full rationale (shared verbatim with buildHybridSearchQuery).
+	var retentionFilter string
+	args, retentionFilter, _ = appendRetentionFilter(args, query.ExcludeRetention)
+
 	// Event-time window, applied in the WHERE clause for the same reason as in
 	// hybridSearch: this statement is capped by LIMIT $2, so the window has to
 	// constrain what is selected, not what is returned after selection.
@@ -526,8 +533,9 @@ func buildFulltextSearchQuery(query model.SearchQuery) (string, []interface{}) {
 		%s
 		%s
 		%s
+		%s
 		ORDER BY %s
-		LIMIT $2`, statusFilter, sourceFilter, excludeFilter, occurredFilter, sortOrder(query, time.Now(), ""))
+		LIMIT $2`, statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, sortOrder(query, time.Now(), ""))
 
 	return q, args
 }
@@ -571,6 +579,55 @@ func appendOccurredRangeFilters(args []interface{}, from, to *time.Time) (newArg
 
 	const sep = "\n\t\t\t"
 	return args, strings.Join(plainParts, sep), strings.Join(qualifiedParts, sep)
+}
+
+// appendRetentionFilter binds the caller's ExcludeRetention list to args and
+// returns the matching WHERE fragment in both the unqualified form (for the
+// four CTEs that scan `documents` directly, and for fulltextSearch's plain
+// query) and the `d.`-qualified form (for the entity lane, which joins).
+// Mirrors appendOccurredRangeFilters' shape and reasoning:
+//
+//   - The predicate coalesces a NULL retention tag to an empty string before
+//     comparing, which is NULL-safe. A large majority of documents.metadata
+//     rows have no "retention" key at all (only gmail has been segmented so
+//     far, per model.RetentionTag's doc comment) — `metadata->>'retention'`
+//     on such a row is SQL NULL, and NULL compared against anything with <>
+//     is never true, which would silently EXCLUDE every untagged document.
+//     The coalesced empty string is never itself one of
+//     RetentionKeep/RetentionLow/RetentionDisposable, so an untagged row
+//     always survives the <> ALL(...) test regardless of what is in the
+//     exclude list.
+//   - The list travels as ONE bound parameter, never interpolated — every
+//     fragment in this file is built with fmt.Sprintf, and an interpolated
+//     list here would reopen the exact injection surface the source-type and
+//     occurred_at filters were written to avoid.
+//   - No index exists on metadata->>'retention', and none is added by this
+//     change. That is a deliberate no-op, not an oversight: every lane this
+//     filter reaches already narrows the candidate set to at most `LIMIT $3`
+//     rows (or `LIMIT $2` for fulltextSearch) via its own indexed access path
+//     — the GIN tsvector index for fts, the HNSW index for vec, pg_bigm's GIN
+//     index for bigm, the entity join, or (for fulltextSearch) the same
+//     tsvector/pg_bigm OR-clause. PostgreSQL therefore evaluates this
+//     COALESCE/<>ALL as an extra Filter condition on that already-bounded row
+//     set, exactly like the pre-existing `status = 'active'` filter — it
+//     cannot change which index scan the planner picks, and at ≤ a few
+//     hundred candidate rows per lane the per-row jsonb text extraction is
+//     immaterial next to the ANN/GIN scan cost it rides alongside. No EXPLAIN
+//     regression is expected for the same reason status/source_type already
+//     don't need their own index: the filter never becomes the plan's driving
+//     predicate, it only trims candidates the driving predicate already found.
+//
+// An empty exclude list returns empty fragments and args unchanged — this is
+// the common case for any request that used IncludeRetention to opt out of
+// the default (search.applyRetentionExclusionDefault).
+func appendRetentionFilter(args []interface{}, exclude []string) (newArgs []interface{}, plain, qualified string) {
+	if len(exclude) == 0 {
+		return args, "", ""
+	}
+	p := len(args) + 1
+	plain = fmt.Sprintf("AND COALESCE(metadata->>'retention', '') <> ALL($%d)", p)
+	qualified = fmt.Sprintf("AND COALESCE(d.metadata->>'retention', '') <> ALL($%d)", p)
+	return append(args, exclude), plain, qualified
 }
 
 // buildOccurredRangeIDQuery renders the statement that narrows a candidate set
@@ -762,6 +819,12 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 		args = append(args, query.ExcludeSourceTypes)
 	}
 
+	// Retention filter (documents.metadata->>'retention'), one bound parameter
+	// shared by all five lanes — see appendRetentionFilter for the NULL-safety
+	// and no-new-index reasoning.
+	var retentionFilter, entityRetentionFilter string
+	args, retentionFilter, entityRetentionFilter = appendRetentionFilter(args, query.ExcludeRetention)
+
 	// Event-time window. Like the source filters, this constrains the candidate
 	// pool INSIDE every lane rather than reordering the fused result: each lane
 	// is capped by LIMIT $3, so an out-of-window document that reaches a lane
@@ -803,7 +866,7 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 	// disabled (weight=0), we use a trivially-empty CTE to avoid syntax errors.
 	entityCTE := emptyEntityCTE
 	if w.EntityWeight > 0 {
-		entityCTE = buildEntityCTE(entityFilterParam, entityStatusFilter, entitySourceFilter, entityExcludeFilter, entityOccurredFilter)
+		entityCTE = buildEntityCTE(entityFilterParam, entityStatusFilter, entitySourceFilter, entityExcludeFilter, entityRetentionFilter, entityOccurredFilter)
 	}
 
 	q := fmt.Sprintf(`
@@ -820,6 +883,7 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 			%s
 			%s
 			%s
+			%s
 			LIMIT $3
 		),
 		vec AS (
@@ -827,6 +891,7 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
 			FROM documents
 			WHERE embedding IS NOT NULL
+			%s
 			%s
 			%s
 			%s
@@ -847,6 +912,7 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 			%s
 			%s
 			%s
+			%s
 			LIMIT $3
 		),
 		summvec AS (
@@ -854,6 +920,7 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
 			FROM documents
 			WHERE summary_embedding IS NOT NULL
+			%s
 			%s
 			%s
 			%s
@@ -879,10 +946,10 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 		JOIN documents d ON d.id = rrf.id
 		ORDER BY %s
 		LIMIT $3`,
-		statusFilter, sourceFilter, excludeFilter, occurredFilter, // fts
-		statusFilter, sourceFilter, excludeFilter, occurredFilter, // vec
-		statusFilter, sourceFilter, excludeFilter, occurredFilter, // bigm
-		statusFilter, sourceFilter, excludeFilter, occurredFilter, // summvec
+		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, // fts
+		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, // vec
+		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, // bigm
+		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, // summvec
 		entityCTE, // entity lane carries the same filters in d.-qualified form
 		buildRRFScoreExpr(w),
 		sortOrder(query, time.Now(), "d"))
@@ -932,15 +999,15 @@ const emptyEntityCTE = `entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank
 // contribution.
 //
 // The filter fragments must be `d.`-qualified — they are the entityStatusFilter
-// / entitySourceFilter / entityExcludeFilter variants built in hybridSearch,
-// not the unqualified ones used by the fts/vec/bigm/summvec CTEs. They bind the
-// same positional parameters.
+// / entitySourceFilter / entityExcludeFilter / entityRetentionFilter variants
+// built in hybridSearch, not the unqualified ones used by the
+// fts/vec/bigm/summvec CTEs. They bind the same positional parameters.
 //
 // Split out of hybridSearch so the filters can be asserted without a database:
 // the lane's previous unfiltered form let soft-deleted and excluded documents
 // (including insights) into results whenever they were reachable by entity
 // name alone, and nothing in the test suite could observe it.
-func buildEntityCTE(entityFilterParam, statusFilter, sourceFilter, excludeFilter, occurredRangeFilter string) string {
+func buildEntityCTE(entityFilterParam, statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredRangeFilter string) string {
 	return fmt.Sprintf(`entity AS (
 			SELECT de.document_id AS id,
 			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
@@ -952,9 +1019,10 @@ func buildEntityCTE(entityFilterParam, statusFilter, sourceFilter, excludeFilter
 			%s
 			%s
 			%s
+			%s
 			GROUP BY de.document_id
 			LIMIT $3
-		)`, entityFilterParam, statusFilter, sourceFilter, excludeFilter, occurredRangeFilter)
+		)`, entityFilterParam, statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredRangeFilter)
 }
 
 // entityExtractionEnabled reports whether entity extraction has been enabled

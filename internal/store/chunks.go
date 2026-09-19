@@ -3,6 +3,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"time"
@@ -57,6 +58,16 @@ type ChunkSearchResult struct {
 	// collected_at belongs to the ordering rule, not to this row.
 	DocumentOccurredAt  *time.Time
 	DocumentCollectedAt time.Time
+
+	// DocumentMetadata is the parent document's metadata jsonb, decoded to a
+	// map. Selected for the same reason as DocumentOccurredAt above: a
+	// document reachable ONLY through a chunk lane never passes through
+	// hybridSearch's WHERE predicates, so internal/search's
+	// applyRetentionFilters (retention exclusion + the retention="low" score
+	// penalty) has nothing to read unless the chunk row carries it directly.
+	// nil (not an empty map) when the source column was NULL or failed to
+	// decode — model.Document.RetentionTag treats nil the same as "no tag".
+	DocumentMetadata map[string]any
 }
 
 // ChunkStore provides chunk persistence and FTS search operations.
@@ -160,7 +171,8 @@ func (s *ChunkStore) SearchFTS(ctx context.Context, query string, limit int) ([]
 			d.source_type    AS document_source,
 			d.status         AS document_status,
 			d.occurred_at    AS document_occurred_at,
-			d.collected_at   AS document_collected_at
+			d.collected_at   AS document_collected_at,
+			d.metadata       AS document_metadata
 		FROM chunks c
 		JOIN documents d ON d.id = c.document_id
 		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
@@ -178,6 +190,7 @@ func (s *ChunkStore) SearchFTS(ctx context.Context, query string, limit int) ([]
 	var results []ChunkSearchResult
 	for rows.Next() {
 		var r ChunkSearchResult
+		var metaJSON []byte
 		if err := rows.Scan(
 			&r.ID,
 			&r.DocumentID,
@@ -191,15 +204,34 @@ func (s *ChunkStore) SearchFTS(ctx context.Context, query string, limit int) ([]
 			&r.DocumentStatus,
 			&r.DocumentOccurredAt,
 			&r.DocumentCollectedAt,
+			&metaJSON,
 		); err != nil {
 			return nil, fmt.Errorf("chunks search FTS scan: %w", err)
 		}
+		r.DocumentMetadata = decodeChunkDocumentMetadata(metaJSON)
 		results = append(results, r)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("chunks search FTS iter: %w", err)
 	}
 	return results, nil
+}
+
+// decodeChunkDocumentMetadata decodes a chunk-lane row's joined
+// documents.metadata jsonb column. A NULL column, an empty payload, or a
+// malformed one all degrade to nil rather than failing the whole search
+// lane — nil reads as "no retention tag" (model.Document.RetentionTag),
+// which is the correct, conservative fallback: a decode failure must never
+// be silently treated as retention="disposable".
+func decodeChunkDocumentMetadata(raw []byte) map[string]any {
+	if len(raw) == 0 {
+		return nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil
+	}
+	return m
 }
 
 // ListByDocument returns all chunks for the given document ordered by
@@ -406,7 +438,8 @@ func (s *ChunkStore) SearchVector(ctx context.Context, queryVec []float32, limit
 			d.source_type    AS document_source,
 			d.status         AS document_status,
 			d.occurred_at    AS document_occurred_at,
-			d.collected_at   AS document_collected_at
+			d.collected_at   AS document_collected_at,
+			d.metadata       AS document_metadata
 		FROM chunks c
 		JOIN documents d ON d.id = c.document_id
 		WHERE c.embedding IS NOT NULL
@@ -423,6 +456,7 @@ func (s *ChunkStore) SearchVector(ctx context.Context, queryVec []float32, limit
 	var results []ChunkSearchResult
 	for rows.Next() {
 		var r ChunkSearchResult
+		var metaJSON []byte
 		if err := rows.Scan(
 			&r.ID,
 			&r.DocumentID,
@@ -436,9 +470,11 @@ func (s *ChunkStore) SearchVector(ctx context.Context, queryVec []float32, limit
 			&r.DocumentStatus,
 			&r.DocumentOccurredAt,
 			&r.DocumentCollectedAt,
+			&metaJSON,
 		); err != nil {
 			return nil, fmt.Errorf("chunks search vector scan: %w", err)
 		}
+		r.DocumentMetadata = decodeChunkDocumentMetadata(metaJSON)
 		results = append(results, r)
 	}
 	if err := rows.Err(); err != nil {

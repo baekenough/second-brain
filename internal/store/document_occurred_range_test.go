@@ -419,7 +419,7 @@ func TestBuildFulltextSearchQuery_NoRange_UnchangedStatement(t *testing.T) {
 func TestBuildEntityCTE_AppliesRangeFilter(t *testing.T) {
 	t.Parallel()
 
-	got := buildEntityCTE("$4", "AND d.status = 'active'", "", "", "AND d.occurred_at >= $5\nAND d.occurred_at < $6")
+	got := buildEntityCTE("$4", "AND d.status = 'active'", "", "", "", "AND d.occurred_at >= $5\nAND d.occurred_at < $6")
 
 	for _, want := range []string{"AND d.occurred_at >= $5", "AND d.occurred_at < $6"} {
 		if !strings.Contains(got, want) {
