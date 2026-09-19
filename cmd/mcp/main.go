@@ -284,6 +284,13 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service) {
 					"after occurred_from when both are given. May be given alone.",
 			),
 		),
+		mcp.WithBoolean("include_retention",
+			mcp.Description(
+				"When true, disables the default exclusion of retention=disposable documents "+
+					"(gmail newsletters/notifications/transactional noise tagged by the segmentation "+
+					"pass). Default false — most callers want that noise filtered out.",
+			),
+		),
 	)
 
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -341,6 +348,8 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service) {
 				"occurred_to must be strictly after occurred_from (half-open window [occurred_from, occurred_to))",
 			), nil
 		}
+
+		sq.IncludeRetention = req.GetBool("include_retention", false)
 
 		results, err := svc.Search(ctx, sq)
 		if err != nil {

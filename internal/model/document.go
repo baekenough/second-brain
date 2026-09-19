@@ -286,6 +286,28 @@ type SearchQuery struct {
 	// the window" as "happened during the window".
 	OccurredFrom *time.Time
 	OccurredTo   *time.Time
+
+	// ExcludeRetention filters out documents whose metadata retention tag
+	// (documents.metadata->>'retention'; see RetentionKeep/RetentionLow/
+	// RetentionDisposable in retention.go) is one of the listed values. Same
+	// shape and same reason as ExcludeSourceTypes — a list, bound as ONE
+	// parameter, never interpolated.
+	//
+	// The store applies this as a WHERE predicate inside every retrieval lane
+	// (internal/store/document.go), NULL-safe via
+	// COALESCE(metadata->>'retention', ''): a document with no "retention" key
+	// at all — most of the corpus, since only gmail is tagged so far — is
+	// NEVER excluded by this filter. search.applyRetentionExclusionDefault
+	// injects RetentionDisposable here by default on every request; callers
+	// do not normally set this field directly.
+	ExcludeRetention []string
+	// IncludeRetention, when true, disables the default disposable-retention
+	// exclusion that search.Service.Search injects on every request (mirrors
+	// IncludeDeleted's opt-out shape: false is the safe default, true is an
+	// explicit ask to see everything). It has no effect on an ExcludeRetention
+	// value the caller set explicitly — that is a stronger, deliberate request
+	// and is never silently overridden.
+	IncludeRetention bool
 }
 
 // SortRecent is the ONLY value of SearchQuery.Sort that ranks by time. Every

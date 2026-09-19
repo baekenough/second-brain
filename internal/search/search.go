@@ -259,6 +259,33 @@ func applyInsightExclusionDefault(q model.SearchQuery) model.SearchQuery {
 	return q
 }
 
+// applyRetentionExclusionDefault enforces the default retention policy:
+// documents tagged retention=disposable (model.RetentionDisposable) in
+// documents.metadata are excluded from search results unless the caller
+// explicitly opts in via q.IncludeRetention, or has already named
+// "disposable" in q.ExcludeRetention itself.
+//
+// Mirrors applyInsightExclusionDefault immediately above — same "explicit
+// opt-in wins, safe default otherwise" shape — and lives here for the same
+// reason: every caller of Service.Search (both /api/v1/search handlers,
+// /api/v1/ask's assembleRetrieval, the MCP search tool, the GraphQL resolver,
+// the Discord gateway) inherits the exclusion without having to remember to
+// ask for it. Gmail is the only tagged source so far (11,965 documents,
+// ~77% low/disposable); untagged documents from every other source are never
+// touched by this — see model.Document.RetentionTag.
+func applyRetentionExclusionDefault(q model.SearchQuery) model.SearchQuery {
+	if q.IncludeRetention {
+		return q
+	}
+	for _, r := range q.ExcludeRetention {
+		if r == model.RetentionDisposable {
+			return q
+		}
+	}
+	q.ExcludeRetention = append(q.ExcludeRetention, model.RetentionDisposable)
+	return q
+}
+
 // applySourceTypeFilters restricts results to q's effective include set and
 // removes anything named by q.ExcludeSourceTypes.
 //
@@ -309,6 +336,68 @@ func applySourceTypeFilters(q model.SearchQuery, results []*model.SearchResult) 
 			if _, ok := included[r.SourceType]; !ok {
 				continue
 			}
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// applyRetentionFilters is the single fusion-time enforcement point for
+// q.ExcludeRetention and the retention="low" score penalty
+// (model.LowRetentionPenalty). It runs uniformly over whichever lane's result
+// set is handed to it, regardless of where that lane's rows came from:
+//
+//   - The document-store lanes (pgvector/FTS/bigm/summvec/entity, fused into
+//     one result set by buildRRFScoreExpr in internal/store/document.go)
+//     already apply the exclusion as a SQL WHERE predicate, so calling this
+//     again on their output is a harmless no-op for exclusion — but it is
+//     NOT a no-op for the low-retention penalty, which is a Go-side score
+//     multiplication the SQL layer never performs.
+//   - The chunk vector/FTS lanes and the OpenSearch lane cannot express the
+//     exclusion in their own query (ChunkSearcher takes only a query/vector
+//     and a limit; see applySourceTypeFilters' doc comment for the same
+//     constraint), so THIS is their only enforcement point for both the
+//     exclusion and the penalty.
+//
+// Untagged documents (no "retention" key in Metadata — most of the corpus;
+// see model.Document.RetentionTag) are returned completely unchanged: absence
+// of a tag must never be treated as "disposable" or "low".
+//
+// KNOWN GAP: the OpenSearch (nori BM25) lane's sb-chunks index does not carry
+// document metadata at all (see opensearch.go's osHit / osSearchResponse) —
+// its rows have no retention tag for this function to read, so a disposable
+// document reachable ONLY through that lane is not excluded here. Closing
+// that gap means adding the field to the index mapping and the external
+// bulk-load script (deploy/ubuntu1-stack/opensearch/), which lives outside
+// this codebase; it is flagged as a follow-up rather than blocking this
+// change, the same way the chunk-lane window-filter gap was tracked as #196
+// before it was closed.
+func applyRetentionFilters(q model.SearchQuery, results []*model.SearchResult) []*model.SearchResult {
+	penalty := model.LowRetentionPenalty()
+	if len(results) == 0 || (len(q.ExcludeRetention) == 0 && penalty == 1.0) {
+		return results
+	}
+
+	exclude := make(map[string]struct{}, len(q.ExcludeRetention))
+	for _, r := range q.ExcludeRetention {
+		exclude[r] = struct{}{}
+	}
+
+	out := make([]*model.SearchResult, 0, len(results))
+	for _, r := range results {
+		tag, tagged := r.RetentionTag()
+		if !tagged {
+			out = append(out, r)
+			continue
+		}
+		if _, skip := exclude[tag]; skip {
+			continue
+		}
+		if tag == model.RetentionLow && penalty != 1.0 {
+			cp := *r // shallow copy — do not mutate the caller's slice/lane result
+			cp.Score *= penalty
+			out = append(out, &cp)
+			continue
 		}
 		out = append(out, r)
 	}
@@ -377,6 +466,7 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	// filters, the chunk lanes' post-filter, and the reranker's input set —
 	// sees the same exclusion list.
 	q = applyInsightExclusionDefault(q)
+	q = applyRetentionExclusionDefault(q)
 	warnOnSourceFilterConflict(q)
 
 	// Apply the default weighting when the caller has not set explicit weights.
@@ -413,6 +503,12 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	if err != nil {
 		return nil, fmt.Errorf("search store: %w", err)
 	}
+	// The store already excluded ExcludeRetention via SQL WHERE (see
+	// buildHybridSearchQuery/buildFulltextSearchQuery), so this call cannot
+	// find anything left to drop here — but it still applies the
+	// retention="low" score penalty, which the SQL layer never performs (see
+	// applyRetentionFilters).
+	results = applyRetentionFilters(q, results)
 
 	// An event-time window is a hard constraint on WHICH documents may be
 	// returned. The document store enforces it in SQL inside every lane; the
@@ -458,6 +554,7 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 			if windowed {
 				chunkVecResults = s.verifyWindow(ctx, q, chunkVecResults)
 			}
+			chunkVecResults = applyRetentionFilters(q, chunkVecResults)
 			if len(chunkVecResults) > 0 {
 				results = mergeRRF(results, chunkVecResults, q.Limit)
 				chunkFused = true
@@ -487,6 +584,7 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 				"error", oerr, "query", q.Query)
 		} else {
 			osResults = applySourceTypeFilters(q, osResults)
+			osResults = applyRetentionFilters(q, osResults)
 			if len(osResults) > 0 {
 				results = mergeRRF(results, osResults, q.Limit)
 				chunkFused = true
@@ -512,6 +610,7 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 		if windowed {
 			results = s.verifyWindow(ctx, q, results)
 		}
+		results = applyRetentionFilters(q, results)
 		chunkFused = true
 	}
 
@@ -782,6 +881,10 @@ func chunkVecToSearchResult(r store.ChunkSearchResult) *model.SearchResult {
 			Status:      r.DocumentStatus,
 			OccurredAt:  occurred,
 			CollectedAt: collected,
+			// Metadata carries the retention tag (if any) so applyRetentionFilters
+			// can enforce the exclusion/penalty on a document reachable only
+			// through this lane — see ChunkSearchResult.DocumentMetadata.
+			Metadata: r.DocumentMetadata,
 		},
 		Score:     r.Score,
 		MatchType: "chunk-vector",
@@ -830,6 +933,9 @@ func chunkToSearchResult(r store.ChunkSearchResult) *model.SearchResult {
 			Status:      r.DocumentStatus,
 			OccurredAt:  occurred,
 			CollectedAt: collected,
+			// Metadata carries the retention tag (if any) — see
+			// chunkVecToSearchResult's identical field for why.
+			Metadata: r.DocumentMetadata,
 		},
 		Score:     r.Rank,
 		MatchType: "chunk-fts",

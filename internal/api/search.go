@@ -33,6 +33,10 @@ type searchRequest struct {
 	UseHyDE            bool               `json:"use_hyde,omitempty"`   // opt-in HyDE query expansion; default false
 	UseRerank          bool               `json:"use_rerank,omitempty"` // opt-in cross-encoder reranking; default false
 	Curated            bool               `json:"curated,omitempty"`    // opt-in LLM curation and re-ranking; default false
+	// IncludeRetention, when true, disables the default retention=disposable
+	// exclusion that search.Service.Search applies to every request (see
+	// search.applyRetentionExclusionDefault). Default false.
+	IncludeRetention bool `json:"include_retention,omitempty"`
 }
 
 // searchHandler handles POST /api/v1/search.
@@ -56,6 +60,7 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 		Sort:               req.Sort,
 		UseHyDE:            req.UseHyDE,
 		UseRerank:          req.UseRerank,
+		IncludeRetention:   req.IncludeRetention,
 	}
 
 	start := time.Now()
@@ -117,13 +122,15 @@ func (s *Server) searchGetHandler(w http.ResponseWriter, r *http.Request) {
 	curated := r.URL.Query().Get("curated") == "true"
 	useHyDE := r.URL.Query().Get("use_hyde") == "true"
 	useRerank := r.URL.Query().Get("use_rerank") == "true"
+	includeRetention := r.URL.Query().Get("include_retention") == "true"
 
 	q := model.SearchQuery{
-		Query:      query,
-		SourceType: srcType,
-		Limit:      limit,
-		UseHyDE:    useHyDE,
-		UseRerank:  useRerank,
+		Query:            query,
+		SourceType:       srcType,
+		Limit:            limit,
+		UseHyDE:          useHyDE,
+		UseRerank:        useRerank,
+		IncludeRetention: includeRetention,
 	}
 
 	start := time.Now()
