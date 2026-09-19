@@ -1,5 +1,5 @@
 // Package classify implements the retention/segment classification pipeline
-// for SMS, Gmail, and call-transcript documents: a deterministic Gate that
+// for SMS, Gmail, and call documents: a deterministic Gate that
 // short-circuits obvious cases and asymmetrically bounds the Jev-based
 // Classifier's output, plus the Classifier itself (see classifier.go).
 //
@@ -126,8 +126,8 @@ func NewEvaluator(lookup SenderLookup) *Evaluator {
 }
 
 // Evaluate computes the Gate for doc. Only SourceSMS, SourceGmail, and
-// SourceCallTranscript documents produce a non-empty Gate; any other source
-// type returns the zero Gate (no signal, no decision).
+// SourceCall documents produce a non-empty Gate; any other source type
+// returns the zero Gate (no signal, no decision).
 func (e *Evaluator) Evaluate(ctx context.Context, doc *model.Document) (Gate, error) {
 	if authPattern.MatchString(doc.Content) {
 		return Gate{Decided: &Tag{Segment: "auth_transient", Retention: model.RetentionDisposable}}, nil
@@ -138,7 +138,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, doc *model.Document) (Gate, er
 		return e.evaluateSMS(ctx, doc)
 	case model.SourceGmail:
 		return evaluateMail(doc), nil
-	case model.SourceCallTranscript:
+	case model.SourceCall:
 		return evaluateCall(doc), nil
 	default:
 		return Gate{}, nil
@@ -195,11 +195,85 @@ func evaluateMail(doc *model.Document) Gate {
 	}
 }
 
+// callLogSegment is the rule-only segment assigned to unrecorded calls
+// (metadata.transcription="none" — see model.SourceCall's doc comment). It
+// is deliberately absent from personSegments/disposableCandidateSegments in
+// classifier.go: a 4-line call-log summary (contact/direction/time/duration)
+// carries no content for Jev to reason about, so this segment is never sent
+// through ClassifyWithJev at all — see evaluateCallNoRecording.
+const callLogSegment = "call_log"
+
+// evaluateCall dispatches on doc's transcription state (see model.SourceCall's
+// doc comment for the none/pending/done lifecycle). The actual enforcement of
+// "never classify a pending call" is ListUnclassified's SQL-layer exclusion
+// (internal/store/classification.go) — a pending document should never reach
+// this function through the worker's normal path. This case exists purely so
+// the switch is exhaustive and self-documenting for any direct Evaluate
+// caller (e.g. a test): it deliberately does NOT apply either the "none" or
+// "done" rule to a pending call's transient call-log-summary content, since
+// neither reflects what the document will look like once transcribed. It
+// still returns the zero Gate (not a hard error) rather than a distinct
+// "skip" signal — no such signal exists in this package's Gate/Result model
+// yet, and returning it here would rely on the caller re-implementing the
+// same SQL-layer guarantee already enforced upstream.
 func evaluateCall(doc *model.Document) Gate {
-	if len([]rune(doc.Content)) < shortCallMinLength {
-		return Gate{Decided: &Tag{Segment: "short_call", Retention: model.RetentionLow}}
+	switch transcription, _ := doc.Metadata["transcription"].(string); transcription {
+	case "pending":
+		return Gate{}
+	case "none":
+		return evaluateCallNoRecording(doc)
+	default:
+		// "done", or missing/legacy (pre-migration-033 call-transcript
+		// documents that never carried a transcription key) — both mean the
+		// content is an actual transcript, so the original short-call rule
+		// applies unchanged.
+		if len([]rune(doc.Content)) < shortCallMinLength {
+			return Gate{Decided: &Tag{Segment: "short_call", Retention: model.RetentionLow}}
+		}
+		return Gate{}
 	}
-	return Gate{}
+}
+
+// evaluateCallNoRecording rule-classifies a call that was never recorded
+// (transcription="none"): its content is always the same short call-log
+// summary (see smsmap.MapCall), which has no information for Jev to weigh —
+// so this is a pure rule, never a Jev call. The signals reuse the same
+// metadata fields evaluateSMS keys off of (metaString already checks
+// "number" — MapCall's key — the same as it checks "sender"/"number" for
+// SMS):
+//
+//   - BulkSender: the number matches the same shortcode/toll-free shape used
+//     for SMS (telemarketing/ARS lines commonly reuse these ranges).
+//   - PersonSignal: a saved contact_name (always trusted — a manually saved
+//     contact name is never a bulk sender in practice), or this call itself
+//     being outgoing ("발신 이력" — the user placed this call, unlike an
+//     unsolicited inbound call from a stranger) UNLESS the number is
+//     BulkSender-shaped: calling a company's shortcode (e.g. customer
+//     support) is still just a factual log entry, not evidence of a personal
+//     relationship. This mirrors the package doc's asymmetric rule —
+//     "BulkSender signals forbid promotion to retention=keep" — for the one
+//     PersonSignal input (outgoing direction) a bulk sender can plausibly
+//     trigger.
+//
+// Retention defaults to low (a bare call-log line is a fact worth keeping
+// briefly, not indefinitely) and is only promoted to keep when PersonSignal
+// holds, per spec.
+func evaluateCallNoRecording(doc *model.Document) Gate {
+	number := metaString(doc.Metadata, "number")
+	g := Gate{
+		BulkSender: smsBulkNumberPattern.MatchString(normalizeNumber(number)),
+	}
+	outgoing := metaString(doc.Metadata, "direction") == "outgoing"
+	if metaString(doc.Metadata, "contact_name") != "" || (outgoing && !g.BulkSender) {
+		g.PersonSignal = true
+	}
+
+	retention := model.RetentionLow
+	if g.PersonSignal {
+		retention = model.RetentionKeep
+	}
+	g.Decided = &Tag{Segment: callLogSegment, Retention: retention}
+	return g
 }
 
 // isPersonalMobileNumber reports whether sender looks like a Korean mobile

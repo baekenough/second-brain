@@ -343,6 +343,68 @@ func TestTick_Unclassified_JevCallFails_AttemptsIncrementFromExistingCount(t *te
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Call source-type tests (migration 033 call-log/call-transcript unification)
+//
+// These two tests exercise the REAL classify.Evaluator/classify.Classifier
+// (not fakeGateEvaluator/fakeClassifier) end to end through tick, unlike the
+// rest of this file, specifically to catch the class of regression that
+// fakes cannot: classify.Evaluator.Evaluate silently returning the zero Gate
+// for an unrecognized model.SourceType (e.g. if the Gate's switch were ever
+// reverted to model.SourceCallTranscript while ListUnclassified's SQL filter
+// still listed model.SourceCall — the fakes would tag correctly regardless
+// of what the real Gate does, hiding exactly this bug).
+// ---------------------------------------------------------------------------
+
+func TestTick_Unclassified_CallNoRecording_RealPipeline_PersonSignalKeep(t *testing.T) {
+	doc := &model.Document{
+		ID:         uuid.New(),
+		SourceID:   "call-none-1",
+		SourceType: model.SourceCall,
+		Content:    "상대방: 엄마\n통화 방향: incoming\n시각: 2026-09-19 10:00:00 UTC\n통화 시간: 5s",
+		Metadata:   map[string]any{"transcription": "none", "direction": "incoming", "contact_name": "엄마"},
+	}
+	store := &fakeClassificationStore{unclassified: []*model.Document{doc}}
+	classifier := &classify.Classifier{} // Jev==nil -> JevEnabled() == false
+	w := newTestClassificationWorker(store, classifier, classify.NewEvaluator(nil), false, 200)
+
+	w.tick(context.Background())
+
+	updates, ok := store.mergeFor(doc.ID)
+	if !ok {
+		t.Fatal("MergeClassificationMetadata was not called for a transcription=none call")
+	}
+	if updates["segment"] != "call_log" || updates["retention"] != model.RetentionKeep {
+		t.Errorf("updates = %+v, want segment=call_log retention=keep (PersonSignal via contact_name)", updates)
+	}
+	if updates["classifier"] != "rule" {
+		t.Errorf("updates[classifier] = %v, want rule — an unrecorded call must never reach Jev", updates["classifier"])
+	}
+}
+
+func TestTick_Unclassified_CallNoRecording_RealPipeline_NoSignalLow(t *testing.T) {
+	doc := &model.Document{
+		ID:         uuid.New(),
+		SourceID:   "call-none-2",
+		SourceType: model.SourceCall,
+		Content:    "상대방: 상대 abcd1234\n통화 방향: incoming\n시각: 2026-09-19 10:00:00 UTC\n통화 시간: 3s",
+		Metadata:   map[string]any{"transcription": "none", "direction": "incoming"},
+	}
+	store := &fakeClassificationStore{unclassified: []*model.Document{doc}}
+	classifier := &classify.Classifier{}
+	w := newTestClassificationWorker(store, classifier, classify.NewEvaluator(nil), false, 200)
+
+	w.tick(context.Background())
+
+	updates, ok := store.mergeFor(doc.ID)
+	if !ok {
+		t.Fatal("MergeClassificationMetadata was not called for a transcription=none call")
+	}
+	if updates["segment"] != "call_log" || updates["retention"] != model.RetentionLow {
+		t.Errorf("updates = %+v, want segment=call_log retention=low (no contact_name, no outgoing direction)", updates)
+	}
+}
+
 // TestTick_MaxCallsPerTick_SharedAcrossQueues verifies the Jev call budget is
 // shared between the unclassified and legacy-recheck queues within one tick.
 func TestTick_MaxCallsPerTick_SharedAcrossQueues(t *testing.T) {

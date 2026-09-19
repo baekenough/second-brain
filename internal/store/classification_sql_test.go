@@ -15,12 +15,24 @@ import (
 func TestListUnclassifiedQuery_ScopesToActiveClassifiableSources(t *testing.T) {
 	for _, want := range []string{
 		"status = 'active'",
-		"source_type IN ('sms', 'gmail', 'call-transcript')",
+		"source_type IN ('sms', 'gmail', 'call')",
 		"NOT (metadata ? 'retention')",
 	} {
 		if !strings.Contains(listUnclassifiedQuery, want) {
 			t.Errorf("listUnclassifiedQuery missing %q:\n%s", want, listUnclassifiedQuery)
 		}
+	}
+}
+
+// TestListUnclassifiedQuery_ExcludesPendingTranscription pins the migration
+// 033 call-unification fix: a call whose recording has not been transcribed
+// yet (metadata.transcription="pending") must not be tagged against its
+// short call-log summary content, since store.AttachTranscript will replace
+// that content wholesale once transcription completes (see
+// model.SourceCall's doc comment).
+func TestListUnclassifiedQuery_ExcludesPendingTranscription(t *testing.T) {
+	if !strings.Contains(listUnclassifiedQuery, "COALESCE(metadata->>'transcription', '') <> 'pending'") {
+		t.Errorf("listUnclassifiedQuery does not exclude transcription=pending documents:\n%s", listUnclassifiedQuery)
 	}
 }
 

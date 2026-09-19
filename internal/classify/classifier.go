@@ -295,7 +295,7 @@ func stateAndCriteria(doc *model.Document) (state string, segmentCriteria map[st
 		state := fmt.Sprintf("제목: %s\n발신 도메인: %s\n본문: %s",
 			doc.Title, localPart2domain(from), truncate(doc.Content, mailStateContentChars))
 		return state, mailSegmentCriteria, mailRetentionCriteria, nil
-	case model.SourceCallTranscript:
+	case model.SourceCall:
 		return fmt.Sprintf("통화 전사(앞부분): %s", truncate(doc.Content, callStateContentChars)),
 			callSegmentCriteria, callRetentionCriteria, nil
 	default:
@@ -307,7 +307,7 @@ func segmentInstructions(src model.SourceType) string {
 	switch src {
 	case model.SourceGmail:
 		return "이 이메일의 종류를 제목과 발신 도메인, 본문으로 판단하세요"
-	case model.SourceCallTranscript:
+	case model.SourceCall:
 		return "이 통화 녹음의 종류를 고르세요"
 	default:
 		return "이 문자 메시지의 종류를 고르세요"

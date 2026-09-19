@@ -14,7 +14,18 @@ import (
 // ListUnclassified and ListLegacyForRecheck. Kept as a single literal (not a
 // parameter) because it is a fixed, code-reviewed set — same convention as
 // ListPendingForExtraction's hardcoded source list in document.go.
-const classifiableSourceTypesSQL = `'sms', 'gmail', 'call-transcript'`
+//
+// 'call-transcript' was replaced with 'call' here (not kept alongside it)
+// when migration 033 unified call-log/call-transcript into a single
+// source_type='call' per phone call (see model.SourceCall's doc comment).
+// Migration 033 rewrites every pre-existing row in place, so no active
+// document should carry source_type='call-transcript' after it has run —
+// leaving the old value in this list would be permanently dead weight, not
+// genuine backward compatibility. If a deployment somehow still has
+// unmigrated 'call-transcript' rows, that is a migration-completeness bug to
+// fix at the DB level (re-run/verify migration 033), not something this
+// query should silently paper over.
+const classifiableSourceTypesSQL = `'sms', 'gmail', 'call'`
 
 // listUnclassifiedQuery backs ListUnclassified. Named/exposed at package
 // scope (rather than inlined as a function-local const, unlike most other
@@ -28,17 +39,26 @@ const listUnclassifiedQuery = `
 	FROM documents
 	WHERE status = 'active'
 	  AND source_type IN (` + classifiableSourceTypesSQL + `)
+	  AND COALESCE(metadata->>'transcription', '') <> 'pending'
 	  AND NOT (metadata ? 'retention')
 	  AND COALESCE((metadata->>'classifier_attempts')::int, 0) < 3
 	  AND ($2::int <= 0 OR collected_at >= now() - make_interval(days => $2::int))
 	ORDER BY collected_at DESC
 	LIMIT $1`
 
-// ListUnclassified returns up to limit active SMS/Gmail/call-transcript
-// documents that have never been tagged with a retention value, ordered by
-// collected_at DESC (newest first) so that the background worker's
-// steady-state Jev spend tracks newly-collected volume rather than being
-// starved by an ever-growing historical backlog.
+// ListUnclassified returns up to limit active SMS/Gmail/call documents that
+// have never been tagged with a retention value, ordered by collected_at
+// DESC (newest first) so that the background worker's steady-state Jev spend
+// tracks newly-collected volume rather than being starved by an
+// ever-growing historical backlog.
+//
+// transcription='pending' call documents (a recording exists but
+// WhisperCollector has not transcribed it yet — see model.SourceCall's doc
+// comment) are excluded: their content is still the short call-log summary,
+// which store.AttachTranscript will wholesale replace once transcription
+// completes. Classifying now would tag against content the document will no
+// longer have moments later; deferring until transcription='done' means the
+// eventual tag actually reflects the transcript.
 //
 // backfillDays, when > 0, additionally restricts the result to documents
 // collected within the last backfillDays days — CLASSIFIER_BACKFILL_DAYS in
@@ -58,8 +78,8 @@ func (s *DocumentStore) ListUnclassified(ctx context.Context, limit int, backfil
 	return collectDocuments(rows)
 }
 
-// ListLegacyForRecheck returns up to limit active SMS/Gmail/call-transcript
-// documents that already carry ANY retention tag and have not yet been
+// ListLegacyForRecheck returns up to limit active SMS/Gmail/call documents
+// that already carry ANY retention tag and have not yet been
 // gate-audited (classifier_gate_checked_at is unset) — i.e. every
 // retention-tagged document except a human-authored "user" (golden-set)
 // label. The scope is deliberately "any retention tag", not "tagged by a
@@ -93,6 +113,11 @@ func (s *DocumentStore) ListUnclassified(ctx context.Context, limit int, backfil
 // MergeClassificationMetadata).
 // listLegacyForRecheckQuery backs ListLegacyForRecheck — see
 // listUnclassifiedQuery's doc comment for why this is a named const.
+//
+// No transcription='pending' guard is needed here (unlike
+// listUnclassifiedQuery): a pending call is, by construction, never listed
+// by ListUnclassified in the first place, so it can never have acquired the
+// `metadata ? 'retention'` tag this query requires.
 const listLegacyForRecheckQuery = `
 	SELECT id, source_type, source_id, title, content, metadata, embedding,
 	       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
