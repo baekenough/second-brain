@@ -30,13 +30,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/joho/godotenv"
-	"golang.org/x/sync/errgroup"
 	"github.com/baekenough/second-brain/internal/config"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
 	"github.com/baekenough/second-brain/internal/telemetry"
+	"github.com/joho/godotenv"
+	"golang.org/x/sync/errgroup"
 )
 
 // otelShutdownTimeout bounds how long the deferred telemetry shutdown may
@@ -74,10 +74,10 @@ func main() {
 
 // evalOutput is the JSON report written to stdout.
 type evalOutput struct {
-	Current    metricsSnapshot              `json:"current"`
-	Baseline   *metricsSnapshot             `json:"baseline"`
-	Regression bool                         `json:"regression"`
-	Deltas     map[string]float64           `json:"deltas,omitempty"`
+	Current    metricsSnapshot               `json:"current"`
+	Baseline   *metricsSnapshot              `json:"baseline"`
+	Regression bool                          `json:"regression"`
+	Deltas     map[string]float64            `json:"deltas,omitempty"`
 	Reindex    *search.ReindexRecommendation `json:"reindex,omitempty"` // populated when --check-reindex is set
 }
 
@@ -105,6 +105,11 @@ func run() error {
 	checkReindex := flag.Bool("check-reindex", false,
 		"evaluate reindex thresholds after computing eval metrics and include "+
 			"the recommendation in the JSON output (exit code 2 when reindex is recommended)")
+	useGolden := flag.Bool("golden", false,
+		"build eval pairs from the human-judged golden set (golden_judgments, "+
+			"judgment='relevant') instead of positive feedback (thumbs>=1); "+
+			"see internal/store.GoldenStore.ExportEvalPairs and "+
+			"GET /api/v1/golden/export for the same data over HTTP")
 	flag.Parse()
 
 	// wg tracks any background goroutines (e.g. webhook alert) so that deferred
@@ -160,6 +165,7 @@ func run() error {
 	docStore := store.NewDocumentStore(pg)
 	chunkStore := store.NewChunkStore(pg)
 	evalStore := store.NewEvalStore(pg)
+	goldenStore := store.NewGoldenStore(pg)
 	metricsStore := store.NewEvalMetricsStore(pg)
 
 	// --- Embedding engine ---
@@ -177,9 +183,27 @@ func run() error {
 		WithReranker(reranker)
 
 	// --- Build eval pairs ---
-	pairs, err := evalStore.BuildFromFeedback(ctx)
-	if err != nil {
-		return fmt.Errorf("build eval pairs: %w", err)
+	// --golden swaps the source from positive-feedback pairs (self-confirming:
+	// a document can only appear here if the search already showed it) to the
+	// human-judged golden set, which is built by presenting FULL candidate
+	// sets for judgment (see internal/store.GoldenStore, migrations/031) and
+	// therefore can surface recall gaps the feedback-derived set cannot.
+	//
+	// judge is hardcoded to "user": an unreviewed hermes ("llm") auto-judgment
+	// must never become the answer key eval scores itself against — see
+	// GoldenStore.ExportEvalPairs and .UpsertJudgments for the enforcement of
+	// that same rule on the write side.
+	var pairs []store.EvalPair
+	if *useGolden {
+		pairs, err = goldenStore.ExportEvalPairs(ctx, "user")
+		if err != nil {
+			return fmt.Errorf("build golden eval pairs: %w", err)
+		}
+	} else {
+		pairs, err = evalStore.BuildFromFeedback(ctx)
+		if err != nil {
+			return fmt.Errorf("build eval pairs: %w", err)
+		}
 	}
 	if len(pairs) == 0 {
 		slog.Warn("eval: no eval pairs found — skipping evaluation")
