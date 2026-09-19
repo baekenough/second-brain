@@ -50,7 +50,7 @@ func TestAssembleRetrieval_KindEntity_BoostsEntityWeight(t *testing.T) {
 	searcher := &recordingSearcher{}
 	params := intent.Params{RawQuery: "김대표 관련 내용", Kind: intent.KindEntity, Confidence: 0.9}
 
-	if _, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3); err != nil {
+	if _, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3, false); err != nil {
 		t.Fatalf("assembleRetrieval() error = %v", err)
 	}
 
@@ -66,12 +66,103 @@ func TestAssembleRetrieval_KindEntity_BoostsEntityWeight(t *testing.T) {
 	}
 }
 
+// TestAssembleRetrieval_UseRerank_FollowsConfigDefault verifies that
+// assembleRetrieval's useRerankDefault parameter (cfg.RerankDefault /
+// SEARCH_RERANK_DEFAULT, threaded in via Server.askRerankDefault) is set on
+// BOTH the 본검색 (observed) and 인사이트검색 (insight) queries — the two
+// lanes are answering the same question about whether the caller wants
+// reranked results — and that a Server which never opts in keeps both lanes
+// opted out (the pre-existing behaviour), matching /api/v1/search and
+// GraphQL's fail-closed default.
+func TestAssembleRetrieval_UseRerank_FollowsConfigDefault(t *testing.T) {
+	t.Parallel()
+
+	for _, useRerankDefault := range []bool{true, false} {
+		useRerankDefault := useRerankDefault
+		t.Run(map[bool]string{true: "default_on", false: "default_off"}[useRerankDefault], func(t *testing.T) {
+			t.Parallel()
+			searcher := &recordingSearcher{}
+			params := intent.Params{RawQuery: "질문"}
+
+			if _, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3, useRerankDefault); err != nil {
+				t.Fatalf("assembleRetrieval() error = %v", err)
+			}
+
+			if len(searcher.calls) != 2 {
+				t.Fatalf("got %d calls, want 2", len(searcher.calls))
+			}
+			for i, name := range []string{"observed", "insight"} {
+				if got := searcher.calls[i].UseRerank; got != useRerankDefault {
+					t.Errorf("%s query UseRerank = %v, want %v", name, got, useRerankDefault)
+				}
+			}
+		})
+	}
+}
+
+// TestAssembleRetrieval_UseRerank_SuppressedWhenSortIsRecent verifies the
+// recency guard: whenever this query resolves to Sort=recent — either via a
+// windowed plan or via KindTemporal — the server's rerank default is
+// suppressed on both lanes, even though useRerankDefault=true, because
+// search.Service applies the cross-encoder AFTER the recency sort and its
+// output order would silently replace the recency order (see
+// assembleRetrieval's doc comment). A general (non-recent) plan is
+// unaffected — TestAssembleRetrieval_UseRerank_FollowsConfigDefault above
+// already covers that the server default applies as-is in that case.
+func TestAssembleRetrieval_UseRerank_SuppressedWhenSortIsRecent(t *testing.T) {
+	t.Parallel()
+
+	from := time.Now().Add(-24 * time.Hour)
+
+	cases := []struct {
+		name   string
+		params intent.Params
+		plan   intent.QueryPlan
+	}{
+		{
+			name:   "windowed_plan",
+			params: intent.Params{RawQuery: "어제 회의 내용"},
+			plan:   intent.QueryPlan{OccurredFrom: &from, Limit: 8},
+		},
+		{
+			name:   "kind_temporal",
+			params: intent.Params{RawQuery: "지난달 요약", Kind: intent.KindTemporal, Confidence: 1.0},
+			plan:   unconstrainedPlan(),
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			searcher := &recordingSearcher{}
+
+			if _, err := assembleRetrieval(context.Background(), searcher, tc.params, tc.plan, 8, 3, true); err != nil {
+				t.Fatalf("assembleRetrieval() error = %v", err)
+			}
+
+			if len(searcher.calls) != 2 {
+				t.Fatalf("got %d calls, want 2", len(searcher.calls))
+			}
+			for i, name := range []string{"observed", "insight"} {
+				call := searcher.calls[i]
+				if call.Sort != model.SortRecent {
+					t.Fatalf("precondition failed: %s query Sort = %q, want %q", name, call.Sort, model.SortRecent)
+				}
+				if call.UseRerank {
+					t.Errorf("%s query UseRerank = true, want false (recency guard should suppress the default)", name)
+				}
+			}
+		})
+	}
+}
+
 func TestAssembleRetrieval_KindTemporal_SortsRecent(t *testing.T) {
 	t.Parallel()
 	searcher := &recordingSearcher{}
 	params := intent.Params{RawQuery: "지난달 요약", Kind: intent.KindTemporal, Confidence: 1.0}
 
-	if _, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3); err != nil {
+	if _, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3, false); err != nil {
 		t.Fatalf("assembleRetrieval() error = %v", err)
 	}
 
@@ -103,7 +194,7 @@ func TestAssembleRetrieval_PlanWindowReachesBothLanes(t *testing.T) {
 		Origin:       intent.OriginDeterministic,
 	}
 
-	if _, err := assembleRetrieval(context.Background(), searcher, params, plan, 8, 3); err != nil {
+	if _, err := assembleRetrieval(context.Background(), searcher, params, plan, 8, 3, false); err != nil {
 		t.Fatalf("assembleRetrieval() error = %v", err)
 	}
 
@@ -132,7 +223,7 @@ func TestAssembleRetrieval_KindTemporal_NilBounds_NoRange(t *testing.T) {
 	searcher := &recordingSearcher{}
 	params := intent.Params{RawQuery: "최근에 뭐 있었지", Kind: intent.KindTemporal, Confidence: 0.8}
 
-	if _, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3); err != nil {
+	if _, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3, false); err != nil {
 		t.Fatalf("assembleRetrieval() error = %v", err)
 	}
 
@@ -162,7 +253,7 @@ func TestAssembleRetrieval_LowConfidenceTemporal_NoRange(t *testing.T) {
 		Confidence:   0.2,
 	}
 
-	if _, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3); err != nil {
+	if _, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3, false); err != nil {
 		t.Fatalf("assembleRetrieval() error = %v", err)
 	}
 
@@ -184,7 +275,7 @@ func TestAssembleRetrieval_PlanOneSidedWindow(t *testing.T) {
 	searcher := &recordingSearcher{}
 	params := intent.Params{RawQuery: "8월 이후", Kind: intent.KindTemporal, Confidence: 1.0}
 	plan := intent.QueryPlan{OccurredFrom: &from, Limit: 8, Reason: "8/1 이후 전체 소스 조회", Origin: intent.OriginLLM}
-	if _, err := assembleRetrieval(context.Background(), searcher, params, plan, 8, 3); err != nil {
+	if _, err := assembleRetrieval(context.Background(), searcher, params, plan, 8, 3, false); err != nil {
 		t.Fatalf("assembleRetrieval() error = %v", err)
 	}
 	q := searcher.calls[0]
@@ -206,7 +297,7 @@ func TestAssembleRetrieval_NonTemporalKinds_NoRange(t *testing.T) {
 		{RawQuery: "요즘 어때", Kind: intent.KindGeneral, Confidence: 0},
 	} {
 		searcher := &recordingSearcher{}
-		if _, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3); err != nil {
+		if _, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3, false); err != nil {
 			t.Fatalf("Kind=%s: assembleRetrieval() error = %v", params.Kind, err)
 		}
 		if q := searcher.calls[0]; q.OccurredFrom != nil || q.OccurredTo != nil {
@@ -220,7 +311,7 @@ func TestAssembleRetrieval_KindExactToken_BoostsBigmWeight(t *testing.T) {
 	searcher := &recordingSearcher{}
 	params := intent.Params{RawQuery: "010-1234-5678", Kind: intent.KindExactToken, Confidence: 1.0}
 
-	if _, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3); err != nil {
+	if _, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3, false); err != nil {
 		t.Fatalf("assembleRetrieval() error = %v", err)
 	}
 
@@ -234,7 +325,7 @@ func TestAssembleRetrieval_KindGeneral_NoOverride(t *testing.T) {
 	searcher := &recordingSearcher{}
 	params := intent.Params{RawQuery: "요즘 뭐하고 지내?", Kind: intent.KindGeneral, Confidence: 0}
 
-	if _, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3); err != nil {
+	if _, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3, false); err != nil {
 		t.Fatalf("assembleRetrieval() error = %v", err)
 	}
 
@@ -251,7 +342,7 @@ func TestAssembleRetrieval_LowConfidence_CollapsesToGeneral(t *testing.T) {
 	// the collapse to "no shaping" happens here, in Stage 2, not in intent.Classify.
 	params := intent.Params{RawQuery: "그 사람 얘기 좀", Kind: intent.KindEntity, EntityName: "그 사람", Confidence: 0.2}
 
-	if _, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3); err != nil {
+	if _, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3, false); err != nil {
 		t.Fatalf("assembleRetrieval() error = %v", err)
 	}
 
@@ -273,7 +364,7 @@ func TestAssembleRetrieval_AlwaysAppliesInsightSplit(t *testing.T) {
 	for _, params := range kinds {
 		params := params
 		searcher := &recordingSearcher{}
-		if _, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3); err != nil {
+		if _, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3, false); err != nil {
 			t.Fatalf("assembleRetrieval() error = %v", err)
 		}
 		if len(searcher.calls) != 2 {
@@ -302,7 +393,7 @@ func TestAssembleRetrieval_ObservedEmpty_InferredStillPopulated(t *testing.T) {
 	}
 	params := intent.Params{RawQuery: "질문", Kind: intent.KindGeneral}
 
-	result, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3)
+	result, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3, false)
 	if err != nil {
 		t.Fatalf("assembleRetrieval() error = %v", err)
 	}
@@ -320,7 +411,7 @@ func TestAssembleRetrieval_SearchError_Propagated(t *testing.T) {
 	searcher := &recordingSearcher{err: wantErr}
 	params := intent.Params{RawQuery: "질문", Kind: intent.KindGeneral}
 
-	_, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3)
+	_, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3, false)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("assembleRetrieval() error = %v, want wrapping %v", err, wantErr)
 	}

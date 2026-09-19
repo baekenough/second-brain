@@ -318,7 +318,7 @@ func (s *Server) askHandler(w http.ResponseWriter, r *http.Request) {
 	)
 
 	// Stage 2: retrieval assembly (원문/정리 vs 추론 layers, spec §5.3).
-	result, err := assembleRetrieval(ctx, s.search, params, plan, s.askTopK, s.askInsightM)
+	result, err := assembleRetrieval(ctx, s.search, params, plan, s.askTopK, s.askInsightM, s.askRerankDefault)
 	if err != nil {
 		slog.Error("ask: retrieval failed", "error", err)
 		_ = writeSSEEvent(w, flusher, "error", askErrorPayload{Message: "retrieval failed"})

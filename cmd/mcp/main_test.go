@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -365,12 +366,16 @@ func (f *fakeSearchSvc) Search(_ context.Context, _ model.SearchQuery) ([]model.
 type fakeOccurredDocSearcher struct {
 	called    bool
 	lastQuery model.SearchQuery
+	// results, when non-nil, is returned verbatim from Search. nil (the
+	// zero value, used by every pre-existing test) preserves the original
+	// "no results" behaviour.
+	results []*model.SearchResult
 }
 
 func (f *fakeOccurredDocSearcher) Search(_ context.Context, q model.SearchQuery) ([]*model.SearchResult, error) {
 	f.called = true
 	f.lastQuery = q
-	return nil, nil
+	return f.results, nil
 }
 
 // disabledEmbeddingEngine implements search.EmbeddingEngine in its
@@ -390,11 +395,13 @@ func (disabledEmbeddingEngine) Dimension() int { return 0 }
 // newOccurredTestServer builds an *mcpserver.MCPServer with the real
 // registerSearchTool wired to a real *search.Service backed by the given
 // fake document searcher, so occurred_from/occurred_to tests observe the
-// production handler code path, not a test stub.
-func newOccurredTestServer(docs *fakeOccurredDocSearcher) *mcpserver.MCPServer {
+// production handler code path, not a test stub. rerankDefault is forwarded
+// to registerSearchTool as-is, so tests can exercise both the
+// SEARCH_RERANK_DEFAULT=on and =off cases through the same helper.
+func newOccurredTestServer(docs *fakeOccurredDocSearcher, rerankDefault bool) *mcpserver.MCPServer {
 	svc := search.NewService(docs, disabledEmbeddingEngine{})
 	s := mcpserver.NewMCPServer("test", "0.0.0", mcpserver.WithToolCapabilities(false))
-	registerSearchTool(s, svc)
+	registerSearchTool(s, svc, rerankDefault)
 	return s
 }
 
@@ -402,7 +409,7 @@ func TestSearchTool_OccurredRange_BothBoundsRFC3339(t *testing.T) {
 	t.Parallel()
 
 	docs := &fakeOccurredDocSearcher{}
-	s := newOccurredTestServer(docs)
+	s := newOccurredTestServer(docs, false)
 
 	result := callTool(t, s, "search", authorizedCtx(), map[string]any{
 		"query":         "test",
@@ -437,7 +444,7 @@ func TestSearchTool_OccurredRange_DateOnly_ParsedAsKSTMidnight(t *testing.T) {
 	t.Parallel()
 
 	docs := &fakeOccurredDocSearcher{}
-	s := newOccurredTestServer(docs)
+	s := newOccurredTestServer(docs, false)
 
 	result := callTool(t, s, "search", authorizedCtx(), map[string]any{
 		"query":         "test",
@@ -467,7 +474,7 @@ func TestSearchTool_OccurredRange_OnlyFromGiven_ToStaysNil(t *testing.T) {
 	t.Parallel()
 
 	docs := &fakeOccurredDocSearcher{}
-	s := newOccurredTestServer(docs)
+	s := newOccurredTestServer(docs, false)
 
 	result := callTool(t, s, "search", authorizedCtx(), map[string]any{
 		"query":         "test",
@@ -489,7 +496,7 @@ func TestSearchTool_OccurredRange_OnlyToGiven_FromStaysNil(t *testing.T) {
 	t.Parallel()
 
 	docs := &fakeOccurredDocSearcher{}
-	s := newOccurredTestServer(docs)
+	s := newOccurredTestServer(docs, false)
 
 	result := callTool(t, s, "search", authorizedCtx(), map[string]any{
 		"query":       "test",
@@ -515,7 +522,7 @@ func TestSearchTool_OccurredRange_BothOmitted_NoRegression(t *testing.T) {
 	t.Parallel()
 
 	docs := &fakeOccurredDocSearcher{}
-	s := newOccurredTestServer(docs)
+	s := newOccurredTestServer(docs, false)
 
 	result := callTool(t, s, "search", authorizedCtx(), map[string]any{
 		"query": "test",
@@ -546,7 +553,7 @@ func TestSearchTool_OccurredRange_InvalidFormat_Rejected(t *testing.T) {
 			t.Parallel()
 
 			docs := &fakeOccurredDocSearcher{}
-			s := newOccurredTestServer(docs)
+			s := newOccurredTestServer(docs, false)
 
 			result := callTool(t, s, "search", authorizedCtx(), args)
 
@@ -582,7 +589,7 @@ func TestSearchTool_OccurredRange_ToNotAfterFrom_Rejected(t *testing.T) {
 			t.Parallel()
 
 			docs := &fakeOccurredDocSearcher{}
-			s := newOccurredTestServer(docs)
+			s := newOccurredTestServer(docs, false)
 
 			result := callTool(t, s, "search", authorizedCtx(), args)
 
@@ -750,7 +757,7 @@ func TestSearchTool_NewSourceTypes_Accepted(t *testing.T) {
 	// Build a search server with a fake search service that returns no results.
 	svc := &fakeSearchSvc{}
 	s := mcpserver.NewMCPServer("test", "0.0.0", mcpserver.WithToolCapabilities(false))
-	registerSearchTool(s, nil) // nil *search.Service — handler short-circuits at source validation
+	registerSearchTool(s, nil, false) // nil *search.Service — handler short-circuits at source validation
 
 	// We need a real *search.Service for registerSearchTool. Use the inline
 	// stub approach: register a custom handler that exercises allowedSourceTypes
@@ -773,6 +780,397 @@ func TestSearchTool_UnknownSourceType_Rejected(t *testing.T) {
 
 	if _, ok := allowedSourceTypes[model.SourceType("unknown-source")]; ok {
 		t.Error("source type \"unknown-source\" should not be in allowedSourceTypes")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// sort parameter tests
+// ---------------------------------------------------------------------------
+
+// TestSearchTool_Sort_ExplicitRecent_SetsSortRecent verifies sort="recent"
+// is forwarded to model.SearchQuery.Sort regardless of whether an
+// occurred_from/occurred_to window is present.
+func TestSearchTool_Sort_ExplicitRecent_SetsSortRecent(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeOccurredDocSearcher{}
+	s := newOccurredTestServer(docs, false)
+
+	result := callTool(t, s, "search", authorizedCtx(), map[string]any{
+		"query": "test",
+		"sort":  "recent",
+	})
+	if isErrorResult(result) {
+		t.Fatalf("unexpected error result: %s", resultText(result))
+	}
+	if docs.lastQuery.Sort != model.SortRecent {
+		t.Errorf("Sort = %q, want %q", docs.lastQuery.Sort, model.SortRecent)
+	}
+}
+
+// TestSearchTool_Sort_ExplicitRelevance_LeavesSortUnset verifies an explicit
+// sort="relevance" does NOT set Sort to "recent" even inside a time window —
+// the caller's explicit choice must win over the auto-apply-on-window default.
+func TestSearchTool_Sort_ExplicitRelevance_LeavesSortUnset(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeOccurredDocSearcher{}
+	s := newOccurredTestServer(docs, false)
+
+	result := callTool(t, s, "search", authorizedCtx(), map[string]any{
+		"query":         "test",
+		"occurred_from": "2026-09-05T00:00:00+09:00",
+		"sort":          "relevance",
+	})
+	if isErrorResult(result) {
+		t.Fatalf("unexpected error result: %s", resultText(result))
+	}
+	if docs.lastQuery.Sort != "" {
+		t.Errorf("Sort = %q, want empty (relevance)", docs.lastQuery.Sort)
+	}
+}
+
+// TestSearchTool_Sort_OmittedWithWindow_AutoAppliesRecent verifies that
+// omitting sort while occurred_from/occurred_to is set auto-applies "recent"
+// ordering — mirroring internal/api/ask_retrieval.go's windowed-plan default
+// (spec-consistent behaviour, requested for the MCP tool because relevance
+// order inside an already-narrowed time window is rarely useful).
+func TestSearchTool_Sort_OmittedWithWindow_AutoAppliesRecent(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		args map[string]any
+	}{
+		{
+			name: "occurred_from_only",
+			args: map[string]any{"query": "test", "occurred_from": "2026-09-05T00:00:00+09:00"},
+		},
+		{
+			name: "occurred_to_only",
+			args: map[string]any{"query": "test", "occurred_to": "2026-09-06T00:00:00+09:00"},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			docs := &fakeOccurredDocSearcher{}
+			s := newOccurredTestServer(docs, false)
+
+			result := callTool(t, s, "search", authorizedCtx(), tc.args)
+			if isErrorResult(result) {
+				t.Fatalf("unexpected error result: %s", resultText(result))
+			}
+			if docs.lastQuery.Sort != model.SortRecent {
+				t.Errorf("Sort = %q, want %q", docs.lastQuery.Sort, model.SortRecent)
+			}
+		})
+	}
+}
+
+// TestSearchTool_Sort_OmittedWithoutWindow_LeavesSortUnset verifies the
+// pre-existing no-window behaviour is unchanged: omitting sort with no
+// occurred_from/occurred_to leaves Sort empty (relevance).
+func TestSearchTool_Sort_OmittedWithoutWindow_LeavesSortUnset(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeOccurredDocSearcher{}
+	s := newOccurredTestServer(docs, false)
+
+	result := callTool(t, s, "search", authorizedCtx(), map[string]any{"query": "test"})
+	if isErrorResult(result) {
+		t.Fatalf("unexpected error result: %s", resultText(result))
+	}
+	if docs.lastQuery.Sort != "" {
+		t.Errorf("Sort = %q, want empty (relevance)", docs.lastQuery.Sort)
+	}
+}
+
+// TestSearchTool_Sort_UnknownValue_Rejected verifies an unrecognised sort
+// value is rejected with a tool-level error rather than silently ignored.
+func TestSearchTool_Sort_UnknownValue_Rejected(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeOccurredDocSearcher{}
+	s := newOccurredTestServer(docs, false)
+
+	result := callTool(t, s, "search", authorizedCtx(), map[string]any{
+		"query": "test",
+		"sort":  "newest",
+	})
+	if !isErrorResult(result) {
+		t.Error("expected an error result for an unknown sort value")
+	}
+	if docs.called {
+		t.Error("expected the document searcher NOT to be called for an invalid sort value")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// use_rerank parameter tests
+// ---------------------------------------------------------------------------
+
+// TestSearchTool_UseRerank_DefaultsToServerConfig verifies that omitting
+// use_rerank falls back to the rerankDefault value registerSearchTool was
+// constructed with — for a query with no time window, where the sort/rerank
+// interaction guard does not apply.
+func TestSearchTool_UseRerank_DefaultsToServerConfig(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name          string
+		rerankDefault bool
+	}{
+		{name: "default_on", rerankDefault: true},
+		{name: "default_off", rerankDefault: false},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			docs := &fakeOccurredDocSearcher{}
+			s := newOccurredTestServer(docs, tc.rerankDefault)
+
+			result := callTool(t, s, "search", authorizedCtx(), map[string]any{"query": "test"})
+			if isErrorResult(result) {
+				t.Fatalf("unexpected error result: %s", resultText(result))
+			}
+			if docs.lastQuery.UseRerank != tc.rerankDefault {
+				t.Errorf("UseRerank = %v, want %v", docs.lastQuery.UseRerank, tc.rerankDefault)
+			}
+		})
+	}
+}
+
+// TestSearchTool_UseRerank_ExplicitFalse_OverridesServerDefault verifies a
+// caller can force reranking off even when the server default is on.
+func TestSearchTool_UseRerank_ExplicitFalse_OverridesServerDefault(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeOccurredDocSearcher{}
+	s := newOccurredTestServer(docs, true) // server default: rerank ON
+
+	result := callTool(t, s, "search", authorizedCtx(), map[string]any{
+		"query":      "test",
+		"use_rerank": false,
+	})
+	if isErrorResult(result) {
+		t.Fatalf("unexpected error result: %s", resultText(result))
+	}
+	if docs.lastQuery.UseRerank {
+		t.Error("UseRerank = true, want false (explicit override)")
+	}
+}
+
+// TestSearchTool_UseRerank_ExplicitTrue_OverridesServerDefault verifies a
+// caller can force reranking on even when the server default is off.
+func TestSearchTool_UseRerank_ExplicitTrue_OverridesServerDefault(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeOccurredDocSearcher{}
+	s := newOccurredTestServer(docs, false) // server default: rerank OFF
+
+	result := callTool(t, s, "search", authorizedCtx(), map[string]any{
+		"query":      "test",
+		"use_rerank": true,
+	})
+	if isErrorResult(result) {
+		t.Fatalf("unexpected error result: %s", resultText(result))
+	}
+	if !docs.lastQuery.UseRerank {
+		t.Error("UseRerank = false, want true (explicit override)")
+	}
+}
+
+// TestSearchTool_UseRerank_AutoRecentSort_SuppressesDefaultRerank verifies
+// the sort/rerank interaction guard: when sort auto-resolves to "recent"
+// (occurred_from given, sort omitted) and the caller did not explicitly ask
+// for reranking, the server default is skipped so the recency ordering this
+// tool just promised is not silently undone by a reranker running after it
+// (see internal/search/search.go's applyRerank ordering comment).
+func TestSearchTool_UseRerank_AutoRecentSort_SuppressesDefaultRerank(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeOccurredDocSearcher{}
+	s := newOccurredTestServer(docs, true) // server default: rerank ON
+
+	result := callTool(t, s, "search", authorizedCtx(), map[string]any{
+		"query":         "test",
+		"occurred_from": "2026-09-05T00:00:00+09:00",
+	})
+	if isErrorResult(result) {
+		t.Fatalf("unexpected error result: %s", resultText(result))
+	}
+	if docs.lastQuery.Sort != model.SortRecent {
+		t.Fatalf("precondition failed: Sort = %q, want %q", docs.lastQuery.Sort, model.SortRecent)
+	}
+	if docs.lastQuery.UseRerank {
+		t.Error("UseRerank = true, want false (auto-recent sort suppresses the silent default)")
+	}
+}
+
+// TestSearchTool_UseRerank_ExplicitTrue_WinsOverRecentSort verifies that an
+// EXPLICIT use_rerank=true is honored even when sort resolved to "recent" —
+// only the silent server default is suppressed, never an explicit caller
+// choice.
+func TestSearchTool_UseRerank_ExplicitTrue_WinsOverRecentSort(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeOccurredDocSearcher{}
+	s := newOccurredTestServer(docs, true)
+
+	result := callTool(t, s, "search", authorizedCtx(), map[string]any{
+		"query":         "test",
+		"occurred_from": "2026-09-05T00:00:00+09:00",
+		"use_rerank":    true,
+	})
+	if isErrorResult(result) {
+		t.Fatalf("unexpected error result: %s", resultText(result))
+	}
+	if docs.lastQuery.Sort != model.SortRecent {
+		t.Fatalf("precondition failed: Sort = %q, want %q", docs.lastQuery.Sort, model.SortRecent)
+	}
+	if !docs.lastQuery.UseRerank {
+		t.Error("UseRerank = false, want true (explicit override wins over the recency guard)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Response field serialization tests
+// ---------------------------------------------------------------------------
+
+// searchToolResponse mirrors the JSON shape registerSearchTool's handler
+// marshals — kept local to this test file rather than reusing the unexported
+// searchResult type, so the test also catches an accidental json tag rename.
+type searchToolResponse struct {
+	Results []struct {
+		DocumentID string  `json:"document_id"`
+		SourceType string  `json:"source_type"`
+		Score      float64 `json:"score"`
+		OccurredAt *string `json:"occurred_at"`
+		Retention  *string `json:"retention"`
+		Segment    *string `json:"segment"`
+	} `json:"results"`
+	Count int `json:"count"`
+}
+
+// TestSearchTool_ResponseFields_PopulatedFromMetadata verifies that
+// occurred_at, retention, and segment are surfaced as explicit fields on
+// each result (alongside the pre-existing source_type/score), sourced from
+// Document.OccurredAt and Document.Metadata.
+func TestSearchTool_ResponseFields_PopulatedFromMetadata(t *testing.T) {
+	t.Parallel()
+
+	occurredAt := time.Date(2026, 9, 10, 3, 0, 0, 0, time.UTC)
+	docID := uuid.New()
+	docs := &fakeOccurredDocSearcher{
+		results: []*model.SearchResult{
+			{
+				Document: model.Document{
+					ID:         docID,
+					SourceType: model.SourceGmail,
+					Title:      "뉴스레터",
+					Content:    "내용",
+					Metadata:   map[string]any{"retention": "low", "segment": "newsletter"},
+					OccurredAt: &occurredAt,
+				},
+				Score:     0.8,
+				MatchType: "fulltext",
+			},
+		},
+	}
+	s := newOccurredTestServer(docs, false)
+
+	result := callTool(t, s, "search", authorizedCtx(), map[string]any{"query": "test"})
+	if isErrorResult(result) {
+		t.Fatalf("unexpected error result: %s", resultText(result))
+	}
+
+	var payload searchToolResponse
+	if err := json.Unmarshal([]byte(resultText(result)), &payload); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if len(payload.Results) != 1 {
+		t.Fatalf("got %d results, want 1", len(payload.Results))
+	}
+
+	r := payload.Results[0]
+	if r.DocumentID != docID.String() {
+		t.Errorf("document_id = %q, want %q", r.DocumentID, docID.String())
+	}
+	if r.SourceType != string(model.SourceGmail) {
+		t.Errorf("source_type = %q, want %q", r.SourceType, model.SourceGmail)
+	}
+	if r.Score <= 0 {
+		t.Errorf("score = %v, want > 0", r.Score)
+	}
+	wantOccurredAt := occurredAt.Format(time.RFC3339)
+	if r.OccurredAt == nil || *r.OccurredAt != wantOccurredAt {
+		t.Errorf("occurred_at = %v, want %q", r.OccurredAt, wantOccurredAt)
+	}
+	if r.Retention == nil || *r.Retention != "low" {
+		t.Errorf("retention = %v, want \"low\"", r.Retention)
+	}
+	if r.Segment == nil || *r.Segment != "newsletter" {
+		t.Errorf("segment = %v, want \"newsletter\"", r.Segment)
+	}
+}
+
+// TestSearchTool_ResponseFields_NullWhenAbsent verifies occurred_at,
+// retention, and segment serialize as explicit JSON null — not omitted —
+// when the underlying document carries none of them, so a caller can rely
+// on the key always being present.
+func TestSearchTool_ResponseFields_NullWhenAbsent(t *testing.T) {
+	t.Parallel()
+
+	docID := uuid.New()
+	docs := &fakeOccurredDocSearcher{
+		results: []*model.SearchResult{
+			{
+				Document: model.Document{
+					ID:         docID,
+					SourceType: model.SourceSlack,
+					Title:      "no metadata",
+					Content:    "content",
+				},
+				Score:     0.5,
+				MatchType: "fulltext",
+			},
+		},
+	}
+	s := newOccurredTestServer(docs, false)
+
+	result := callTool(t, s, "search", authorizedCtx(), map[string]any{"query": "test"})
+	if isErrorResult(result) {
+		t.Fatalf("unexpected error result: %s", resultText(result))
+	}
+
+	text := resultText(result)
+	for _, key := range []string{`"occurred_at":null`, `"retention":null`, `"segment":null`} {
+		if !strings.Contains(text, key) {
+			t.Errorf("expected response to contain %s, got: %s", key, text)
+		}
+	}
+
+	var payload searchToolResponse
+	if err := json.Unmarshal([]byte(text), &payload); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if len(payload.Results) != 1 {
+		t.Fatalf("got %d results, want 1", len(payload.Results))
+	}
+	r := payload.Results[0]
+	if r.OccurredAt != nil {
+		t.Errorf("occurred_at = %v, want nil", *r.OccurredAt)
+	}
+	if r.Retention != nil {
+		t.Errorf("retention = %v, want nil", *r.Retention)
+	}
+	if r.Segment != nil {
+		t.Errorf("segment = %v, want nil", *r.Segment)
 	}
 }
 

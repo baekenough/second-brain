@@ -45,7 +45,7 @@ func TestAssembleRetrieval_PlanWindowAndSourcesReachObservedLane(t *testing.T) {
 		Origin:       intent.OriginDeterministic,
 	}
 
-	if _, err := assembleRetrieval(context.Background(), searcher, params, plan, 8, 3); err != nil {
+	if _, err := assembleRetrieval(context.Background(), searcher, params, plan, 8, 3, false); err != nil {
 		t.Fatalf("assembleRetrieval() error = %v", err)
 	}
 	if len(searcher.calls) != 2 {
@@ -82,7 +82,7 @@ func TestAssembleRetrieval_SourceOnlyPlan(t *testing.T) {
 		Origin:      intent.OriginLLM,
 	}
 
-	if _, err := assembleRetrieval(context.Background(), searcher, intent.Params{RawQuery: "홍길동이랑 통화한 내용"}, plan, 8, 3); err != nil {
+	if _, err := assembleRetrieval(context.Background(), searcher, intent.Params{RawQuery: "홍길동이랑 통화한 내용"}, plan, 8, 3, false); err != nil {
 		t.Fatalf("assembleRetrieval() error = %v", err)
 	}
 
@@ -103,7 +103,7 @@ func TestAssembleRetrieval_FallbackPlanIsUnconstrained(t *testing.T) {
 	searcher := &recordingSearcher{}
 	plan := intent.QueryPlan{Limit: 8, Reason: "시간·소스 제약 없이 전체 검색", Origin: intent.OriginFallback}
 
-	if _, err := assembleRetrieval(context.Background(), searcher, intent.Params{RawQuery: "질문"}, plan, 8, 3); err != nil {
+	if _, err := assembleRetrieval(context.Background(), searcher, intent.Params{RawQuery: "질문"}, plan, 8, 3, false); err != nil {
 		t.Fatalf("assembleRetrieval() error = %v", err)
 	}
 
@@ -134,7 +134,7 @@ func TestAssembleRetrieval_PlanOwnsTheWindow_NotParams(t *testing.T) {
 	}
 	plan := intent.QueryPlan{Limit: 8, Reason: "제약 없음", Origin: intent.OriginFallback}
 
-	if _, err := assembleRetrieval(context.Background(), searcher, params, plan, 8, 3); err != nil {
+	if _, err := assembleRetrieval(context.Background(), searcher, params, plan, 8, 3, false); err != nil {
 		t.Fatalf("assembleRetrieval() error = %v", err)
 	}
 
@@ -154,7 +154,7 @@ func TestAssembleRetrieval_RankingShapingSurvivesAPlan(t *testing.T) {
 	params := intent.Params{RawQuery: "오늘 홍길동 통화", Kind: intent.KindEntity, Confidence: 0.9}
 	plan := intent.QueryPlan{OccurredFrom: from, OccurredTo: to, Limit: 8, Reason: "오늘", Origin: intent.OriginDeterministic}
 
-	if _, err := assembleRetrieval(context.Background(), searcher, params, plan, 8, 3); err != nil {
+	if _, err := assembleRetrieval(context.Background(), searcher, params, plan, 8, 3, false); err != nil {
 		t.Fatalf("assembleRetrieval() error = %v", err)
 	}
 
@@ -175,7 +175,7 @@ func TestAssembleRetrieval_PlanLimitZeroFallsBackToTopK(t *testing.T) {
 	searcher := &recordingSearcher{}
 	plan := intent.QueryPlan{Reason: "제약 없음", Origin: intent.OriginFallback}
 
-	if _, err := assembleRetrieval(context.Background(), searcher, intent.Params{RawQuery: "질문"}, plan, 8, 3); err != nil {
+	if _, err := assembleRetrieval(context.Background(), searcher, intent.Params{RawQuery: "질문"}, plan, 8, 3, false); err != nil {
 		t.Fatalf("assembleRetrieval() error = %v", err)
 	}
 	if got := searcher.calls[0].Limit; got != 8 {
@@ -192,7 +192,7 @@ func TestAssembleRetrieval_InsightOnlyPlanStillSkipsObservedLane(t *testing.T) {
 	searcher := &recordingSearcher{}
 	plan := intent.QueryPlan{SourceTypes: []model.SourceType{model.SourceInsight}, Limit: 8, Reason: "추론", Origin: intent.OriginLLM}
 
-	if _, err := assembleRetrieval(context.Background(), searcher, intent.Params{RawQuery: "질문"}, plan, 8, 3); err != nil {
+	if _, err := assembleRetrieval(context.Background(), searcher, intent.Params{RawQuery: "질문"}, plan, 8, 3, false); err != nil {
 		t.Fatalf("assembleRetrieval() error = %v", err)
 	}
 	if len(searcher.calls) != 1 {

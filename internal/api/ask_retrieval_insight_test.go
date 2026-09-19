@@ -177,7 +177,7 @@ func TestAssembleRetrieval_UsesTheReconciledLanes(t *testing.T) {
 	}}
 	params := intent.Params{RawQuery: "q", Kind: intent.KindGeneral}
 
-	res, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3)
+	res, err := assembleRetrieval(context.Background(), searcher, params, unconstrainedPlan(), 8, 3, false)
 	if err != nil {
 		t.Fatalf("assembleRetrieval() error = %v", err)
 	}
