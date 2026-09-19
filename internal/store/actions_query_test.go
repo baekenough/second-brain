@@ -238,6 +238,115 @@ func TestListOpenActionsClampsLimit(t *testing.T) {
 	}
 }
 
+// TestActionSortClausesDefaultsToRecent is a pure-Go check (no database
+// needed) that the whitelist contains "recent" and that an unrecognised sort
+// value degrades to it. Unlike the ORDER BY behaviour itself — which can only
+// be proven against a real query planner — this is just map lookups, so it
+// runs everywhere `go test ./...` does, without TEST_DATABASE_URL.
+func TestActionSortClausesDefaultsToRecent(t *testing.T) {
+	if _, ok := actionSortClauses["recent"]; !ok {
+		t.Fatal(`actionSortClauses is missing "recent"`)
+	}
+	if defaultActionSort != "recent" {
+		t.Fatalf("defaultActionSort = %q, want %q", defaultActionSort, "recent")
+	}
+	// Existing sort options must survive the default change.
+	for _, want := range []string{"due", "confidence"} {
+		if _, ok := actionSortClauses[want]; !ok {
+			t.Errorf("actionSortClauses is missing %q", want)
+		}
+	}
+}
+
+// TestListOpenActionsDefaultSortIsRecent pins that a zero-value ActionFilter
+// (and an explicitly unknown Sort) order by newest-detected first, not by
+// due_at. Detection order and due order are made to disagree on purpose — an
+// action with the furthest-away due_at is seeded as the most recently
+// observed one — so a test that silently kept the old "due" default would
+// fail instead of passing by coincidence.
+func TestListOpenActionsDefaultSortIsRecent(t *testing.T) {
+	pg := actionTestDB(t)
+	ctx := context.Background()
+	docID, entityID := seedActionFixtures(t, pg)
+	s := NewActionQueryStore(pg)
+
+	now := time.Now().UTC()
+	// due_at is fixed to 1990-01-01 by insertTestAction for every row, so
+	// ordering only by observed_at (the "recent" sort) versus only by due_at
+	// (the "due" sort) would otherwise be indistinguishable; give each row its
+	// own due_at here to make the two sorts disagree.
+	type seed struct {
+		key        string
+		observedAt time.Time
+		dueAt      time.Time
+	}
+	rows := []seed{
+		{actionTestKeyPrefix + "sort-oldest-observed-nearest-due", now.Add(-2 * time.Hour), now.Add(1 * time.Hour)},
+		{actionTestKeyPrefix + "sort-newest-observed-farthest-due", now, now.Add(72 * time.Hour)},
+		{actionTestKeyPrefix + "sort-middle", now.Add(-1 * time.Hour), now.Add(24 * time.Hour)},
+	}
+	for _, r := range rows {
+		insertTestAction(t, pg, docID, entityID, r.key, model.KindScheduled, 1.00, r.observedAt)
+		if _, err := pg.pool.Exec(ctx, `UPDATE actions SET due_at = $1 WHERE identity_key = $2`, r.dueAt, r.key); err != nil {
+			t.Fatalf("set due_at for %s: %v", r.key, err)
+		}
+	}
+
+	wantRecentOrder := []string{
+		actionTestKeyPrefix + "sort-newest-observed-farthest-due",
+		actionTestKeyPrefix + "sort-middle",
+		actionTestKeyPrefix + "sort-oldest-observed-nearest-due",
+	}
+
+	// Case 1: zero-value Sort ("") — the documented default.
+	got, err := s.ListOpenActions(ctx, ActionFilter{Counterpart: actionTestCounterpart})
+	if err != nil {
+		t.Fatalf("ListOpenActions (zero-value Sort): %v", err)
+	}
+	if keys := identityKeysOf(keysWithTestPrefix(got)); !equalStrings(keys, wantRecentOrder) {
+		t.Fatalf("zero-value Sort order = %v, want newest-observed-first %v", keys, wantRecentOrder)
+	}
+
+	// Case 2: an unrecognised Sort value must fall back to the same default,
+	// not to the previous "due" default.
+	got, err = s.ListOpenActions(ctx, ActionFilter{Counterpart: actionTestCounterpart, Sort: "not-a-real-sort"})
+	if err != nil {
+		t.Fatalf("ListOpenActions (unknown Sort): %v", err)
+	}
+	if keys := identityKeysOf(keysWithTestPrefix(got)); !equalStrings(keys, wantRecentOrder) {
+		t.Fatalf("unknown Sort order = %v, want the recent-default order %v", keys, wantRecentOrder)
+	}
+
+	// Case 3: explicit Sort="due" still works and disagrees with the default,
+	// proving the two orderings above weren't accidentally identical.
+	got, err = s.ListOpenActions(ctx, ActionFilter{Counterpart: actionTestCounterpart, Sort: "due"})
+	if err != nil {
+		t.Fatalf("ListOpenActions (Sort=due): %v", err)
+	}
+	wantDueOrder := []string{
+		actionTestKeyPrefix + "sort-oldest-observed-nearest-due",
+		actionTestKeyPrefix + "sort-middle",
+		actionTestKeyPrefix + "sort-newest-observed-farthest-due",
+	}
+	if keys := identityKeysOf(keysWithTestPrefix(got)); !equalStrings(keys, wantDueOrder) {
+		t.Fatalf("Sort=due order = %v, want nearest-due-first %v", keys, wantDueOrder)
+	}
+}
+
+// equalStrings reports whether a and b have the same elements in the same
+// order.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // readResolvedAt returns action_status.resolved_at for key, or the zero time
 // when the column is NULL.
 func readResolvedAt(t *testing.T, pg *Postgres, key string) time.Time {

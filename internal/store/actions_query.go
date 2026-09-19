@@ -27,7 +27,8 @@ const (
 const actionArchiveWindow = "90 days"
 
 // ActionFilter narrows ListOpenActions. The zero value is valid and means
-// "open actions observed in the last 90 days, newest-due first, at most 50".
+// "open actions observed in the last 90 days, newest-detected first, at most
+// 50".
 type ActionFilter struct {
 	// Kinds restricts to the given action kinds. Empty means all kinds.
 	Kinds []model.ActionKind
@@ -43,7 +44,8 @@ type ActionFilter struct {
 	MinConfidence float64
 	// IncludeArchived disables the 90-day observed_at window.
 	IncludeArchived bool
-	// Sort is "due" or "confidence". Anything else falls back to "due".
+	// Sort is "recent", "due", or "confidence". Anything else falls back to
+	// "recent".
 	Sort string
 	// Limit is clamped to [1, 200]; <= 0 means the 50-row default.
 	Limit int
@@ -75,11 +77,16 @@ func NewActionQueryStore(pg *Postgres) *ActionQueryStore {
 // and nothing else, so an unknown value degrades to the default instead of
 // being interpolated.
 var actionSortClauses = map[string]string{
+	"recent":     "a.observed_at DESC, a.due_at ASC NULLS LAST",
 	"due":        "a.due_at ASC NULLS LAST, a.observed_at DESC",
 	"confidence": "a.confidence DESC, a.observed_at DESC",
 }
 
-const defaultActionSort = "due"
+// defaultActionSort is "recent" (newest detected first), not "due": a user
+// opening the action list wants to see what just showed up, and an action
+// with no due_at at all — the common case for awaiting_my_reply — would
+// otherwise sort behind every dated action forever under "due".
+const defaultActionSort = "recent"
 
 // clampActionLimit maps any caller-supplied limit into [1, 200].
 func clampActionLimit(limit int) int {

@@ -114,8 +114,11 @@ func parseActionFilter(r *http.Request) (store.ActionFilter, string) {
 
 	switch v := q.Get("sort"); v {
 	case "":
-		f.Sort = "due"
-	case "due", "confidence":
+		// Empty means "let the store apply its default" (currently "recent" —
+		// newest detected first, spec update: users open this list to see what
+		// just showed up, not what is nearest due).
+		f.Sort = "recent"
+	case "recent", "due", "confidence":
 		f.Sort = v
 	default:
 		return f, "invalid sort filter"

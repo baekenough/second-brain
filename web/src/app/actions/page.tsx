@@ -7,11 +7,10 @@ import { BriefingPanel } from "./BriefingPanel";
 import { ActionsDisabledError, listActions, setActionState } from "@/lib/api";
 import { ACTION_KINDS, type ActionItem, type ActionKind } from "@/lib/types";
 import { Button, Spinner } from "@/components/ui";
+import { DEFAULT_SORT, parseSort, type SortMode } from "./actionsSort";
 
-type SortMode = "due" | "confidence";
 type LoadStatus = "ok" | "disabled" | "error";
 
-const DEFAULT_SORT: SortMode = "due";
 /** No confidence floor by default. The production confidence distribution is
  * unknown, and an arbitrary floor would silently hide every LLM-detected
  * action (plan §확정 판단). */
@@ -21,10 +20,6 @@ function parseKinds(raw: string | null): ActionKind[] {
   if (!raw) return [];
   const allowed = new Set<string>(ACTION_KINDS);
   return raw.split(",").filter((k): k is ActionKind => allowed.has(k));
-}
-
-function parseSort(raw: string | null): SortMode {
-  return raw === "confidence" ? "confidence" : DEFAULT_SORT;
 }
 
 function parseConfidence(raw: string | null): number {
@@ -215,9 +210,10 @@ function ActionsPageInner() {
             <span>정렬</span>
             <select
               value={sort}
-              onChange={(e) => setSort(e.target.value === "confidence" ? "confidence" : "due")}
+              onChange={(e) => setSort(parseSort(e.target.value))}
               className="h-8 rounded-md border border-border bg-surface px-2 text-sm text-foreground"
             >
+              <option value="recent">최신순</option>
               <option value="due">기한순</option>
               <option value="confidence">신뢰도순</option>
             </select>

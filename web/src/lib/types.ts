@@ -393,7 +393,7 @@ export interface ActionListParams {
   counterpart?: string;
   dueBefore?: string;
   minConfidence?: number;
-  sort?: "due" | "confidence";
+  sort?: "recent" | "due" | "confidence";
   limit?: number;
   includeArchived?: boolean;
 }

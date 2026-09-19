@@ -124,6 +124,42 @@ func TestListActionsHandlerParsesFilters(t *testing.T) {
 	}
 }
 
+// TestListActionsHandlerSortDefaultsToRecent pins that an omitted sort
+// parameter reaches the store as "recent" (newest detected first), not "due".
+// The default changed after users reported wanting to see freshly detected
+// actions first regardless of due date.
+func TestListActionsHandlerSortDefaultsToRecent(t *testing.T) {
+	lister := &stubActionLister{items: []store.ActionListItem{dummyActionItem()}}
+	srv := newActionsTestServer(lister, nil)
+
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/actions", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if lister.got.Sort != "recent" {
+		t.Errorf("Sort = %q, want %q for an omitted sort parameter", lister.got.Sort, "recent")
+	}
+}
+
+// TestListActionsHandlerAcceptsExplicitRecentSort pins that "sort=recent" is
+// in the accepted vocabulary, not just the implicit default.
+func TestListActionsHandlerAcceptsExplicitRecentSort(t *testing.T) {
+	lister := &stubActionLister{items: []store.ActionListItem{dummyActionItem()}}
+	srv := newActionsTestServer(lister, nil)
+
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/actions?sort=recent", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if lister.got.Sort != "recent" {
+		t.Errorf("Sort = %q, want %q", lister.got.Sort, "recent")
+	}
+}
+
 // TestListActionsHandlerTruncatedFlag pins that a full page is reported as
 // truncated, so the caller can tell "50 results" from "at least 50 results".
 func TestListActionsHandlerTruncatedFlag(t *testing.T) {
