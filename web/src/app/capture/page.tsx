@@ -13,6 +13,7 @@ import { getNoteMetadata } from "@/lib/types";
 import type { DocumentDetail } from "@/lib/types";
 import { describeEnrichmentStatus } from "@/lib/enrichmentStatus";
 import { formatRelative } from "@/lib/dates";
+import { sortByRecency } from "@/lib/sortByRecency";
 import { Button } from "@/components/ui";
 
 const NOTES_LIMIT = 20;
@@ -91,7 +92,12 @@ export default function CapturePage() {
   const refresh = useCallback(async () => {
     try {
       const docs = await listDocuments({ source: "note", limit: NOTES_LIMIT });
-      setNotes(docs);
+      // The backend already returns these newest-first (occurred_at,
+      // falling back to collected_at); this sort is a defensive no-op that
+      // keeps the list correct if that ordering ever regresses.
+      setNotes(
+        sortByRecency(docs, (doc) => (doc.metadata.occurred_at as string) ?? doc.collected_at),
+      );
     } catch {
       // A background refresh failing must not disrupt the compose field —
       // the user's in-progress typing is more important than a stale list.
@@ -162,9 +168,7 @@ export default function CapturePage() {
     if (!file || uploading) return;
 
     if (file.size > MAX_UPLOAD_FILE_BYTES) {
-      setError(
-        `파일이 너무 큽니다 (최대 ${Math.floor(MAX_UPLOAD_FILE_BYTES / (1024 * 1024))}MB).`,
-      );
+      setError(`파일이 너무 큽니다 (최대 ${Math.floor(MAX_UPLOAD_FILE_BYTES / (1024 * 1024))}MB).`);
       return;
     }
 

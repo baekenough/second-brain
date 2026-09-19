@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import { getStats, getBaselineStats, listRecentByKind } from "@/lib/api";
 import type { StatsResponse, RecentItem, RecentItemsResponse } from "@/lib/types";
 import { formatDateTime, formatRelative } from "@/lib/dates";
+import { sortByRecency } from "@/lib/sortByRecency";
 import { SOURCE_LABELS, DASHBOARD_SOURCES } from "@/lib/constants";
 import type { SourceType } from "@/lib/types";
 
@@ -168,9 +169,14 @@ export default function DashboardPage() {
       .then(
         ([sms, call, voice]: [RecentItemsResponse, RecentItemsResponse, RecentItemsResponse]) => {
           if (cancelled) return;
-          setSmsRecent(sms.items ?? []);
-          setCallRecent(call.items ?? []);
-          setVoiceRecent(voice.items ?? []);
+          // The backend already returns these newest-first (occurred_at,
+          // falling back to collected_at); this sort is a defensive no-op
+          // that keeps the panel correct if that ordering ever regresses.
+          const byRecency = (items: RecentItem[]) =>
+            sortByRecency(items, (item) => item.occurred_at ?? item.collected_at);
+          setSmsRecent(byRecency(sms.items ?? []));
+          setCallRecent(byRecency(call.items ?? []));
+          setVoiceRecent(byRecency(voice.items ?? []));
         },
       )
       .catch(console.error)

@@ -8,6 +8,7 @@ import type { DocumentDetail, SearchResultItem, StatsResponse } from "@/lib/type
 import { getExtension, rawUrl } from "@/lib/preview";
 import { extractSummary } from "@/lib/summary";
 import { formatDateTime } from "@/lib/dates";
+import { sortByRecency } from "@/lib/sortByRecency";
 import { SOURCE_LABELS, SEARCH_FILTER_SOURCES, DEFAULT_EXCLUDED_SOURCES } from "@/lib/constants";
 import type { SourceType } from "@/lib/types";
 import { Button, SourceBadge } from "@/components/ui";
@@ -222,7 +223,14 @@ function SearchPageInner() {
       excludeSource: isAll ? DEFAULT_EXCLUDED_SOURCES.join(",") : undefined,
     })
       .then((r) => {
-        if (!cancelled) setRecent(r);
+        // The backend already returns these newest-first (occurred_at,
+        // falling back to collected_at); this sort is a defensive no-op that
+        // keeps the list correct if that ordering ever regresses.
+        if (!cancelled) {
+          setRecent(
+            sortByRecency(r, (doc) => (doc.metadata.occurred_at as string) ?? doc.collected_at),
+          );
+        }
       })
       .catch(() => {
         if (!cancelled) setRecent([]);
