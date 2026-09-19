@@ -10,7 +10,7 @@ import (
 // 2026-09-19), with SMS expected to follow the same three-value scheme.
 // Search never writes these — it only reads them, via Document.RetentionTag,
 // to decide default exclusion (search.applyRetentionExclusionDefault) and the
-// low-retention score penalty (search.applyRetentionFilters / LowRetentionPenalty
+// low-retention score penalty (search.applyLowRetentionPenalty / LowRetentionPenalty
 // below).
 const (
 	RetentionKeep       = "keep"
@@ -21,12 +21,21 @@ const (
 // DefaultLowRetentionPenalty is the score multiplier applied to
 // retention="low" search results when SEARCH_LOW_RETENTION_PENALTY is unset
 // or invalid.
-const DefaultLowRetentionPenalty = 0.5
+//
+// 0.8, not 0.5: on the post-fusion RRF score scale search.applyLowRetentionPenalty
+// operates on (roughly 1/(60+rank), k=60), multiplying a rank-1 score by 0.8
+// lands close to the rank-16 score — a MILD demotion. 0.5 was tried and
+// rejected as the default: it lands close to the rank-61 score, which is an
+// effective exclusion from a typical page rather than a down-weighting. See
+// search.applyLowRetentionPenalty's "Score scale note" for the full
+// derivation.
+const DefaultLowRetentionPenalty = 0.8
 
 // LowRetentionPenalty returns the score multiplier applied to a
-// retention="low" document during RRF/score fusion (see
-// search.applyRetentionFilters). It is read at call time — not cached — so an
-// operator can retune it with a config reload rather than a redeploy.
+// retention="low" document AFTER RRF/score fusion completes, on the final
+// result set (see search.applyLowRetentionPenalty). It is read at call time —
+// not cached — so an operator can retune it with a config reload rather than
+// a redeploy.
 //
 // SEARCH_LOW_RETENTION_PENALTY must parse as a float in [0, 1]:
 //   - 1.0 disables the penalty entirely (score unchanged) — the explicit
@@ -37,7 +46,7 @@ const DefaultLowRetentionPenalty = 0.5
 //     RetentionLow is never added to ExcludeRetention by default, only
 //     RetentionDisposable is.
 //   - Unset, unparsable, or outside [0, 1] all fall back to
-//     DefaultLowRetentionPenalty (0.5) — the same "invalid input degrades to a
+//     DefaultLowRetentionPenalty (0.8) — the same "invalid input degrades to a
 //     safe default" convention SummaryVecCoverageThreshold uses above.
 func LowRetentionPenalty() float64 {
 	if v := os.Getenv("SEARCH_LOW_RETENTION_PENALTY"); v != "" {
@@ -50,9 +59,10 @@ func LowRetentionPenalty() float64 {
 
 // RetentionTag returns the document's metadata["retention"] value and whether
 // one was present. A missing key, a non-string value, or an empty string all
-// report false — callers (search.applyRetentionFilters) must treat "no tag"
-// as "never excluded, never penalised": most of the corpus predates the
-// segmentation pass and carries no retention key at all.
+// report false — callers (search.applyRetentionExclusion,
+// search.applyLowRetentionPenalty) must treat "no tag" as "never excluded,
+// never penalised": most of the corpus predates the segmentation pass and
+// carries no retention key at all.
 func (d Document) RetentionTag() (string, bool) {
 	if d.Metadata == nil {
 		return "", false
