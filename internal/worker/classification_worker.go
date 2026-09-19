@@ -16,9 +16,9 @@ type ClassificationDocumentStore interface {
 	// ListUnclassified returns up to limit active documents (sms/gmail/
 	// call-transcript) that have never been tagged with retention.
 	ListUnclassified(ctx context.Context, limit int, backfillDays int) ([]*model.Document, error)
-	// ListLegacyForRecheck returns up to limit already-tagged documents
-	// whose classifier is not "rule"/"jev-latest"/"user" and that have not
-	// yet been gate-audited.
+	// ListLegacyForRecheck returns up to limit already retention-tagged
+	// documents (any classifier value except "user") that have not yet been
+	// gate-audited (classifier_gate_checked_at unset).
 	ListLegacyForRecheck(ctx context.Context, limit int) ([]*model.Document, error)
 	// MergeClassificationMetadata merges updates into a document's
 	// metadata, refusing to touch classifier="user" documents.
@@ -201,6 +201,7 @@ func (w *ClassificationWorker) tick(ctx context.Context) {
 	}
 
 	if stats.listed == 0 {
+		slog.Debug("classification worker: tick idle (nothing listed)")
 		return
 	}
 

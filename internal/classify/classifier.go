@@ -114,14 +114,29 @@ type Result struct {
 // merge into documents.metadata (see spec: segment, retention, classifier,
 // classifier_p, classified_at, needs_review, gate). classifiedAt is passed
 // in rather than computed here so tests get deterministic output.
+//
+// classifier_gate_checked_at is stamped alongside classified_at because
+// producing a Result at all means the document's Gate has just been
+// evaluated (Classifier.ClassifyDeterministic/ClassifyWithJev both require a
+// Gate argument) — this is true whether the caller is
+// ClassificationWorker.classifyOne tagging a previously-unclassified
+// document for the first time, or recheckOne re-tagging a legacy document
+// after finding a contradiction. Without this marker here, a document this
+// method just tagged classifier="rule"/"jev-latest" would immediately
+// re-enter internal/store.ListLegacyForRecheck's queue on the very next
+// tick, since that query no longer excludes those two values by name (see
+// listLegacyForRecheckQuery's doc comment) — only the marker, not the
+// classifier value, stops the requeue.
 func (r *Result) Metadata(classifiedAt time.Time) map[string]any {
+	checkedAt := classifiedAt.UTC().Format(time.RFC3339)
 	return map[string]any{
-		"segment":       r.Segment,
-		"retention":     r.Retention,
-		"classifier":    r.Classifier,
-		"classifier_p":  r.ClassifierP,
-		"classified_at": classifiedAt.UTC().Format(time.RFC3339),
-		"needs_review":  r.NeedsReview,
+		"segment":                    r.Segment,
+		"retention":                  r.Retention,
+		"classifier":                 r.Classifier,
+		"classifier_p":               r.ClassifierP,
+		"classified_at":              checkedAt,
+		"classifier_gate_checked_at": checkedAt,
+		"needs_review":               r.NeedsReview,
 		"gate": map[string]any{
 			"bulk_sender":   r.Gate.BulkSender,
 			"person_signal": r.Gate.PersonSignal,
