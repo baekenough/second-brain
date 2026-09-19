@@ -3,7 +3,12 @@ import {
   allJudged,
   applyJudgment,
   buildJudgmentInputs,
+  formatAbsoluteDate,
+  formatAskedAtLabel,
+  formatMonthDay,
+  formatWindowLabel,
   goldenSourceLabel,
+  goldenStreamLabel,
   isSkipKey,
   judgmentForKey,
   nextFocusIndex,
@@ -22,6 +27,7 @@ function candidate(documentId: string, rank: number): GoldenCandidate {
     occurred_at: null,
     retention: null,
     rank,
+    stream: "relevance",
   };
 }
 
@@ -148,5 +154,74 @@ describe("goldenSourceLabel", () => {
 
   it("알 수 없는 값은 원문을 그대로 노출한다", () => {
     expect(goldenSourceLabel("unknown_future_source")).toBe("unknown_future_source");
+  });
+});
+
+describe("goldenStreamLabel", () => {
+  it("알려진 stream 값을 한국어 라벨로 매핑한다", () => {
+    expect(goldenStreamLabel("relevance")).toBe("관련도");
+    expect(goldenStreamLabel("recent")).toBe("최신");
+  });
+
+  it("알 수 없는 값은 원문을 그대로 노출한다", () => {
+    expect(goldenStreamLabel("unknown_future_stream")).toBe("unknown_future_stream");
+  });
+});
+
+describe("formatAbsoluteDate", () => {
+  it("ISO 문자열을 YYYY-MM-DD로 변환한다", () => {
+    expect(formatAbsoluteDate("2026-06-03T04:00:00Z")).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  });
+
+  it("파싱 불가능한 값은 빈 문자열이다", () => {
+    expect(formatAbsoluteDate("not-a-date")).toBe("");
+  });
+});
+
+describe("formatMonthDay", () => {
+  it("ISO 문자열을 M/D로 변환한다", () => {
+    expect(formatMonthDay("2026-06-03T04:00:00Z")).toMatch(/^\d{1,2}\/\d{1,2}$/);
+  });
+
+  it("파싱 불가능한 값은 빈 문자열이다", () => {
+    expect(formatMonthDay("not-a-date")).toBe("");
+  });
+});
+
+describe("formatAskedAtLabel", () => {
+  it("주입된 now 기준으로 '개월 전'을 계산한다 (약 3개월 전)", () => {
+    const askedAt = "2026-06-03T00:00:00Z";
+    const now = new Date("2026-09-03T00:00:00Z");
+    expect(formatAskedAtLabel(askedAt, now)).toBe("2026-06-03 (3개월 전)");
+  });
+
+  it("같은 날이면 '오늘'이다", () => {
+    const askedAt = "2026-06-03T00:00:00Z";
+    const now = new Date("2026-06-03T12:00:00Z");
+    expect(formatAskedAtLabel(askedAt, now)).toBe("2026-06-03 (오늘)");
+  });
+
+  it("1년 이상이면 '년 전'이다", () => {
+    const askedAt = "2024-06-03T00:00:00Z";
+    const now = new Date("2026-06-03T00:00:00Z");
+    expect(formatAskedAtLabel(askedAt, now)).toBe("2024-06-03 (2년 전)");
+  });
+
+  it("파싱 불가능한 값은 빈 문자열이다", () => {
+    expect(formatAskedAtLabel("not-a-date", new Date())).toBe("");
+  });
+});
+
+describe("formatWindowLabel", () => {
+  it("window가 있으면 M/D ~ M/D 형식으로 표시한다", () => {
+    const label = formatWindowLabel({
+      from: "2026-05-27T00:00:00Z",
+      to: "2026-06-03T00:00:00Z",
+    });
+    expect(label).toMatch(/^검색 창: \d{1,2}\/\d{1,2} ~ \d{1,2}\/\d{1,2}$/);
+  });
+
+  it("window가 null이면 '없음' 설명을 표시한다", () => {
+    expect(formatWindowLabel(null)).toBe("검색 창: 없음(최근 90일 최신순 섞음)");
   });
 });

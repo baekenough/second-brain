@@ -446,11 +446,32 @@ export type RetentionTag = "keep" | "low" | "disposable" | null;
 export const GOLDEN_QUERY_SOURCES = ["ask_history", "seed", "manual"] as const;
 export type GoldenQuerySource = (typeof GOLDEN_QUERY_SOURCES)[number];
 
+/** A query's search-window expression resolved against `asked_at` — the
+ * concrete `[from, to]` range the backend actually searched within. `null`
+ * means the query carries no period expression, so the backend fell back to
+ * a recency-mixed search over the whole corpus. */
+export interface GoldenQueryWindow {
+  from: string;
+  to: string;
+}
+
 export interface GoldenQuery {
   id: string;
   text: string;
   source: string;
+  /** When this query was asked (RFC3339) — the real timestamp for
+   * `ask_history` queries, the generation timestamp for `seed` queries. Judges
+   * must weigh candidate relevance against this moment, not "now" (spec:
+   * coordinator confirmation, 2026-09-19). */
+  asked_at: string;
+  window: GoldenQueryWindow | null;
 }
+
+/** Which retrieval lane produced a candidate: `relevance` came back for
+ * semantic/keyword match, `recent` came back purely for being recent within
+ * the window. */
+export const GOLDEN_CANDIDATE_STREAMS = ["relevance", "recent"] as const;
+export type GoldenCandidateStream = (typeof GOLDEN_CANDIDATE_STREAMS)[number];
 
 export interface GoldenCandidate {
   document_id: string;
@@ -461,6 +482,7 @@ export interface GoldenCandidate {
   retention: RetentionTag;
   segment?: string | null;
   rank: number;
+  stream: GoldenCandidateStream;
 }
 
 export interface GoldenProgress {
