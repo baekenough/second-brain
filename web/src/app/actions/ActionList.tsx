@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { Badge, Button, Card } from "@/components/ui";
+import { formatRelative } from "@/lib/dates";
 import type { ActionDetectedBy, ActionItem, ActionKind } from "@/lib/types";
 
 /** Korean labels for the closed `kind` vocabulary (internal/model/action.go).
@@ -119,6 +120,11 @@ export function ActionList({
                   >
                     근거 문서
                   </Link>
+                  {/* Sort mode ("정렬") is due-date/confidence by design (this
+                      is a task list, not a feed) — this relative label just
+                      surfaces when the action was detected, since due-date
+                      order alone can otherwise hide how recent an item is. */}
+                  <span className="text-foreground-subtle">{formatRelative(item.observed_at)}</span>
                 </div>
 
                 {/* Buttons stay inside the card. A fixed bottom bar would sit
