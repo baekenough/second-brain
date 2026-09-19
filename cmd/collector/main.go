@@ -14,10 +14,12 @@ import (
 	"time"
 
 	"github.com/baekenough/second-brain/internal/api"
+	"github.com/baekenough/second-brain/internal/classify"
 	"github.com/baekenough/second-brain/internal/collector"
 	"github.com/baekenough/second-brain/internal/collector/extractor"
 	"github.com/baekenough/second-brain/internal/config"
 	"github.com/baekenough/second-brain/internal/graph"
+	"github.com/baekenough/second-brain/internal/jev"
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/scheduler"
 	"github.com/baekenough/second-brain/internal/search"
@@ -383,6 +385,73 @@ func run() error {
 		noteEnrichmentWorker.Run(ctx)
 	}()
 
+	// --- Classification worker (retention/segment tagging) ---
+	// Tags newly-collected SMS/Gmail/call-transcript documents with
+	// metadata.segment/retention, backfills the remaining untagged
+	// historical corpus, and re-audits pre-existing (e.g. ox-alpha) tags
+	// against the deterministic Gate (internal/classify). Opt-in like
+	// entity extraction: TYPESAFE_API_KEY is a paid third-party dependency,
+	// so a vanilla deployment incurs zero extra cost until an operator sets
+	// CLASSIFIER_ENABLED=true. Unlike EntityWorker, the Gate can still tag
+	// documents (rule-only) even when TYPESAFE_API_KEY is unset — only the
+	// Jev-requiring share of the backlog idles — so this worker is not
+	// additionally gated on Classifier.JevEnabled() the way EntityWorker
+	// gates its whole Run() on llmClient.Enabled().
+	cv := os.Getenv("CLASSIFIER_ENABLED")
+	classifierEnabled := cv == "true" || cv == "1"
+	if classifierEnabled {
+		slog.Info("classification worker enabled via CLASSIFIER_ENABLED=" + cv)
+	} else {
+		slog.Info("classification worker disabled (set CLASSIFIER_ENABLED=true to enable)")
+	}
+	recheckLegacy := true
+	if v := os.Getenv("CLASSIFIER_RECHECK_LEGACY"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			recheckLegacy = b
+		} else {
+			slog.Warn("config: invalid CLASSIFIER_RECHECK_LEGACY, using default true", "value", v, "error", err)
+		}
+	}
+	// CLASSIFIER_BACKFILL_DAYS is parsed inline (not via envInt) because 0 is
+	// its own valid, intentional value ("no limit" — classify the entire
+	// history), not an error sentinel the way it is for every other
+	// envInt-backed setting here.
+	backfillDays := 0
+	if v := os.Getenv("CLASSIFIER_BACKFILL_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			backfillDays = n
+		} else {
+			slog.Warn("config: invalid CLASSIFIER_BACKFILL_DAYS, using default 0 (no limit)", "value", v, "error", err)
+		}
+	}
+	jevClient := jev.New(os.Getenv("TYPESAFE_API_KEY"), nil)
+	classifier := &classify.Classifier{
+		Jev:                 jevClient,
+		ConfidenceThreshold: envFloat("CLASSIFIER_CONFIDENCE_THRESHOLD", 0.9),
+	}
+	classificationWorker := worker.NewClassificationWorker(worker.ClassificationWorkerConfig{
+		Store:      docStore,
+		Classifier: classifier,
+		NewEvaluator: func() worker.ClassificationGateEvaluator {
+			return classify.NewEvaluator(docStore)
+		},
+		Interval:        envDuration("CLASSIFIER_INTERVAL", 10*time.Minute),
+		BatchSize:       envInt("CLASSIFIER_BATCH_SIZE", 50),
+		BackfillDays:    backfillDays,
+		RecheckLegacy:   recheckLegacy,
+		MaxCallsPerTick: envInt("CLASSIFIER_MAX_CALLS_PER_TICK", 200),
+	})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if !classifierEnabled {
+			// Block until shutdown so the WaitGroup stays balanced.
+			<-ctx.Done()
+			return
+		}
+		classificationWorker.Run(ctx)
+	}()
+
 	// drainTimeout is the maximum time to wait for in-flight ticks to finish
 	// after the shutdown signal is received.
 	//
@@ -617,4 +686,21 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+// envFloat parses a float64 from the environment variable key, falling back
+// to def when unset or invalid. See envDuration's doc comment for why this
+// lives here instead of internal/config.
+func envFloat(key string, def float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 || f > 1 {
+		slog.Warn("config: invalid float env var, using default",
+			"key", key, "value", v, "default", def, "error", err)
+		return def
+	}
+	return f
 }
