@@ -21,6 +21,10 @@ import type {
   GraphFilters,
   GraphNeighbor,
   GraphNode,
+  GoldenGenerateResponse,
+  GoldenJudgmentsRequest,
+  GoldenJudgmentsResponse,
+  GoldenNextResponse,
   IngestFileResponse,
   RecentItemsResponse,
   SearchParams,
@@ -422,4 +426,49 @@ export async function sendEvidenceFeedback(
   const data = (await response.json()) as EvidenceFeedbackResponse;
   // Defensive: an unexpected value must not become the rendered state.
   return data.thumbs === 1 || data.thumbs === -1 ? data.thumbs : 0;
+}
+
+// ── Golden set labeling ──────────────────────────────────────────────────
+//
+// Browser-only helpers behind the /api/golden/* proxy routes
+// (web/src/app/api/golden/*), which forward to the backend's
+// /api/v1/golden/*. Query text and candidate titles/snippets are personal
+// search material, so nothing here is logged.
+
+/** Fetches the next open query and up to `limit` unjudged candidates.
+ * `query: null` in the response means there is nothing left to label. */
+export async function getNextGoldenQuery(limit = 10): Promise<GoldenNextResponse> {
+  return fetchJson<GoldenNextResponse>(`${getApiBase()}/golden/next?limit=${limit}`);
+}
+
+/** Submits judgments for (a subset of) one query's candidates. Candidates the
+ * user never selected a verdict for are simply absent from `judgments` —
+ * this is a partial-submit endpoint, not an all-or-nothing one. */
+export async function submitGoldenJudgments(
+  request: GoldenJudgmentsRequest,
+): Promise<GoldenJudgmentsResponse> {
+  return fetchJson<GoldenJudgmentsResponse>(`${getApiBase()}/golden/judgments`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+}
+
+/** Marks a query as intentionally skipped (no judgments recorded). The
+ * backend answers 204/200 with no body, so this does not go through
+ * fetchJson, which always calls response.json(). */
+export async function skipGoldenQuery(id: string): Promise<void> {
+  const response = await fetch(`${getApiBase()}/golden/queries/${encodeURIComponent(id)}/skip`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error(`API error: ${response.status} ${response.statusText}`);
+  }
+}
+
+/** Asks the backend to synthesize more open queries to label. */
+export async function generateGoldenQueries(): Promise<GoldenGenerateResponse> {
+  return fetchJson<GoldenGenerateResponse>(`${getApiBase()}/golden/queries/generate`, {
+    method: "POST",
+  });
 }

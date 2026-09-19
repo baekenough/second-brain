@@ -63,8 +63,8 @@ type ChunkSearchResult struct {
 	// map. Selected for the same reason as DocumentOccurredAt above: a
 	// document reachable ONLY through a chunk lane never passes through
 	// hybridSearch's WHERE predicates, so internal/search's
-	// applyRetentionFilters (retention exclusion + the retention="low" score
-	// penalty) has nothing to read unless the chunk row carries it directly.
+	// applyRetentionExclusion and applyLowRetentionPenalty have nothing to
+	// read unless the chunk row carries it directly.
 	// nil (not an empty map) when the source column was NULL or failed to
 	// decode — model.Document.RetentionTag treats nil the same as "no tag".
 	DocumentMetadata map[string]any

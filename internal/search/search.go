@@ -342,22 +342,27 @@ func applySourceTypeFilters(q model.SearchQuery, results []*model.SearchResult) 
 	return out
 }
 
-// applyRetentionFilters is the single fusion-time enforcement point for
-// q.ExcludeRetention and the retention="low" score penalty
-// (model.LowRetentionPenalty). It runs uniformly over whichever lane's result
-// set is handed to it, regardless of where that lane's rows came from:
+// applyRetentionExclusion is the single fusion-time enforcement point for
+// q.ExcludeRetention. It runs uniformly over whichever lane's result set is
+// handed to it, regardless of where that lane's rows came from:
 //
 //   - The document-store lanes (pgvector/FTS/bigm/summvec/entity, fused into
 //     one result set by buildRRFScoreExpr in internal/store/document.go)
 //     already apply the exclusion as a SQL WHERE predicate, so calling this
-//     again on their output is a harmless no-op for exclusion — but it is
-//     NOT a no-op for the low-retention penalty, which is a Go-side score
-//     multiplication the SQL layer never performs.
+//     again on their output is a harmless no-op.
 //   - The chunk vector/FTS lanes and the OpenSearch lane cannot express the
 //     exclusion in their own query (ChunkSearcher takes only a query/vector
 //     and a limit; see applySourceTypeFilters' doc comment for the same
-//     constraint), so THIS is their only enforcement point for both the
-//     exclusion and the penalty.
+//     constraint), so THIS is their only enforcement point.
+//
+// This function does NOT apply the retention="low" score penalty — see
+// applyLowRetentionPenalty for why that has to happen once, after fusion,
+// rather than per-lane here. Splitting the two matters because exclusion
+// changes MEMBERSHIP (which documents can appear at all, before mergeRRF
+// ever sees them), while the penalty only changes ORDER within an already-
+// fused set; running them at the same call site made it easy to assume the
+// penalty affected order too, when a per-lane Score multiplication before
+// fusion has no effect on the RRF-fused Score mergeRRF computes afterwards.
 //
 // Untagged documents (no "retention" key in Metadata — most of the corpus;
 // see model.Document.RetentionTag) are returned completely unchanged: absence
@@ -372,9 +377,8 @@ func applySourceTypeFilters(q model.SearchQuery, results []*model.SearchResult) 
 // this codebase; it is flagged as a follow-up rather than blocking this
 // change, the same way the chunk-lane window-filter gap was tracked as #196
 // before it was closed.
-func applyRetentionFilters(q model.SearchQuery, results []*model.SearchResult) []*model.SearchResult {
-	penalty := model.LowRetentionPenalty()
-	if len(results) == 0 || (len(q.ExcludeRetention) == 0 && penalty == 1.0) {
+func applyRetentionExclusion(q model.SearchQuery, results []*model.SearchResult) []*model.SearchResult {
+	if len(results) == 0 || len(q.ExcludeRetention) == 0 {
 		return results
 	}
 
@@ -393,13 +397,71 @@ func applyRetentionFilters(q model.SearchQuery, results []*model.SearchResult) [
 		if _, skip := exclude[tag]; skip {
 			continue
 		}
-		if tag == model.RetentionLow && penalty != 1.0 {
-			cp := *r // shallow copy — do not mutate the caller's slice/lane result
-			cp.Score *= penalty
-			out = append(out, &cp)
+		out = append(out, r)
+	}
+	return out
+}
+
+// applyLowRetentionPenalty is the SINGLE point where the retention="low"
+// score penalty (model.LowRetentionPenalty) is applied. It runs exactly once
+// per request, on the fused candidate set — after every lane has contributed
+// via mergeRRF (which may have overfetched beyond q.Limit; see the laneLimit
+// comment in Search(), above s.store.Search, for why) and before Sort="recent"
+// is (re-)established, the cross-encoder reranks, or Search()'s own trailing
+// truncate cuts the set down to q.Limit.
+//
+// Applying it any earlier does not change ranking, only the number attached
+// to a result:
+//
+//   - Per-lane, before fusion, multiplying a lane's own Score has no effect
+//     on the fused order at all. mergeRRF computes each entry's Score from
+//     its RANK POSITION in its input slice (1/(k+rank+1)), never from the
+//     Score value the lane handed it, so a penalty applied there is silently
+//     discarded the moment mergeRRF runs.
+//   - On the store-only path (no chunk lane contributed), the store already
+//     returned its rows ordered by SQL's `ORDER BY score DESC`. Multiplying
+//     Score afterwards without re-sorting leaves that order stale — a low
+//     document that legitimately scored higher pre-penalty stays ranked
+//     above a document that now has the higher Score.
+//
+// Score scale note: post-fusion Score is an RRF sum, roughly
+// 1/(60+1) .. 1/(60+60) ≈ 0.033 down to 0.016 for a typical page (k=60). The
+// default 0.8 multiplier is therefore NOT "20% less relevant" in any absolute
+// sense — multiplying a rank-1 RRF score (1/61) by 0.8 lands at ~1/76, close
+// to the rank-16 score (1/76.25): a MILD demotion, roughly rank 1 -> rank 15,
+// not an effective exclusion. (A 0.5 multiplier, tried and rejected as the
+// default, computes to ~1/122 — close to rank 61, i.e. pushed entirely off a
+// typical page.) Operators tuning SEARCH_LOW_RETENTION_PENALTY (see
+// .env.example) should read it as a rank-distance knob, not a probability or
+// confidence adjustment.
+//
+// Sort="recent" is deliberately left un-resorted here: recency and relevance
+// answer different questions, and re-sorting by the penalised score at this
+// point would silently override the time order those requests asked for.
+// Ranking by score is the caller's default (Sort=="" or "relevance"); only
+// then does the penalty get to change rank instead of just the score field.
+func applyLowRetentionPenalty(q model.SearchQuery, results []*model.SearchResult) []*model.SearchResult {
+	penalty := model.LowRetentionPenalty()
+	if len(results) == 0 || penalty == 1.0 {
+		return results
+	}
+
+	changed := false
+	out := make([]*model.SearchResult, len(results))
+	for i, r := range results {
+		tag, tagged := r.RetentionTag()
+		if !tagged || tag != model.RetentionLow {
+			out[i] = r
 			continue
 		}
-		out = append(out, r)
+		cp := *r // shallow copy — do not mutate the caller's slice/lane result
+		cp.Score *= penalty
+		out[i] = &cp
+		changed = true
+	}
+
+	if changed && !q.SortsByRecency() {
+		sortByScore(out)
 	}
 	return out
 }
@@ -437,6 +499,31 @@ func warnOnSourceFilterConflict(q model.SearchQuery) {
 		"conflicting", conflicting,
 		"remaining_included", survivors,
 		"empty_result_guaranteed", survivors == 0)
+}
+
+// overfetchLimitCap bounds how large an overfetched candidate pool
+// (overfetchLimit) may grow, regardless of the caller's requested page size.
+// Kept well above any real page size (typically 8-50) so it never binds in
+// practice; it exists solely to keep a pathological caller-supplied Limit
+// from doubling into an unbounded per-lane query.
+const overfetchLimitCap = 200
+
+// overfetchLimit returns the candidate-pool size a lane should retrieve when
+// a fusion lane (chunk vector/FTS, OpenSearch) might merge into the result
+// set — see the comment on laneLimit in Search(), above s.store.Search, for
+// why membership (not just score) needs a larger pool than the page size
+// ultimately returned to the caller.
+func overfetchLimit(limit int) int {
+	of := limit * 2
+	if of > overfetchLimitCap {
+		return overfetchLimitCap
+	}
+	if of < limit {
+		// Overflow guard for a pathological caller-supplied limit; never
+		// return less than the page size itself.
+		return limit
+	}
+	return of
 }
 
 // Search executes a search for the given query. If an embedding client is
@@ -499,16 +586,46 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 		}
 	}
 
-	results, err := s.store.Search(ctx, q)
+	// laneLimit is the candidate-pool size handed to the store and to the
+	// chunk/OpenSearch lanes when a fusion lane is configured, capped at
+	// overfetchLimitCap — NOT the page size returned to the caller (q.Limit
+	// still is; see the final truncation at the end of this function).
+	//
+	// Why overfetch at all: applyLowRetentionPenalty is the ONLY place a
+	// retention="low" document's score is ever adjusted — deliberately a
+	// single Go-side point rather than duplicated per-lane SQL, so the number
+	// a caller sees is never double-multiplied (store lane + chunk lane +
+	// OpenSearch lane all feed the same un-adjusted score into fusion, and get
+	// penalised exactly once, together, afterward). But every lane along the
+	// way — the store's own SQL LIMIT, and mergeRRF's internal truncation
+	// after each chunk/OpenSearch merge — truncates its candidate set BEFORE
+	// applyLowRetentionPenalty ever runs. A keep-tagged document that a
+	// tight, un-penalised truncation evicted at exactly q.Limit is gone by
+	// the time the penalty demotes whatever displaced it — reordering an
+	// already-truncated list cannot restore a document that fell off the end
+	// of it. Overfetching gives every lane, and mergeRRF's own fusion step,
+	// room to keep a genuinely competitive document in play until the single
+	// post-fusion point (applyLowRetentionPenalty) decides the final order and
+	// this function's own trailing truncate cuts down to q.Limit.
+	fusionPossible := s.chunkStore != nil || (s.opensearch != nil && s.opensearch.Enabled())
+	laneLimit := q.Limit
+	if fusionPossible {
+		laneLimit = overfetchLimit(q.Limit)
+	}
+
+	storeQuery := q
+	storeQuery.Limit = laneLimit
+	results, err := s.store.Search(ctx, storeQuery)
 	if err != nil {
 		return nil, fmt.Errorf("search store: %w", err)
 	}
 	// The store already excluded ExcludeRetention via SQL WHERE (see
-	// buildHybridSearchQuery/buildFulltextSearchQuery), so this call cannot
-	// find anything left to drop here — but it still applies the
-	// retention="low" score penalty, which the SQL layer never performs (see
-	// applyRetentionFilters).
-	results = applyRetentionFilters(q, results)
+	// buildHybridSearchQuery/buildFulltextSearchQuery), so this call is a
+	// harmless no-op here — it exists so a lane that does NOT filter in SQL
+	// (chunk vector/FTS, OpenSearch, below) shares the same enforcement
+	// point. The retention="low" score penalty is applied once, after every
+	// lane has been fused — see applyLowRetentionPenalty below.
+	results = applyRetentionExclusion(q, results)
 
 	// An event-time window is a hard constraint on WHICH documents may be
 	// returned. The document store enforces it in SQL inside every lane; the
@@ -545,7 +662,7 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	// RRF. This is an ADDITIVE signal — the full-document path above always
 	// runs first, and chunk results are merged in rather than replacing it.
 	if s.chunkStore != nil && len(queryVec) > 0 && chunkLanesEnabled {
-		chunkVecResults, cerr := s.searchChunksVector(ctx, queryVec, q.Limit)
+		chunkVecResults, cerr := s.searchChunksVector(ctx, queryVec, laneLimit)
 		if cerr != nil {
 			slog.Warn("search: chunk vector search failed, skipping",
 				"error", cerr, "query", q.Query)
@@ -554,9 +671,13 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 			if windowed {
 				chunkVecResults = s.verifyWindow(ctx, q, chunkVecResults)
 			}
-			chunkVecResults = applyRetentionFilters(q, chunkVecResults)
+			chunkVecResults = applyRetentionExclusion(q, chunkVecResults)
 			if len(chunkVecResults) > 0 {
-				results = mergeRRF(results, chunkVecResults, q.Limit)
+				// laneLimit, not q.Limit: see the overfetch comment above
+				// s.store.Search — mergeRRF's own internal truncation must not
+				// evict a keep-tagged document before applyLowRetentionPenalty
+				// gets a chance to demote whatever displaced it.
+				results = mergeRRF(results, chunkVecResults, laneLimit)
 				chunkFused = true
 			}
 		}
@@ -575,7 +696,7 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	// run below as cheap defense in depth, not because the server-side filter
 	// is expected to fail.
 	if s.opensearch != nil && s.opensearch.Enabled() {
-		osResults, oerr := s.opensearch.Search(ctx, q, q.Limit)
+		osResults, oerr := s.opensearch.Search(ctx, q, laneLimit)
 		if oerr != nil {
 			// Non-fatal: an unreachable/erroring OpenSearch node must never
 			// fail the whole search request. Log and drop this lane's
@@ -584,9 +705,10 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 				"error", oerr, "query", q.Query)
 		} else {
 			osResults = applySourceTypeFilters(q, osResults)
-			osResults = applyRetentionFilters(q, osResults)
+			osResults = applyRetentionExclusion(q, osResults)
 			if len(osResults) > 0 {
-				results = mergeRRF(results, osResults, q.Limit)
+				// laneLimit — same reason as the chunk vector merge above.
+				results = mergeRRF(results, osResults, laneLimit)
 				chunkFused = true
 			}
 		}
@@ -597,7 +719,7 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	// verified like the vector lane's; unverifiable hits are dropped, so an
 	// empty answer stays empty rather than silently widening the window.
 	if len(results) == 0 && s.chunkStore != nil && chunkLanesEnabled {
-		chunkResults, cerr := s.searchChunksFTS(ctx, q.Query, q.Limit)
+		chunkResults, cerr := s.searchChunksFTS(ctx, q.Query, laneLimit)
 		if cerr != nil {
 			// Non-fatal: log and return the empty primary result set.
 			slog.Warn("search: chunk FTS fallback failed",
@@ -610,9 +732,19 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 		if windowed {
 			results = s.verifyWindow(ctx, q, results)
 		}
-		results = applyRetentionFilters(q, results)
+		results = applyRetentionExclusion(q, results)
 		chunkFused = true
 	}
+
+	// Single fusion-time enforcement point for the retention="low" score
+	// penalty (see applyLowRetentionPenalty's doc comment for why it has to
+	// live here rather than per-lane above): every lane has now either
+	// contributed to `results` via mergeRRF or been the sole source of it.
+	// `results` may still carry up to laneLimit entries here (see the
+	// overfetch comment above s.store.Search) — the trailing truncate to
+	// q.Limit runs AFTER this and the recency branch below, once both
+	// orderings this penalty can affect have already been decided.
+	results = applyLowRetentionPenalty(q, results)
 
 	// Sort="recent" over a set this service assembled.
 	//
@@ -648,6 +780,19 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	// ingest instant among event instants.
 	if chunkFused && q.SortsByRecency() {
 		sortByRecency(results, q.RecencyAscending(time.Now()))
+	}
+
+	// Final truncation to the caller's requested page size. `results` may
+	// carry up to laneLimit entries at this point — every lane above may have
+	// overfetched (see the comment on laneLimit, above s.store.Search) so that
+	// mergeRRF and applyLowRetentionPenalty had room to keep a keep-tagged
+	// document in play instead of losing it to a premature LIMIT. Both
+	// ordering branches above (score, via applyLowRetentionPenalty's own
+	// sortByScore; recency, via sortByRecency just above) have already put
+	// `results` in its final order by the time this runs, so truncating here
+	// is a plain cut, not a re-decision of what belongs in the page.
+	if len(results) > q.Limit {
+		results = results[:q.Limit]
 	}
 
 	// Cross-encoder reranking: opt-in per-request via UseRerank.
@@ -881,9 +1026,10 @@ func chunkVecToSearchResult(r store.ChunkSearchResult) *model.SearchResult {
 			Status:      r.DocumentStatus,
 			OccurredAt:  occurred,
 			CollectedAt: collected,
-			// Metadata carries the retention tag (if any) so applyRetentionFilters
-			// can enforce the exclusion/penalty on a document reachable only
-			// through this lane — see ChunkSearchResult.DocumentMetadata.
+			// Metadata carries the retention tag (if any) so
+			// applyRetentionExclusion / applyLowRetentionPenalty can enforce
+			// the exclusion/penalty on a document reachable only through this
+			// lane — see ChunkSearchResult.DocumentMetadata.
 			Metadata: r.DocumentMetadata,
 		},
 		Score:     r.Score,
