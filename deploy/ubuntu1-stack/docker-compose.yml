@@ -2,7 +2,10 @@
 # second-brain — ubuntu1 프로덕션 Compose (x86_64)
 # =============================================================================
 # 용도: macmini(arm64)에서 ubuntu1(x86_64)로 이전된 프로덕션 스택.
-#   server / collector / web / neo4j 네 서비스만 포함한다.
+#   server / collector / web / neo4j / mcp / eval-runner 여섯 서비스를 포함한다.
+#   (mcp/eval-runner는 2026-08-29 배포 때 이 사본에서 유실됐다가 2026-09-19
+#   프로덕션 백업에서 정의를 복원했다 — 배포 전 반드시 이 파일과 프로덕션
+#   `docker compose config --services` 출력을 대조할 것.)
 #
 # PostgreSQL은 이 스택에 없다 — 이미 ubuntu1에서 별도 compose 프로젝트로
 # 실행 중이다 (~/second-brain-postgres/docker-compose.yml, 컨테이너명
@@ -97,6 +100,65 @@ services:
       - /home/baekenough/.second-brain/stage/sms:/data/sms:ro
       - /home/baekenough/.second-brain/stage/call:/data/call:ro
     restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # mcp — MCP streamable HTTP 서버 (포트 8090).
+  #   마이그레이션은 server가 적용하므로, server가 기동된 뒤 시작한다.
+  #   포트를 두 곳에만 바인딩한다(0.0.0.0 금지, LAN/공인망 노출 방지):
+  #     - 127.0.0.1:8090 — cloudflared 터널용(brain-mcp.baekenough.com ingress)
+  #     - 100.68.237.99:8090 (ubuntu1 Tailscale IP) — macmini hermes-agent 접근 경로
+  #   postgres는 별도 compose 프로젝트이므로 depends_on을 걸지 않는다.
+  #   2026-08-29 배포 때 이 사본에 없어서 프로덕션 파일에서 유실됐던 서비스(2026-09-19 복원).
+  # ---------------------------------------------------------------------------
+  mcp:
+    image: second-brain-mcp:ubuntu1
+    ports:
+      - "127.0.0.1:8090:8090"
+      - "100.68.237.99:8090:8090"
+    env_file:
+      - .env.local
+    environment:
+      MCP_BIND_ADDR: "0.0.0.0"
+    depends_on:
+      server:
+        condition: service_started
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # eval-runner — nightly eval 스케줄러 (포트 없음).
+  #   매일 03:00 KST (TZ=Asia/Seoul) 에 /app/eval --check-reindex 를 실행한다.
+  #   Exit-code 계약 (k8s eval-cronjob.yaml 과 동일):
+  #     0 — eval 통과 (회귀 없음, reindex 불필요)
+  #     1 — 회귀 감지 → 로그 기록 후 다음 사이클 대기 (컨테이너 종료 안 함)
+  #     2 — reindex 권장 (eval 바이너리가 이미 웹훅 알림 발송) → 무시하고 계속
+  #   supercronic 등 외부 의존성 없이 셸 루프로 self-contained 스케줄링.
+  #   postgres는 별도 compose 프로젝트이므로 depends_on을 걸지 않는다.
+  #   2026-08-29 배포 때 이 사본에 없어서 프로덕션 파일에서 유실됐던 서비스(2026-09-19 복원).
+  # ---------------------------------------------------------------------------
+  eval-runner:
+    image: second-brain-eval:ubuntu1
+    env_file:
+      - .env.local
+    environment:
+      TZ: Asia/Seoul
+    restart: unless-stopped
+    # Dockerfile eval 스테이지에 ENTRYPOINT ["/app/eval"] 이 있어 command 가
+    # eval 의 인수로 전달되면 /app/eval sh -c '...' 가 실행되어 즉시 exit → restart-loop.
+    # /bin/sh 로 ENTRYPOINT 를 오버라이드하면 command 스크립트가 sh -c "<script>" 로 실행된다.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          now=$$(date +%s)
+          target=$$(date -d "today 03:00" +%s 2>/dev/null || echo $$((now + 86400)))
+          [ "$$target" -le "$$now" ] && target=$$(($$target + 86400))
+          sleep_sec=$$(($$target - $$now))
+          echo "[eval-runner] sleeping $${sleep_sec}s until next 03:00 KST"
+          sleep "$$sleep_sec"
+          echo "[eval-runner] starting /app/eval --check-reindex at $$(date '+%Y-%m-%d %H:%M:%S %Z')"
+          /app/eval --check-reindex
+          echo "[eval-runner] eval exited $$?"
+        done
 
   # ---------------------------------------------------------------------------
   # web — Next.js 프론트엔드 (포트 3000).
