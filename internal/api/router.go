@@ -37,6 +37,10 @@ type DocumentStore interface {
 	ListRecent(ctx context.Context, includeSrc model.SourceType, excludeSrcs []model.SourceType, limit, offset int) ([]*model.Document, error)
 	CountBySource(ctx context.Context) (map[string]int, error)
 	QueryBaselineStats(ctx context.Context) (*store.BaselineStats, error)
+	// CountPendingTranscription returns the number of active call documents
+	// (source_type='call') still awaiting a whisper transcript merge
+	// (metadata.transcription="pending"). Surfaced on GET /api/v1/stats.
+	CountPendingTranscription(ctx context.Context) (int, error)
 }
 
 // Server holds the dependencies needed by all handlers.

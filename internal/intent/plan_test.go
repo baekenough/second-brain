@@ -70,7 +70,14 @@ var planGolden = []planGoldenCase{
 	{8, "지난달에 뭐 있었어", "2026-07-01", "2026-08-01", nil, true},
 	{9, "2026년 6월 요약", "2026-06-01", "2026-07-01", nil, true},
 	{10, "홍길동한테 뭐라고 했더라", "", "", nil, false},
-	{11, "홍길동이랑 통화한 내용", "", "", []model.SourceType{model.SourceCallTranscript, model.SourceCallLog}, false},
+	// Row 11 diverges from the spec §8 table as originally written: the spec
+	// predates migration 033's call-log/call-transcript unification (see
+	// model.SourceCall's doc comment) and expected the LLM to name both
+	// legacy types. Post-unification there is only one "통화" source to
+	// name — planSourceTypes no longer offers the legacy pair at all (see
+	// that var's doc comment), so this row is updated to match the single
+	// model.SourceCall value the LLM is now actually asked to choose from.
+	{11, "홍길동이랑 통화한 내용", "", "", []model.SourceType{model.SourceCall}, false},
 	{12, "프로젝트 진행 상황 어때", "", "", nil, false},
 	{13, "최근에 받은 메일 정리", "", "", []model.SourceType{model.SourceGmail}, false},
 	{14, "010-0000-0000 누구야", "", "", nil, false},
@@ -319,7 +326,7 @@ func TestPlanner_LLMPrompt_CarriesKSTNow(t *testing.T) {
 	if strings.Contains(oracle.lastSystem, "2026-08-19") {
 		t.Errorf("system prompt states the UTC date 2026-08-19, which is not today in KST; got:\n%s", oracle.lastSystem)
 	}
-	if !strings.Contains(oracle.lastSystem, "calendar") || !strings.Contains(oracle.lastSystem, "call-transcript") {
+	if !strings.Contains(oracle.lastSystem, "calendar") || !strings.Contains(oracle.lastSystem, "call") {
 		t.Errorf("system prompt does not enumerate the allowed source types; got:\n%s", oracle.lastSystem)
 	}
 }

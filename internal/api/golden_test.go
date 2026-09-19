@@ -251,7 +251,7 @@ func TestGoldenNextHandler_ExcludesAlreadyJudged(t *testing.T) {
 				ID:         freshDocID,
 				Title:      "fresh candidate",
 				Content:    "line one\nline two   with   extra   spaces",
-				SourceType: model.SourceCallLog,
+				SourceType: model.SourceCall,
 				OccurredAt: &occurredAt,
 				Metadata:   map[string]any{"retention": model.RetentionLow, "segment": "personal"},
 			}},

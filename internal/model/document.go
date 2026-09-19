@@ -43,13 +43,49 @@ const (
 	// "왜 막혀 있지?" 하고 나중에 누군가 되살릴 수 있으므로 반드시 유지할 것.
 	// 이 값을 model.KnownSourceTypes()/DeprecatedSourceTypes() 에서 지우거나
 	// 옮기려면 위 배경을 먼저 이해할 것 (internal/model/source_validation.go).
-	SourceLLMMemory      SourceType = "llm-memory"
-	SourceGmail          SourceType = "gmail"
-	SourceCalendar       SourceType = "calendar"
-	SourceSMS            SourceType = "sms"
-	SourceCallLog        SourceType = "call-log"
+	SourceLLMMemory SourceType = "llm-memory"
+	SourceGmail     SourceType = "gmail"
+	SourceCalendar  SourceType = "calendar"
+	SourceSMS       SourceType = "sms"
+	// SourceCallLog is DEPRECATED as of 2026-09-19 (migration 033) — DO NOT
+	// write new documents with this source_type.
+	//
+	// 폐기 사유: "통화(call-log)와 전사(call-transcript)는 같은 사건(전화 한
+	// 통)을 가리키는 두 문서로 쪼개져 있었다 — 둘을 구분해야 할 이유가
+	// 없다"는 사용자 판단에 따라 SourceCall 로 통합했다. 녹음이 없는 통화는
+	// SourceCall 문서 하나(요약 content, metadata.transcription="none")로,
+	// 녹음이 있는 통화는 같은 문서가 전사 완료 시 store.AttachTranscript로
+	// content/embedding 이 교체되며 metadata.transcription 이
+	// "pending"→"done" 으로 바뀐다(1 통화 = 1 문서). 마이그레이션
+	// 033_call_unify.sql 이 기존 call-log/call-transcript 문서를 병합·재타입
+	// (source_type='call', metadata.legacy_source_type 보존)한다.
+	//
+	// 이 상수 자체를 지우지 않는 이유는 SourceLLMMemory 와 동일하다: 마이그
+	// 레이션이 놓친 레거시 문서를 여전히 이 값으로 식별해야 할 수 있고,
+	// internal/store 의 upsert 가드(checkSourceTypeGuard)가 신규 저장 시도를
+	// 감지해 경고 로그를 남긴다. model.KnownSourceTypes()/DeprecatedSourceTypes()
+	// 에서 다루는 방식을 바꾸려면 이 배경을 먼저 이해할 것
+	// (internal/model/source_validation.go).
+	SourceCallLog SourceType = "call-log"
+	// SourceCallTranscript is DEPRECATED — see SourceCallLog's doc comment
+	// above for the full background (both were merged into SourceCall).
 	SourceCallTranscript SourceType = "call-transcript"
-	SourceUpload         SourceType = "upload"
+	// SourceCall is a single document per phone call, replacing the
+	// SourceCallLog / SourceCallTranscript split (see their doc comments for
+	// why). Every call — recorded or not — gets exactly one SourceCall
+	// document, keyed by smsmap.MapCall's SourceID formula
+	// (call-log:{dateMs}:{numHash}:{durHash}, kept unchanged across the
+	// rename so existing SourceIDs and dedup/upsert identity are undisturbed).
+	// metadata.transcription distinguishes the document's state:
+	//   - "none"    — no recording was ever captured for this call.
+	//   - "pending" — a recording exists (ingest/recording) but WhisperCollector
+	//     has not transcribed it yet; content is still the short call-log
+	//     summary (contact/direction/time/duration).
+	//   - "done"    — WhisperCollector transcribed the recording and merged
+	//     the transcript into this document via store.AttachTranscript;
+	//     content is now the transcript text (or diarized speaker blocks).
+	SourceCall   SourceType = "call"
+	SourceUpload SourceType = "upload"
 	// SourceNote is a user-authored note captured via POST /api/v1/notes
 	// (Capture). Distinct from SourceAgentNote (MCP add_note tool,
 	// AI-agent-authored) — see spec §3.3. Content is write-once; only

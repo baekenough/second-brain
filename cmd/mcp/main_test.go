@@ -729,6 +729,7 @@ func TestAllowedSourceTypes_AllDeclaredTypesAccepted(t *testing.T) {
 		model.SourceGmail,
 		model.SourceCalendar,
 		model.SourceSMS,
+		model.SourceCall,
 		model.SourceCallLog,
 		model.SourceCallTranscript,
 		model.SourceUpload,
@@ -746,13 +747,16 @@ func TestAllowedSourceTypes_AllDeclaredTypesAccepted(t *testing.T) {
 	}
 }
 
-// TestSearchTool_NewSourceTypes_Accepted verifies that the 6 source types added
-// in this fix (gmail, calendar, sms, call-log, call-transcript, upload) are
+// TestSearchTool_NewSourceTypes_Accepted verifies that the 7 source types added
+// in this fix (gmail, calendar, sms, call, call-log, call-transcript, upload) are
 // accepted by the search tool's source filter and do not produce an error result.
+// call-log/call-transcript are the deprecated pre-migration-033 aliases of call
+// (see model.SourceCallLog's doc comment) — still accepted so legacy searches
+// keep working.
 func TestSearchTool_NewSourceTypes_Accepted(t *testing.T) {
 	t.Parallel()
 
-	newTypes := []string{"gmail", "calendar", "sms", "call-log", "call-transcript", "upload"}
+	newTypes := []string{"gmail", "calendar", "sms", "call", "call-log", "call-transcript", "upload"}
 
 	// Build a search server with a fake search service that returns no results.
 	svc := &fakeSearchSvc{}

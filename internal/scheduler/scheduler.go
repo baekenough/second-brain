@@ -54,6 +54,15 @@ type DocumentUpserter interface {
 	// no-op on empty input. Called per batch so duplicate-rejected files are
 	// ledgered and never re-transcribed.
 	RecordTranscribed(ctx context.Context, sourceType model.SourceType, sourceIDs []string) error
+	// AttachTranscript merges a whisper transcript into an existing call
+	// document (see model.SourceCall / store.AttachTranscript doc comments):
+	// content/embedding are replaced, metadata is merged (not overwritten),
+	// title/occurred_at are preserved when already set. Used instead of
+	// Upsert whenever a batch document carries
+	// metadata["transcript_source_id"] — WhisperCollector's signal that this
+	// document should merge into the call-log document rather than become a
+	// second, unlinked one. Returns contentChanged like UpsertTracked.
+	AttachTranscript(ctx context.Context, doc *model.Document) (contentChanged bool, err error)
 }
 
 // ActiveDocumentCounter is retained for backward compatibility and for use by
@@ -380,6 +389,21 @@ func (s *Scheduler) runningFor(name string) bool {
 	return false
 }
 
+// transcriptLedgerID returns the audio-file identity that should be recorded
+// in the transcription ledger for doc: metadata["transcript_source_id"] when
+// present — set by WhisperCollector's buildDocument when it merges a
+// transcript into an existing call-log document (see
+// internal/collector/whisper.go's callLogMergeSourceID) — falling back to
+// doc.SourceID for a standalone transcript document whose SourceID already
+// IS its own raw identity ("transcript:{relPath}"). See
+// store.TranscribedSourceIDSet's doc comment for why this distinction matters.
+func transcriptLedgerID(doc *model.Document) string {
+	if v, ok := doc.Metadata["transcript_source_id"].(string); ok && v != "" {
+		return v
+	}
+	return doc.SourceID
+}
+
 // runCollector executes a single collection cycle for one collector.
 // It must only be called while the caller holds the collector's per-collector
 // flag (via runningPerCollector[col.Name()]) or the global running flag
@@ -484,13 +508,30 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 		// active index — are durably marked as "already transcribed" and are never
 		// re-submitted to the (expensive) whisper API on a later cycle.
 		//
+		// col.Name() == "whisper" replaces the old col.Source() ==
+		// model.SourceCallTranscript gate: since migration 033 unified
+		// call-log/call-transcript into model.SourceCall, Source() is shared
+		// with the SMS collector's call-log documents (which never go through
+		// this codepath) and can no longer identify "this is whisper" by
+		// itself — see WhisperCollector.Source's doc comment.
+		//
+		// ledgerID uses metadata["transcript_source_id"] when present — the
+		// AUDIO FILE's own raw identity ("transcript:{relPath}"), preserved by
+		// buildDocument even when the document itself is merge-keyed under
+		// the call-log-formula SourceID — falling back to SourceID for
+		// standalone transcripts (no sidecar / no call-log document to merge
+		// into). Ledgering under any other id would let the raw identity
+		// re-enter WalkDir's filter as "never transcribed" on the next cycle,
+		// reintroducing the infinite re-transcription loop through the merge
+		// path (see store.TranscribedSourceIDSet's doc comment).
+		//
 		// This is a single batched round-trip and is best-effort: a failure is
 		// logged but never blocks ingestion (worst case is a redundant
 		// re-transcription, which the active-index union still mostly prevents).
-		if col.Source() == model.SourceCallTranscript && len(batch) > 0 {
+		if col.Name() == "whisper" && len(batch) > 0 {
 			ids := make([]string, len(batch))
 			for i := range batch {
-				ids[i] = batch[i].SourceID
+				ids[i] = transcriptLedgerID(&batch[i])
 			}
 			if err := s.store.RecordTranscribed(ctx, col.Source(), ids); err != nil {
 				slog.Warn("scheduler: record transcribed ledger failed (non-fatal)",
@@ -504,9 +545,22 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 		}
 
 		for i := range batch {
-			if err := s.store.Upsert(ctx, &batch[i]); err != nil {
-				if errors.Is(err, store.ErrDuplicateTranscript) {
-					slog.Debug("scheduler: skipped duplicate call-transcript",
+			// A document carrying metadata["transcript_source_id"] is
+			// WhisperCollector's signal (buildDocument, callLogMergeSourceID)
+			// that it must MERGE into the existing call-log document at
+			// (SourceType, SourceID) rather than overwrite it wholesale — see
+			// store.AttachTranscript's doc comment for exactly what that
+			// preserves (call-log-only metadata, title, authoritative
+			// occurred_at).
+			var upsertErr error
+			if _, merging := batch[i].Metadata["transcript_source_id"]; merging {
+				_, upsertErr = s.store.AttachTranscript(ctx, &batch[i])
+			} else {
+				upsertErr = s.store.Upsert(ctx, &batch[i])
+			}
+			if upsertErr != nil {
+				if errors.Is(upsertErr, store.ErrDuplicateTranscript) {
+					slog.Debug("scheduler: skipped duplicate call content",
 						"collector", col.Name(),
 						"source_id", batch[i].SourceID)
 					continue
@@ -514,7 +568,7 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 				slog.Warn("scheduler: upsert failed",
 					"collector", col.Name(),
 					"source_id", batch[i].SourceID,
-					"error", err)
+					"error", upsertErr)
 				continue
 			}
 			count++

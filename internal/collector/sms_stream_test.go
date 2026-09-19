@@ -434,8 +434,8 @@ func TestCollectStream_PartialResult_SMSAndCalls(t *testing.T) {
 	if types[model.SourceSMS] != 2 {
 		t.Errorf("expected 2 SMS docs, got %d", types[model.SourceSMS])
 	}
-	if types[model.SourceCallLog] != 1 {
-		t.Errorf("expected 1 call-log doc, got %d", types[model.SourceCallLog])
+	if types[model.SourceCall] != 1 {
+		t.Errorf("expected 1 call doc, got %d", types[model.SourceCall])
 	}
 }
 

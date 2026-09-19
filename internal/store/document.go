@@ -37,9 +37,15 @@ func NewDocumentStore(pg *Postgres) *DocumentStore {
 	return &DocumentStore{pg: pg}
 }
 
-// callTranscriptDupCheckQuery is the existence check used by Upsert to detect
-// call-transcript documents that share identical content under a different
-// source_id. The query is a SELECT 1 probe (LIMIT 1) so it avoids a full scan.
+// callDupCheckQuery is the existence check used by Upsert/UpsertTracked/
+// AttachTranscript to detect call documents that share identical transcript
+// content under a different source_id (issue #134, generalized to
+// source_type='call' by migration 033's call-log/call-transcript unification —
+// see model.SourceCall's doc comment). The query is a SELECT 1 probe
+// (LIMIT 1) so it avoids a full scan. 'call-transcript' is matched alongside
+// 'call' defensively for the brief window before migration 033 has run against
+// a given database; every ROW WhisperCollector emits post-unification carries
+// source_type='call'.
 //
 // Parameters:
 //
@@ -48,13 +54,13 @@ func NewDocumentStore(pg *Postgres) *DocumentStore {
 //
 // The query intentionally targets only status='active' rows so that a previously
 // soft-deleted duplicate does not block re-insertion of a renamed recording.
-const callTranscriptDupCheckQuery = `
+const callDupCheckQuery = `
 	SELECT 1
 	FROM documents
-	WHERE source_type = 'call-transcript'
-	  AND status      = 'active'
-	  AND content     = $1
-	  AND source_id  <> $2
+	WHERE source_type IN ('call', 'call-transcript')
+	  AND status       = 'active'
+	  AND content      = $1
+	  AND source_id   <> $2
 	LIMIT 1`
 
 // UpsertTracked is identical to Upsert but additionally returns a bool that
@@ -80,16 +86,20 @@ func (s *DocumentStore) UpsertTracked(ctx context.Context, doc *model.Document) 
 	checkSourceTypeGuard(doc)
 	s.checkDuplicateArrival(ctx, doc)
 
-	// Duplicate guard: call-transcript content dedup (issue #134).
-	if doc.SourceType == model.SourceCallTranscript {
+	// Duplicate guard: call content dedup (issue #134, generalized to
+	// source_type='call' by migration 033 — see callDupCheckQuery's doc
+	// comment). In practice this only ever fires for transcript content: a
+	// plain call-log summary embeds its own timestamp-to-the-second, so two
+	// distinct real calls essentially cannot produce byte-identical content.
+	if doc.SourceType == model.SourceCall {
 		var exists int
-		qErr := s.pg.pool.QueryRow(ctx, callTranscriptDupCheckQuery,
+		qErr := s.pg.pool.QueryRow(ctx, callDupCheckQuery,
 			doc.Content,
 			doc.SourceID,
 		).Scan(&exists)
 		switch {
 		case qErr == nil:
-			slog.Info("store: skipping duplicate call-transcript",
+			slog.Info("store: skipping duplicate call content",
 				"source_id", doc.SourceID,
 				"content_len", len(doc.Content),
 			)
@@ -97,7 +107,7 @@ func (s *DocumentStore) UpsertTracked(ctx context.Context, doc *model.Document) 
 		case isNoRows(qErr):
 			// No duplicate — proceed with the normal upsert.
 		default:
-			return false, fmt.Errorf("call-transcript dup check: %w", qErr)
+			return false, fmt.Errorf("call dup check: %w", qErr)
 		}
 	}
 
@@ -178,8 +188,8 @@ func (s *DocumentStore) UpsertTracked(ctx context.Context, doc *model.Document) 
 // Upsert inserts a document or updates it when (source_type, source_id) already exists.
 // On conflict the status is reset to 'active' (handles re-appearance of previously deleted files).
 //
-// Duplicate call-transcript guard: for source_type='call-transcript' only, a
-// cheap pre-insert existence check is performed. When an active document with
+// Duplicate call content guard: for source_type='call' only, a cheap
+// pre-insert existence check is performed. When an active document with
 // identical content but a DIFFERENT source_id already exists, the upsert is
 // skipped and ErrDuplicateTranscript is returned (the caller may safely ignore
 // or log it). A same-source_id re-upsert is NOT affected: the ON CONFLICT path
@@ -192,20 +202,22 @@ func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
 	checkSourceTypeGuard(doc)
 	s.checkDuplicateArrival(ctx, doc)
 
-	// Duplicate guard: call-transcript content dedup (issue #134).
-	// Only applied when source_type is 'call-transcript'. Other source types are
-	// unaffected. Same-source_id re-upserts bypass this check because the query
-	// excludes the document's own source_id; the ON CONFLICT path below handles them.
-	if doc.SourceType == model.SourceCallTranscript {
+	// Duplicate guard: call content dedup (issue #134, generalized to
+	// source_type='call' by migration 033 — see callDupCheckQuery's doc
+	// comment). Only applied when source_type is 'call'. Other source types
+	// are unaffected. Same-source_id re-upserts bypass this check because the
+	// query excludes the document's own source_id; the ON CONFLICT path below
+	// handles them.
+	if doc.SourceType == model.SourceCall {
 		var exists int
-		err := s.pg.pool.QueryRow(ctx, callTranscriptDupCheckQuery,
+		err := s.pg.pool.QueryRow(ctx, callDupCheckQuery,
 			doc.Content,
 			doc.SourceID,
 		).Scan(&exists)
 		switch {
 		case err == nil:
 			// A duplicate row was found — skip the insert.
-			slog.Info("store: skipping duplicate call-transcript",
+			slog.Info("store: skipping duplicate call content",
 				"source_id", doc.SourceID,
 				"content_len", len(doc.Content),
 			)
@@ -213,7 +225,7 @@ func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
 		case isNoRows(err):
 			// No duplicate — proceed with the normal upsert.
 		default:
-			return fmt.Errorf("call-transcript dup check: %w", err)
+			return fmt.Errorf("call dup check: %w", err)
 		}
 	}
 
@@ -272,6 +284,126 @@ var ErrDuplicateTranscript = fmt.Errorf("store: call-transcript with identical c
 // helper so the Upsert guard remains readable without importing pgx directly.
 func isNoRows(err error) bool {
 	return err == pgx.ErrNoRows
+}
+
+// AttachTranscript merges a whisper transcript into the call document at
+// (doc.SourceType, doc.SourceID) — normally the call-log-formula SourceID
+// computed by internal/collector/whisper.go's callLogMergeSourceID, so the
+// transcript lands on the SAME document ingest_recording.go created rather
+// than a second, unlinked one (model.SourceCall's doc comment: "통화 1건 =
+// 문서 1건").
+//
+// Unlike Upsert/UpsertTracked, on conflict this method:
+//   - REPLACES content and embedding — the transcript supersedes the short
+//     call-log summary as the document's substantive content.
+//   - MERGES metadata via `documents.metadata || EXCLUDED.metadata` rather
+//     than replacing it wholesale: doc.Metadata is treated as a PATCH
+//     (transcription, transcript_source_id, model, language, diarization,
+//     speaker_count, ...), so call-log-only keys the transcript never knows
+//     about (contact_name/direction/duration_seconds from smsmap.MapCall,
+//     any later retention tag) survive the merge. On key collision the
+//     patch's value wins (jsonb `||` is right-biased).
+//   - Does NOT touch title on conflict — the call-log title ("incoming 통화
+//     상대") stays more useful than the transcript's raw filename-stem
+//     title. collected_at IS still refreshed to EXCLUDED, matching Upsert's
+//     "last time this document was touched" semantics.
+//   - COALESCEs occurred_at onto the EXISTING value first, not the incoming
+//     one — the call-log's dateMs-derived timestamp is authoritative;
+//     WhisperCollector's filename-parsed occurredAt only matters for the
+//     INSERT branch below (no existing call document to merge into).
+//
+// When no document exists yet at (source_type, source_id) — e.g. a recording
+// was transcribed before its call-log document was ever created — this
+// INSERTs a new one using doc's own Title/OccurredAt/Metadata, identical in
+// shape to what Upsert would have produced for a standalone transcript.
+//
+// The same call-content dedup guard as Upsert/UpsertTracked applies (issue
+// #134, see callDupCheckQuery's doc comment): if an active call document
+// with byte-identical content already exists under a DIFFERENT source_id,
+// this returns (false, ErrDuplicateTranscript) without writing — this is the
+// guard that protects against the SAME audio being merged under two
+// different SourceIDs (e.g. a duplicate or renamed recording file).
+//
+// Returns contentChanged exactly like UpsertTracked, for callers (the
+// scheduler) that skip chunk/embedding regeneration when content did not
+// actually change — rare here (a successful transcription produces new
+// content by definition), but it keeps a re-run against the same audio
+// idempotent rather than repeatedly re-chunking.
+func (s *DocumentStore) AttachTranscript(ctx context.Context, doc *model.Document) (contentChanged bool, err error) {
+	checkSourceTypeGuard(doc)
+
+	var exists int
+	qErr := s.pg.pool.QueryRow(ctx, callDupCheckQuery,
+		doc.Content,
+		doc.SourceID,
+	).Scan(&exists)
+	switch {
+	case qErr == nil:
+		slog.Info("store: skipping duplicate call content (attach-transcript)",
+			"source_id", doc.SourceID,
+			"content_len", len(doc.Content),
+		)
+		return false, ErrDuplicateTranscript
+	case isNoRows(qErr):
+		// No duplicate — proceed with the merge/insert.
+	default:
+		return false, fmt.Errorf("call dup check: %w", qErr)
+	}
+
+	meta, err := json.Marshal(doc.Metadata)
+	if err != nil {
+		return false, fmt.Errorf("marshal metadata: %w", err)
+	}
+
+	var embeddingArg interface{}
+	if len(doc.Embedding) > 0 {
+		embeddingArg = pgvector.NewVector(doc.Embedding)
+	}
+
+	// Change detection mirrors UpsertTracked's CTE pattern — see that
+	// method's doc comment for why EXCLUDED cannot be referenced in RETURNING
+	// and why documents.content in RETURNING would already hold the
+	// post-update value.
+	const q = `
+		WITH prev AS (
+			SELECT content AS old_content
+			FROM documents
+			WHERE source_type = $1 AND source_id = $2
+		)
+		INSERT INTO documents
+			(source_type, source_id, title, content, metadata, embedding, occurred_at, collected_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (source_type, source_id) DO UPDATE SET
+			content      = EXCLUDED.content,
+			metadata     = documents.metadata || EXCLUDED.metadata,
+			embedding    = COALESCE(EXCLUDED.embedding, documents.embedding),
+			occurred_at  = COALESCE(documents.occurred_at, EXCLUDED.occurred_at),
+			collected_at = EXCLUDED.collected_at,
+			status       = 'active',
+			deleted_at   = NULL,
+			updated_at   = now()
+		RETURNING id, created_at, updated_at,
+		          (xmax::text::bigint = 0) AS was_insert,
+		          COALESCE((SELECT old_content FROM prev), '') IS DISTINCT FROM $4 AS content_changed`
+
+	var wasInsert bool
+	row := s.pg.pool.QueryRow(ctx, q,
+		doc.SourceType,
+		doc.SourceID,
+		doc.Title,
+		doc.Content,
+		meta,
+		embeddingArg,
+		doc.OccurredAt,
+		doc.CollectedAt,
+	)
+	if err := row.Scan(&doc.ID, &doc.CreatedAt, &doc.UpdatedAt, &wasInsert, &contentChanged); err != nil {
+		return false, err
+	}
+	if wasInsert {
+		contentChanged = true
+	}
+	return contentChanged, nil
 }
 
 // GetByID retrieves a single document by primary key.
@@ -1206,6 +1338,27 @@ func (s *DocumentStore) CountBySource(ctx context.Context) (map[string]int, erro
 		return nil, fmt.Errorf("count by source iter: %w", err)
 	}
 	return out, nil
+}
+
+// CountPendingTranscription returns the number of active call documents
+// (source_type='call') whose metadata.transcription is still "pending" —
+// i.e. a recording was captured (ingest_recording.go) but WhisperCollector
+// has not yet merged the transcript in via AttachTranscript. Surfaced on
+// GET /api/v1/stats so a stuck whisper pipeline (offline server, exhausted
+// disk, etc.) is visible without querying the database directly.
+func (s *DocumentStore) CountPendingTranscription(ctx context.Context) (int, error) {
+	var n int
+	err := s.pg.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM documents
+		WHERE source_type = 'call'
+		  AND status      = 'active'
+		  AND metadata ->> 'transcription' = 'pending'`,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count pending transcription: %w", err)
+	}
+	return n, nil
 }
 
 // --- baseline stats ---

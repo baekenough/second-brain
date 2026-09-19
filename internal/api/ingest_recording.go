@@ -89,9 +89,14 @@ type IngestRecordingResponse struct {
 //     works:
 //     - call:       "{sanitized-number}_{YYYYMMDDHHMMSS}.{ext}"
 //     - voice-memo: "voice-memo_{YYYYMMDDHHMMSS}.{ext}"
-//  4. Create a PENDING call-log model.Document (SourceType=SourceCallLog) with
-//     "[TRANSCRIPTION PENDING]" in the content and idempotently upsert it.
-//     WhisperCollector transcribes the audio on its next scheduled run.
+//  4. Create a model.Document (SourceType=SourceCall) with the same 4-line
+//     call summary content as smsmap.MapCall (metadata.transcription="pending"
+//     for kind=call; voice-memo keeps a "[TRANSCRIPTION PENDING]" placeholder,
+//     since it has no summary format of its own) and idempotently upsert it.
+//     WhisperCollector transcribes the audio on its next scheduled run and,
+//     for kind=call recordings, merges the transcript into THIS SAME document
+//     via store.AttachTranscript (see model.SourceCall's doc comment) rather
+//     than creating a second document.
 //  5. The upsert is idempotent: same inputs → same SourceID.
 //     - call:       call-log:{date_ms}:{numHash}:{durHash}  (mirrors smsmap.MapCall)
 //     - voice-memo: call-log:voice-memo:{hash(originalFilename)}
@@ -450,8 +455,16 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 		title = fmt.Sprintf("incoming 통화 %s", contact)
-		content = fmt.Sprintf("상대방: %s\n통화 방향: incoming\n통화 시간: %ds\n[TRANSCRIPTION PENDING]",
-			contact, durationSec)
+		// content mirrors smsmap.MapCall's call-summary format exactly (no
+		// "[TRANSCRIPTION PENDING]" placeholder) — see model.SourceCall's doc
+		// comment: this document IS the call, recorded or not, so it must be
+		// useful (searchable, readable) the instant it is created. When
+		// WhisperCollector later transcribes the recording it replaces this
+		// content via store.AttachTranscript; until then this 4-line summary
+		// is what the user sees and what the FTS/vector indexes carry.
+		recordedTime := recordedAt.Format("2006-01-02 15:04:05 MST")
+		content = fmt.Sprintf("상대방: %s\n통화 방향: incoming\n시각: %s\n통화 시간: %ds",
+			contact, recordedTime, durationSec)
 		meta = map[string]any{
 			"contact_name":     contactName,
 			"direction":        "incoming",
@@ -473,7 +486,7 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 
 	t := recordedAt
 	doc := &model.Document{
-		SourceType:  model.SourceCallLog,
+		SourceType:  model.SourceCall,
 		SourceID:    sourceID,
 		Title:       title,
 		Content:     content,

@@ -445,8 +445,8 @@ func TestSMSCollector_Collect_CallLog(t *testing.T) {
 
 	wantDirs := []string{"incoming", "outgoing", "missed"}
 	for i, doc := range docs {
-		if doc.SourceType != model.SourceCallLog {
-			t.Errorf("doc[%d] SourceType=%q, want %q", i, doc.SourceType, model.SourceCallLog)
+		if doc.SourceType != model.SourceCall {
+			t.Errorf("doc[%d] SourceType=%q, want %q", i, doc.SourceType, model.SourceCall)
 		}
 		got, _ := doc.Metadata["direction"].(string)
 		if got != wantDirs[i] {

@@ -16,11 +16,13 @@ const (
 	// RecentKindSMS returns documents with source_type = 'sms'.
 	RecentKindSMS RecentKind = "sms"
 
-	// RecentKindCallRecording returns call-log documents that have an
-	// audio_file entry in their metadata JSON (i.e. a recording was captured).
+	// RecentKindCallRecording returns call documents (source_type='call', or
+	// the deprecated pre-migration-033 'call-log') that have an audio_file
+	// entry in their metadata JSON (i.e. a recording was captured).
 	RecentKindCallRecording RecentKind = "call-recording"
 
-	// RecentKindVoiceMemo returns call-log documents whose metadata field
+	// RecentKindVoiceMemo returns call documents (source_type='call', or the
+	// deprecated pre-migration-033 'call-log') whose metadata field
 	// recording_type equals 'voice-memo'.
 	RecentKindVoiceMemo RecentKind = "voice-memo"
 )
@@ -68,13 +70,17 @@ func (s *DocumentStore) ListRecentByKind(ctx context.Context, kind RecentKind, l
 
 	case RecentKindCallRecording:
 		// Calls that have a recording but are NOT a voice-memo:
+		//   - source_type IN ('call', 'call-log') → 'call' post migration 033
+		//     (call-log/call-transcript unification, model.SourceCall doc
+		//     comment); 'call-log' kept defensively for the brief
+		//     pre-migration window.
 		//   - metadata ? 'audio_file'          → a recording file was captured
 		//   - IS DISTINCT FROM 'voice-memo'    → excludes voice-memo rows (including
 		//     those where recording_type is NULL, i.e. older call-log rows)
 		// IS DISTINCT FROM treats NULL as not-equal-to-'voice-memo', so legacy
 		// call-log rows without a recording_type field are correctly included.
 		const q = selectCols + `
-		  AND source_type = 'call-log'
+		  AND source_type IN ('call', 'call-log')
 		  AND metadata ? 'audio_file'
 		  AND (metadata->>'recording_type' IS DISTINCT FROM 'voice-memo')` + orderBy
 		rows, err = s.pg.pool.Query(ctx, q, limit)
@@ -84,7 +90,7 @@ func (s *DocumentStore) ListRecentByKind(ctx context.Context, kind RecentKind, l
 
 	case RecentKindVoiceMemo:
 		const q = selectCols + `
-		  AND source_type = 'call-log'
+		  AND source_type IN ('call', 'call-log')
 		  AND metadata->>'recording_type' = 'voice-memo'` + orderBy
 		rows, err = s.pg.pool.Query(ctx, q, limit)
 		if err != nil {
@@ -136,16 +142,16 @@ func (s *DocumentStore) CountByKind(ctx context.Context, kind RecentKind) (int, 
 		  AND source_type = 'sms'`
 
 	case RecentKindCallRecording:
-		// Mirrors the ListRecentByKind filter: call-log rows that carry an
+		// Mirrors the ListRecentByKind filter: call rows that carry an
 		// audio_file but are NOT voice-memos (IS DISTINCT FROM handles NULLs).
 		q = base + `
-		  AND source_type = 'call-log'
+		  AND source_type IN ('call', 'call-log')
 		  AND metadata ? 'audio_file'
 		  AND (metadata->>'recording_type' IS DISTINCT FROM 'voice-memo')`
 
 	case RecentKindVoiceMemo:
 		q = base + `
-		  AND source_type = 'call-log'
+		  AND source_type IN ('call', 'call-log')
 		  AND metadata->>'recording_type' = 'voice-memo'`
 
 	default:

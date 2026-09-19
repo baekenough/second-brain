@@ -65,7 +65,7 @@ func TestSearch_IncludeFilter_AppliesToChunkVectorLane(t *testing.T) {
 	// The chunk lane matched six documents from three other sources — exactly
 	// the slots the store's narrower result left open.
 	otherSources := []model.SourceType{
-		model.SourceSMS, model.SourceGmail, model.SourceCallTranscript,
+		model.SourceSMS, model.SourceGmail, model.SourceCall,
 		model.SourceSMS, model.SourceGmail, model.SourceSMS,
 	}
 	chunkRows := make([]store.ChunkSearchResult, 0, chunkHits)

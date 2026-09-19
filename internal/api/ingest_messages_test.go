@@ -206,8 +206,8 @@ func TestIngestMessages_CallMapsCorrectly(t *testing.T) {
 	}
 	doc := upserter.upserted[0]
 
-	if doc.SourceType != model.SourceCallLog {
-		t.Errorf("SourceType=%q, want %q", doc.SourceType, model.SourceCallLog)
+	if doc.SourceType != model.SourceCall {
+		t.Errorf("SourceType=%q, want %q", doc.SourceType, model.SourceCall)
 	}
 
 	wantSourceID := fmt.Sprintf("call-log:%d:%s:%s", dateMs,
@@ -224,6 +224,13 @@ func TestIngestMessages_CallMapsCorrectly(t *testing.T) {
 	dur, _ := doc.Metadata["duration_seconds"].(int)
 	if dur != durationSec {
 		t.Errorf("duration_seconds=%d, want %d", dur, durationSec)
+	}
+
+	// A call synced from the phone's call log has no recording — see
+	// model.SourceCall's doc comment for the three transcription states.
+	transcription, _ := doc.Metadata["transcription"].(string)
+	if transcription != "none" {
+		t.Errorf("transcription=%q, want none", transcription)
 	}
 }
 

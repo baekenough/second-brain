@@ -712,8 +712,17 @@ func (c *WhisperCollector) concurrency() int {
 	return c.workerCount
 }
 
-func (c *WhisperCollector) Name() string             { return "whisper" }
-func (c *WhisperCollector) Source() model.SourceType { return model.SourceCallTranscript }
+func (c *WhisperCollector) Name() string { return "whisper" }
+
+// Source returns model.SourceCall — as of migration 033, every document this
+// collector emits (whether merged into an existing call document via
+// store.AttachTranscript or created standalone for a file with no call-log
+// sidecar) carries source_type='call'. Callers that used to gate on
+// model.SourceCallTranscript to identify "this is whisper's collector" must
+// switch to Name() == "whisper" instead, since SourceCall is now shared with
+// smsmap.MapCall's call-log documents (see internal/scheduler/scheduler.go's
+// runCollector for the two call sites this affected).
+func (c *WhisperCollector) Source() model.SourceType { return model.SourceCall }
 
 // Enabled reports whether the collector is configured.
 // WhisperAPIKey is intentionally NOT required: local whisper.cpp servers do
@@ -1368,12 +1377,32 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 		"model":         c.cfg.WhisperModel,
 	}
 
+	// docSourceID defaults to this file's own identity (transcript:{relPath}).
+	// When the sidecar identifies this as a call recording (Kind=="call") with
+	// enough fields to reproduce smsmap.MapCall's SourceID formula, it is
+	// overridden below so the returned Document MERGES into the existing call
+	// document via store.AttachTranscript (internal/scheduler/scheduler.go)
+	// instead of becoming a second, unlinked one — model.SourceCall's doc
+	// comment: "통화 1건 = 문서 1건" (one document per phone call).
+	docSourceID := item.sourceID
+
 	// Merge sidecar metadata when present (written by the ingest-recording
 	// handler alongside the audio file). Missing sidecar = historical file or
 	// OneDrive-staged file — silently skip, no error.
-	if sidecarMeta, ok := readRecordingSidecar(item.path); ok {
-		for k, v := range sidecarMeta {
+	if raw, ok := readRecordingSidecarRaw(item.path); ok {
+		for k, v := range sidecarMetaFields(raw) {
 			meta[k] = v
+		}
+		if mergeID, ok := callLogMergeSourceID(raw); ok {
+			docSourceID = mergeID
+			// transcript_source_id preserves this audio file's own identity on
+			// the merged document. internal/scheduler's runCollector ledgers
+			// THIS value (not docSourceID) so the transcription_ledger stays
+			// keyed by the immutable audio file rather than by a document
+			// identity that never changes for this file but is shared with
+			// the call-log side of the merge.
+			meta["transcript_source_id"] = item.sourceID
+			meta["transcription"] = "done"
 		}
 	}
 
@@ -1495,8 +1524,8 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 
 	return model.Document{
 		ID:          uuid.New(),
-		SourceType:  model.SourceCallTranscript,
-		SourceID:    item.sourceID,
+		SourceType:  model.SourceCall,
+		SourceID:    docSourceID,
 		Title:       title,
 		Content:     content,
 		Metadata:    meta,
@@ -1505,48 +1534,91 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 	}, true
 }
 
-// readRecordingSidecar attempts to read and parse the sidecar metadata file
-// written by the ingest-recording handler at audioPath + ".meta.json".
+// recordingSidecarRaw mirrors the JSON shape written by
+// internal/api/ingest_recording.go's recordingSidecar struct. It is
+// redeclared here (rather than imported) to avoid a collector -> api import
+// cycle — internal/api already imports internal/collector/smsmap, and this
+// package needs only the field shapes, not any behaviour from internal/api.
 //
-// When the sidecar exists and is valid JSON, the function returns a map
-// containing the recording metadata fields present in the file
-// (contact_name, direction, recording_type, duration_seconds, and — issue
-// #164 policy reversal, additive — number) and true. Only non-empty/non-zero
-// values are included so callers do not overwrite existing metadata with
-// zero-value defaults.
-//
-// number (issue #164 additive improvement): the sidecar's "number" key is
-// only present when the ingest-recording handler wrote it with
-// PIINumberHashingEnabled=false (see recordingSidecar's doc comment in
-// internal/api/ingest_recording.go). When present, it is surfaced here as
-// Metadata["number"] on the call-transcript document, making the phone number
-// searchable/visible — the point of disabling hashing. The sidecar's
-// "number_hash" key is deliberately NOT parsed into metadata: a hash provides
-// no searchability benefit, so surfacing it would add noise without value.
-//
-// When the sidecar is absent, unreadable, or unparseable, the function returns
-// (nil, false) so the caller can proceed with existing metadata unchanged. This
-// is the expected path for historical files and OneDrive-staged files that were
-// present before the sidecar feature was introduced.
-func readRecordingSidecar(audioPath string) (map[string]any, bool) {
+// DateMs and Kind (added for migration 033's call-unify work) let
+// callLogMergeSourceID reproduce smsmap.MapCall's SourceID formula for
+// Kind=="call" recordings, so the eventual transcript can be merged into the
+// SAME document that ingest_recording.go created rather than becoming a
+// second, unlinked one. Voice-memo sidecars (Kind=="voice-memo") have no
+// call-log counterpart to merge into and are left on the standalone
+// transcript:{relPath} identity, same as pre-migration-033 behaviour.
+type recordingSidecarRaw struct {
+	ContactName     string `json:"contact_name"`
+	Number          string `json:"number"`
+	NumberHash      string `json:"number_hash"`
+	Direction       string `json:"direction"`
+	RecordingType   string `json:"recording_type"`
+	DurationSeconds int    `json:"duration_seconds"`
+	DateMs          int64  `json:"date_ms"`
+	Kind            string `json:"kind"`
+}
+
+// readRecordingSidecarRaw reads and parses {audioPath}.meta.json into a
+// recordingSidecarRaw. Returns (zero value, false) when the sidecar is
+// absent, unreadable, or unparseable — the expected path for historical
+// files and OneDrive-staged files that predate the sidecar feature.
+func readRecordingSidecarRaw(audioPath string) (recordingSidecarRaw, bool) {
 	data, err := os.ReadFile(audioPath + ".meta.json")
 	if err != nil {
 		// Not present or unreadable — expected for pre-sidecar files.
-		return nil, false
+		return recordingSidecarRaw{}, false
 	}
 
-	var raw struct {
-		ContactName     string `json:"contact_name"`
-		Number          string `json:"number"`
-		Direction       string `json:"direction"`
-		RecordingType   string `json:"recording_type"`
-		DurationSeconds int    `json:"duration_seconds"`
-	}
+	var raw recordingSidecarRaw
 	if err := json.Unmarshal(data, &raw); err != nil {
 		// Corrupt sidecar — skip without surfacing an error.
-		return nil, false
+		return recordingSidecarRaw{}, false
 	}
+	return raw, true
+}
 
+// callLogMergeSourceID reproduces smsmap.MapCall / ingest_recording.go's
+// call-log SourceID formula (call-log:{dateMs}:{numHash}:{durHash}) from a
+// sidecar, so that a transcript for this recording can be merged into the
+// EXISTING call document (via store.AttachTranscript) instead of creating a
+// second, unlinked call-transcript document.
+//
+// Returns ("", false) when the sidecar cannot reproduce the formula:
+// Kind != "call" (voice-memo — no call-log document exists to merge into),
+// DateMs == 0 (missing/corrupt sidecar field), or neither NumberHash nor
+// Number is present (sidecar written by neither hashing mode — should not
+// happen for a Kind=="call" sidecar, but the collector must never guess).
+func callLogMergeSourceID(raw recordingSidecarRaw) (string, bool) {
+	if raw.Kind != "call" || raw.DateMs == 0 {
+		return "", false
+	}
+	numHash := raw.NumberHash
+	if numHash == "" && raw.Number != "" {
+		numHash = smsmap.ShortHash(raw.Number)
+	}
+	if numHash == "" {
+		return "", false
+	}
+	durHash := smsmap.BodyShortHash(fmt.Sprintf("%d", raw.DurationSeconds))
+	return fmt.Sprintf("call-log:%d:%s:%s", raw.DateMs, numHash, durHash), true
+}
+
+// sidecarMetaFields projects the non-empty/non-zero fields of raw into a
+// metadata patch map (contact_name, direction, recording_type,
+// duration_seconds, and — issue #164 policy reversal, additive — number).
+// Only non-empty/non-zero values are included so callers do not overwrite
+// existing metadata with zero-value defaults.
+//
+// number (issue #164 additive improvement): raw.Number is only populated
+// when the ingest-recording handler wrote the sidecar with
+// PIINumberHashingEnabled=false (see recordingSidecar's doc comment in
+// internal/api/ingest_recording.go). When present, it is surfaced here as
+// Metadata["number"] on the call document, making the phone number
+// searchable/visible — the point of disabling hashing. raw.NumberHash is
+// deliberately NOT projected into metadata: a hash provides no
+// searchability benefit, so surfacing it would add noise without value (it
+// IS used, unprojected, by callLogMergeSourceID above).
+func sidecarMetaFields(raw recordingSidecarRaw) map[string]any {
 	result := make(map[string]any, 5)
 	if raw.ContactName != "" {
 		result["contact_name"] = raw.ContactName
@@ -1563,7 +1635,24 @@ func readRecordingSidecar(audioPath string) (map[string]any, bool) {
 	if raw.DurationSeconds != 0 {
 		result["duration_seconds"] = raw.DurationSeconds
 	}
+	return result
+}
 
+// readRecordingSidecar attempts to read and parse the sidecar metadata file
+// written by the ingest-recording handler at audioPath + ".meta.json", and
+// projects it down to the metadata patch fields buildDocument merges into a
+// document's Metadata (see sidecarMetaFields). Returns (nil, false) when the
+// sidecar is absent, unreadable, unparseable, or carries no non-empty field —
+// the expected path for historical files and OneDrive-staged files that
+// predate the sidecar feature. Callers that also need Kind/DateMs/NumberHash
+// (to compute callLogMergeSourceID) should call readRecordingSidecarRaw
+// directly instead.
+func readRecordingSidecar(audioPath string) (map[string]any, bool) {
+	raw, ok := readRecordingSidecarRaw(audioPath)
+	if !ok {
+		return nil, false
+	}
+	result := sidecarMetaFields(raw)
 	if len(result) == 0 {
 		return nil, false
 	}

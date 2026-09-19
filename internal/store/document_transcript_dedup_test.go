@@ -8,28 +8,29 @@ import (
 	"github.com/baekenough/second-brain/internal/model"
 )
 
-// TestCallTranscriptDupCheckQuery_SQLFragments verifies that the
-// callTranscriptDupCheckQuery constant contains the critical clauses that make
-// the content-based dedup guard correct.  This is a structural test that runs
-// without a live database.
+// TestCallDupCheckQuery_SQLFragments verifies that the callDupCheckQuery
+// constant contains the critical clauses that make the content-based dedup
+// guard correct.  This is a structural test that runs without a live database.
 //
 // The guard must:
-//  1. Target only source_type = 'call-transcript'
+//  1. Target source_type IN ('call', 'call-transcript') — 'call' post
+//     migration-033 (call-log/call-transcript unification), 'call-transcript'
+//     kept only as a defensive pre-migration fallback.
 //  2. Limit to status = 'active' rows (soft-deleted duplicates should not block)
 //  3. Match on content = $1
 //  4. Exclude the current document's own source_id (<> $2)
 //  5. Use LIMIT 1 so the probe is an O(1) existence check
-func TestCallTranscriptDupCheckQuery_SQLFragments(t *testing.T) {
+func TestCallDupCheckQuery_SQLFragments(t *testing.T) {
 	t.Parallel()
 
 	required := []struct {
 		fragment string
 		reason   string
 	}{
-		{"source_type = 'call-transcript'", "must scope check to call-transcript only"},
-		{"status      = 'active'", "must ignore soft-deleted duplicates"},
-		{"content     = $1", "must match on content"},
-		{"source_id  <> $2", "must exclude the document's own source_id"},
+		{"source_type IN ('call', 'call-transcript')", "must scope check to call (and legacy call-transcript) only"},
+		{"status       = 'active'", "must ignore soft-deleted duplicates"},
+		{"content      = $1", "must match on content"},
+		{"source_id   <> $2", "must exclude the document's own source_id"},
 		{"LIMIT 1", "must be a cheap existence probe"},
 	}
 
@@ -37,9 +38,9 @@ func TestCallTranscriptDupCheckQuery_SQLFragments(t *testing.T) {
 		tc := tc
 		t.Run(tc.reason, func(t *testing.T) {
 			t.Parallel()
-			if !strings.Contains(callTranscriptDupCheckQuery, tc.fragment) {
-				t.Errorf("callTranscriptDupCheckQuery missing %q (%s)\nfull query:\n%s",
-					tc.fragment, tc.reason, callTranscriptDupCheckQuery)
+			if !strings.Contains(callDupCheckQuery, tc.fragment) {
+				t.Errorf("callDupCheckQuery missing %q (%s)\nfull query:\n%s",
+					tc.fragment, tc.reason, callDupCheckQuery)
 			}
 		})
 	}
@@ -70,41 +71,42 @@ func TestErrDuplicateTranscript_Sentinel(t *testing.T) {
 
 // TestUpsertDedupGuard_SourceTypeScope verifies the guard's source-type
 // branching logic: the duplicate check is performed when and only when the
-// document's source_type equals model.SourceCallTranscript. Other source types
-// must proceed directly to the upsert without any dedup check.
+// document's source_type equals model.SourceCall (migration 033 unified
+// call-log/call-transcript into this one type). Other source types must
+// proceed directly to the upsert without any dedup check.
 //
 // This test runs without a live database by inspecting the guard condition
-// defined in the Upsert implementation indirectly: we enumerate the
-// SourceType constants and confirm that only SourceCallTranscript equals
-// "call-transcript" (the hard-coded value embedded in callTranscriptDupCheckQuery).
+// defined in the Upsert/UpsertTracked/AttachTranscript implementations
+// indirectly: we confirm that model.SourceCall equals "call" (the value
+// callDupCheckQuery's IN-list leads with).
 func TestUpsertDedupGuard_SourceTypeScope(t *testing.T) {
 	t.Parallel()
 
-	// The guard is active when doc.SourceType == model.SourceCallTranscript.
-	// The SQL constant hard-codes the string 'call-transcript'. If either value
-	// ever drifts the dedup guard silently stops working.
-	if string(model.SourceCallTranscript) != "call-transcript" {
-		t.Errorf("model.SourceCallTranscript = %q, want \"call-transcript\"; "+
-			"callTranscriptDupCheckQuery hard-codes this literal — update both together",
-			model.SourceCallTranscript)
+	// The guard is active when doc.SourceType == model.SourceCall.
+	// callDupCheckQuery hard-codes the string 'call' (plus a defensive
+	// 'call-transcript' fallback). If either value ever drifts the dedup
+	// guard silently stops working.
+	if string(model.SourceCall) != "call" {
+		t.Errorf("model.SourceCall = %q, want \"call\"; "+
+			"callDupCheckQuery hard-codes this literal — update both together",
+			model.SourceCall)
 	}
 
-	// Confirm that the guard condition in Upsert matches the constant value.
-	// This check is necessarily textual (we cannot call Upsert without a DB),
-	// but it guards the most dangerous drift: renaming the constant without
-	// updating the Upsert branch.
-	guardType := model.SourceCallTranscript
+	// Confirm that the guard condition matches the constant value. This check
+	// is necessarily textual (we cannot call Upsert without a DB), but it
+	// guards the most dangerous drift: renaming the constant without updating
+	// the guard branch.
+	guardType := model.SourceCall
 	unaffectedTypes := []model.SourceType{
 		model.SourceSlack,
 		model.SourceGmail,
 		model.SourceSMS,
 		model.SourceFilesystem,
-		model.SourceCallLog,
 		model.SourceUpload,
 	}
 	for _, st := range unaffectedTypes {
 		if st == guardType {
-			t.Errorf("source type %q unexpectedly equals SourceCallTranscript; "+
+			t.Errorf("source type %q unexpectedly equals SourceCall; "+
 				"dedup guard would fire for all documents of this type", st)
 		}
 	}
@@ -121,7 +123,7 @@ func TestIsNoRows_IdentifiesPgxSentinel(t *testing.T) {
 	// returns zero rows. The Upsert guard must recognise it as the "no duplicate"
 	// branch.
 	import_pgx_ErrNoRows := errors.New("no rows in result set") // pgx.ErrNoRows message
-	_ = import_pgx_ErrNoRows                                     // used for documentation only
+	_ = import_pgx_ErrNoRows                                    // used for documentation only
 
 	// We cannot import pgx.ErrNoRows without a build-time dependency here, but
 	// isNoRows is tested indirectly: the function uses err == pgx.ErrNoRows, so
@@ -136,10 +138,11 @@ func TestIsNoRows_IdentifiesPgxSentinel(t *testing.T) {
 	}
 }
 
-// TestCallTranscriptDedupLogic_BehaviourTable documents the three cases that
-// the Upsert guard must handle correctly.  Because a live DB is required to
-// actually exercise Upsert end-to-end, this test verifies the branching
-// conditions as pure Go logic rather than making real DB calls.
+// TestCallDedupLogic_BehaviourTable documents the three cases that the
+// Upsert/UpsertTracked/AttachTranscript dedup guard must handle correctly.
+// Because a live DB is required to actually exercise them end-to-end, this
+// test verifies the branching conditions as pure Go logic rather than making
+// real DB calls.
 //
 // The three cases:
 //
@@ -149,12 +152,12 @@ func TestIsNoRows_IdentifiesPgxSentinel(t *testing.T) {
 //
 // The table below models the guard as a pure function of (dupFound bool) to
 // verify that the branch logic is correct independently of the SQL.
-func TestCallTranscriptDedupLogic_BehaviourTable(t *testing.T) {
+func TestCallDedupLogic_BehaviourTable(t *testing.T) {
 	t.Parallel()
 
-	// guardDecision mirrors the Upsert guard branch:
+	// guardDecision mirrors the dedup guard branch:
 	//   dupFound=true  → return ErrDuplicateTranscript (skip)
-	//   dupFound=false → return nil (proceed with upsert)
+	//   dupFound=false → return nil (proceed with upsert/merge)
 	guardDecision := func(dupFound bool) error {
 		if dupFound {
 			return ErrDuplicateTranscript
@@ -202,11 +205,11 @@ func TestCallTranscriptDedupLogic_BehaviourTable(t *testing.T) {
 	}
 }
 
-// TestCallTranscriptDedupGuard_NonTranscriptSourceType verifies that the guard
-// condition (doc.SourceType == model.SourceCallTranscript) is false for all
-// other source types, meaning no dedup check would be performed for them.
-// This prevents accidental behaviour changes for non-transcript sources.
-func TestCallTranscriptDedupGuard_NonTranscriptSourceType(t *testing.T) {
+// TestCallDedupGuard_NonCallSourceType verifies that the guard condition
+// (doc.SourceType == model.SourceCall) is false for all other source types,
+// meaning no dedup check would be performed for them. This prevents
+// accidental behaviour changes for non-call sources.
+func TestCallDedupGuard_NonCallSourceType(t *testing.T) {
 	t.Parallel()
 
 	otherTypes := []model.SourceType{
@@ -214,7 +217,6 @@ func TestCallTranscriptDedupGuard_NonTranscriptSourceType(t *testing.T) {
 		model.SourceSMS,
 		model.SourceCalendar,
 		model.SourceFilesystem,
-		model.SourceCallLog,
 		model.SourceSlack,
 		model.SourceGitHub,
 		model.SourceUpload,
@@ -225,8 +227,8 @@ func TestCallTranscriptDedupGuard_NonTranscriptSourceType(t *testing.T) {
 		t.Run(string(st), func(t *testing.T) {
 			t.Parallel()
 
-			// The guard fires only for SourceCallTranscript.
-			guardFires := st == model.SourceCallTranscript
+			// The guard fires only for SourceCall.
+			guardFires := st == model.SourceCall
 			if guardFires {
 				t.Errorf("dedup guard must NOT fire for source type %q", st)
 			}

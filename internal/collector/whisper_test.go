@@ -223,9 +223,10 @@ func TestWhisperCollector_Collect_BasicTranscription(t *testing.T) {
 
 	doc := docs[0]
 
-	// SourceType
-	if doc.SourceType != model.SourceCallTranscript {
-		t.Errorf("SourceType = %q, want %q", doc.SourceType, model.SourceCallTranscript)
+	// SourceType — migration 033 unified call-log/call-transcript into
+	// model.SourceCall (see that const's doc comment).
+	if doc.SourceType != model.SourceCall {
+		t.Errorf("SourceType = %q, want %q", doc.SourceType, model.SourceCall)
 	}
 
 	// SourceID = "transcript:" + relative path
@@ -814,8 +815,10 @@ func TestWhisperCollector_Name_And_Source(t *testing.T) {
 	if c.Name() != "whisper" {
 		t.Errorf("Name() = %q, want %q", c.Name(), "whisper")
 	}
-	if c.Source() != model.SourceCallTranscript {
-		t.Errorf("Source() = %q, want %q", c.Source(), model.SourceCallTranscript)
+	// Source() returns the unified model.SourceCall as of migration 033 — see
+	// WhisperCollector.Source's doc comment.
+	if c.Source() != model.SourceCall {
+		t.Errorf("Source() = %q, want %q", c.Source(), model.SourceCall)
 	}
 }
 
