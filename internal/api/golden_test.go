@@ -376,7 +376,13 @@ func TestGoldenNextHandler_PeriodPhraseResolvesWindowFromAskedAt(t *testing.T) {
 		nextQuery: &store.GoldenQuery{ID: queryID, Text: "오늘 통화 내역 보여줘", Source: "seed", Status: "open", AskedAt: askedAt},
 		progress:  store.GoldenProgress{OpenQueries: 1},
 	}
-	searcher := &recordingGoldenSearcher{}
+	// One canned hit on every call so the merge is non-empty and the
+	// window-relaxation fallback (TestGoldenNextHandler_WindowFallback*)
+	// never kicks in here — this test's only concern is that both streams
+	// receive the resolved window, not the fallback behavior.
+	searcher := &recordingGoldenSearcher{results: []*model.SearchResult{
+		{Document: model.Document{ID: uuid.New(), Title: "today's call", SourceType: model.SourceCallLog}},
+	}}
 	srv := newGoldenTestServer(stub, searcher)
 
 	rec := doGoldenRequest(srv, http.MethodGet, "/api/v1/golden/next", nil)
@@ -479,6 +485,144 @@ func TestGoldenNextHandler_MergesStreamsRatioAndDedup(t *testing.T) {
 		if got.Rank != i+1 {
 			t.Errorf("candidates[%d].rank = %d, want %d", i, got.Rank, i+1)
 		}
+	}
+}
+
+// TestGoldenNextHandler_WindowFallbackWhenBothStreamsEmpty covers the
+// production scenario that motivated the fallback: a query naming an
+// explicit period ("오늘") whose window has no matching documents at all.
+// goldenNextHandler must retry once with the window relaxed — relevance
+// stream searched with NO window, recent stream falling back to the
+// standard 90-day-before-asked_at window — and report
+// query.window_fallback=true while query.window still reflects the
+// ORIGINALLY resolved (unhelpful) period, not the relaxed one.
+func TestGoldenNextHandler_WindowFallbackWhenBothStreamsEmpty(t *testing.T) {
+	t.Parallel()
+
+	askedAt := time.Date(2026, 5, 10, 1, 0, 0, 0, time.UTC) // 2026-05-10 10:00 KST
+	wantFrom, wantTo, label, ok := intent.DeterministicWindow("오늘 통화 내역 보여줘", askedAt.In(timeutil.KST()))
+	if !ok {
+		t.Fatalf("test setup: DeterministicWindow did not match %q", label)
+	}
+
+	queryID := uuid.New()
+	stub := &stubGoldenSet{
+		nextQuery: &store.GoldenQuery{ID: queryID, Text: "오늘 통화 내역 보여줘", Source: "seed", Status: "open", AskedAt: askedAt},
+		progress:  store.GoldenProgress{OpenQueries: 1},
+	}
+
+	fallbackDocID := uuid.New()
+	searcher := &recordingGoldenSearcher{
+		streamResults: [][]*model.SearchResult{
+			{}, // relevance stream, windowed to today: nothing
+			{}, // recent stream, windowed to today: nothing
+			{ // relevance fallback, no window: one hit
+				{Document: model.Document{ID: fallbackDocID, Title: "fallback hit", SourceType: model.SourceCallLog}},
+			},
+			{}, // recent fallback, 90-day window: nothing new
+		},
+	}
+	srv := newGoldenTestServer(stub, searcher)
+
+	rec := doGoldenRequest(srv, http.MethodGet, "/api/v1/golden/next", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+
+	if len(searcher.calls) != 4 {
+		t.Fatalf("Search called %d times, want 4 (2 windowed + 2 fallback)", len(searcher.calls))
+	}
+	relCall, recCall, fbRelCall, fbRecCall := searcher.calls[0], searcher.calls[1], searcher.calls[2], searcher.calls[3]
+	if relCall.OccurredFrom == nil || !relCall.OccurredFrom.Equal(wantFrom) {
+		t.Errorf("relevance call OccurredFrom = %v, want %v (original window)", relCall.OccurredFrom, wantFrom)
+	}
+	if recCall.OccurredTo == nil || !recCall.OccurredTo.Equal(wantTo) {
+		t.Errorf("recent call OccurredTo = %v, want %v (original window)", recCall.OccurredTo, wantTo)
+	}
+	if fbRelCall.OccurredFrom != nil || fbRelCall.OccurredTo != nil {
+		t.Errorf("relevance fallback call window = [%v, %v), want none (whole corpus)", fbRelCall.OccurredFrom, fbRelCall.OccurredTo)
+	}
+	if fbRelCall.Sort != "" {
+		t.Errorf("relevance fallback call Sort = %q, want \"\" (score-ranked)", fbRelCall.Sort)
+	}
+	wantFbRecentFrom := askedAt.Add(-goldenRecentFallbackWindow)
+	if fbRecCall.OccurredFrom == nil || !fbRecCall.OccurredFrom.Equal(wantFbRecentFrom) {
+		t.Errorf("recent fallback call OccurredFrom = %v, want %v (asked_at - 90d)", fbRecCall.OccurredFrom, wantFbRecentFrom)
+	}
+	if fbRecCall.OccurredTo == nil || !fbRecCall.OccurredTo.Equal(askedAt) {
+		t.Errorf("recent fallback call OccurredTo = %v, want asked_at %v", fbRecCall.OccurredTo, askedAt)
+	}
+	if fbRecCall.Sort != model.SortRecent {
+		t.Errorf("recent fallback call Sort = %q, want %q", fbRecCall.Sort, model.SortRecent)
+	}
+
+	var resp goldenNextResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.Query == nil {
+		t.Fatalf("query = nil, want the open query")
+	}
+	if !resp.Query.WindowFallback {
+		t.Error("query.window_fallback = false, want true when both windowed streams return nothing")
+	}
+	if resp.Query.Window == nil || resp.Query.Window.From != wantFrom.Format(time.RFC3339) || resp.Query.Window.To != wantTo.Format(time.RFC3339) {
+		t.Errorf("query.window = %+v, want the ORIGINAL resolved window %s..%s (fallback must not overwrite it)", resp.Query.Window, wantFrom, wantTo)
+	}
+	if len(resp.Candidates) != 1 || resp.Candidates[0].DocumentID != fallbackDocID.String() {
+		t.Fatalf("candidates = %+v, want exactly the fallback hit %s", resp.Candidates, fallbackDocID)
+	}
+}
+
+// TestGoldenNextHandler_NoWindowFallbackWhenPrimaryStreamsHaveResults covers
+// the non-degenerate case: when the windowed streams already produce at
+// least one candidate, goldenNextHandler must NOT retry with a relaxed
+// window, and query.window_fallback must be omitted (false).
+func TestGoldenNextHandler_NoWindowFallbackWhenPrimaryStreamsHaveResults(t *testing.T) {
+	t.Parallel()
+
+	askedAt := time.Date(2026, 5, 10, 1, 0, 0, 0, time.UTC)
+	docID := uuid.New()
+	stub := &stubGoldenSet{
+		nextQuery: &store.GoldenQuery{ID: uuid.New(), Text: "오늘 통화 내역 보여줘", Source: "seed", Status: "open", AskedAt: askedAt},
+		progress:  store.GoldenProgress{OpenQueries: 1},
+	}
+	searcher := &recordingGoldenSearcher{
+		streamResults: [][]*model.SearchResult{
+			{ // relevance stream: one hit, so no fallback is needed
+				{Document: model.Document{ID: docID, Title: "today's call", SourceType: model.SourceCallLog}},
+			},
+			{}, // recent stream
+		},
+	}
+	srv := newGoldenTestServer(stub, searcher)
+
+	rec := doGoldenRequest(srv, http.MethodGet, "/api/v1/golden/next", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+
+	if len(searcher.calls) != 2 {
+		t.Fatalf("Search called %d times, want 2 (no fallback retry expected)", len(searcher.calls))
+	}
+
+	var resp goldenNextResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.Query == nil {
+		t.Fatalf("query = nil, want the open query")
+	}
+	if resp.Query.WindowFallback {
+		t.Error("query.window_fallback = true, want false (omitted) when the primary streams already had a candidate")
+	}
+	if len(resp.Candidates) != 1 || resp.Candidates[0].DocumentID != docID.String() {
+		t.Fatalf("candidates = %+v, want exactly %s", resp.Candidates, docID)
+	}
+
+	body := rec.Body.String()
+	if strings.Contains(body, "window_fallback") {
+		t.Errorf("response body contains window_fallback despite omitempty: %s", body)
 	}
 }
 

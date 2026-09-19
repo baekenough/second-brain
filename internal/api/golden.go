@@ -132,6 +132,14 @@ type goldenQueryResponse struct {
 	// absent, so a web client's rendering never needs an existence check on
 	// top of a nil check.
 	Window *goldenWindowResponse `json:"window"`
+	// WindowFallback is true when Window was resolved to a period but that
+	// period's search returned no candidates at all, so goldenNextHandler
+	// re-ran both streams with the window relaxed (see the handler's doc
+	// comment) — Candidates below came from the WHOLE corpus (relevance
+	// stream) plus the standard 90-day-before-asked_at trailing window
+	// (recent stream), not from Window. Omitted (not false) in the common
+	// case so existing clients that don't know this field see no change.
+	WindowFallback bool `json:"window_fallback,omitempty"`
 }
 
 // goldenWindowResponse is the half-open [From, To) period a golden query's
@@ -245,6 +253,32 @@ func (s *Server) goldenGenerateHandler(w http.ResponseWriter, r *http.Request) {
 // one (see model.SearchQuery.IncludeRetention) — and candidates already
 // judged for this query BY THAT SAME judge are excluded (a document hermes
 // already auto-judged is still fair game for human review, and vice versa).
+//
+// When the window above (explicit or the unmatched-text 90-day default)
+// leaves BOTH streams with nothing to show — observed in production for a
+// same-day query like "오늘 통화 내역" asked on a day with no matching
+// documents yet — a windowed queue would hand the reviewer an empty screen
+// they can only skip. Instead, the handler retries once with the window
+// relaxed: the relevance stream searches the whole corpus (no window at
+// all) and the recent stream falls back to the same trailing 90-day window
+// used for text with no period phrase. The response then reports
+// WindowFallback=true (goldenQueryResponse.WindowFallback) while Window
+// itself still reflects the ORIGINALLY resolved period, so a caller can
+// still show what was asked even though the candidates it got came from
+// wider search.
+// goldenSearchStream issues one search call on behalf of goldenNextHandler
+// and, on error, logs it tagged with label (e.g. "relevance", "recent
+// fallback") so ops can tell which of the handler's up-to-four search calls
+// failed without needing to correlate by timestamp alone.
+func (s *Server) goldenSearchStream(ctx context.Context, label string, q model.SearchQuery) ([]*model.SearchResult, error) {
+	results, err := s.search.Search(ctx, q)
+	if err != nil {
+		slog.Error("golden: "+label+" search failed", "error", err)
+		return nil, err
+	}
+	return results, nil
+}
+
 func (s *Server) goldenNextHandler(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(r, "limit", goldenNextDefaultLimit)
 	if limit <= 0 {
@@ -302,7 +336,7 @@ func (s *Server) goldenNextHandler(w http.ResponseWriter, r *http.Request) {
 		recFrom, recTo = &fallbackFrom, &fallbackTo
 	}
 
-	relResults, err := s.search.Search(r.Context(), model.SearchQuery{
+	relResults, err := s.goldenSearchStream(r.Context(), "relevance", model.SearchQuery{
 		Query:            q.Text,
 		Limit:            goldenStreamLimit(limit, goldenRelevanceStreamRatio),
 		IncludeRetention: true,
@@ -310,12 +344,11 @@ func (s *Server) goldenNextHandler(w http.ResponseWriter, r *http.Request) {
 		OccurredTo:       relTo,
 	})
 	if err != nil {
-		slog.Error("golden: relevance search failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 
-	recResults, err := s.search.Search(r.Context(), model.SearchQuery{
+	recResults, err := s.goldenSearchStream(r.Context(), "recent", model.SearchQuery{
 		Query:            q.Text,
 		Limit:            goldenStreamLimit(limit, goldenRecentStreamRatio),
 		IncludeRetention: true,
@@ -324,20 +357,55 @@ func (s *Server) goldenNextHandler(w http.ResponseWriter, r *http.Request) {
 		OccurredTo:       recTo,
 	})
 	if err != nil {
-		slog.Error("golden: recent search failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 
 	candidates := goldenMergeStreams(relResults, recResults, judged, limit)
 
+	// Both streams' window (explicit period, or the unmatched-text 90-day
+	// default) left nothing to judge — see the handler's doc comment. Retry
+	// once with the window relaxed entirely rather than handing the reviewer
+	// an empty screen they can only skip past.
+	windowFallback := false
+	if len(candidates) == 0 {
+		fbRelResults, err := s.goldenSearchStream(r.Context(), "relevance fallback", model.SearchQuery{
+			Query:            q.Text,
+			Limit:            goldenStreamLimit(limit, goldenRelevanceStreamRatio),
+			IncludeRetention: true,
+		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal server error")
+			return
+		}
+
+		fbRecentFrom := q.AskedAt.Add(-goldenRecentFallbackWindow)
+		fbRecentTo := q.AskedAt
+		fbRecResults, err := s.goldenSearchStream(r.Context(), "recent fallback", model.SearchQuery{
+			Query:            q.Text,
+			Limit:            goldenStreamLimit(limit, goldenRecentStreamRatio),
+			IncludeRetention: true,
+			Sort:             model.SortRecent,
+			OccurredFrom:     &fbRecentFrom,
+			OccurredTo:       &fbRecentTo,
+		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal server error")
+			return
+		}
+
+		candidates = goldenMergeStreams(fbRelResults, fbRecResults, judged, limit)
+		windowFallback = true
+	}
+
 	writeJSON(w, http.StatusOK, goldenNextResponse{
 		Query: &goldenQueryResponse{
-			ID:      q.ID.String(),
-			Text:    q.Text,
-			Source:  q.Source,
-			AskedAt: q.AskedAt.Format(time.RFC3339),
-			Window:  windowResp,
+			ID:             q.ID.String(),
+			Text:           q.Text,
+			Source:         q.Source,
+			AskedAt:        q.AskedAt.Format(time.RFC3339),
+			Window:         windowResp,
+			WindowFallback: windowFallback,
 		},
 		Candidates: candidates,
 		Progress:   goldenProgressFrom(progress),
