@@ -59,6 +59,16 @@ next-auth 제거로 `web/.env.local` 요구사항 자체가 없어졌다(아래 
 
 ## 기동 방법
 
+> **마이그레이션 033(call-log/call-transcript 통합) 배포 전 필수 백업**:
+> server가 기동하며 `migrations/` 전체를 자동 적용하므로 별도 마이그레이션
+> 명령이 없다 — 033은 기존 call-log/call-transcript 문서 전체를 한 트랜잭션
+> 안에서 병합·재타입한다. 배포 직전 반드시 `documents`/`chunks` 테이블을
+> 백업할 것: `pg_dump -t documents -t chunks "$DATABASE_URL" >
+> pre-033-backup.sql`. 마이그레이션은 멱등이고 실패 시 전체 롤백되지만
+> (자세한 안전장치는 `migrations/033_call_unify.sql` 헤더 주석 참고),
+> pairing 휴리스틱이 예상과 다르게 동작할 가능성에 대비한 유일한 복구
+> 수단은 이 백업뿐이다.
+
 ```bash
 docker compose --env-file .env.local -f docker-compose.ubuntu1.yml up -d
 ```

@@ -46,8 +46,19 @@ func (s *Server) statsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// transcription_pending: a stuck whisper pipeline (offline server,
+	// exhausted disk, etc.) leaves call recordings sitting at
+	// metadata.transcription="pending" indefinitely — surface the count so
+	// this is visible without querying the database directly. Non-fatal on
+	// error: a stats metric failing must not take down the whole endpoint.
+	pending, pendingErr := s.docs.CountPendingTranscription(r.Context())
+	if pendingErr != nil {
+		slog.Warn("stats: count pending transcription failed", "error", pendingErr)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"by_source": bySource,
-		"total":     total,
+		"by_source":             bySource,
+		"total":                 total,
+		"transcription_pending": pending,
 	})
 }

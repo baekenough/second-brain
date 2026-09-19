@@ -147,7 +147,9 @@ func TestIngestRecording_AuthRequired(t *testing.T) {
 }
 
 // TestIngestRecording_Success verifies that a valid recording upload saves the
-// file, creates a PENDING document, and returns 201.
+// file, creates a document with metadata.transcription="pending" (content is
+// the normal call summary, no placeholder text — see model.SourceCall's doc
+// comment), and returns 201.
 func TestIngestRecording_Success(t *testing.T) {
 	t.Parallel()
 
@@ -242,9 +244,10 @@ func TestIngestRecording_StoresPendingDocument(t *testing.T) {
 	}
 	doc := upserter.upserted[0]
 
-	// Must be call-log source type (not call-transcript — transcription pending).
-	if doc.SourceType != "call-log" {
-		t.Errorf("SourceType=%q, want call-log", doc.SourceType)
+	// Must be the unified call source type (migration 033) — transcription
+	// pending, not yet merged with a transcript.
+	if doc.SourceType != "call" {
+		t.Errorf("SourceType=%q, want call", doc.SourceType)
 	}
 
 	// OccurredAt must match dateMs.
@@ -259,6 +262,19 @@ func TestIngestRecording_StoresPendingDocument(t *testing.T) {
 	transcription, _ := doc.Metadata["transcription"].(string)
 	if transcription != "pending" {
 		t.Errorf("metadata[transcription]=%q, want pending", transcription)
+	}
+
+	// Content must be the normal call summary — NOT the old
+	// "[TRANSCRIPTION PENDING]" placeholder (model.SourceCall's doc comment:
+	// this document must be useful/searchable immediately, before whisper
+	// ever runs). It should mirror smsmap.MapCall's 4-line shape.
+	if strings.Contains(doc.Content, "TRANSCRIPTION PENDING") {
+		t.Errorf("Content = %q must not contain the PENDING placeholder", doc.Content)
+	}
+	for _, want := range []string{"상대방:", "통화 방향:", "시각:", "통화 시간:"} {
+		if !strings.Contains(doc.Content, want) {
+			t.Errorf("Content = %q missing expected line prefix %q", doc.Content, want)
+		}
 	}
 }
 
@@ -543,9 +559,9 @@ func TestIngestRecording_VoiceMemoSuccess(t *testing.T) {
 	}
 	doc := upserter.upserted[0]
 
-	// SourceType must remain call-log for schema compatibility.
-	if doc.SourceType != "call-log" {
-		t.Errorf("SourceType=%q, want call-log", doc.SourceType)
+	// SourceType is the unified call source type (migration 033).
+	if doc.SourceType != "call" {
+		t.Errorf("SourceType=%q, want call", doc.SourceType)
 	}
 
 	// recording_type must be "voice-memo".

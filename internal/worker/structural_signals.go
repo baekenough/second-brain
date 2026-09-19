@@ -57,15 +57,19 @@ func NewPgStructuralSignalLister(pool *pgxpool.Pool) *PgStructuralSignalLister {
 	return &PgStructuralSignalLister{pool: pool}
 }
 
-// listLatestPerThreadQuery groups gmail/sms/call-log/call-transcript
-// documents into threads and returns only the single most recent document
-// per thread (spec §7.1: "각 스레드에서 occurred_at 최대인 문서"). gmail
-// threads are grouped by metadata->>'thread_id'; sms by
-// metadata->>'contact_name'; call-log AND call-transcript are grouped
-// TOGETHER by metadata->>'contact_name' (spec §7.1 table: both map to the
-// same "call:" thread_key prefix, so a call and its transcript are one
-// thread). sms documents flagged is_auth_like are excluded at the source
-// (spec §7.4) — StructuralSignalWorker also re-checks this defensively.
+// listLatestPerThreadQuery groups gmail/sms/call documents into threads and
+// returns only the single most recent document per thread (spec §7.1: "각
+// 스레드에서 occurred_at 최대인 문서"). gmail threads are grouped by
+// metadata->>'thread_id'; sms by metadata->>'contact_name'; call is grouped
+// by metadata->>'contact_name' under the same "call:" thread_key prefix
+// (spec §7.1 table). Pre-migration-033, this was call-log AND
+// call-transcript grouped TOGETHER (both mapped to "call:" since they were
+// two documents per call) — migration 033 unified them into model.SourceCall
+// (one document per call), so the ELSE branch below now also covers 'call'
+// without needing a dedicated WHEN; 'call-log'/'call-transcript' remain in
+// the WHERE IN list defensively for the brief pre-migration window. sms
+// documents flagged is_auth_like are excluded at the source (spec §7.4) —
+// StructuralSignalWorker also re-checks this defensively.
 // No LLM call — pure SQL, safe to run far more often than ExtractionWorker.
 const listLatestPerThreadQuery = `
 	WITH ranked AS (
@@ -82,7 +86,7 @@ const listLatestPerThreadQuery = `
 		       ) AS rn
 		FROM documents
 		WHERE status = 'active'
-		  AND source_type IN ('gmail', 'sms', 'call-log', 'call-transcript')
+		  AND source_type IN ('gmail', 'sms', 'call', 'call-log', 'call-transcript')
 		  AND occurred_at >= now() - interval '30 days'
 		  AND (source_type <> 'sms' OR COALESCE((metadata->>'is_auth_like')::boolean, false) = false)
 	)
@@ -391,7 +395,7 @@ func isOutbound(doc *model.Document) bool {
 	case model.SourceSMS:
 		d, _ := doc.Metadata["direction"].(string)
 		return d == "sent" || d == "draft"
-	case model.SourceCallLog, model.SourceCallTranscript:
+	case model.SourceCall, model.SourceCallLog, model.SourceCallTranscript:
 		d, _ := doc.Metadata["direction"].(string)
 		return d == "outgoing"
 	default:

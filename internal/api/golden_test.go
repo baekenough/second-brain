@@ -266,7 +266,7 @@ func TestGoldenNextHandler_ExcludesAlreadyJudged(t *testing.T) {
 			ID:         freshDocID,
 			Title:      "fresh candidate",
 			Content:    "line one\nline two   with   extra   spaces",
-			SourceType: model.SourceCallLog,
+			SourceType: model.SourceCall,
 			OccurredAt: &occurredAt,
 			Metadata:   map[string]any{"retention": model.RetentionLow, "segment": "personal"},
 		}},
@@ -381,7 +381,7 @@ func TestGoldenNextHandler_PeriodPhraseResolvesWindowFromAskedAt(t *testing.T) {
 	// never kicks in here — this test's only concern is that both streams
 	// receive the resolved window, not the fallback behavior.
 	searcher := &recordingGoldenSearcher{results: []*model.SearchResult{
-		{Document: model.Document{ID: uuid.New(), Title: "today's call", SourceType: model.SourceCallLog}},
+		{Document: model.Document{ID: uuid.New(), Title: "today's call", SourceType: model.SourceCall}},
 	}}
 	srv := newGoldenTestServer(stub, searcher)
 
@@ -517,7 +517,7 @@ func TestGoldenNextHandler_WindowFallbackWhenBothStreamsEmpty(t *testing.T) {
 			{}, // relevance stream, windowed to today: nothing
 			{}, // recent stream, windowed to today: nothing
 			{ // relevance fallback, no window: one hit
-				{Document: model.Document{ID: fallbackDocID, Title: "fallback hit", SourceType: model.SourceCallLog}},
+				{Document: model.Document{ID: fallbackDocID, Title: "fallback hit", SourceType: model.SourceCall}},
 			},
 			{}, // recent fallback, 90-day window: nothing new
 		},
@@ -590,7 +590,7 @@ func TestGoldenNextHandler_NoWindowFallbackWhenPrimaryStreamsHaveResults(t *test
 	searcher := &recordingGoldenSearcher{
 		streamResults: [][]*model.SearchResult{
 			{ // relevance stream: one hit, so no fallback is needed
-				{Document: model.Document{ID: docID, Title: "today's call", SourceType: model.SourceCallLog}},
+				{Document: model.Document{ID: docID, Title: "today's call", SourceType: model.SourceCall}},
 			},
 			{}, // recent stream
 		},

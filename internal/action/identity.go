@@ -128,7 +128,7 @@ func CounterpartIdentity(doc *model.Document, isUserAddress func(string) bool) (
 			return "", false
 		}
 		return from, true
-	case model.SourceSMS, model.SourceCallLog, model.SourceCallTranscript:
+	case model.SourceSMS, model.SourceCall, model.SourceCallLog, model.SourceCallTranscript:
 		if cn, ok := doc.Metadata["contact_name"].(string); ok && cn != "" {
 			return cn, true
 		}

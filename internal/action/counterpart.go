@@ -40,7 +40,7 @@ func CounterpartDisplay(doc *model.Document) (name string, entityType model.Enti
 			return "", "", false
 		}
 		return display, model.EntityTypePerson, true
-	case model.SourceSMS, model.SourceCallLog, model.SourceCallTranscript:
+	case model.SourceSMS, model.SourceCall, model.SourceCallLog, model.SourceCallTranscript:
 		if contact := strings.TrimSpace(metadataString(doc, "contact_name")); contact != "" {
 			return contact, model.EntityTypePerson, true
 		}

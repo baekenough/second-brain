@@ -137,12 +137,21 @@ var (
 // plan naming them would empty the observed lane — which askHandler reports as
 // finish_reason="no_evidence" regardless of how much insight material came
 // back. See stripInsight.
+//
+// model.SourceCall replaces the old model.SourceCallLog/SourceCallTranscript
+// pair as of migration 033 (model.SourceCall's doc comment): the LLM now
+// picks ONE "통화" source for a call, whether or not it was recorded/
+// transcribed, rather than having to guess between two source types that
+// described the same event. The prompt is regenerated from this list on
+// every call (llmPlan below), so the LLM is never shown the retired values —
+// parseSourceTypes' existing fail-closed behaviour (reject the whole plan on
+// any name outside planSourceTypes) is unchanged and needs no special case
+// for them.
 var planSourceTypes = []model.SourceType{
 	model.SourceCalendar,
 	model.SourceGmail,
 	model.SourceSMS,
-	model.SourceCallLog,
-	model.SourceCallTranscript,
+	model.SourceCall,
 	model.SourceNote,
 	model.SourceUpload,
 	model.SourceSecretary,
@@ -479,13 +488,12 @@ func stripInsight(sources []model.SourceType) (kept []model.SourceType, widened 
 // Unlisted types fall through to their raw identifier — a slightly technical
 // Reason is better than a plan that cannot describe itself.
 var sourceLabels = map[model.SourceType]string{
-	model.SourceCalendar:       "캘린더",
-	model.SourceGmail:          "메일",
-	model.SourceSMS:            "문자",
-	model.SourceCallLog:        "통화 기록",
-	model.SourceCallTranscript: "통화 전사",
-	model.SourceNote:           "노트",
-	model.SourceUpload:         "업로드 파일",
+	model.SourceCalendar: "캘린더",
+	model.SourceGmail:    "메일",
+	model.SourceSMS:      "문자",
+	model.SourceCall:     "통화",
+	model.SourceNote:     "노트",
+	model.SourceUpload:   "업로드 파일",
 }
 
 // planReason renders "내일(8/20) 캘린더만 조회".

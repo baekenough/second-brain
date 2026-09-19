@@ -171,7 +171,7 @@ func TestSearch_SortRecent_PastWindow_ChunkOnlyHit_RanksByTime(t *testing.T) {
 
 	docs := &recordingDocSearcher{results: []*model.SearchResult{newest, oldest}}
 	chunks := &mockChunkSearcher{vectorResults: []store.ChunkSearchResult{
-		chunkResultAt(middleID, model.SourceCallTranscript, 0.99, &middleAt, now),
+		chunkResultAt(middleID, model.SourceCall, 0.99, &middleAt, now),
 	}}
 	checker := &fakeOccurredChecker{occurredAt: map[uuid.UUID]time.Time{
 		newest.ID: now.Add(-2 * time.Hour),

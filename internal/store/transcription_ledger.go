@@ -7,15 +7,28 @@ import (
 	"github.com/baekenough/second-brain/internal/model"
 )
 
-// TranscribedSourceIDSet returns the set of source_ids that the whisper pipeline
-// has already transcribed for the given source type, as recorded in the
-// transcription_ledger table.
+// TranscribedSourceIDSet returns the set of source_ids that the whisper
+// pipeline has already transcribed for the given source type — the UNION of:
 //
-// The ledger is the durable counterpart to the active document index: a
-// source_id is present here as soon as it has been successfully transcribed,
-// regardless of whether the resulting document was stored or rejected as a
-// duplicate (ErrDuplicateTranscript). The whisper collector unions this set with
-// the active document index to decide which immutable audio files must NOT be
+//  1. transcription_ledger rows for sourceType — a source_id lands here as
+//     soon as it has been successfully transcribed, regardless of whether
+//     the resulting document was stored or rejected as a duplicate
+//     (ErrDuplicateTranscript).
+//  2. active documents' metadata->>'transcript_source_id' for sourceType —
+//     migration 033's call-log/call-transcript unification (model.SourceCall
+//     doc comment) means a transcribed recording's own raw identity
+//     ("transcript:{relPath}") is often NOT the document's SourceID: when
+//     WhisperCollector merges a transcript into an existing call-log
+//     document via AttachTranscript, the DOCUMENT is keyed by the
+//     call-log-formula SourceID, and the raw identity survives only in this
+//     metadata field. Without this second source, a merged recording's raw
+//     "transcript:..." id would never appear in the union, and the file
+//     would be re-transcribed forever — the exact bug this ledger exists to
+//     prevent (see package background below), just reintroduced through the
+//     merge path.
+//
+// The whisper collector unions this set with the active document index
+// (ActiveSourceIDSet) to decide which immutable audio files must NOT be
 // re-transcribed, eliminating the infinite re-transcription loop.
 //
 // The returned map is keyed by source_id and is safe for O(1) membership tests.
@@ -23,7 +36,13 @@ import (
 func (s *DocumentStore) TranscribedSourceIDSet(ctx context.Context, sourceType model.SourceType) (map[string]struct{}, error) {
 	rows, err := s.pg.pool.Query(ctx, `
 		SELECT source_id FROM transcription_ledger
-		WHERE source_type = $1`,
+		WHERE source_type = $1
+		UNION
+		SELECT metadata ->> 'transcript_source_id'
+		FROM documents
+		WHERE source_type = $1
+		  AND status      = 'active'
+		  AND metadata ?  'transcript_source_id'`,
 		sourceType,
 	)
 	if err != nil {

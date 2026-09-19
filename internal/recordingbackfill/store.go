@@ -29,10 +29,15 @@ func NewPostgresSourceIDStore(pool *pgxpool.Pool) *PostgresSourceIDStore {
 	return &PostgresSourceIDStore{Pool: pool}
 }
 
-// RenameCallTranscriptSourceID renames the source_id of the call-transcript
-// document currently stored under oldSourceID to newSourceID. Both active and
-// soft-deleted rows are eligible (no status filter) — the SourceID identity
-// must stay correct regardless of the document's current lifecycle state.
+// RenameCallTranscriptSourceID renames the source_id of the call document
+// (source_type='call' post migration 033, or the deprecated pre-migration
+// 'call-transcript') currently stored under oldSourceID to newSourceID. Only
+// standalone transcript documents (source_id still "transcript:{relPath}")
+// are ever matched here — a document merged via store.AttachTranscript is
+// keyed by the call-log-formula SourceID instead and has nothing to rename.
+// Both active and soft-deleted rows are eligible (no status filter) — the
+// SourceID identity must stay correct regardless of the document's current
+// lifecycle state.
 //
 // Returns:
 //   - RenameApplied  — exactly one row was found and renamed.
@@ -46,7 +51,7 @@ func (s *PostgresSourceIDStore) RenameCallTranscriptSourceID(ctx context.Context
 	const q = `
 		UPDATE documents
 		SET source_id = $2, updated_at = now()
-		WHERE source_type = 'call-transcript' AND source_id = $1`
+		WHERE source_type IN ('call', 'call-transcript') AND source_id = $1`
 
 	tag, err := s.Pool.Exec(ctx, q, oldSourceID, newSourceID)
 	if err != nil {

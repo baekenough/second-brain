@@ -78,8 +78,15 @@ func channelLabel(doc *model.Document) string {
 		return "메일"
 	case model.SourceSMS:
 		return "문자"
-	case model.SourceCallTranscript:
-		return "통화 녹취"
+	case model.SourceCall:
+		// model.SourceCall unifies the old call-log/call-transcript split
+		// (migration 033): metadata.transcription=="done" is the merge
+		// signal set by store.AttachTranscript, replacing the old
+		// SourceCallTranscript branch below.
+		if metadataString(doc, "transcription") == "done" {
+			return "통화 녹취"
+		}
+		fallthrough
 	case model.SourceCallLog:
 		switch metadataString(doc, "direction") {
 		case "missed":
@@ -89,6 +96,8 @@ func channelLabel(doc *model.Document) string {
 		default:
 			return "통화"
 		}
+	case model.SourceCallTranscript:
+		return "통화 녹취"
 	default:
 		return "메시지"
 	}

@@ -10,15 +10,14 @@ func TestKnownSourceTypes_MatchesTaskSpec(t *testing.T) {
 	t.Parallel()
 
 	want := map[SourceType]bool{
-		SourceGmail:          true,
-		SourceSMS:            true,
-		SourceCallLog:        true,
-		SourceCallTranscript: true,
-		SourceCalendar:       true,
-		SourceInsight:        true,
-		SourceNote:           true,
-		SourceUpload:         true,
-		SourceAgentNote:      true,
+		SourceGmail:     true,
+		SourceSMS:       true,
+		SourceCall:      true,
+		SourceCalendar:  true,
+		SourceInsight:   true,
+		SourceNote:      true,
+		SourceUpload:    true,
+		SourceAgentNote: true,
 	}
 
 	got := KnownSourceTypes()
@@ -78,16 +77,20 @@ func TestIsContainerSourceType(t *testing.T) {
 	}
 }
 
-// TestIsDeprecatedSourceType verifies only llm-memory is flagged as
-// deprecated, and that the newly introduced agent-note replacement is NOT
-// itself flagged (a regression here would make every add_note call warn).
+// TestIsDeprecatedSourceType verifies llm-memory and the two legacy call
+// types (call-log, call-transcript — unified into SourceCall by migration
+// 033, see that const's doc comment) are flagged as deprecated, and that
+// their live replacements (agent-note, call) are NOT themselves flagged (a
+// regression here would make every add_note / call ingest warn).
 func TestIsDeprecatedSourceType(t *testing.T) {
 	t.Parallel()
 
-	if !IsDeprecatedSourceType(SourceLLMMemory) {
-		t.Error("IsDeprecatedSourceType(llm-memory) = false, want true")
+	for _, st := range []SourceType{SourceLLMMemory, SourceCallLog, SourceCallTranscript} {
+		if !IsDeprecatedSourceType(st) {
+			t.Errorf("IsDeprecatedSourceType(%q) = false, want true", st)
+		}
 	}
-	for _, st := range []SourceType{SourceAgentNote, SourceNote, SourceGmail, SourceSecretary} {
+	for _, st := range []SourceType{SourceAgentNote, SourceCall, SourceNote, SourceGmail, SourceSecretary} {
 		if IsDeprecatedSourceType(st) {
 			t.Errorf("IsDeprecatedSourceType(%q) = true, want false", st)
 		}

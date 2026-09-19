@@ -165,6 +165,12 @@ func MapCall(number string, dateMs int64, durationSec int, typ int, contactName 
 		"contact_name":     contactName,
 		"direction":        direction,
 		"duration_seconds": durationSec,
+		// transcription="none": this call has no recording, so there is
+		// nothing for WhisperCollector to ever merge in via
+		// store.AttachTranscript (see model.SourceCall's doc comment). A call
+		// that DOES get recorded starts at "pending" instead — see
+		// ingest_recording.go's ingestRecordingHandler.
+		"transcription": "none",
 	}
 	if !numberHashingEnabled {
 		meta["number"] = number
@@ -173,7 +179,7 @@ func MapCall(number string, dateMs int64, durationSec int, typ int, contactName 
 	t := occurredAt
 	return model.Document{
 		ID:          uuid.New(),
-		SourceType:  model.SourceCallLog,
+		SourceType:  model.SourceCall,
 		SourceID:    sourceID,
 		Title:       title,
 		Content:     content,

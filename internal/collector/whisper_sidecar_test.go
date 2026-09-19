@@ -3,12 +3,15 @@ package collector
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/baekenough/second-brain/internal/collector/smsmap"
 	"github.com/baekenough/second-brain/internal/config"
+	"github.com/baekenough/second-brain/internal/model"
 )
 
 // writeSidecar writes a JSON sidecar file at audioPath + ".meta.json".
@@ -156,6 +159,79 @@ func TestReadRecordingSidecar_PartialFields(t *testing.T) {
 }
 
 // --- Integration test: Collect merges sidecar into transcript metadata ---
+
+// --- Unit tests for callLogMergeSourceID (migration 033 call-unify) ---
+
+// TestCallLogMergeSourceID_CallKindWithNumberHash verifies the formula
+// matches smsmap.MapCall/ingest_recording.go exactly when the sidecar was
+// written with PII hashing enabled (NumberHash populated, Number empty).
+func TestCallLogMergeSourceID_CallKindWithNumberHash(t *testing.T) {
+	t.Parallel()
+
+	raw := recordingSidecarRaw{
+		Kind: "call", DateMs: 1705311000000, DurationSeconds: 120,
+		NumberHash: "abc123", ContactName: "Bob",
+	}
+	got, ok := callLogMergeSourceID(raw)
+	if !ok {
+		t.Fatal("callLogMergeSourceID returned ok=false for a well-formed call sidecar")
+	}
+	want := "call-log:1705311000000:abc123:" + smsmap.BodyShortHash("120")
+	if got != want {
+		t.Errorf("callLogMergeSourceID = %q, want %q", got, want)
+	}
+}
+
+// TestCallLogMergeSourceID_CallKindWithRawNumber verifies the formula
+// computes the same numHash smsmap.ShortHash(number) would, when hashing is
+// disabled (Number populated, NumberHash empty).
+func TestCallLogMergeSourceID_CallKindWithRawNumber(t *testing.T) {
+	t.Parallel()
+
+	raw := recordingSidecarRaw{
+		Kind: "call", DateMs: 1705311000000, DurationSeconds: 30,
+		Number: "010-1234-5678",
+	}
+	got, ok := callLogMergeSourceID(raw)
+	if !ok {
+		t.Fatal("callLogMergeSourceID returned ok=false for a well-formed call sidecar")
+	}
+	want := "call-log:1705311000000:" + smsmap.ShortHash("010-1234-5678") + ":" + smsmap.BodyShortHash("30")
+	if got != want {
+		t.Errorf("callLogMergeSourceID = %q, want %q", got, want)
+	}
+}
+
+// TestCallLogMergeSourceID_VoiceMemoNeverMerges verifies a voice-memo
+// sidecar (Kind != "call") never produces a merge target, even if it happens
+// to carry a DateMs/Number — voice-memo has no call-log counterpart to merge
+// into.
+func TestCallLogMergeSourceID_VoiceMemoNeverMerges(t *testing.T) {
+	t.Parallel()
+
+	raw := recordingSidecarRaw{Kind: "voice-memo", DateMs: 1705311000000, Number: "010-0000-0000"}
+	if _, ok := callLogMergeSourceID(raw); ok {
+		t.Error("callLogMergeSourceID returned ok=true for a voice-memo sidecar")
+	}
+}
+
+// TestCallLogMergeSourceID_MissingFieldsNeverMerge verifies that a sidecar
+// missing DateMs, or missing both NumberHash and Number, never produces a
+// merge target — the collector must never guess at the formula's inputs.
+func TestCallLogMergeSourceID_MissingFieldsNeverMerge(t *testing.T) {
+	t.Parallel()
+
+	cases := []recordingSidecarRaw{
+		{Kind: "call", DateMs: 0, NumberHash: "abc"},         // missing DateMs
+		{Kind: "call", DateMs: 1705311000000},                // missing NumberHash and Number
+		{Kind: "", DateMs: 1705311000000, NumberHash: "abc"}, // missing Kind entirely (pre-migration-033 sidecar)
+	}
+	for i, raw := range cases {
+		if _, ok := callLogMergeSourceID(raw); ok {
+			t.Errorf("case %d: callLogMergeSourceID returned ok=true for incomplete sidecar %+v", i, raw)
+		}
+	}
+}
 
 // TestWhisperCollector_Collect_SidecarMerged verifies that when a sidecar file
 // exists alongside an audio file, the WhisperCollector merges its fields into
@@ -344,5 +420,130 @@ func TestWhisperCollector_Collect_SidecarJsonFilesIgnoredByWalk(t *testing.T) {
 	}
 	if len(docs) != 1 {
 		t.Errorf("Collect() returned %d docs, want 1 (sidecar .meta.json must not be transcribed)", len(docs))
+	}
+}
+
+// --- Integration tests: buildDocument's call-log merge decision (migration 033) ---
+
+// TestWhisperCollector_Collect_CallSidecarMergesIntoCallLogID verifies that a
+// recording with a Kind=="call" sidecar (carrying date_ms/number_hash/
+// duration_seconds — the shape internal/api/ingest_recording.go writes) is
+// emitted with the call-log-formula SourceID rather than its own
+// transcript:{relPath} identity, so internal/scheduler routes it through
+// store.AttachTranscript and merges it into the existing call document
+// instead of creating a second one (model.SourceCall's doc comment).
+func TestWhisperCollector_Collect_CallSidecarMergesIntoCallLogID(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	const wantTranscript = "실제 통화 전사 내용."
+	srv, _ := newWhisperTestServer(t, wantTranscript)
+
+	mtime := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Second)
+	audioName := "01012345678_20260101120000.m4a"
+	audioPath := writeDummyAudio(t, dir, audioName, mtime)
+
+	const dateMs = int64(1705311000000)
+	const durationSec = 120
+	const numHash = "abc123def456"
+	writeSidecar(t, audioPath, map[string]any{
+		"contact_name":     "Bob",
+		"direction":        "incoming",
+		"recording_type":   "call",
+		"kind":             "call",
+		"date_ms":          dateMs,
+		"duration_seconds": durationSec,
+		"number_hash":      numHash,
+	})
+
+	cfg := &config.Config{
+		WhisperAudioDir: dir,
+		WhisperAPIURL:   srv.URL,
+		WhisperModel:    "whisper-1",
+		WhisperLanguage: "ko",
+	}
+	c := makeWhisperCollector(cfg, srv)
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect() error: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("Collect() returned %d docs, want 1", len(docs))
+	}
+	doc := docs[0]
+
+	if doc.SourceType != model.SourceCall {
+		t.Errorf("SourceType = %q, want %q", doc.SourceType, model.SourceCall)
+	}
+
+	wantSourceID := fmt.Sprintf("call-log:%d:%s:%s", dateMs, numHash, smsmap.BodyShortHash(fmt.Sprintf("%d", durationSec)))
+	if doc.SourceID != wantSourceID {
+		t.Errorf("SourceID = %q, want %q (must merge into the call-log document, not its own transcript:{relPath} identity)", doc.SourceID, wantSourceID)
+	}
+
+	wantRawID := "transcript:" + audioName
+	if doc.Metadata["transcript_source_id"] != wantRawID {
+		t.Errorf("metadata[transcript_source_id] = %v, want %q (the raw audio identity, preserved for the ledger)", doc.Metadata["transcript_source_id"], wantRawID)
+	}
+	if doc.Metadata["transcription"] != "done" {
+		t.Errorf("metadata[transcription] = %v, want \"done\"", doc.Metadata["transcription"])
+	}
+	if doc.Content != wantTranscript {
+		t.Errorf("Content = %q, want the transcript text %q", doc.Content, wantTranscript)
+	}
+}
+
+// TestWhisperCollector_Collect_VoiceMemoSidecarStaysStandalone verifies that a
+// voice-memo sidecar (Kind=="voice-memo") — which carries no call identity to
+// merge into — keeps the file's own transcript:{relPath} SourceID and does
+// NOT set transcript_source_id/transcription, exactly like the no-sidecar
+// case (TestWhisperCollector_Collect_NoSidecar_MetadataUnchanged).
+func TestWhisperCollector_Collect_VoiceMemoSidecarStaysStandalone(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	srv, _ := newWhisperTestServer(t, "음성 메모 전사")
+
+	mtime := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Second)
+	audioName := "voice-memo_20260101120000.m4a"
+	audioPath := writeDummyAudio(t, dir, audioName, mtime)
+
+	writeSidecar(t, audioPath, map[string]any{
+		"recording_type":   "voice-memo",
+		"kind":             "voice-memo",
+		"date_ms":          1705311000000,
+		"duration_seconds": 45,
+	})
+
+	cfg := &config.Config{
+		WhisperAudioDir: dir,
+		WhisperAPIURL:   srv.URL,
+		WhisperModel:    "whisper-1",
+		WhisperLanguage: "ko",
+	}
+	c := makeWhisperCollector(cfg, srv)
+
+	docs, err := c.Collect(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatalf("Collect() error: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("Collect() returned %d docs, want 1", len(docs))
+	}
+	doc := docs[0]
+
+	if doc.SourceType != model.SourceCall {
+		t.Errorf("SourceType = %q, want %q", doc.SourceType, model.SourceCall)
+	}
+	wantSourceID := "transcript:" + audioName
+	if doc.SourceID != wantSourceID {
+		t.Errorf("SourceID = %q, want %q (voice-memo has no call-log document to merge into)", doc.SourceID, wantSourceID)
+	}
+	if _, ok := doc.Metadata["transcript_source_id"]; ok {
+		t.Errorf("metadata[transcript_source_id] should not be set for a standalone voice-memo document, got %v", doc.Metadata["transcript_source_id"])
+	}
+	if _, ok := doc.Metadata["transcription"]; ok {
+		t.Errorf("metadata[transcription] should not be set for a standalone voice-memo document, got %v", doc.Metadata["transcription"])
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/baekenough/second-brain/internal/collector"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/search"
+	"github.com/google/uuid"
 )
 
 // countingCollector records every Collect invocation.
@@ -53,6 +54,7 @@ func (c *countingCollector) callCount() int {
 type mockStore struct {
 	mu       sync.Mutex
 	upserts  int
+	attaches int      // AttachTranscript call count
 	recorded []string // source_ids passed to RecordTranscribed
 }
 
@@ -121,6 +123,27 @@ func (m *mockStore) recordedIDs() []string {
 // Returns 0 by default so the deletion-ratio guard never blocks in pure-mock tests.
 func (m *mockStore) CountActiveDocuments(_ context.Context, _ model.SourceType) (int, error) {
 	return 0, nil
+}
+
+// AttachTranscript satisfies DocumentUpserter (call-unify merge path, migration
+// 033). Mutates doc.ID like the real store.AttachTranscript so callers that
+// inspect it afterward don't see a zero-value UUID, and always reports
+// contentChanged=true (a real merge always ships new transcript content).
+func (m *mockStore) AttachTranscript(_ context.Context, doc *model.Document) (bool, error) {
+	m.mu.Lock()
+	m.attaches++
+	m.mu.Unlock()
+	if doc.ID == uuid.Nil {
+		doc.ID = uuid.New()
+	}
+	return true, nil
+}
+
+// attachCount returns the number of AttachTranscript calls observed so far.
+func (m *mockStore) attachCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.attaches
 }
 
 // mockStoreErrorIDs is like mockStore but returns an error from ActiveSourceIDSet,

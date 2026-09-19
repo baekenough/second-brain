@@ -1,8 +1,8 @@
 package model
 
 // KnownSourceTypes lists the source types that this corpus actually contains
-// as of 2026-08-25 (see migration 027 background): gmail, sms, call-log,
-// call-transcript, calendar, insight, note, and upload.
+// as of 2026-09-19 (see migration 033 background): gmail, sms, call,
+// calendar, insight, note, and upload.
 //
 // This list is DELIBERATELY narrower than the full SourceType const block
 // above. Several of those consts (SourceSlack, SourceGitHub, SourceGDrive,
@@ -18,6 +18,10 @@ package model
 // torn down) and its one remaining secretary-routed row is intentionally
 // left alone by migration 027 rather than resurrected into a live bucket.
 //
+// SourceCallLog/SourceCallTranscript are also excluded as of migration 033:
+// they were unified into SourceCall (see SourceCallLog's doc comment in
+// document.go) and are listed in DeprecatedSourceTypes below instead.
+//
 // Extending this list (e.g. re-enabling a dormant collector) is a one-line
 // change here; nothing else needs updating for the guard in internal/store
 // to recognise the new value.
@@ -28,8 +32,7 @@ func KnownSourceTypes() []SourceType {
 	return []SourceType{
 		SourceGmail,
 		SourceSMS,
-		SourceCallLog,
-		SourceCallTranscript,
+		SourceCall,
 		SourceCalendar,
 		SourceInsight,
 		SourceNote,
@@ -86,8 +89,15 @@ func IsContainerSourceType(st SourceType) bool {
 // metadata fields — whenever a write targets a deprecated source_type, so a
 // reintroduced write path is discoverable instead of silently resurrecting
 // the same contamination.
+//
+// SourceCallLog/SourceCallTranscript are deprecated as of 2026-09-19
+// (migration 033): see SourceCallLog's doc comment in document.go for the
+// full background (unified into SourceCall — one document per phone call).
+// The same upsert guard logs a warning on any new write to either value, so
+// a collector or handler that was missed during the unification is
+// discoverable rather than silently reintroducing the split.
 func DeprecatedSourceTypes() []SourceType {
-	return []SourceType{SourceLLMMemory}
+	return []SourceType{SourceLLMMemory, SourceCallLog, SourceCallTranscript}
 }
 
 // IsDeprecatedSourceType reports whether st is a known deprecated source_type

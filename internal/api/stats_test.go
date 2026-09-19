@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/store"
+	"github.com/google/uuid"
 )
 
 // --- stub DocumentStore ---
@@ -18,10 +18,12 @@ import (
 // stubDocumentStore implements DocumentStore with configurable return values.
 // Only the methods exercised by the stats handlers need non-stub implementations.
 type stubDocumentStore struct {
-	countBySource      map[string]int
-	countBySourceErr   error
-	baselineStats      *store.BaselineStats
-	baselineStatsErr   error
+	countBySource        map[string]int
+	countBySourceErr     error
+	baselineStats        *store.BaselineStats
+	baselineStatsErr     error
+	pendingTranscript    int
+	pendingTranscriptErr error
 }
 
 func (s *stubDocumentStore) GetByID(_ context.Context, _ uuid.UUID) (*model.Document, error) {
@@ -38,6 +40,9 @@ func (s *stubDocumentStore) CountBySource(_ context.Context) (map[string]int, er
 }
 func (s *stubDocumentStore) QueryBaselineStats(_ context.Context) (*store.BaselineStats, error) {
 	return s.baselineStats, s.baselineStatsErr
+}
+func (s *stubDocumentStore) CountPendingTranscription(_ context.Context) (int, error) {
+	return s.pendingTranscript, s.pendingTranscriptErr
 }
 
 // --- helpers ---
@@ -284,6 +289,7 @@ func TestStats_ExistingEndpoint_Unbroken(t *testing.T) {
 			"filesystem": 5,
 			"slack":      3,
 		},
+		pendingTranscript: 2,
 	}
 	srv := newTestServer(docs)
 
@@ -304,5 +310,31 @@ func TestStats_ExistingEndpoint_Unbroken(t *testing.T) {
 	}
 	if _, ok := body["by_source"]; !ok {
 		t.Error("stats response missing 'by_source' key")
+	}
+	if got, ok := body["transcription_pending"]; !ok {
+		t.Error("stats response missing 'transcription_pending' key")
+	} else if got != float64(2) {
+		t.Errorf("transcription_pending = %v, want 2", got)
+	}
+}
+
+// TestStats_PendingTranscriptionError_NonFatal verifies that a failure from
+// CountPendingTranscription does not fail the whole /api/v1/stats request —
+// this is a supplementary metric, not core data.
+func TestStats_PendingTranscriptionError_NonFatal(t *testing.T) {
+	t.Parallel()
+
+	docs := &stubDocumentStore{
+		countBySource:        map[string]int{"filesystem": 1},
+		pendingTranscriptErr: context.DeadlineExceeded,
+	}
+	srv := newTestServer(docs)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+	srv.statsHandler(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d (pending-transcription error must be non-fatal)", rr.Code, http.StatusOK)
 	}
 }

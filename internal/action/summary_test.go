@@ -147,6 +147,11 @@ func TestAwaitingReplySummary_ChannelReflectsSource(t *testing.T) {
 		want      string
 	}{
 		{model.SourceSMS, "received", "문자"},
+		// model.SourceCall (migration 033 unification) without
+		// metadata.transcription set behaves exactly like the legacy
+		// SourceCallLog branch — a call with no merged transcript.
+		{model.SourceCall, "missed", "부재중 전화"},
+		{model.SourceCall, "incoming", "통화"},
 		{model.SourceCallLog, "missed", "부재중 전화"},
 		{model.SourceCallLog, "incoming", "통화"},
 		{model.SourceCallTranscript, "incoming", "통화 녹취"},
@@ -157,6 +162,24 @@ func TestAwaitingReplySummary_ChannelReflectsSource(t *testing.T) {
 		if !strings.Contains(got, tc.want) {
 			t.Errorf("%s/%s: summary = %q, want it to contain %q", tc.src, tc.direction, got, tc.want)
 		}
+	}
+}
+
+// TestAwaitingReplySummary_CallSourceWithTranscriptionDone verifies that a
+// model.SourceCall document merged with a transcript
+// (metadata.transcription=="done", stamped by store.AttachTranscript) shows
+// "통화 녹취" — the same label the legacy SourceCallTranscript branch used —
+// regardless of its direction metadata.
+func TestAwaitingReplySummary_CallSourceWithTranscriptionDone(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 18, 3, 0, 0, 0, time.UTC)
+
+	doc := mustDoc(model.SourceCall, "", map[string]any{
+		"direction": "incoming", "from": "a@example.test", "transcription": "done",
+	}, now.AddDate(0, 0, -2))
+	got := action.AwaitingReplySummary(doc, "테스트연락처", now)
+	if !strings.Contains(got, "통화 녹취") {
+		t.Errorf("summary = %q, want it to contain \"통화 녹취\"", got)
 	}
 }
 

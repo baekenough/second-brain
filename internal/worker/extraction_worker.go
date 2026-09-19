@@ -406,7 +406,7 @@ func threadKeyForDocument(doc *model.Document) (string, bool) {
 		return action.ThreadKeyGmail(threadID), true
 	case model.SourceSMS:
 		return action.ThreadKeySMS(smsCallContactKey(doc)), true
-	case model.SourceCallLog, model.SourceCallTranscript:
+	case model.SourceCall, model.SourceCallLog, model.SourceCallTranscript:
 		return action.ThreadKeyCall(smsCallContactKey(doc)), true
 	default:
 		return "", false

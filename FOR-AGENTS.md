@@ -102,7 +102,7 @@ v0.17.0부터 Cloudflare Tunnel 또는 역방향 프록시를 통해 공개 TLS 
 |------|------|------|--------|------|
 | `query` | string | **필수** | — | 검색 질의 텍스트 |
 | `limit` | number | 선택 | `10` | 최대 반환 건수 (1–50; 50 초과 시 50으로 고정) |
-| `source` | string | 선택 | 없음 (전체) | 소스 타입 필터. 허용값: `slack` `github` `gdrive` `notion` `filesystem` `discord` `telegram` `secretary` `llm-memory` `gmail` `calendar` `sms` `call-log` `call-transcript` `upload` |
+| `source` | string | 선택 | 없음 (전체) | 소스 타입 필터. 허용값: `slack` `github` `gdrive` `notion` `filesystem` `discord` `telegram` `secretary` `llm-memory` `gmail` `calendar` `sms` `call` `call-log`(폐기) `call-transcript`(폐기) `upload` |
 
 #### 출력 구조
 
@@ -339,8 +339,8 @@ curl -X POST https://<your-tunnel-host>/api/v1/ingest/file \
 | `gmail` | Gmail 메일 원문 | 직접 수집 (2026-05-30 이후) |
 | `calendar` | 캘린더 일정 | 직접 수집 (2026-05-30 이후) |
 | `sms` | SMS 메시지 | 직접 수집 (2026-05-30 이후) |
-| `call-log` | 통화기록 (발신·수신 목록) | 직접 수집 (2026-05-30 이후) |
-| `call-transcript` | 통화 녹취 전사 텍스트 | 직접 수집 (2026-05-30 이후) |
+| `call` | 통화 1건 = 문서 1건 (발신·수신·부재중, 녹음 유무 무관). `metadata.transcription`이 `none`(녹음 없음)/`pending`(녹음 있으나 아직 미전사)/`done`(전사 완료, 본문이 전사 텍스트)을 구분합니다. `call-log`/`call-transcript` 통합(마이그레이션 033, 2026-09-19) | 직접 수집 (2026-05-30 이후) |
+| `call-log` / `call-transcript` | **폐기됨** — `call`로 통합. `source` 필터에는 하위호환으로 여전히 허용되지만, 신규 문서는 절대 이 값으로 저장되지 않습니다 | 폐기 (레거시 문서만 존재) |
 | `secretary` | Gmail·SMS·통화기록·통화녹취·캘린더 **통합 아카이브** (2026-05-30 이전 레거시 데이터) | 레거시 (이관 완료 후 점진 축소) |
 | `llm-memory` | LLM 세션 메모리. 이전 Claude/GPT 대화 중 저장된 메모, 작업 로그, 프로젝트 노트. `add_note`로 추가된 노트 포함. | MCP 쓰기 / 자동 수집 |
 | `upload` | 에이전트·사용자가 `POST /api/v1/ingest/file`로 업로드한 파일 | HTTP 업로드 |
@@ -352,7 +352,7 @@ curl -X POST https://<your-tunnel-host>/api/v1/ingest/file \
 | `discord` | Discord 메시지 | 커넥터 |
 | `telegram` | Telegram 메시지 | 커넥터 |
 
-> **레거시 `secretary` 소스**: 2026-05-30 이전 수집된 Gmail·SMS·통화·캘린더 데이터는 `secretary` 단일 소스로 저장되어 있습니다. 커트오버 이후 신규 데이터는 `gmail`·`sms`·`call-log`·`call-transcript`·`calendar`로 분리 저장됩니다. 두 소스를 함께 검색하려면 `source` 필터를 생략하고 전체 검색을 사용하십시오.
+> **레거시 `secretary` 소스**: 2026-05-30 이전 수집된 Gmail·SMS·통화·캘린더 데이터는 `secretary` 단일 소스로 저장되어 있습니다. 커트오버 이후 신규 데이터는 `gmail`·`sms`·`call`·`calendar`로 분리 저장됩니다. 두 소스를 함께 검색하려면 `source` 필터를 생략하고 전체 검색을 사용하십시오.
 
 ---
 
@@ -363,7 +363,7 @@ curl -X POST https://<your-tunnel-host>/api/v1/ingest/file \
 | 상황 | 권장 source 필터 |
 |------|----------------|
 | "저번에 ChatGPT에서 정리했던 내용" | `llm-memory` |
-| "최근 문자 / 통화 내용 (2026-05-30 이후)" | `sms` / `call-log` / `call-transcript` |
+| "최근 문자 / 통화 내용 (2026-05-30 이후)" | `sms` / `call` |
 | "최근 이메일 (2026-05-30 이후)" | `gmail` |
 | "일정·스케줄 정보" | `calendar` |
 | "2026-05-30 이전 통화·문자·이메일·일정" | `secretary` (레거시) |
@@ -434,7 +434,7 @@ MCP 읽기 도구(`search` / `get_document` / `stats`)는 지식 베이스를 �
 
 ### 민감 정보 취급
 
-`secretary`·`sms`·`call-log`·`call-transcript`·`gmail`·`calendar` 소스에는 **SMS 원문, 통화 녹취 전사, 개인 이메일, 일정** 등 고도로 민감한 개인정보가 포함됩니다.
+`secretary`·`sms`·`call`·`gmail`·`calendar` 소스에는 **SMS 원문, 통화 녹취 전사, 개인 이메일, 일정** 등 고도로 민감한 개인정보가 포함됩니다.
 
 - 검색 결과를 외부 시스템·API에 전달하지 마십시오.
 - 로그에 본문(`content`)을 그대로 기록하지 마십시오.

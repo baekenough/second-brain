@@ -236,8 +236,9 @@ var allowedSourceTypes = map[model.SourceType]struct{}{
 	model.SourceGmail:          {},
 	model.SourceCalendar:       {},
 	model.SourceSMS:            {},
-	model.SourceCallLog:        {},
-	model.SourceCallTranscript: {},
+	model.SourceCall:           {},
+	model.SourceCallLog:        {}, // deprecated (see model.SourceCallLog doc comment); kept so legacy rows remain searchable
+	model.SourceCallTranscript: {}, // deprecated (see model.SourceCallLog doc comment); kept so legacy rows remain searchable
 	model.SourceUpload:         {},
 	model.SourceAgentNote:      {},
 }
@@ -306,7 +307,9 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service, rerankDefault 
 			mcp.Description(
 				"Optional source type filter. One of: slack, github, gdrive, notion, "+
 					"filesystem, discord, telegram, secretary, llm-memory (deprecated), "+
-					"gmail, calendar, sms, call-log, call-transcript, upload, agent-note.",
+					"gmail, calendar, sms, call, call-log (deprecated), call-transcript (deprecated), "+
+					"upload, agent-note. call-log/call-transcript were unified into a single "+
+					"'call' source type (one document per phone call, recorded or not).",
 			),
 		),
 		mcp.WithString("occurred_from",
@@ -385,7 +388,7 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service, rerankDefault 
 			st := model.SourceType(strings.TrimSpace(src))
 			if _, ok := allowedSourceTypes[st]; !ok {
 				return mcp.NewToolResultError(fmt.Sprintf(
-					"unknown source type %q; allowed: slack, github, gdrive, notion, filesystem, discord, telegram, secretary, llm-memory, gmail, calendar, sms, call-log, call-transcript, upload, agent-note",
+					"unknown source type %q; allowed: slack, github, gdrive, notion, filesystem, discord, telegram, secretary, llm-memory, gmail, calendar, sms, call, call-log (deprecated), call-transcript (deprecated), upload, agent-note",
 					src,
 				)), nil
 			}

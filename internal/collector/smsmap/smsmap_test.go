@@ -235,8 +235,20 @@ func TestMapCall_SourceIDFormat(t *testing.T) {
 func TestMapCall_SourceType(t *testing.T) {
 	t.Parallel()
 	doc := smsmap.MapCall("010-0000-0001", time.Now().UnixMilli(), 30, 1, "", true)
-	if doc.SourceType != model.SourceCallLog {
-		t.Errorf("SourceType=%q, want %q", doc.SourceType, model.SourceCallLog)
+	if doc.SourceType != model.SourceCall {
+		t.Errorf("SourceType=%q, want %q", doc.SourceType, model.SourceCall)
+	}
+}
+
+// TestMapCall_TranscriptionNone verifies that a call synced from the phone's
+// call log (no recording attached) is marked metadata.transcription="none" —
+// see model.SourceCall's doc comment for the three transcription states.
+func TestMapCall_TranscriptionNone(t *testing.T) {
+	t.Parallel()
+	doc := smsmap.MapCall("010-0000-0001", time.Now().UnixMilli(), 30, 1, "", true)
+	transcription, _ := doc.Metadata["transcription"].(string)
+	if transcription != "none" {
+		t.Errorf("metadata[transcription]=%q, want none", transcription)
 	}
 }
 

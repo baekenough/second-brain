@@ -75,8 +75,11 @@ func TestAssembleRetrieval_SourceOnlyPlan(t *testing.T) {
 	t.Parallel()
 
 	searcher := &recordingSearcher{}
+	// Golden row #11's SourceTypes are model.SourceCall as of migration 033
+	// (call-log/call-transcript unification — see internal/intent's
+	// planGolden table and model.SourceCall's doc comment).
 	plan := intent.QueryPlan{
-		SourceTypes: []model.SourceType{model.SourceCallTranscript, model.SourceCallLog},
+		SourceTypes: []model.SourceType{model.SourceCall},
 		Limit:       8,
 		Reason:      "통화 기록만 조회",
 		Origin:      intent.OriginLLM,

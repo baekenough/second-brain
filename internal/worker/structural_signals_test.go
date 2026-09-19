@@ -234,7 +234,7 @@ func TestStructuralSignalWorker_SummariesAreThreadSpecific(t *testing.T) {
 			Title:    "8월 정산 자료 요청", EventAt: fixedNow.AddDate(0, 0, -5),
 		},
 		{
-			DocumentID: uuid.New(), SourceType: string(model.SourceCallLog),
+			DocumentID: uuid.New(), SourceType: string(model.SourceCall),
 			Metadata: map[string]any{"contact_name": "테스트연락처C", "direction": "missed"},
 			Title:    "missed 통화 C", EventAt: fixedNow,
 		},
