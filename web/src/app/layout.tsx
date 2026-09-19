@@ -85,6 +85,12 @@ export default function RootLayout({ children }: RootLayoutProps) {
                 그래프
               </Link>
               <Link
+                href="/golden"
+                className="rounded-md px-3 py-1.5 text-foreground-muted transition-colors hover:bg-surface-subtle hover:text-foreground"
+              >
+                골든셋
+              </Link>
+              <Link
                 href="/governance"
                 className="rounded-md px-3 py-1.5 text-foreground-muted transition-colors hover:bg-surface-subtle hover:text-foreground"
               >
