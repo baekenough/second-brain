@@ -127,3 +127,18 @@ func TestMeanFloat(t *testing.T) {
 		})
 	}
 }
+
+// TestShouldPersistEvalRun verifies a --rerank=true run is never marked for
+// eval_metrics persistence — it must not become the next default run's
+// regression baseline (see the Save call site's CAVEAT comment in main.go) —
+// while a default (rerank-off) run still persists as before.
+func TestShouldPersistEvalRun(t *testing.T) {
+	t.Parallel()
+
+	if got := shouldPersistEvalRun(false); !got {
+		t.Errorf("shouldPersistEvalRun(false) = %v, want true (default run must persist to the baseline)", got)
+	}
+	if got := shouldPersistEvalRun(true); got {
+		t.Errorf("shouldPersistEvalRun(true) = %v, want false (a --rerank run must not contaminate the baseline)", got)
+	}
+}

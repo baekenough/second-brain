@@ -69,7 +69,22 @@ type documentSearcher interface {
 //     function. It must NOT be retried with a widened plan: "내일 일정이
 //     없습니다" is an answer, and re-running without the window would replace it
 //     with unrelated documents from other days (design §6.2).
-func assembleRetrieval(ctx context.Context, searcher documentSearcher, params intent.Params, plan intent.QueryPlan, topK, insightM int) (RetrievalResult, error) {
+//
+// useRerankDefault mirrors cfg.RerankDefault (SEARCH_RERANK_DEFAULT) and sets
+// model.SearchQuery.UseRerank on both the observed and insight lanes — EXCEPT
+// when this query resolved to recency ordering (base.Sort == SortRecent, set
+// below by either the windowed-plan branch or KindTemporal), in which case
+// the default is suppressed and UseRerank stays false. search.Service applies
+// the cross-encoder AFTER the recency sort and its output order is final
+// (internal/search/search.go's applyRerank ordering comment) — silently
+// defaulting rerank on would silently undo the recency order this function
+// just asked for, exactly the regression the MCP search tool's use_rerank
+// guard (cmd/mcp/main.go) also protects against. Unlike that tool, callers
+// here have no per-request override: assembleRetrieval takes a single
+// server-wide default, so suppression is the only lever available at this
+// layer. search.Service.Search itself no-ops UseRerank when no reranker is
+// configured, the same fail-safe every other caller of that flag relies on.
+func assembleRetrieval(ctx context.Context, searcher documentSearcher, params intent.Params, plan intent.QueryPlan, topK, insightM int, useRerankDefault bool) (RetrievalResult, error) {
 	limit := plan.Limit
 	if limit <= 0 {
 		// A plan that forgot its limit must not ask the store for nothing.
@@ -118,6 +133,13 @@ func assembleRetrieval(ctx context.Context, searcher documentSearcher, params in
 		// retrieves anything the lanes did not already select.
 		base.Sort = model.SortRecent
 	}
+
+	// UseRerank: apply the server default, UNLESS this query resolved to
+	// recency ordering above (windowed plan or KindTemporal) — see this
+	// function's doc comment for why a recency query must not silently pick
+	// up rerank's final-order override. No explicit per-call override exists
+	// at this layer, so suppression is a one-way switch, never a re-enable.
+	base.UseRerank = useRerankDefault && !base.SortsByRecency()
 
 	observedQuery, runObserved, insightQuery := splitInsightLane(base, insightM)
 

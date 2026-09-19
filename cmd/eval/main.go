@@ -30,13 +30,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/joho/godotenv"
-	"golang.org/x/sync/errgroup"
 	"github.com/baekenough/second-brain/internal/config"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
 	"github.com/baekenough/second-brain/internal/telemetry"
+	"github.com/joho/godotenv"
+	"golang.org/x/sync/errgroup"
 )
 
 // otelShutdownTimeout bounds how long the deferred telemetry shutdown may
@@ -74,10 +74,10 @@ func main() {
 
 // evalOutput is the JSON report written to stdout.
 type evalOutput struct {
-	Current    metricsSnapshot              `json:"current"`
-	Baseline   *metricsSnapshot             `json:"baseline"`
-	Regression bool                         `json:"regression"`
-	Deltas     map[string]float64           `json:"deltas,omitempty"`
+	Current    metricsSnapshot               `json:"current"`
+	Baseline   *metricsSnapshot              `json:"baseline"`
+	Regression bool                          `json:"regression"`
+	Deltas     map[string]float64            `json:"deltas,omitempty"`
 	Reindex    *search.ReindexRecommendation `json:"reindex,omitempty"` // populated when --check-reindex is set
 }
 
@@ -98,6 +98,18 @@ type metricsSnapshot struct {
 	SearchLatencyP50Ms  float64 `json:"search_latency_p50_ms"`
 	SearchLatencyP95Ms  float64 `json:"search_latency_p95_ms"`
 	SearchLatencyMeanMs float64 `json:"search_latency_mean_ms"`
+
+	// Reranked records whether --rerank was set for THIS run (model.
+	// SearchQuery.UseRerank on every eval query). It is a CLI-output-only
+	// tag, deliberately NOT added to store.EvalMetricsRecord/eval_metrics —
+	// no schema change for this comparison feature. Consequence: Baseline's
+	// Reranked is always the zero value (false), never the flag the baseline
+	// run was actually taken with, because eval_metrics carries no such
+	// column to read it back from. To compare rerank on vs off, run this
+	// binary twice (once with --rerank, once without) and diff the two JSON
+	// reports' Current.NDCG10/MRR10/SearchLatency* — do not rely on
+	// Baseline/Deltas for that comparison.
+	Reranked bool `json:"reranked"`
 }
 
 func run() error {
@@ -105,6 +117,12 @@ func run() error {
 	checkReindex := flag.Bool("check-reindex", false,
 		"evaluate reindex thresholds after computing eval metrics and include "+
 			"the recommendation in the JSON output (exit code 2 when reindex is recommended)")
+	rerank := flag.Bool("rerank", false,
+		"apply cross-encoder reranking (model.SearchQuery.UseRerank) to every eval "+
+			"query. Default false, matching the nightly baseline's historical "+
+			"behaviour. No-op when RERANKER_URL is unconfigured. Run once with and "+
+			"once without to compare NDCG/MRR/latency — see metricsSnapshot.Reranked "+
+			"for why this is not persisted as a new eval_metrics column.")
 	flag.Parse()
 
 	// wg tracks any background goroutines (e.g. webhook alert) so that deferred
@@ -169,7 +187,12 @@ func run() error {
 	}
 
 	// --- Reranker (optional) ---
-	reranker := search.NewHTTPReranker(cfg.RerankURL, cfg.RerankAPIKey, cfg.RerankModel, 0)
+	reranker := search.NewHTTPReranker(cfg.RerankURL, cfg.RerankAPIKey, cfg.RerankModel, cfg.RerankTopN)
+	if reranker.Enabled() && *rerank {
+		slog.Info("eval: reranking enabled for this run", "url", cfg.RerankURL, "model", cfg.RerankModel, "top_n", cfg.RerankTopN)
+	} else if *rerank {
+		slog.Warn("eval: --rerank set but RERANKER_URL is unconfigured — every query.UseRerank=true is a no-op")
+	}
 
 	// --- Search service ---
 	searchSvc := search.NewService(docStore, embedClient).
@@ -217,8 +240,9 @@ func run() error {
 		i, pair := i, pair // capture loop variables
 		g.Go(func() error {
 			q := model.SearchQuery{
-				Query: pair.Query,
-				Limit: 10, // evaluate top-10
+				Query:     pair.Query,
+				Limit:     10, // evaluate top-10
+				UseRerank: *rerank,
 			}
 
 			start := time.Now()
@@ -311,19 +335,37 @@ func run() error {
 		"search_latency_p50_ms", p50Ms,
 		"search_latency_p95_ms", p95Ms,
 		"search_latency_mean_ms", meanMs,
+		"rerank", *rerank, // the only durable record of which run this was — see metricsSnapshot.Reranked
 	)
 
 	// --- Persist current run ---
-	if err := metricsStore.Save(ctx, store.EvalMetricsRecord{
-		NDCG5:               metrics.NDCG5,
-		NDCG10:              metrics.NDCG10,
-		MRR10:               metrics.MRR10,
-		Pairs:               metrics.Pairs,
-		SearchLatencyP50Ms:  p50Ms,
-		SearchLatencyP95Ms:  p95Ms,
-		SearchLatencyMeanMs: meanMs,
-	}); err != nil {
-		return fmt.Errorf("save eval metrics: %w", err)
+	//
+	// CAVEAT (resolved by NOT persisting — see metricsSnapshot.Reranked):
+	// eval_metrics has no column to tell a rerank-on run apart from a
+	// rerank-off run, and this change does not add one. Saving a
+	// --rerank=true run anyway would make it the "latest" row
+	// metricsStore.Latest returns, so the NEXT default (rerank-off) run
+	// would diff itself against it — an apples-to-oranges comparison that
+	// can look like a false regression (or a false improvement) in
+	// Deltas/out.Regression above and in --check-reindex's
+	// CheckWithBaseline path. So a --rerank run is never persisted to
+	// eval_metrics at all: it is NOT part of the automated regression
+	// baseline. The JSON report (Current.Reranked) and the "rerank" log
+	// field above are the only record of it — see shouldPersistEvalRun.
+	if shouldPersistEvalRun(*rerank) {
+		if err := metricsStore.Save(ctx, store.EvalMetricsRecord{
+			NDCG5:               metrics.NDCG5,
+			NDCG10:              metrics.NDCG10,
+			MRR10:               metrics.MRR10,
+			Pairs:               metrics.Pairs,
+			SearchLatencyP50Ms:  p50Ms,
+			SearchLatencyP95Ms:  p95Ms,
+			SearchLatencyMeanMs: meanMs,
+		}); err != nil {
+			return fmt.Errorf("save eval metrics: %w", err)
+		}
+	} else {
+		slog.Info("eval: skipping eval_metrics persistence for this --rerank run — not part of the regression baseline")
 	}
 
 	// --- Build output ---
@@ -336,6 +378,7 @@ func run() error {
 		SearchLatencyP50Ms:  p50Ms,
 		SearchLatencyP95Ms:  p95Ms,
 		SearchLatencyMeanMs: meanMs,
+		Reranked:            *rerank,
 	}
 
 	out := evalOutput{Current: current}
@@ -549,6 +592,19 @@ func computeDeltas(current, baseline metricsSnapshot) (map[string]float64, bool)
 	}
 
 	return deltas, regression
+}
+
+// shouldPersistEvalRun reports whether this run's metrics should be saved to
+// eval_metrics — pulled out as a pure function (no I/O), the same technique
+// cmd/server/main.go's buildSearchService/wireActionsAndBriefing use, so the
+// decision is unit-testable without a live Postgres connection.
+//
+// A --rerank=true run must never be saved: eval_metrics has no rerank column
+// (see the CAVEAT comment at the Save call site), so persisting it would
+// silently become the next default run's regression baseline. Only a
+// rerank-off run (the nightly cron's only mode) is allowed to persist.
+func shouldPersistEvalRun(rerank bool) bool {
+	return !rerank
 }
 
 // percentile returns the p-th percentile (0–100) of vals using the nearest-rank
