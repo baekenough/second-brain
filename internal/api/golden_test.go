@@ -239,6 +239,11 @@ func TestGoldenNextHandler_NoOpenQuery(t *testing.T) {
 // intent.DeterministicWindow phrase, so this also pins the "no explicit
 // period" shape: an unconstrained relevance stream plus a 90-day-fallback
 // recent stream, and a null query.window in the response.
+//
+// storedAskedAt is set on the stub's GoldenQuery but deliberately far from
+// reviewNow: the recent-stream fallback window and response asked_at must be
+// computed from reviewNow (s.nowFunc(), injected below), NOT from this stored
+// value — see goldenNextHandler's doc comment.
 func TestGoldenNextHandler_ExcludesAlreadyJudged(t *testing.T) {
 	t.Parallel()
 
@@ -246,10 +251,11 @@ func TestGoldenNextHandler_ExcludesAlreadyJudged(t *testing.T) {
 	judgedDocID := uuid.New()
 	freshDocID := uuid.New()
 	occurredAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	askedAt := time.Date(2026, 8, 20, 3, 0, 0, 0, time.UTC)
+	storedAskedAt := time.Date(2026, 8, 20, 3, 0, 0, 0, time.UTC)
+	reviewNow := time.Date(2026, 9, 20, 3, 0, 0, 0, time.UTC)
 
 	stub := &stubGoldenSet{
-		nextQuery: &store.GoldenQuery{ID: queryID, Text: "지난주에 누구랑 통화했지", Source: "seed", Status: "open", AskedAt: askedAt},
+		nextQuery: &store.GoldenQuery{ID: queryID, Text: "지난주에 누구랑 통화했지", Source: "seed", Status: "open", AskedAt: storedAskedAt},
 		judgedDocIDs: map[uuid.UUID]struct{}{
 			judgedDocID: {},
 		},
@@ -273,6 +279,7 @@ func TestGoldenNextHandler_ExcludesAlreadyJudged(t *testing.T) {
 	}
 	searcher := &recordingGoldenSearcher{results: sharedResults}
 	srv := newGoldenTestServer(stub, searcher)
+	srv.now = func() time.Time { return reviewNow }
 
 	rec := doGoldenRequest(srv, http.MethodGet, "/api/v1/golden/next?limit=5", nil)
 	if rec.Code != http.StatusOK {
@@ -301,12 +308,12 @@ func TestGoldenNextHandler_ExcludesAlreadyJudged(t *testing.T) {
 	if relCall.OccurredFrom != nil || relCall.OccurredTo != nil {
 		t.Errorf("relevance stream window = [%v, %v), want none (no period phrase in the query text)", relCall.OccurredFrom, relCall.OccurredTo)
 	}
-	wantRecentFrom := askedAt.Add(-goldenRecentFallbackWindow)
+	wantRecentFrom := reviewNow.Add(-goldenRecentFallbackWindow)
 	if recCall.OccurredFrom == nil || !recCall.OccurredFrom.Equal(wantRecentFrom) {
-		t.Errorf("recent stream OccurredFrom = %v, want %v (asked_at - 90d fallback)", recCall.OccurredFrom, wantRecentFrom)
+		t.Errorf("recent stream OccurredFrom = %v, want %v (reviewNow - 90d fallback)", recCall.OccurredFrom, wantRecentFrom)
 	}
-	if recCall.OccurredTo == nil || !recCall.OccurredTo.Equal(askedAt) {
-		t.Errorf("recent stream OccurredTo = %v, want asked_at %v", recCall.OccurredTo, askedAt)
+	if recCall.OccurredTo == nil || !recCall.OccurredTo.Equal(reviewNow) {
+		t.Errorf("recent stream OccurredTo = %v, want reviewNow %v (NOT the stored asked_at %v)", recCall.OccurredTo, reviewNow, storedAskedAt)
 	}
 	if stub.nextJudgeGot != "user" {
 		t.Errorf("NextQuery judge = %q, want default 'user' when ?judge= is omitted", stub.nextJudgeGot)
@@ -322,8 +329,8 @@ func TestGoldenNextHandler_ExcludesAlreadyJudged(t *testing.T) {
 	if resp.Query == nil || resp.Query.ID != queryID.String() {
 		t.Fatalf("query = %+v, want id %s", resp.Query, queryID)
 	}
-	if resp.Query.AskedAt != askedAt.Format(time.RFC3339) {
-		t.Errorf("query.asked_at = %q, want %q", resp.Query.AskedAt, askedAt.Format(time.RFC3339))
+	if resp.Query.AskedAt != reviewNow.Format(time.RFC3339) {
+		t.Errorf("query.asked_at = %q, want reviewNow %q (NOT the stored asked_at %q)", resp.Query.AskedAt, reviewNow.Format(time.RFC3339), storedAskedAt.Format(time.RFC3339))
 	}
 	if resp.Query.Window != nil {
 		t.Errorf("query.window = %+v, want nil (no period phrase in the query text)", resp.Query.Window)
@@ -355,25 +362,33 @@ func TestGoldenNextHandler_ExcludesAlreadyJudged(t *testing.T) {
 	}
 }
 
-// TestGoldenNextHandler_PeriodPhraseResolvesWindowFromAskedAt covers a query
-// text carrying an explicit period phrase ("오늘"): both search streams must
-// receive the SAME window, resolved via intent.DeterministicWindow anchored
-// at the query's asked_at (NOT at whenever this test — or any real review —
-// happens to run), and the response must surface that window verbatim.
-func TestGoldenNextHandler_PeriodPhraseResolvesWindowFromAskedAt(t *testing.T) {
+// TestGoldenNextHandler_PeriodPhraseResolvesWindowFromReviewTime covers a
+// query text carrying an explicit period phrase ("오늘"): both search streams
+// must receive the SAME window, resolved via intent.DeterministicWindow
+// anchored at REVIEW TIME (s.nowFunc(), injected as reviewNow below) — NOT at
+// the query's stored asked_at, which is deliberately set to a different date
+// so a window computed off the stale stored value would fail obviously
+// rather than by coincidence — and the response must surface that window,
+// and its own asked_at field, as reviewNow.
+func TestGoldenNextHandler_PeriodPhraseResolvesWindowFromReviewTime(t *testing.T) {
 	t.Parallel()
 
-	// Deliberately far from "now" so a window computed off time.Now() instead
-	// of asked_at would fail obviously rather than by coincidence.
-	askedAt := time.Date(2026, 5, 10, 1, 0, 0, 0, time.UTC) // 2026-05-10 10:00 KST
-	wantFrom, wantTo, label, ok := intent.DeterministicWindow("오늘 통화 내역 보여줘", askedAt.In(timeutil.KST()))
+	storedAskedAt := time.Date(2026, 5, 10, 1, 0, 0, 0, time.UTC) // 2026-05-10 10:00 KST
+	reviewNow := time.Date(2026, 9, 20, 1, 0, 0, 0, time.UTC)     // 2026-09-20 10:00 KST
+	wantFrom, wantTo, label, ok := intent.DeterministicWindow("오늘 통화 내역 보여줘", reviewNow.In(timeutil.KST()))
 	if !ok {
 		t.Fatalf("test setup: DeterministicWindow did not match %q", label)
+	}
+	// Sanity check that storedAskedAt would have resolved to a DIFFERENT
+	// window — otherwise this test could pass even if the handler still read
+	// q.AskedAt instead of reviewNow.
+	if staleFrom, _, _, _ := intent.DeterministicWindow("오늘 통화 내역 보여줘", storedAskedAt.In(timeutil.KST())); staleFrom.Equal(wantFrom) {
+		t.Fatalf("test setup: storedAskedAt and reviewNow resolve to the same window (%v) — pick dates far enough apart to distinguish them", wantFrom)
 	}
 
 	queryID := uuid.New()
 	stub := &stubGoldenSet{
-		nextQuery: &store.GoldenQuery{ID: queryID, Text: "오늘 통화 내역 보여줘", Source: "seed", Status: "open", AskedAt: askedAt},
+		nextQuery: &store.GoldenQuery{ID: queryID, Text: "오늘 통화 내역 보여줘", Source: "seed", Status: "open", AskedAt: storedAskedAt},
 		progress:  store.GoldenProgress{OpenQueries: 1},
 	}
 	// One canned hit on every call so the merge is non-empty and the
@@ -384,6 +399,7 @@ func TestGoldenNextHandler_PeriodPhraseResolvesWindowFromAskedAt(t *testing.T) {
 		{Document: model.Document{ID: uuid.New(), Title: "today's call", SourceType: model.SourceCall}},
 	}}
 	srv := newGoldenTestServer(stub, searcher)
+	srv.now = func() time.Time { return reviewNow }
 
 	rec := doGoldenRequest(srv, http.MethodGet, "/api/v1/golden/next", nil)
 	if rec.Code != http.StatusOK {
@@ -414,6 +430,69 @@ func TestGoldenNextHandler_PeriodPhraseResolvesWindowFromAskedAt(t *testing.T) {
 	}
 	if resp.Query.Window.To != wantTo.Format(time.RFC3339) {
 		t.Errorf("window.to = %q, want %q", resp.Query.Window.To, wantTo.Format(time.RFC3339))
+	}
+	if resp.Query.AskedAt != reviewNow.Format(time.RFC3339) {
+		t.Errorf("query.asked_at = %q, want reviewNow %q", resp.Query.AskedAt, reviewNow.Format(time.RFC3339))
+	}
+}
+
+// TestGoldenNextHandler_WindowIgnoresArbitrarilyOldStoredAskedAt is a direct,
+// standalone assertion of the "질문 시점을 현재로" contract: no matter how far
+// in the past a query's stored asked_at is (here, years old), the resolved
+// window and the response's asked_at field must reflect review time
+// (s.nowFunc()), never the stored value. The other window tests in this file
+// pin this as a side effect of a more specific scenario; this test exists
+// purely to make the general rule fail loudly on its own if it ever
+// regresses.
+func TestGoldenNextHandler_WindowIgnoresArbitrarilyOldStoredAskedAt(t *testing.T) {
+	t.Parallel()
+
+	ancientAskedAt := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	reviewNow := time.Date(2026, 9, 20, 1, 0, 0, 0, time.UTC) // 2026-09-20 10:00 KST
+	wantFrom, wantTo, label, ok := intent.DeterministicWindow("오늘 통화 내역 보여줘", reviewNow.In(timeutil.KST()))
+	if !ok {
+		t.Fatalf("test setup: DeterministicWindow did not match %q", label)
+	}
+
+	stub := &stubGoldenSet{
+		nextQuery: &store.GoldenQuery{ID: uuid.New(), Text: "오늘 통화 내역 보여줘", Source: "seed", Status: "open", AskedAt: ancientAskedAt},
+		progress:  store.GoldenProgress{OpenQueries: 1},
+	}
+	searcher := &recordingGoldenSearcher{results: []*model.SearchResult{
+		{Document: model.Document{ID: uuid.New(), Title: "today's call", SourceType: model.SourceCall}},
+	}}
+	srv := newGoldenTestServer(stub, searcher)
+	srv.now = func() time.Time { return reviewNow }
+
+	rec := doGoldenRequest(srv, http.MethodGet, "/api/v1/golden/next", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+
+	if len(searcher.calls) != 2 {
+		t.Fatalf("Search called %d times, want 2", len(searcher.calls))
+	}
+	for i, call := range searcher.calls {
+		if call.OccurredFrom == nil || !call.OccurredFrom.Equal(wantFrom) {
+			t.Errorf("call[%d].OccurredFrom = %v, want %v (reviewNow's window, NOT the 2020 stored asked_at's)", i, call.OccurredFrom, wantFrom)
+		}
+		if call.OccurredTo == nil || !call.OccurredTo.Equal(wantTo) {
+			t.Errorf("call[%d].OccurredTo = %v, want %v (reviewNow's window, NOT the 2020 stored asked_at's)", i, call.OccurredTo, wantTo)
+		}
+	}
+
+	var resp goldenNextResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.Query == nil || resp.Query.Window == nil {
+		t.Fatalf("query.window = %v, want a resolved window", resp.Query)
+	}
+	if resp.Query.Window.From != wantFrom.Format(time.RFC3339) || resp.Query.Window.To != wantTo.Format(time.RFC3339) {
+		t.Errorf("query.window = %+v, want %s..%s", resp.Query.Window, wantFrom, wantTo)
+	}
+	if resp.Query.AskedAt != reviewNow.Format(time.RFC3339) {
+		t.Errorf("query.asked_at = %q, want reviewNow %q (NOT the stored 2020 asked_at)", resp.Query.AskedAt, reviewNow.Format(time.RFC3339))
 	}
 }
 
@@ -493,21 +572,25 @@ func TestGoldenNextHandler_MergesStreamsRatioAndDedup(t *testing.T) {
 // explicit period ("오늘") whose window has no matching documents at all.
 // goldenNextHandler must retry once with the window relaxed — relevance
 // stream searched with NO window, recent stream falling back to the
-// standard 90-day-before-asked_at window — and report
+// standard 90-day-before-reviewNow window — and report
 // query.window_fallback=true while query.window still reflects the
-// ORIGINALLY resolved (unhelpful) period, not the relaxed one.
+// ORIGINALLY resolved (unhelpful) period, not the relaxed one. The query's
+// stored asked_at is deliberately a different date from reviewNow, pinning
+// that both the original window and the fallback window are anchored at
+// review time (s.nowFunc()), not the stored value.
 func TestGoldenNextHandler_WindowFallbackWhenBothStreamsEmpty(t *testing.T) {
 	t.Parallel()
 
-	askedAt := time.Date(2026, 5, 10, 1, 0, 0, 0, time.UTC) // 2026-05-10 10:00 KST
-	wantFrom, wantTo, label, ok := intent.DeterministicWindow("오늘 통화 내역 보여줘", askedAt.In(timeutil.KST()))
+	storedAskedAt := time.Date(2026, 5, 10, 1, 0, 0, 0, time.UTC) // 2026-05-10 10:00 KST
+	reviewNow := time.Date(2026, 9, 20, 1, 0, 0, 0, time.UTC)     // 2026-09-20 10:00 KST
+	wantFrom, wantTo, label, ok := intent.DeterministicWindow("오늘 통화 내역 보여줘", reviewNow.In(timeutil.KST()))
 	if !ok {
 		t.Fatalf("test setup: DeterministicWindow did not match %q", label)
 	}
 
 	queryID := uuid.New()
 	stub := &stubGoldenSet{
-		nextQuery: &store.GoldenQuery{ID: queryID, Text: "오늘 통화 내역 보여줘", Source: "seed", Status: "open", AskedAt: askedAt},
+		nextQuery: &store.GoldenQuery{ID: queryID, Text: "오늘 통화 내역 보여줘", Source: "seed", Status: "open", AskedAt: storedAskedAt},
 		progress:  store.GoldenProgress{OpenQueries: 1},
 	}
 
@@ -523,6 +606,7 @@ func TestGoldenNextHandler_WindowFallbackWhenBothStreamsEmpty(t *testing.T) {
 		},
 	}
 	srv := newGoldenTestServer(stub, searcher)
+	srv.now = func() time.Time { return reviewNow }
 
 	rec := doGoldenRequest(srv, http.MethodGet, "/api/v1/golden/next", nil)
 	if rec.Code != http.StatusOK {
@@ -545,12 +629,12 @@ func TestGoldenNextHandler_WindowFallbackWhenBothStreamsEmpty(t *testing.T) {
 	if fbRelCall.Sort != "" {
 		t.Errorf("relevance fallback call Sort = %q, want \"\" (score-ranked)", fbRelCall.Sort)
 	}
-	wantFbRecentFrom := askedAt.Add(-goldenRecentFallbackWindow)
+	wantFbRecentFrom := reviewNow.Add(-goldenRecentFallbackWindow)
 	if fbRecCall.OccurredFrom == nil || !fbRecCall.OccurredFrom.Equal(wantFbRecentFrom) {
-		t.Errorf("recent fallback call OccurredFrom = %v, want %v (asked_at - 90d)", fbRecCall.OccurredFrom, wantFbRecentFrom)
+		t.Errorf("recent fallback call OccurredFrom = %v, want %v (reviewNow - 90d)", fbRecCall.OccurredFrom, wantFbRecentFrom)
 	}
-	if fbRecCall.OccurredTo == nil || !fbRecCall.OccurredTo.Equal(askedAt) {
-		t.Errorf("recent fallback call OccurredTo = %v, want asked_at %v", fbRecCall.OccurredTo, askedAt)
+	if fbRecCall.OccurredTo == nil || !fbRecCall.OccurredTo.Equal(reviewNow) {
+		t.Errorf("recent fallback call OccurredTo = %v, want reviewNow %v (NOT the stored asked_at %v)", fbRecCall.OccurredTo, reviewNow, storedAskedAt)
 	}
 	if fbRecCall.Sort != model.SortRecent {
 		t.Errorf("recent fallback call Sort = %q, want %q", fbRecCall.Sort, model.SortRecent)
