@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/google/uuid"
@@ -190,6 +191,20 @@ func insertAskSession(t *testing.T, pg *Postgres, question string) {
 	`, question)
 	if err != nil {
 		t.Fatalf("insert ask_sessions row: %v", err)
+	}
+}
+
+// insertAskSessionAt is insertAskSession with an explicit created_at, for
+// tests that need to control which of several same-question rows is the
+// earliest (GenerateQueries' asked_at = MIN(created_at) rule).
+func insertAskSessionAt(t *testing.T, pg *Postgres, question string, createdAt time.Time) {
+	t.Helper()
+	_, err := pg.pool.Exec(context.Background(), `
+		INSERT INTO ask_sessions (conversation_id, turn_index, question, answer, finish_reason, created_at)
+		VALUES (gen_random_uuid(), 0, $1, 'dummy answer', 'stop', $2)
+	`, question, createdAt)
+	if err != nil {
+		t.Fatalf("insert ask_sessions row at %v: %v", createdAt, err)
 	}
 }
 
@@ -594,7 +609,7 @@ func TestGoldenStore_UpsertQueryByText(t *testing.T) {
 	// Exact normalized duplicate (extra trailing space) of an existing query
 	// created by a completely different source ("seed") must resolve to the
 	// SAME id, and must NOT rewrite that row's source to "hermes".
-	gotID, err := s.UpsertQueryByText(ctx, goldenTestSentinel+"기존 질의 ", "hermes")
+	gotID, err := s.UpsertQueryByText(ctx, goldenTestSentinel+"기존 질의 ", "hermes", time.Time{})
 	if err != nil {
 		t.Fatalf("UpsertQueryByText (duplicate): %v", err)
 	}
@@ -611,7 +626,7 @@ func TestGoldenStore_UpsertQueryByText(t *testing.T) {
 
 	// A genuinely new query text must create a new row with the given source.
 	newText := goldenTestSentinel + "완전히 새로운 질의"
-	newID, err := s.UpsertQueryByText(ctx, newText, "hermes")
+	newID, err := s.UpsertQueryByText(ctx, newText, "hermes", time.Time{})
 	if err != nil {
 		t.Fatalf("UpsertQueryByText (new): %v", err)
 	}
@@ -631,11 +646,158 @@ func TestGoldenStore_UpsertQueryByText(t *testing.T) {
 
 	// Calling it again with the exact same text must be idempotent (resolve
 	// to the same new row, not create a second one).
-	againID, err := s.UpsertQueryByText(ctx, newText, "hermes")
+	againID, err := s.UpsertQueryByText(ctx, newText, "hermes", time.Time{})
 	if err != nil {
 		t.Fatalf("UpsertQueryByText (repeat): %v", err)
 	}
 	if againID != newID {
 		t.Errorf("UpsertQueryByText (repeat) = %s, want the same id %s", againID, newID)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// asked_at (migrations/032_golden_asked_at.sql) — the reference instant GET
+// /api/v1/golden/next resolves a query's period expression ("지난주", "오늘",
+// ...) against. Pinned against a real database because the earliest-vs-latest
+// distinction below (MIN vs MAX of ask_sessions.created_at) is exactly the
+// kind of off-by-one an in-memory stub cannot catch.
+// ---------------------------------------------------------------------------
+
+// TestGoldenStore_GenerateQueries_AskedAtIsEarliestAskOccurrence pins
+// GenerateQueries' asked_at rule for source="ask_history": it must be the
+// EARLIEST ask_sessions.created_at recorded for that question text, not the
+// latest (which only decides the recency cutoff for which questions are even
+// considered — see candidateAskHistoryQueries' ORDER BY latest DESC).
+func TestGoldenStore_GenerateQueries_AskedAtIsEarliestAskOccurrence(t *testing.T) {
+	pg := goldenTestDB(t)
+	s := NewGoldenStore(pg)
+	ctx := context.Background()
+
+	question := goldenTestSentinel + "지난주에 배송된 물건 확인해줘"
+	earliest := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+	middle := time.Date(2026, 3, 10, 9, 0, 0, 0, time.UTC)
+	latest := time.Date(2026, 3, 20, 9, 0, 0, 0, time.UTC)
+	// Inserted out of chronological order on purpose: a query keyed off
+	// insertion order rather than the created_at values themselves would
+	// pass by accident.
+	insertAskSessionAt(t, pg, question, middle)
+	insertAskSessionAt(t, pg, question, latest)
+	insertAskSessionAt(t, pg, question, earliest)
+
+	if _, _, err := s.GenerateQueries(ctx); err != nil {
+		t.Fatalf("GenerateQueries: %v", err)
+	}
+
+	var gotAskedAt time.Time
+	if err := pg.pool.QueryRow(ctx,
+		`SELECT asked_at FROM golden_queries WHERE text = $1`, question,
+	).Scan(&gotAskedAt); err != nil {
+		t.Fatalf("read asked_at: %v", err)
+	}
+	if !gotAskedAt.Equal(earliest) {
+		t.Errorf("asked_at = %v, want the EARLIEST ask_sessions.created_at %v (not latest %v)", gotAskedAt, earliest, latest)
+	}
+}
+
+// TestGoldenStore_GenerateQueries_SeedAskedAtDefaultsNear pins the
+// seed-source half of the same rule: seed queries carry no original asking
+// context, so their asked_at must default to (approximately) the moment
+// GenerateQueries ran, via the column's DEFAULT now() — not zero, not some
+// value borrowed from an unrelated ask_history row.
+func TestGoldenStore_GenerateQueries_SeedAskedAtDefaultsNear(t *testing.T) {
+	pg := goldenTestDB(t)
+	s := NewGoldenStore(pg)
+	ctx := context.Background()
+
+	before := time.Now().Add(-time.Minute)
+	if _, _, err := s.GenerateQueries(ctx); err != nil {
+		t.Fatalf("GenerateQueries: %v", err)
+	}
+	after := time.Now().Add(time.Minute)
+
+	var gotAskedAt time.Time
+	if err := pg.pool.QueryRow(ctx,
+		`SELECT asked_at FROM golden_queries WHERE source = 'seed' LIMIT 1`,
+	).Scan(&gotAskedAt); err != nil {
+		t.Fatalf("read a seed row's asked_at: %v", err)
+	}
+	if gotAskedAt.Before(before) || gotAskedAt.After(after) {
+		t.Errorf("seed asked_at = %v, want within [%v, %v] (DEFAULT now())", gotAskedAt, before, after)
+	}
+}
+
+// TestGoldenStore_NextQuery_ReturnsAskedAt pins that NextQuery's SELECT
+// actually surfaces asked_at (not just accepts the column existing) — GET
+// /api/v1/golden/next's window resolution reads GoldenQuery.AskedAt directly
+// off this return value.
+func TestGoldenStore_NextQuery_ReturnsAskedAt(t *testing.T) {
+	pg := goldenTestDB(t)
+	s := NewGoldenStore(pg)
+	ctx := context.Background()
+
+	wantAskedAt := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	var id uuid.UUID
+	if err := pg.pool.QueryRow(ctx, `
+		INSERT INTO golden_queries (text, source, status, asked_at)
+		VALUES ($1, 'manual', 'open', $2)
+		RETURNING id
+	`, goldenTestSentinel+"asked_at 반환 확인", wantAskedAt).Scan(&id); err != nil {
+		t.Fatalf("seed query with explicit asked_at: %v", err)
+	}
+
+	next, err := s.NextQuery(ctx, "user")
+	if err != nil {
+		t.Fatalf("NextQuery: %v", err)
+	}
+	if next == nil || next.ID != id {
+		t.Fatalf("NextQuery = %+v, want the seeded query %s", next, id)
+	}
+	if !next.AskedAt.Equal(wantAskedAt) {
+		t.Errorf("NextQuery.AskedAt = %v, want %v", next.AskedAt, wantAskedAt)
+	}
+}
+
+// TestGoldenStore_UpsertQueryByText_PersistsGivenAskedAt covers the
+// POST /api/v1/golden/feedback path: a caller-supplied askedAt must be
+// persisted on a NEWLY created row, and — mirroring the source-provenance
+// rule already pinned above — must NOT be rewritten on a normalized-duplicate
+// call against a pre-existing row.
+func TestGoldenStore_UpsertQueryByText_PersistsGivenAskedAt(t *testing.T) {
+	pg := goldenTestDB(t)
+	s := NewGoldenStore(pg)
+	ctx := context.Background()
+
+	text := goldenTestSentinel + "이번 달 구독료 정리"
+	wantAskedAt := time.Date(2026, 6, 15, 8, 30, 0, 0, time.UTC)
+
+	id, err := s.UpsertQueryByText(ctx, text, "hermes", wantAskedAt)
+	if err != nil {
+		t.Fatalf("UpsertQueryByText: %v", err)
+	}
+
+	var gotAskedAt time.Time
+	if err := pg.pool.QueryRow(ctx, `SELECT asked_at FROM golden_queries WHERE id = $1`, id).Scan(&gotAskedAt); err != nil {
+		t.Fatalf("read asked_at: %v", err)
+	}
+	if !gotAskedAt.Equal(wantAskedAt) {
+		t.Errorf("asked_at = %v, want the given %v", gotAskedAt, wantAskedAt)
+	}
+
+	// A second call with a DIFFERENT askedAt against the same normalized text
+	// must resolve to the same row without moving its asked_at.
+	otherAskedAt := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	againID, err := s.UpsertQueryByText(ctx, text+" ", "hermes", otherAskedAt)
+	if err != nil {
+		t.Fatalf("UpsertQueryByText (duplicate): %v", err)
+	}
+	if againID != id {
+		t.Fatalf("UpsertQueryByText (duplicate) = %s, want existing id %s", againID, id)
+	}
+	var stillAskedAt time.Time
+	if err := pg.pool.QueryRow(ctx, `SELECT asked_at FROM golden_queries WHERE id = $1`, id).Scan(&stillAskedAt); err != nil {
+		t.Fatalf("read asked_at after duplicate call: %v", err)
+	}
+	if !stillAskedAt.Equal(wantAskedAt) {
+		t.Errorf("asked_at after duplicate call = %v, want unchanged %v (got instead %v)", stillAskedAt, wantAskedAt, otherAskedAt)
 	}
 }

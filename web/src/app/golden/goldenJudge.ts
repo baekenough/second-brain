@@ -13,6 +13,7 @@ import type {
   GoldenJudgment,
   GoldenJudgmentInput,
   GoldenQuerySource,
+  GoldenQueryWindow,
 } from "@/lib/types";
 
 /** Per-candidate selection state, keyed by document_id. A candidate absent
@@ -129,4 +130,84 @@ export function nextFocusIndex(current: number, direction: FocusDirection, lengt
   const clamped = Math.min(Math.max(current, 0), length - 1);
   if (direction === "up") return Math.max(clamped - 1, 0);
   return Math.min(clamped + 1, length - 1);
+}
+
+// ── asked_at / window display formatting ────────────────────────────────────
+//
+// A judge must weigh candidate relevance against the moment the query was
+// *asked*, not against "now" — a historical ask_history query from three
+// months ago should be judged by what was true then, not by what's freshest
+// today. These helpers live here (not in lib/dates.ts) because they take an
+// explicit `now` reference instead of reading Date.now() themselves, which is
+// what makes them testable without faking the system clock.
+
+/** `YYYY-MM-DD`, no time component. Used for both the asked_at label and as
+ * a building block for testing — kept separate from lib/dates.ts's
+ * locale-formatted variants because the golden screen wants a fixed-width,
+ * unambiguous date next to a relative-time parenthetical. */
+export function formatAbsoluteDate(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+/** `M/D`, no leading zeros or year — compact enough to fit two of them in a
+ * "5/27 ~ 6/3" window label. Uses UTC fields (like formatAbsoluteDate) so the
+ * displayed date is stable regardless of the viewer's/runner's local
+ * timezone, rather than shifting by a day near midnight. */
+export function formatMonthDay(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  return `${date.getUTCMonth() + 1}/${date.getUTCDate()}`;
+}
+
+/**
+ * "질문 시점" label: `YYYY-MM-DD (N개월 전)`. The relative part uses the same
+ * day-bucket thresholds as lib/dates.ts's formatRelative, but is reimplemented
+ * here (rather than imported) so `now` can be injected — formatRelative reads
+ * `new Date()` internally, which would make this function's output
+ * time-dependent and untestable.
+ */
+export function formatAskedAtLabel(askedAt: string, now: Date = new Date()): string {
+  const date = new Date(askedAt);
+  if (Number.isNaN(date.getTime())) return "";
+  const diffMs = now.getTime() - date.getTime();
+  const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+  let relative: string;
+  if (diffDays <= 0) relative = "오늘";
+  else if (diffDays === 1) relative = "어제";
+  else if (diffDays < 7) relative = `${diffDays}일 전`;
+  else if (diffDays < 30) relative = `${Math.floor(diffDays / 7)}주 전`;
+  else if (diffDays < 365) relative = `${Math.floor(diffDays / 30)}개월 전`;
+  else relative = `${Math.floor(diffDays / 365)}년 전`;
+
+  return `${formatAbsoluteDate(askedAt)} (${relative})`;
+}
+
+/**
+ * "검색 창" label. `null` means the query carried no period expression, so
+ * the backend searched without a date bound — that state gets an explicit
+ * explanation rather than a blank, since a judge seeing no window text at all
+ * cannot tell "no window" from "field not loaded yet".
+ */
+export function formatWindowLabel(window: GoldenQueryWindow | null): string {
+  if (!window) return "검색 창: 없음(최근 90일 최신순 섞음)";
+  return `검색 창: ${formatMonthDay(window.from)} ~ ${formatMonthDay(window.to)}`;
+}
+
+/** Korean labels for GoldenCandidate.stream. */
+const GOLDEN_STREAM_LABELS: Record<string, string> = {
+  relevance: "관련도",
+  recent: "최신",
+};
+
+/** Returns the Korean label for a candidate's retrieval stream, or the raw
+ * value if it is not one of the two known streams (same fallback convention
+ * as goldenSourceLabel). */
+export function goldenStreamLabel(stream: string): string {
+  return GOLDEN_STREAM_LABELS[stream] ?? stream;
 }
