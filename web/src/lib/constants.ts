@@ -1,6 +1,13 @@
 import type { AskLayer, SourceType } from "./types";
 
-/** Human-readable labels for each source type. */
+/**
+ * Human-readable labels for each source type.
+ *
+ * `call-log` and `call-transcript` are kept mapped to the same "통화" label
+ * as the unified `call` type — this is a read compatibility shim for
+ * documents collected before the backend's call-unification migration ran.
+ * Do not give them a distinct label; they represent the same concept.
+ */
 export const SOURCE_LABELS: Record<SourceType, string> = {
   slack: "Slack",
   github: "GitHub",
@@ -14,8 +21,9 @@ export const SOURCE_LABELS: Record<SourceType, string> = {
   gmail: "Gmail",
   calendar: "Calendar",
   sms: "SMS",
+  call: "통화",
   "call-log": "통화",
-  "call-transcript": "전사",
+  "call-transcript": "통화",
   upload: "Upload",
   note: "내 노트",
   insight: "추론",
@@ -29,8 +37,9 @@ export const SOURCE_LABELS: Record<SourceType, string> = {
  */
 export const SOURCE_BADGE_CLASSES: Record<SourceType, string> = {
   sms: "badge-sms",
-  "call-log": "badge-call-log",
-  "call-transcript": "badge-call-transcript",
+  call: "badge-call",
+  "call-log": "badge-call",
+  "call-transcript": "badge-call",
   gmail: "badge-gmail",
   calendar: "badge-calendar",
   filesystem: "badge-filesystem",
@@ -51,7 +60,7 @@ export const SOURCE_BADGE_CLASSES: Record<SourceType, string> = {
 export const SEARCH_FILTER_SOURCES: (SourceType | "all")[] = [
   "all",
   "sms",
-  "call-transcript",
+  "call",
   "gmail",
   "calendar",
   "filesystem",
@@ -64,8 +73,7 @@ export const DEFAULT_EXCLUDED_SOURCES: SourceType[] = ["slack"];
 /** Source types shown in the dashboard stats grid. */
 export const DASHBOARD_SOURCES: SourceType[] = [
   "sms",
-  "call-log",
-  "call-transcript",
+  "call",
   "gmail",
   "calendar",
   "filesystem",

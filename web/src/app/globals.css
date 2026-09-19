@@ -178,8 +178,7 @@
   }
 
   .badge-sms { background: oklch(20% 0.07 145); color: oklch(62% 0.15 145); }
-  .badge-call-log { background: oklch(19% 0.06 250); color: oklch(62% 0.13 250); }
-  .badge-call-transcript { background: oklch(18% 0.06 240); color: oklch(60% 0.12 240); }
+  .badge-call { background: oklch(19% 0.06 250); color: oklch(62% 0.13 250); }
   .badge-gmail { background: oklch(22% 0.07 25); color: oklch(62% 0.17 25); }
   .badge-calendar { background: oklch(19% 0.06 200); color: oklch(60% 0.12 200); }
   .badge-filesystem { background: oklch(20% 0.05 80); color: oklch(65% 0.13 80); }

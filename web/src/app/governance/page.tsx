@@ -24,16 +24,11 @@ const PII_ROWS: PIIRow[] = [
     notes: "OTP 패턴 해시, 전화번호 마스킹 적용",
   },
   {
-    source: "call-log",
-    label: "통화 로그",
-    status: "covered",
-    notes: "발신/수신 번호 메타데이터만 저장, 오디오 없음",
-  },
-  {
-    source: "call-transcript",
-    label: "통화 전사",
+    source: "call",
+    label: "통화",
     status: "partial",
-    notes: "전사 텍스트에 PII 필터 미적용 (#112 #2a). 주민번호·계좌·OTP 포함 가능",
+    notes:
+      "발신/수신 번호 메타데이터는 저장(오디오 없음), 전사 텍스트에는 PII 필터 미적용 (#112 #2a). 주민번호·계좌·OTP 포함 가능",
   },
   {
     source: "gmail",
