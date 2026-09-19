@@ -179,21 +179,36 @@ func (p *LLMPlanner) nowFunc() time.Time {
 	return time.Now()
 }
 
-// deterministicPlan resolves the nine phrasings of spec §4.1 without an LLM
-// call. ok is false when nothing matched.
-func (p *LLMPlanner) deterministicPlan(question string, now time.Time) (QueryPlan, bool) {
-	var (
-		from, to time.Time
-		label    string
-	)
-
+// DeterministicWindow runs the same regex pre-pass deterministicPlan uses to
+// resolve one of the nine Korean date/period phrasings of spec §4.1 to a
+// half-open [from, to) window, evaluated relative to the given base time
+// rather than time.Now(). now should already be normalised to
+// timeutil.KST() by the caller, exactly as Plan does before calling
+// deterministicPlan — the range helpers (monthRange/weekRange/dayRange) all
+// re-normalise internally, but the regexes' own reading of "this month" /
+// "this week" depends on which calendar day now names, so an un-normalised
+// UTC instant can still misclassify one.
+//
+// Exported so callers outside an LLMPlanner instance can reuse the exact
+// phrase list deterministicPlan is held to, instead of maintaining a second
+// list that could drift. Currently used by the golden-set candidate handler
+// (internal/api/golden.go), which must resolve "지난주" relative to when a
+// question was originally asked, not relative to whenever a human happens to
+// review it later.
+//
+// ok is false when no phrase in the pre-pass list matched — callers should
+// then treat the query as carrying no time constraint, exactly like the LLM
+// path's fallback plan does. label is the matched Korean phrase ("지난달",
+// "오늘", ...), useful for a Reason-style rendering; callers that don't need
+// it can discard it.
+func DeterministicWindow(question string, now time.Time) (from, to time.Time, label string, ok bool) {
 	switch {
 	case yearMonthRe.MatchString(question):
 		m := yearMonthRe.FindStringSubmatch(question)
 		year, errY := strconv.Atoi(m[1])
 		month, errM := strconv.Atoi(m[2])
 		if errY != nil || errM != nil || month < 1 || month > 12 {
-			return QueryPlan{}, false
+			return time.Time{}, time.Time{}, "", false
 		}
 		from, to = monthRange(year, month)
 		label = fmt.Sprintf("%d년 %d월", year, month)
@@ -227,6 +242,16 @@ func (p *LLMPlanner) deterministicPlan(question string, now time.Time) (QueryPla
 		from, to = dayRange(now.AddDate(0, 0, -1))
 		label = "어제"
 	default:
+		return time.Time{}, time.Time{}, "", false
+	}
+	return from, to, label, true
+}
+
+// deterministicPlan resolves the nine phrasings of spec §4.1 without an LLM
+// call. ok is false when nothing matched.
+func (p *LLMPlanner) deterministicPlan(question string, now time.Time) (QueryPlan, bool) {
+	from, to, label, ok := DeterministicWindow(question, now)
+	if !ok {
 		return QueryPlan{}, false
 	}
 

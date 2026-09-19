@@ -1,0 +1,37 @@
+-- Migration 032: golden_queries.asked_at — the reference instant a period
+-- expression inside the query text ("지난주", "오늘", ...) must be resolved
+-- against.
+--
+-- Background: GET /api/v1/golden/next searched candidates with NO time
+-- constraint at all (model.SearchQuery{Query, Limit, IncludeRetention}), so a
+-- query like "지난주 통화" was ranked purely by text/vector relevance. When
+-- one period of the corpus vastly outweighs the rest (observed: 2026-05 call
+-- transcripts), every candidate slot for that query gets filled from that one
+-- period regardless of when the question was actually asked, and truly
+-- recent documents never enter the candidate set at all — the golden set
+-- cannot measure recall for anything current.
+--
+-- Fixing that requires resolving a query's period expression ("지난주") to a
+-- window, and that resolution needs SOME anchor instant. "now" — whenever a
+-- human happens to click through the review queue, possibly weeks after the
+-- query was generated — is the wrong anchor for ask_history-sourced queries:
+-- the correct one is when the question was originally asked, so review
+-- doesn't silently reinterpret "지난주" as a different week than the asker
+-- meant, and so a document that did not exist yet when the question was
+-- asked can never leak into its ground truth (no future leakage).
+--
+-- asked_at defaults to now() so every pre-existing row (and any future
+-- seed/manual row, which carries no original asking context) gets a
+-- defensible value without a separate backfill statement. Postgres evaluates
+-- a volatile DEFAULT expression exactly once for an ADD COLUMN statement —
+-- not per row — so every row that exists at migration time receives the
+-- same single timestamp (the moment this migration ran), which is the best
+-- available anchor for data with no better one.
+--
+-- GoldenStore.GenerateQueries overwrites this default for freshly generated
+-- ask_history rows with the earliest matching ask_sessions.created_at (see
+-- candidateAskHistoryQueries) — the actual moment the question was asked.
+--
+-- Additive only, idempotent (IF NOT EXISTS) so a re-run against an
+-- already-migrated database is a no-op.
+ALTER TABLE golden_queries ADD COLUMN IF NOT EXISTS asked_at TIMESTAMPTZ NOT NULL DEFAULT now();

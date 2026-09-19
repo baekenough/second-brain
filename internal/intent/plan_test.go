@@ -558,3 +558,78 @@ func TestPlanner_NoTimePhrase_NoSilentWindow(t *testing.T) {
 		t.Errorf("window = [%v, %v), want none", got.OccurredFrom, got.OccurredTo)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// DeterministicWindow — the exported half of deterministicPlan's regex
+// pre-pass, reused outside an LLMPlanner instance by the golden-set candidate
+// handler (internal/api/golden.go).
+// ---------------------------------------------------------------------------
+
+// TestDeterministicWindow_MatchesPlanGoldenRows pins DeterministicWindow
+// against the same deterministic-path rows Plan is already held to (spec §8),
+// so a future edit to the regex/range logic cannot make the exported function
+// and deterministicPlan diverge without a test failure.
+func TestDeterministicWindow_MatchesPlanGoldenRows(t *testing.T) {
+	t.Parallel()
+	now := planNowUTC.In(timeutil.KST())
+	for _, c := range planGolden {
+		if !c.deterministic {
+			continue
+		}
+		c := c
+		t.Run(c.question, func(t *testing.T) {
+			t.Parallel()
+			from, to, _, ok := intent.DeterministicWindow(c.question, now)
+			if !ok {
+				t.Fatalf("DeterministicWindow(%q) ok = false, want true (row is deterministic)", c.question)
+			}
+			wantFrom := kstMidnight(t, c.wantFrom)
+			wantTo := kstMidnight(t, c.wantTo)
+			if !from.Equal(wantFrom) {
+				t.Errorf("from = %v, want %v", from, wantFrom)
+			}
+			if !to.Equal(wantTo) {
+				t.Errorf("to = %v, want %v", to, wantTo)
+			}
+		})
+	}
+}
+
+// TestDeterministicWindow_AnchorsToGivenBaseTime proves `now` is a real,
+// load-bearing input rather than a disguised time.Now() or a hardcoded date —
+// exactly the property the golden-set candidate handler depends on to resolve
+// "어제" relative to when a question was originally asked (asked_at), not
+// relative to whenever a human happens to review it later.
+func TestDeterministicWindow_AnchorsToGivenBaseTime(t *testing.T) {
+	t.Parallel()
+	// Deliberately far from planNowUTC's 2026-08-19, so a result that
+	// accidentally used the wrong clock would fail obviously rather than by
+	// coincidence.
+	askedAt := time.Date(2026, 5, 10, 1, 0, 0, 0, time.UTC).In(timeutil.KST()) // 2026-05-10 10:00 KST
+
+	from, to, label, ok := intent.DeterministicWindow("어제 뭐 했지", askedAt)
+	if !ok {
+		t.Fatal(`DeterministicWindow("어제 뭐 했지") ok = false, want true`)
+	}
+	if label != "어제" {
+		t.Errorf("label = %q, want %q", label, "어제")
+	}
+	wantFrom := kstMidnight(t, "2026-05-09")
+	wantTo := kstMidnight(t, "2026-05-10")
+	if !from.Equal(wantFrom) {
+		t.Errorf("from = %v, want %v (one day before the injected base time, not planNowUTC)", from, wantFrom)
+	}
+	if !to.Equal(wantTo) {
+		t.Errorf("to = %v, want %v", to, wantTo)
+	}
+}
+
+// TestDeterministicWindow_NoMatchReturnsOkFalse pins the "no phrase matched"
+// contract callers rely on to fall back to an unconstrained query.
+func TestDeterministicWindow_NoMatchReturnsOkFalse(t *testing.T) {
+	t.Parallel()
+	_, _, _, ok := intent.DeterministicWindow("프로젝트 진행 상황 어때", planNowUTC.In(timeutil.KST()))
+	if ok {
+		t.Error("ok = true, want false for a question with no recognised period phrase")
+	}
+}
