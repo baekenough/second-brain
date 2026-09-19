@@ -419,3 +419,82 @@ export interface BriefingResponse {
   cached: boolean;
   generated_at: string;
 }
+
+// ── Golden set labeling ────────────────────────────────────────────────────
+//
+// Search-quality golden-set screen: the user judges each candidate document
+// returned for a query as relevant / irrelevant / noise. A judgment is both
+// an eval ground-truth label and a retention-noise feedback signal (spec:
+// GET /api/v1/golden/next, POST /api/v1/golden/judgments).
+
+/** Closed judgment vocabulary — mirrors the backend's golden judgment enum. */
+export const GOLDEN_JUDGMENTS = ["relevant", "irrelevant", "noise"] as const;
+export type GoldenJudgment = (typeof GOLDEN_JUDGMENTS)[number];
+
+/** Retention tag mirrors model.RetentionTag (internal/model/retention.go).
+ * `null` covers both "untagged" (most of the corpus predates segmentation)
+ * and "tag absent from the wire payload" — the UI renders both identically
+ * as "미태그", the same convention AskSourceItem.occurred_at uses for its
+ * own null case. */
+export type RetentionTag = "keep" | "low" | "disposable" | null;
+
+/** Known values of GoldenQuery.source (coordinator confirmation, 2026-09-19).
+ * Kept as a const tuple rather than baked into GoldenQuery.source's type
+ * because an unrecognised value must still round-trip through the UI
+ * unchanged — see app/golden/goldenJudge.ts's goldenSourceLabel, which falls
+ * back to the raw string for anything outside this set. */
+export const GOLDEN_QUERY_SOURCES = ["ask_history", "seed", "manual"] as const;
+export type GoldenQuerySource = (typeof GOLDEN_QUERY_SOURCES)[number];
+
+export interface GoldenQuery {
+  id: string;
+  text: string;
+  source: string;
+}
+
+export interface GoldenCandidate {
+  document_id: string;
+  title: string;
+  snippet: string;
+  source_type: SourceType;
+  occurred_at: string | null;
+  retention: RetentionTag;
+  segment?: string | null;
+  rank: number;
+}
+
+export interface GoldenProgress {
+  judged_queries: number;
+  open_queries: number;
+  total_judgments: number;
+}
+
+/** `query: null` means there is nothing left to label — the screen offers
+ * "후보 질의 생성" instead of a candidate list. */
+export interface GoldenNextResponse {
+  query: GoldenQuery | null;
+  candidates: GoldenCandidate[];
+  progress: GoldenProgress;
+}
+
+export interface GoldenJudgmentInput {
+  document_id: string;
+  judgment: GoldenJudgment;
+  rank: number;
+}
+
+export interface GoldenJudgmentsRequest {
+  query_id: string;
+  judgments: GoldenJudgmentInput[];
+  finish_query: boolean;
+}
+
+export interface GoldenJudgmentsResponse {
+  saved: number;
+  feedback_applied: number;
+}
+
+export interface GoldenGenerateResponse {
+  created: number;
+  total_open: number;
+}
