@@ -1,0 +1,641 @@
+package store
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"testing"
+
+	"github.com/baekenough/second-brain/internal/model"
+	"github.com/google/uuid"
+)
+
+// ---------------------------------------------------------------------------
+// GoldenStore — real-database tests (migrations/031_golden_set.sql).
+//
+// Skipped unless TEST_DATABASE_URL is set. It must NEVER point at production
+// — run a throwaway pgvector+pg_bigm container (deploy/postgres/Dockerfile)
+// with the full migration set applied via Postgres.RunMigrations.
+//
+// golden_queries/golden_judgments/ask_sessions are truncated at setup and
+// cleanup: unlike documents (shared with other _db_test.go files in this
+// package and cleaned by sentinel prefix instead), nothing else in the
+// package writes these three tables, so owning them exclusively for the
+// duration of this file's tests is safe, keeps every case starting from an
+// empty golden set regardless of run order, and lets ask_sessions test
+// fixtures use realistically short strings without a length-inflating
+// sentinel prefix getting in the way of the min-length filter under test.
+// ---------------------------------------------------------------------------
+
+const goldenTestSentinel = "zz-dummy-golden-"
+
+func goldenTestDB(t *testing.T) *Postgres {
+	t.Helper()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping real-database golden-set test")
+	}
+	pg, err := NewPostgres(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("connect to TEST_DATABASE_URL: %v", err)
+	}
+	t.Cleanup(pg.Close)
+
+	ctx := context.Background()
+	truncateOwned := func() {
+		if _, err := pg.pool.Exec(ctx, `TRUNCATE golden_judgments, golden_queries, ask_sessions`); err != nil {
+			t.Fatalf("truncate golden/ask_sessions tables: %v", err)
+		}
+	}
+	truncateOwned()
+	t.Cleanup(truncateOwned)
+
+	cleanupShared := func() {
+		if _, err := pg.pool.Exec(ctx, `DELETE FROM documents WHERE source_id LIKE $1`, goldenTestSentinel+"%"); err != nil {
+			t.Errorf("cleanup documents: %v", err)
+		}
+	}
+	t.Cleanup(cleanupShared)
+
+	return pg
+}
+
+// seedGoldenDocument inserts one throwaway document for golden_judgments'
+// document_id FK, with a metadata blob callers can pre-seed (e.g. an
+// existing retention tag to verify UpsertJudgments overwrites vs. leaves
+// alone).
+func seedGoldenDocument(t *testing.T, pg *Postgres, metadata map[string]any) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	metaJSON := "{}"
+	if metadata != nil {
+		b, err := json.Marshal(metadata)
+		if err != nil {
+			t.Fatalf("marshal metadata: %v", err)
+		}
+		metaJSON = string(b)
+	}
+	_, err := pg.pool.Exec(context.Background(), `
+		INSERT INTO documents (id, source_type, source_id, title, content, metadata, collected_at)
+		VALUES ($1, 'filesystem', $2, 'dummy title', 'dummy content', $3::jsonb, now())`,
+		id, goldenTestSentinel+id.String(), metaJSON,
+	)
+	if err != nil {
+		t.Fatalf("seed document: %v", err)
+	}
+	return id
+}
+
+// seedGoldenQuery inserts a golden_queries row directly (bypassing
+// GenerateQueries) for tests that only need a query to hang judgments off
+// of, not the generation logic itself.
+func seedGoldenQuery(t *testing.T, pg *Postgres, text, source, status string) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	err := pg.pool.QueryRow(context.Background(), `
+		INSERT INTO golden_queries (text, source, status) VALUES ($1, $2, $3) RETURNING id
+	`, text, source, status).Scan(&id)
+	if err != nil {
+		t.Fatalf("seed golden query: %v", err)
+	}
+	return id
+}
+
+func documentMetadata(t *testing.T, pg *Postgres, docID uuid.UUID) map[string]any {
+	t.Helper()
+	var meta map[string]any
+	err := pg.pool.QueryRow(context.Background(),
+		`SELECT metadata FROM documents WHERE id = $1`, docID).Scan(&meta)
+	if err != nil {
+		t.Fatalf("read document metadata: %v", err)
+	}
+	return meta
+}
+
+func TestGoldenStore_GenerateQueries_SeedsAndIsIdempotent(t *testing.T) {
+	pg := goldenTestDB(t)
+	s := NewGoldenStore(pg)
+	ctx := context.Background()
+
+	created, totalOpen, err := s.GenerateQueries(ctx)
+	if err != nil {
+		t.Fatalf("GenerateQueries (first call): %v", err)
+	}
+	if created != len(goldenSeedQueries) {
+		t.Errorf("created = %d, want %d (all seed queries, no ask_history rows exist yet)", created, len(goldenSeedQueries))
+	}
+	if totalOpen != len(goldenSeedQueries) {
+		t.Errorf("totalOpen = %d, want %d", totalOpen, len(goldenSeedQueries))
+	}
+
+	// A second call must be a no-op: every seed query already exists.
+	created2, totalOpen2, err := s.GenerateQueries(ctx)
+	if err != nil {
+		t.Fatalf("GenerateQueries (second call): %v", err)
+	}
+	if created2 != 0 {
+		t.Errorf("created (second call) = %d, want 0 (idempotent)", created2)
+	}
+	if totalOpen2 != totalOpen {
+		t.Errorf("totalOpen (second call) = %d, want unchanged %d", totalOpen2, totalOpen)
+	}
+}
+
+func TestGoldenStore_GenerateQueries_AskHistoryFilteringAndDedup(t *testing.T) {
+	pg := goldenTestDB(t)
+	s := NewGoldenStore(pg)
+	ctx := context.Background()
+
+	// Too short (< 6 runes after trim) — must be skipped. No sentinel prefix
+	// here on purpose: this table is truncated wholesale by goldenTestDB
+	// (see its doc comment), so a length-inflating prefix is not needed for
+	// cleanup and would defeat the very filter under test.
+	insertAskSession(t, pg, "짧음")
+	// A real candidate.
+	longQuestion := goldenTestSentinel + "지난주 통화 기록 좀 보여줘"
+	insertAskSession(t, pg, longQuestion)
+	// A near-duplicate of the one above (extra trailing space + different
+	// case does not apply to Korean, but the space alone must still collapse
+	// via goldenNormalize's Trim).
+	insertAskSession(t, pg, longQuestion+" ")
+
+	created, _, err := s.GenerateQueries(ctx)
+	if err != nil {
+		t.Fatalf("GenerateQueries: %v", err)
+	}
+
+	// created = seed list + exactly ONE ask_history row (the short one and
+	// the near-duplicate must both be excluded).
+	wantCreated := len(goldenSeedQueries) + 1
+	if created != wantCreated {
+		t.Errorf("created = %d, want %d (short question and near-duplicate must be filtered)", created, wantCreated)
+	}
+
+	var count int
+	if err := pg.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM golden_queries WHERE source = 'ask_history'`,
+	).Scan(&count); err != nil {
+		t.Fatalf("count ask_history queries: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("ask_history query count = %d, want 1", count)
+	}
+}
+
+func insertAskSession(t *testing.T, pg *Postgres, question string) {
+	t.Helper()
+	_, err := pg.pool.Exec(context.Background(), `
+		INSERT INTO ask_sessions (conversation_id, turn_index, question, answer, finish_reason)
+		VALUES (gen_random_uuid(), 0, $1, 'dummy answer', 'stop')
+	`, question)
+	if err != nil {
+		t.Fatalf("insert ask_sessions row: %v", err)
+	}
+}
+
+func TestGoldenStore_NextQuery_PicksFewestJudgmentsAmongOpen(t *testing.T) {
+	pg := goldenTestDB(t)
+	s := NewGoldenStore(pg)
+	ctx := context.Background()
+
+	doneID := seedGoldenQuery(t, pg, goldenTestSentinel+"done query", "manual", "done")
+	skippedID := seedGoldenQuery(t, pg, goldenTestSentinel+"skipped query", "manual", "skipped")
+	fewerJudgmentsID := seedGoldenQuery(t, pg, goldenTestSentinel+"fewer judgments", "manual", "open")
+	moreJudgmentsID := seedGoldenQuery(t, pg, goldenTestSentinel+"more judgments", "manual", "open")
+	_ = doneID
+	_ = skippedID
+
+	doc1 := seedGoldenDocument(t, pg, nil)
+	doc2 := seedGoldenDocument(t, pg, nil)
+
+	// moreJudgmentsID gets 2 judgments; fewerJudgmentsID gets 0 — NextQuery
+	// must prefer the one with fewer (here: zero).
+	if _, _, err := s.UpsertJudgments(ctx, moreJudgmentsID, []GoldenJudgmentInput{
+		{DocumentID: doc1, Judgment: "relevant", Rank: 1},
+		{DocumentID: doc2, Judgment: "irrelevant", Rank: 2},
+	}, false); err != nil {
+		t.Fatalf("seed judgments on moreJudgmentsID: %v", err)
+	}
+
+	next, err := s.NextQuery(ctx, "user")
+	if err != nil {
+		t.Fatalf("NextQuery: %v", err)
+	}
+	if next == nil {
+		t.Fatal("NextQuery = nil, want fewerJudgmentsID")
+	}
+	if next.ID != fewerJudgmentsID {
+		t.Errorf("NextQuery.ID = %s, want fewerJudgmentsID %s (done/skipped must be excluded, fewest judgments must win)",
+			next.ID, fewerJudgmentsID)
+	}
+
+	// Once fewerJudgmentsID also gets a judgment, moreJudgmentsID (2) still
+	// loses to it (1) — NextQuery must keep returning the same query until
+	// it is finished or skipped, not alternate.
+	if _, _, err := s.UpsertJudgments(ctx, fewerJudgmentsID, []GoldenJudgmentInput{
+		{DocumentID: doc1, Judgment: "noise", Rank: 1},
+	}, false); err != nil {
+		t.Fatalf("seed one judgment on fewerJudgmentsID: %v", err)
+	}
+	next2, err := s.NextQuery(ctx, "user")
+	if err != nil {
+		t.Fatalf("NextQuery (second): %v", err)
+	}
+	if next2 == nil || next2.ID != fewerJudgmentsID {
+		t.Errorf("NextQuery (second) = %+v, want fewerJudgmentsID %s (1 judgment vs. moreJudgmentsID's 2)", next2, fewerJudgmentsID)
+	}
+}
+
+func TestGoldenStore_NextQuery_NilWhenNoneOpen(t *testing.T) {
+	pg := goldenTestDB(t)
+	s := NewGoldenStore(pg)
+	ctx := context.Background()
+
+	seedGoldenQuery(t, pg, goldenTestSentinel+"only done", "manual", "done")
+	seedGoldenQuery(t, pg, goldenTestSentinel+"only skipped", "manual", "skipped")
+
+	next, err := s.NextQuery(ctx, "user")
+	if err != nil {
+		t.Fatalf("NextQuery: %v", err)
+	}
+	if next != nil {
+		t.Errorf("NextQuery = %+v, want nil when no status='open' query remains", next)
+	}
+}
+
+func TestGoldenStore_UpsertJudgments_AppliesRetentionFeedbackAndIsIdempotent(t *testing.T) {
+	pg := goldenTestDB(t)
+	s := NewGoldenStore(pg)
+	ctx := context.Background()
+
+	queryID := seedGoldenQuery(t, pg, goldenTestSentinel+"feedback query", "manual", "open")
+	relevantDoc := seedGoldenDocument(t, pg, nil)
+	noiseDoc := seedGoldenDocument(t, pg, nil)
+	irrelevantDoc := seedGoldenDocument(t, pg, map[string]any{"retention": "keep"})
+
+	saved, feedbackApplied, err := s.UpsertJudgments(ctx, queryID, []GoldenJudgmentInput{
+		{DocumentID: relevantDoc, Judgment: "relevant", Rank: 1},
+		{DocumentID: noiseDoc, Judgment: "noise", Rank: 2},
+		{DocumentID: irrelevantDoc, Judgment: "irrelevant", Rank: 3},
+	}, true)
+	if err != nil {
+		t.Fatalf("UpsertJudgments: %v", err)
+	}
+	if saved != 3 {
+		t.Errorf("saved = %d, want 3", saved)
+	}
+	if feedbackApplied != 2 {
+		t.Errorf("feedbackApplied = %d, want 2 (relevant + noise; irrelevant must not count)", feedbackApplied)
+	}
+
+	relMeta := documentMetadata(t, pg, relevantDoc)
+	if relMeta["retention"] != model.RetentionKeep || relMeta["classifier"] != "user" {
+		t.Errorf("relevantDoc metadata = %+v, want retention=keep classifier=user", relMeta)
+	}
+	noiseMeta := documentMetadata(t, pg, noiseDoc)
+	if noiseMeta["retention"] != model.RetentionDisposable || noiseMeta["classifier"] != "user" {
+		t.Errorf("noiseDoc metadata = %+v, want retention=disposable classifier=user", noiseMeta)
+	}
+	irrMeta := documentMetadata(t, pg, irrelevantDoc)
+	if irrMeta["retention"] != "keep" {
+		t.Errorf("irrelevantDoc metadata retention = %v, want unchanged 'keep' (irrelevant must not touch retention)", irrMeta["retention"])
+	}
+	if _, hasClassifier := irrMeta["classifier"]; hasClassifier {
+		t.Errorf("irrelevantDoc metadata = %+v, want no classifier key written", irrMeta)
+	}
+
+	var status string
+	if err := pg.pool.QueryRow(ctx, `SELECT status FROM golden_queries WHERE id = $1`, queryID).Scan(&status); err != nil {
+		t.Fatalf("read query status: %v", err)
+	}
+	if status != "done" {
+		t.Errorf("query status = %q, want 'done' (finishQuery=true)", status)
+	}
+
+	// Re-judging the same (query, document) pair must UPDATE, not duplicate
+	// (UNIQUE(query_id, document_id) + ON CONFLICT DO UPDATE).
+	saved2, feedbackApplied2, err := s.UpsertJudgments(ctx, queryID, []GoldenJudgmentInput{
+		{DocumentID: relevantDoc, Judgment: "noise", Rank: 1},
+	}, false)
+	if err != nil {
+		t.Fatalf("UpsertJudgments (re-judge): %v", err)
+	}
+	if saved2 != 1 || feedbackApplied2 != 1 {
+		t.Errorf("re-judge saved/feedbackApplied = %d/%d, want 1/1", saved2, feedbackApplied2)
+	}
+
+	var judgmentCount int
+	if err := pg.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM golden_judgments WHERE query_id = $1 AND document_id = $2`,
+		queryID, relevantDoc,
+	).Scan(&judgmentCount); err != nil {
+		t.Fatalf("count judgments: %v", err)
+	}
+	if judgmentCount != 1 {
+		t.Errorf("judgment row count for re-judged pair = %d, want 1 (upsert, not duplicate)", judgmentCount)
+	}
+
+	relMetaAfter := documentMetadata(t, pg, relevantDoc)
+	if relMetaAfter["retention"] != model.RetentionDisposable {
+		t.Errorf("relevantDoc retention after re-judge = %v, want disposable (judgment flipped to noise)", relMetaAfter["retention"])
+	}
+}
+
+func TestGoldenStore_JudgedDocumentIDs(t *testing.T) {
+	pg := goldenTestDB(t)
+	s := NewGoldenStore(pg)
+	ctx := context.Background()
+
+	queryA := seedGoldenQuery(t, pg, goldenTestSentinel+"judged-a", "manual", "open")
+	queryB := seedGoldenQuery(t, pg, goldenTestSentinel+"judged-b", "manual", "open")
+	docForA := seedGoldenDocument(t, pg, nil)
+	docForB := seedGoldenDocument(t, pg, nil)
+
+	if _, _, err := s.UpsertJudgments(ctx, queryA, []GoldenJudgmentInput{
+		{DocumentID: docForA, Judgment: "relevant", Rank: 1},
+	}, false); err != nil {
+		t.Fatalf("upsert for queryA: %v", err)
+	}
+	if _, _, err := s.UpsertJudgments(ctx, queryB, []GoldenJudgmentInput{
+		{DocumentID: docForB, Judgment: "noise", Rank: 1},
+	}, false); err != nil {
+		t.Fatalf("upsert for queryB: %v", err)
+	}
+
+	judgedA, err := s.JudgedDocumentIDs(ctx, queryA, "user")
+	if err != nil {
+		t.Fatalf("JudgedDocumentIDs(queryA): %v", err)
+	}
+	if _, ok := judgedA[docForA]; !ok {
+		t.Errorf("judgedA = %v, want it to contain docForA %s", judgedA, docForA)
+	}
+	if _, ok := judgedA[docForB]; ok {
+		t.Errorf("judgedA = %v, must NOT contain docForB (judged under a different query)", judgedA)
+	}
+}
+
+func TestGoldenStore_SkipQuery_OnlyAffectsOpen(t *testing.T) {
+	pg := goldenTestDB(t)
+	s := NewGoldenStore(pg)
+	ctx := context.Background()
+
+	openID := seedGoldenQuery(t, pg, goldenTestSentinel+"skip-me", "manual", "open")
+
+	found, err := s.SkipQuery(ctx, openID)
+	if err != nil {
+		t.Fatalf("SkipQuery: %v", err)
+	}
+	if !found {
+		t.Error("found = false, want true for an open query")
+	}
+
+	var status string
+	if err := pg.pool.QueryRow(ctx, `SELECT status FROM golden_queries WHERE id = $1`, openID).Scan(&status); err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	if status != "skipped" {
+		t.Errorf("status = %q, want 'skipped'", status)
+	}
+
+	// Skipping again must report not-found: the query is no longer 'open'.
+	found2, err := s.SkipQuery(ctx, openID)
+	if err != nil {
+		t.Fatalf("SkipQuery (second): %v", err)
+	}
+	if found2 {
+		t.Error("found (second call) = true, want false — a non-open query must not be re-skippable")
+	}
+
+	foundMissing, err := s.SkipQuery(ctx, uuid.New())
+	if err != nil {
+		t.Fatalf("SkipQuery (nonexistent id): %v", err)
+	}
+	if foundMissing {
+		t.Error("found = true for a nonexistent query id, want false")
+	}
+}
+
+func TestGoldenStore_ExportEvalPairs_OnlyRelevantJudgments(t *testing.T) {
+	pg := goldenTestDB(t)
+	s := NewGoldenStore(pg)
+	ctx := context.Background()
+
+	queryText := goldenTestSentinel + "export query"
+	queryID := seedGoldenQuery(t, pg, queryText, "manual", "open")
+	relevantDoc := seedGoldenDocument(t, pg, nil)
+	irrelevantDoc := seedGoldenDocument(t, pg, nil)
+	noiseDoc := seedGoldenDocument(t, pg, nil)
+
+	if _, _, err := s.UpsertJudgments(ctx, queryID, []GoldenJudgmentInput{
+		{DocumentID: relevantDoc, Judgment: "relevant", Rank: 1},
+		{DocumentID: irrelevantDoc, Judgment: "irrelevant", Rank: 2},
+		{DocumentID: noiseDoc, Judgment: "noise", Rank: 3},
+	}, false); err != nil {
+		t.Fatalf("UpsertJudgments: %v", err)
+	}
+
+	pairs, err := s.ExportEvalPairs(ctx, "user")
+	if err != nil {
+		t.Fatalf("ExportEvalPairs: %v", err)
+	}
+
+	var found *EvalPair
+	for i := range pairs {
+		if pairs[i].Query == queryText {
+			found = &pairs[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("ExportEvalPairs did not include query %q; pairs = %+v", queryText, pairs)
+	}
+	if found.Source != "golden" {
+		t.Errorf("Source = %q, want 'golden'", found.Source)
+	}
+	if len(found.RelevantDocIDs) != 1 || found.RelevantDocIDs[0] != relevantDoc.String() {
+		t.Errorf("RelevantDocIDs = %v, want exactly [%s] (only the relevant judgment)", found.RelevantDocIDs, relevantDoc)
+	}
+}
+
+func TestGoldenStore_Progress(t *testing.T) {
+	pg := goldenTestDB(t)
+	s := NewGoldenStore(pg)
+	ctx := context.Background()
+
+	seedGoldenQuery(t, pg, goldenTestSentinel+"progress-open-1", "manual", "open")
+	seedGoldenQuery(t, pg, goldenTestSentinel+"progress-open-2", "manual", "open")
+	doneID := seedGoldenQuery(t, pg, goldenTestSentinel+"progress-done", "manual", "done")
+	doc := seedGoldenDocument(t, pg, nil)
+
+	if _, _, err := s.UpsertJudgments(ctx, doneID, []GoldenJudgmentInput{
+		{DocumentID: doc, Judgment: "relevant", Rank: 1},
+	}, false); err != nil {
+		t.Fatalf("UpsertJudgments: %v", err)
+	}
+
+	p, err := s.Progress(ctx)
+	if err != nil {
+		t.Fatalf("Progress: %v", err)
+	}
+	if p.OpenQueries != 2 {
+		t.Errorf("OpenQueries = %d, want 2", p.OpenQueries)
+	}
+	if p.JudgedQueries != 1 {
+		t.Errorf("JudgedQueries = %d, want 1 (status='done' count)", p.JudgedQueries)
+	}
+	if p.TotalJudgments != 1 {
+		t.Errorf("TotalJudgments = %d, want 1", p.TotalJudgments)
+	}
+}
+
+// TestGoldenStore_UpsertJudgments_LLMJudgeIsRecordedButNeverAppliesRetention
+// covers the core safety property of the judge dimension: an unreviewed
+// hermes auto-judgment (judge="llm") must be saved for later human review,
+// but must NEVER retag a document's retention the way a judge="user"
+// judgment does — see UpsertJudgments' doc comment.
+func TestGoldenStore_UpsertJudgments_LLMJudgeIsRecordedButNeverAppliesRetention(t *testing.T) {
+	pg := goldenTestDB(t)
+	s := NewGoldenStore(pg)
+	ctx := context.Background()
+
+	queryID := seedGoldenQuery(t, pg, goldenTestSentinel+"llm judge query", "hermes", "open")
+	noiseDoc := seedGoldenDocument(t, pg, nil)
+	relevantDoc := seedGoldenDocument(t, pg, nil)
+
+	saved, feedbackApplied, err := s.UpsertJudgments(ctx, queryID, []GoldenJudgmentInput{
+		{DocumentID: noiseDoc, Judgment: "noise", Rank: 1, Judge: "llm"},
+		{DocumentID: relevantDoc, Judgment: "relevant", Rank: 2, Judge: "llm"},
+	}, false)
+	if err != nil {
+		t.Fatalf("UpsertJudgments: %v", err)
+	}
+	if saved != 2 {
+		t.Errorf("saved = %d, want 2 (both judgments recorded)", saved)
+	}
+	if feedbackApplied != 0 {
+		t.Errorf("feedbackApplied = %d, want 0 (judge='llm' must never apply retention feedback)", feedbackApplied)
+	}
+
+	noiseMeta := documentMetadata(t, pg, noiseDoc)
+	if _, hasRetention := noiseMeta["retention"]; hasRetention {
+		t.Errorf("noiseDoc metadata = %+v, want no retention key written for an llm judgment", noiseMeta)
+	}
+	relMeta := documentMetadata(t, pg, relevantDoc)
+	if _, hasRetention := relMeta["retention"]; hasRetention {
+		t.Errorf("relevantDoc metadata = %+v, want no retention key written for an llm judgment", relMeta)
+	}
+
+	var judge string
+	if err := pg.pool.QueryRow(ctx,
+		`SELECT judge FROM golden_judgments WHERE query_id = $1 AND document_id = $2`,
+		queryID, noiseDoc,
+	).Scan(&judge); err != nil {
+		t.Fatalf("read judge column: %v", err)
+	}
+	if judge != "llm" {
+		t.Errorf("judge column = %q, want 'llm'", judge)
+	}
+}
+
+// TestGoldenStore_UpsertJudgments_UserAndLLMCoexistOnSameDocument covers the
+// UNIQUE(query_id, document_id, judge) constraint added alongside the judge
+// column: a "user" and an "llm" judgment on the SAME (query, document) pair
+// must both persist as separate rows rather than one overwriting the other,
+// and a later "user" re-judgment must not touch the "llm" row or vice versa.
+func TestGoldenStore_UpsertJudgments_UserAndLLMCoexistOnSameDocument(t *testing.T) {
+	pg := goldenTestDB(t)
+	s := NewGoldenStore(pg)
+	ctx := context.Background()
+
+	queryID := seedGoldenQuery(t, pg, goldenTestSentinel+"coexist query", "manual", "open")
+	doc := seedGoldenDocument(t, pg, nil)
+
+	if _, _, err := s.UpsertJudgments(ctx, queryID, []GoldenJudgmentInput{
+		{DocumentID: doc, Judgment: "noise", Rank: 1, Judge: "llm"},
+	}, false); err != nil {
+		t.Fatalf("upsert llm judgment: %v", err)
+	}
+	if _, _, err := s.UpsertJudgments(ctx, queryID, []GoldenJudgmentInput{
+		{DocumentID: doc, Judgment: "relevant", Rank: 1, Judge: "user"},
+	}, false); err != nil {
+		t.Fatalf("upsert user judgment: %v", err)
+	}
+
+	var rowCount int
+	if err := pg.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM golden_judgments WHERE query_id = $1 AND document_id = $2`,
+		queryID, doc,
+	).Scan(&rowCount); err != nil {
+		t.Fatalf("count judgment rows: %v", err)
+	}
+	if rowCount != 2 {
+		t.Errorf("judgment row count = %d, want 2 (user and llm coexist, do not overwrite each other)", rowCount)
+	}
+
+	// The user judgment ("relevant") must have applied retention=keep, since
+	// judge="user" is the only track that ever does.
+	meta := documentMetadata(t, pg, doc)
+	if meta["retention"] != model.RetentionKeep {
+		t.Errorf("retention = %v, want %q (from the user judgment; the llm judgment must not have won)", meta["retention"], model.RetentionKeep)
+	}
+}
+
+// TestGoldenStore_UpsertQueryByText covers POST /api/v1/golden/feedback's
+// query-resolution step: a normalized-duplicate of an existing query must
+// resolve to the SAME id without changing its original source, while a
+// genuinely new query text must create a fresh row with the given source.
+func TestGoldenStore_UpsertQueryByText(t *testing.T) {
+	pg := goldenTestDB(t)
+	s := NewGoldenStore(pg)
+	ctx := context.Background()
+
+	existingID := seedGoldenQuery(t, pg, goldenTestSentinel+"기존 질의", "seed", "open")
+
+	// Exact normalized duplicate (extra trailing space) of an existing query
+	// created by a completely different source ("seed") must resolve to the
+	// SAME id, and must NOT rewrite that row's source to "hermes".
+	gotID, err := s.UpsertQueryByText(ctx, goldenTestSentinel+"기존 질의 ", "hermes")
+	if err != nil {
+		t.Fatalf("UpsertQueryByText (duplicate): %v", err)
+	}
+	if gotID != existingID {
+		t.Errorf("UpsertQueryByText (duplicate) = %s, want existing id %s", gotID, existingID)
+	}
+	var source string
+	if err := pg.pool.QueryRow(ctx, `SELECT source FROM golden_queries WHERE id = $1`, existingID).Scan(&source); err != nil {
+		t.Fatalf("read source: %v", err)
+	}
+	if source != "seed" {
+		t.Errorf("source = %q, want unchanged 'seed' (UpsertQueryByText must never rewrite an existing row's source)", source)
+	}
+
+	// A genuinely new query text must create a new row with the given source.
+	newText := goldenTestSentinel + "완전히 새로운 질의"
+	newID, err := s.UpsertQueryByText(ctx, newText, "hermes")
+	if err != nil {
+		t.Fatalf("UpsertQueryByText (new): %v", err)
+	}
+	if newID == existingID {
+		t.Error("UpsertQueryByText (new) reused the existing id, want a fresh row")
+	}
+	var newSource, newStatus string
+	if err := pg.pool.QueryRow(ctx, `SELECT source, status FROM golden_queries WHERE id = $1`, newID).Scan(&newSource, &newStatus); err != nil {
+		t.Fatalf("read new row: %v", err)
+	}
+	if newSource != "hermes" {
+		t.Errorf("new row source = %q, want 'hermes'", newSource)
+	}
+	if newStatus != "open" {
+		t.Errorf("new row status = %q, want default 'open'", newStatus)
+	}
+
+	// Calling it again with the exact same text must be idempotent (resolve
+	// to the same new row, not create a second one).
+	againID, err := s.UpsertQueryByText(ctx, newText, "hermes")
+	if err != nil {
+		t.Fatalf("UpsertQueryByText (repeat): %v", err)
+	}
+	if againID != newID {
+		t.Errorf("UpsertQueryByText (repeat) = %s, want the same id %s", againID, newID)
+	}
+}

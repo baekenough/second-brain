@@ -117,6 +117,11 @@ func run() error {
 	checkReindex := flag.Bool("check-reindex", false,
 		"evaluate reindex thresholds after computing eval metrics and include "+
 			"the recommendation in the JSON output (exit code 2 when reindex is recommended)")
+	useGolden := flag.Bool("golden", false,
+		"build eval pairs from the human-judged golden set (golden_judgments, "+
+			"judgment='relevant') instead of positive feedback (thumbs>=1); "+
+			"see internal/store.GoldenStore.ExportEvalPairs and "+
+			"GET /api/v1/golden/export for the same data over HTTP")
 	rerank := flag.Bool("rerank", false,
 		"apply cross-encoder reranking (model.SearchQuery.UseRerank) to every eval "+
 			"query. Default false, matching the nightly baseline's historical "+
@@ -178,6 +183,7 @@ func run() error {
 	docStore := store.NewDocumentStore(pg)
 	chunkStore := store.NewChunkStore(pg)
 	evalStore := store.NewEvalStore(pg)
+	goldenStore := store.NewGoldenStore(pg)
 	metricsStore := store.NewEvalMetricsStore(pg)
 
 	// --- Embedding engine ---
@@ -200,9 +206,27 @@ func run() error {
 		WithReranker(reranker)
 
 	// --- Build eval pairs ---
-	pairs, err := evalStore.BuildFromFeedback(ctx)
-	if err != nil {
-		return fmt.Errorf("build eval pairs: %w", err)
+	// --golden swaps the source from positive-feedback pairs (self-confirming:
+	// a document can only appear here if the search already showed it) to the
+	// human-judged golden set, which is built by presenting FULL candidate
+	// sets for judgment (see internal/store.GoldenStore, migrations/031) and
+	// therefore can surface recall gaps the feedback-derived set cannot.
+	//
+	// judge is hardcoded to "user": an unreviewed hermes ("llm") auto-judgment
+	// must never become the answer key eval scores itself against — see
+	// GoldenStore.ExportEvalPairs and .UpsertJudgments for the enforcement of
+	// that same rule on the write side.
+	var pairs []store.EvalPair
+	if *useGolden {
+		pairs, err = goldenStore.ExportEvalPairs(ctx, "user")
+		if err != nil {
+			return fmt.Errorf("build golden eval pairs: %w", err)
+		}
+	} else {
+		pairs, err = evalStore.BuildFromFeedback(ctx)
+		if err != nil {
+			return fmt.Errorf("build eval pairs: %w", err)
+		}
 	}
 	if len(pairs) == 0 {
 		slog.Warn("eval: no eval pairs found — skipping evaluation")

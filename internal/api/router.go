@@ -195,6 +195,15 @@ type Server struct {
 	briefingMaxActions int
 	briefingModel      string
 
+	// golden is optional. When non-nil, the six POST/GET
+	// /api/v1/golden/* routes are registered (query generation, next-query
+	// candidate serving, human judgment upsert, hermes auto-eval feedback,
+	// skip, and export). Set via WithGolden before calling Handler().
+	// Candidates are drawn from s.search — the same search service every
+	// other read route uses — so no separate dependency exists for that
+	// half of the feature.
+	golden GoldenSet
+
 	// handlerOnce ensures buildHandler is called exactly once per Server so
 	// that the graphql-go schema (and its package-level type objects) are
 	// constructed a single time regardless of how many goroutines call Handler.
@@ -405,6 +414,14 @@ func (s *Server) buildHandler() http.Handler {
 			r.Post("/api/v1/notes", s.createNoteHandler)
 			r.Post("/api/v1/notes/{id}/retry-enrichment", s.retryEnrichmentHandler)
 			r.Delete("/api/v1/notes/{id}", s.deleteNoteHandler)
+		}
+		if s.golden != nil {
+			r.Post("/api/v1/golden/queries/generate", s.goldenGenerateHandler)
+			r.Get("/api/v1/golden/next", s.goldenNextHandler)
+			r.Post("/api/v1/golden/judgments", s.goldenJudgmentsHandler)
+			r.Post("/api/v1/golden/feedback", s.goldenFeedbackHandler)
+			r.Post("/api/v1/golden/queries/{id}/skip", s.goldenSkipHandler)
+			r.Get("/api/v1/golden/export", s.goldenExportHandler)
 		}
 	})
 

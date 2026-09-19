@@ -200,7 +200,8 @@ func run() error {
 		WithNotes(docStore, chunkStore, embedClient).
 		WithAskConfig(time.Duration(cfg.AskTimeoutSeconds)*time.Second, cfg.AskContextTopK, cfg.AskContextInsightM).
 		WithAskRerankDefault(cfg.RerankDefault).
-		WithAskSessions(askSessionStore)
+		WithAskSessions(askSessionStore).
+		WithGolden(store.NewGoldenStore(pg))
 
 	// --- Actions & Briefing (Part C, plan Task 12, feature-flagged off) ---
 	actionStore := store.NewActionQueryStore(pg)
