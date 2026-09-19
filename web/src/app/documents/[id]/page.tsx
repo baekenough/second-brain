@@ -83,11 +83,30 @@ function TranscriptView({ content }: { content: string }) {
   );
 }
 
+/** A unified `call` document renders as a transcript once
+ * metadata.transcription is "done"; the legacy call-transcript source_type
+ * is treated the same way for documents predating the merge. `pending`
+ * gets its own notice rather than falling through to (전사 없음), since
+ * the two convey different things to the user (a transcript is coming vs.
+ * one was never generated). */
+function isCallTranscriptReady(doc: DocumentDetail): boolean {
+  if (doc.source_type === "call-transcript") return true;
+  return doc.source_type === "call" && doc.metadata.transcription === "done";
+}
+
+function isCallTranscriptPending(doc: DocumentDetail): boolean {
+  return doc.source_type === "call" && doc.metadata.transcription === "pending";
+}
+
 function DocumentContent({ doc }: { doc: DocumentDetail }) {
   const ext = getExtension(doc.source_id ?? doc.id, doc.metadata);
   const renderKind = getRenderKind(ext);
 
-  if (doc.source_type === "call-transcript") {
+  if (isCallTranscriptPending(doc)) {
+    return <p className="text-sm text-foreground-subtle italic">(전사 대기 중)</p>;
+  }
+
+  if (isCallTranscriptReady(doc)) {
     return doc.content ? (
       <TranscriptView content={doc.content} />
     ) : (

@@ -7,6 +7,7 @@ import { formatDateTime, formatRelative } from "@/lib/dates";
 import { sortByRecency } from "@/lib/sortByRecency";
 import { SOURCE_LABELS, DASHBOARD_SOURCES } from "@/lib/constants";
 import type { SourceType } from "@/lib/types";
+import { resolveTranscriptionPending } from "./transcriptionPending";
 
 // ── Source stats card ─────────────────────────────────────────────────────
 
@@ -84,12 +85,15 @@ function RecentPanel({ title, items, loading, kind }: RecentPanelProps) {
 // ── Whisper queue estimation ──────────────────────────────────────────────
 
 interface WhisperQueueProps {
-  callLogCount: number | undefined;
-  callTranscriptCount: number | undefined;
+  callCount: number | undefined;
+  /** stats.transcription_pending from the backend. Missing on older
+   * backends that predate the call-unification migration — callers pass 0
+   * in that case (see resolveTranscriptionPending). */
+  transcriptionPending: number | undefined;
 }
 
-function WhisperQueue({ callLogCount, callTranscriptCount }: WhisperQueueProps) {
-  if (callLogCount === undefined || callTranscriptCount === undefined) {
+function WhisperQueue({ callCount, transcriptionPending }: WhisperQueueProps) {
+  if (callCount === undefined || transcriptionPending === undefined) {
     return (
       <div className="rounded-lg border border-border bg-surface p-4">
         <div className="h-8 animate-pulse rounded bg-surface-subtle" />
@@ -97,7 +101,7 @@ function WhisperQueue({ callLogCount, callTranscriptCount }: WhisperQueueProps) 
     );
   }
 
-  const pending = Math.max(0, callLogCount - callTranscriptCount);
+  const pending = transcriptionPending;
   const isHealthy = pending === 0;
 
   return (
@@ -119,8 +123,7 @@ function WhisperQueue({ callLogCount, callTranscriptCount }: WhisperQueueProps) 
         </span>
       </div>
       <p className="text-xs text-foreground-subtle">
-        통화 로그 {callLogCount.toLocaleString()}건 · 전사 완료{" "}
-        {callTranscriptCount.toLocaleString()}건{pending > 0 && ` · ${pending}건 대기 중`}
+        통화 {callCount.toLocaleString()}건{pending > 0 && ` · 전사 대기 ${pending}건`}
       </p>
     </div>
   );
@@ -219,8 +222,8 @@ export default function DashboardPage() {
       <section className="space-y-3">
         <h2 className="text-sm font-semibold text-foreground">Whisper 전사 큐</h2>
         <WhisperQueue
-          callLogCount={loadingStats ? undefined : (bySource?.["call-log"] ?? 0)}
-          callTranscriptCount={loadingStats ? undefined : (bySource?.["call-transcript"] ?? 0)}
+          callCount={loadingStats ? undefined : (bySource?.["call"] ?? 0)}
+          transcriptionPending={loadingStats ? undefined : resolveTranscriptionPending(stats)}
         />
       </section>
 

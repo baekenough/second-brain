@@ -1,6 +1,13 @@
 /**
  * Source types mirror model.SourceType in the Go backend (internal/model/document.go).
  * Keep in sync when new source types are added.
+ *
+ * `call-log` and `call-transcript` are being unified into a single `call`
+ * source type on the backend (see metadata.legacy_source_type /
+ * metadata.transcription below). `call-log` and `call-transcript` are kept
+ * here as a read compatibility shim for documents collected before the
+ * migration ran — do not use them for new UI decisions once the backend
+ * cutover ships; prefer `call` + `metadata.transcription`.
  */
 export type SourceType =
   | "slack"
@@ -15,11 +22,18 @@ export type SourceType =
   | "gmail"
   | "calendar"
   | "sms"
+  | "call"
   | "call-log"
   | "call-transcript"
   | "upload"
   | "note"
   | "insight";
+
+/** Transcription status for a unified `call` document (metadata.transcription).
+ * `none`: no transcript exists, content is a one-line call summary.
+ * `pending`: a transcript is expected but not yet ready.
+ * `done`: content is the full transcript. */
+export type CallTranscriptionStatus = "none" | "pending" | "done";
 
 export type MatchType = "fulltext" | "vector" | "hybrid";
 
@@ -37,6 +51,19 @@ export interface DocumentMetadata {
   direction?: "incoming" | "outgoing";
   duration_ms?: number;
   occurred_at?: string;
+  /** Transcription status for a unified `call` document. Absent on
+   * non-call documents and on call documents predating the merge. */
+  transcription?: CallTranscriptionStatus;
+  /** The pre-merge source_type ("call-log" | "call-transcript") this
+   * document originated from, kept for audit/debugging. */
+  legacy_source_type?: string;
+  /** Set when this document was superseded by the call unification merge
+   * (e.g. the call-log side once its transcript arrived) — the UI should
+   * treat it as hidden/merged rather than a standalone result. */
+  merged_into?: string;
+  /** document_id of the matching transcript-side document, when this
+   * document is the call-log side of a not-yet-merged pair. */
+  transcript_source_id?: string;
   [key: string]: string | number | boolean | undefined;
 }
 
@@ -218,6 +245,9 @@ export interface SearchParams {
 export interface StatsResponse {
   by_source: Partial<Record<SourceType, number>>;
   total: number;
+  /** Count of `call` documents with metadata.transcription === "pending".
+   * Optional on the wire — older backends omit it; treat missing as 0. */
+  transcription_pending?: number;
 }
 
 /** Matches store.BaselineStats in internal/store/document.go */
