@@ -331,6 +331,40 @@ func TestPlanner_LLMPrompt_CarriesKSTNow(t *testing.T) {
 	}
 }
 
+// TestPlanner_LLM_LegacyCallSourceType_NormalizedToCall covers the one
+// planSourceTypes' doc comment above flags as untested by construction: the
+// prompt is regenerated from planSourceTypes on every call, so the LLM is
+// never SHOWN "call-transcript"/"call-log" — but the model's training data
+// predates migration 033, and it could still answer with one of those
+// retired names from memory. Before parseSourceTypes normalized its input,
+// that single unrecognised name failed the whole plan closed to
+// fallbackPlan() (spec §6: no source filter at all — the entire corpus),
+// which is a much larger over-broadening than "just search the call source"
+// for a question that named calls specifically.
+func TestPlanner_LLM_LegacyCallSourceType_NormalizedToCall(t *testing.T) {
+	t.Parallel()
+
+	oracle := newPlanOracle(t, func(string) string {
+		payload, _ := json.Marshal(map[string]any{
+			"source_types": []string{"call-transcript"},
+			"reason":       "레거시 소스명 테스트",
+		})
+		return string(payload)
+	})
+	p := newPlanner(t, oracle.client(), planNowUTC)
+	intent.DisableDeterministicPath(p)
+
+	got := p.Plan(context.Background(), "홍길동이랑 통화한 내용")
+
+	if got.Origin != intent.OriginLLM {
+		t.Fatalf("Origin = %q, want %q; a legacy-but-known source name must not trip the fail-closed fallback",
+			got.Origin, intent.OriginLLM)
+	}
+	if !sameSourceSet(got.SourceTypes, []model.SourceType{model.SourceCall}) {
+		t.Errorf("SourceTypes = %v, want [call] (call-transcript is a pre-migration-033 alias for call)", got.SourceTypes)
+	}
+}
+
 // --- Failure handling (spec §6) --------------------------------------------
 
 func assertFallback(t *testing.T, got intent.QueryPlan) {
