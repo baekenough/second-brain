@@ -70,10 +70,18 @@ var goldenSeedQueries = []string{
 // GoldenQuery is a single candidate query awaiting (or having received)
 // human relevance judgments (migrations/031_golden_set.sql).
 type GoldenQuery struct {
-	ID        uuid.UUID
-	Text      string
-	Source    string // "ask_history" | "seed" | "manual" | "hermes"
-	Status    string // "open" | "done" | "skipped"
+	ID     uuid.UUID
+	Text   string
+	Source string // "ask_history" | "seed" | "manual" | "hermes"
+	Status string // "open" | "done" | "skipped"
+	// AskedAt is the instant a period expression in Text ("지난주", "오늘",
+	// ...) must be resolved against (migrations/032_golden_asked_at.sql). For
+	// source="ask_history" it is the earliest ask_sessions.created_at the
+	// question was actually asked at; for "seed"/"manual"/"hermes" — which
+	// carry no original asking context — it is the instant the row was
+	// created. See GET /api/v1/golden/next's use of
+	// internal/intent.DeterministicWindow.
+	AskedAt   time.Time
 	CreatedAt time.Time
 }
 
@@ -142,7 +150,14 @@ func (s *GoldenStore) GenerateQueries(ctx context.Context) (created int, totalOp
 		return 0, 0, fmt.Errorf("golden: insert ask_history queries: %w", err)
 	}
 
-	seedCreated, err := s.insertQueries(ctx, goldenSeedQueries, "seed", seen)
+	seedCandidates := make([]goldenCandidateQuery, len(goldenSeedQueries))
+	for i, text := range goldenSeedQueries {
+		// AskedAt left zero: seed queries carry no original asking context,
+		// so insertQueries lets the column default (now(), migration 032)
+		// apply instead.
+		seedCandidates[i] = goldenCandidateQuery{Text: text}
+	}
+	seedCreated, err := s.insertQueries(ctx, seedCandidates, "seed", seen)
 	if err != nil {
 		return 0, 0, fmt.Errorf("golden: insert seed queries: %w", err)
 	}
@@ -175,10 +190,23 @@ func (s *GoldenStore) normalizedExistingTexts(ctx context.Context) (map[string]s
 	return out, rows.Err()
 }
 
+// goldenCandidateQuery pairs a candidate query text with the instant its
+// period expressions ("지난주", "오늘", ...) should be resolved against
+// (migrations/032_golden_asked_at.sql). AskedAt zero (time.Time{}) means "let
+// the golden_queries.asked_at column default (now()) apply" — used for
+// sources that carry no original asking context (seed/manual).
+type goldenCandidateQuery struct {
+	Text    string
+	AskedAt time.Time
+}
+
 // candidateAskHistoryQueries reads the most recent distinct ask_sessions
 // questions, filters out ones too short to carry retrievable intent, and
 // deduplicates by normalized form against `seen` (and against each other),
-// returning at most goldenAskHistoryCap results ordered by recency.
+// returning at most goldenAskHistoryCap results ordered by recency. Each
+// result's AskedAt is the EARLIEST ask_sessions.created_at recorded for that
+// question text — the moment it was actually first asked, not the most
+// recent repeat of it (which only decides the ORDER BY recency cutoff below).
 //
 // `seen` is read-only here: this function works against a local copy rather
 // than mutating the caller's map. If it mutated `seen` directly, every
@@ -187,9 +215,9 @@ func (s *GoldenStore) normalizedExistingTexts(ctx context.Context) (map[string]s
 // afterwards, and insertQueries would skip every one of them as a
 // false-positive duplicate — the caller (GenerateQueries) mutates `seen`
 // itself, incrementally, as each candidate is actually inserted.
-func (s *GoldenStore) candidateAskHistoryQueries(ctx context.Context, seen map[string]struct{}) ([]string, error) {
+func (s *GoldenStore) candidateAskHistoryQueries(ctx context.Context, seen map[string]struct{}) ([]goldenCandidateQuery, error) {
 	rows, err := s.pg.pool.Query(ctx, `
-		SELECT question, MAX(created_at) AS latest
+		SELECT question, MIN(created_at) AS asked_at, MAX(created_at) AS latest
 		FROM ask_sessions
 		GROUP BY question
 		ORDER BY latest DESC
@@ -205,11 +233,11 @@ func (s *GoldenStore) candidateAskHistoryQueries(ctx context.Context, seen map[s
 		local[k] = struct{}{}
 	}
 
-	var out []string
+	var out []goldenCandidateQuery
 	for rows.Next() {
 		var question string
-		var latest time.Time
-		if err := rows.Scan(&question, &latest); err != nil {
+		var askedAt, latest time.Time
+		if err := rows.Scan(&question, &askedAt, &latest); err != nil {
 			return nil, err
 		}
 		trimmed := strings.TrimSpace(question)
@@ -224,7 +252,7 @@ func (s *GoldenStore) candidateAskHistoryQueries(ctx context.Context, seen map[s
 			continue
 		}
 		local[norm] = struct{}{}
-		out = append(out, question)
+		out = append(out, goldenCandidateQuery{Text: question, AskedAt: askedAt})
 		if len(out) >= goldenAskHistoryCap {
 			break
 		}
@@ -232,15 +260,15 @@ func (s *GoldenStore) candidateAskHistoryQueries(ctx context.Context, seen map[s
 	return out, rows.Err()
 }
 
-// insertQueries inserts each text as a new golden_queries row with the given
-// source, skipping any whose normalized form is already present in `seen`.
-// `seen` is updated for every text considered (inserted or not) so a second
-// call in the same GenerateQueries invocation cannot admit a near-duplicate.
-// Returns the number of rows actually created.
-func (s *GoldenStore) insertQueries(ctx context.Context, texts []string, source string, seen map[string]struct{}) (int, error) {
+// insertQueries inserts each candidate as a new golden_queries row with the
+// given source, skipping any whose normalized text form is already present
+// in `seen`. `seen` is updated for every text considered (inserted or not)
+// so a second call in the same GenerateQueries invocation cannot admit a
+// near-duplicate. Returns the number of rows actually created.
+func (s *GoldenStore) insertQueries(ctx context.Context, candidates []goldenCandidateQuery, source string, seen map[string]struct{}) (int, error) {
 	created := 0
-	for _, text := range texts {
-		norm := goldenNormalize(text)
+	for _, c := range candidates {
+		norm := goldenNormalize(c.Text)
 		if norm == "" {
 			continue
 		}
@@ -250,12 +278,22 @@ func (s *GoldenStore) insertQueries(ctx context.Context, texts []string, source 
 		seen[norm] = struct{}{}
 
 		var id uuid.UUID
-		err := s.pg.pool.QueryRow(ctx, `
-			INSERT INTO golden_queries (text, source)
-			VALUES ($1, $2)
-			ON CONFLICT (text) DO NOTHING
-			RETURNING id
-		`, text, source).Scan(&id)
+		var err error
+		if c.AskedAt.IsZero() {
+			err = s.pg.pool.QueryRow(ctx, `
+				INSERT INTO golden_queries (text, source)
+				VALUES ($1, $2)
+				ON CONFLICT (text) DO NOTHING
+				RETURNING id
+			`, c.Text, source).Scan(&id)
+		} else {
+			err = s.pg.pool.QueryRow(ctx, `
+				INSERT INTO golden_queries (text, source, asked_at)
+				VALUES ($1, $2, $3)
+				ON CONFLICT (text) DO NOTHING
+				RETURNING id
+			`, c.Text, source, c.AskedAt).Scan(&id)
+		}
 		if err != nil {
 			if err == pgx.ErrNoRows {
 				// Exact-text conflict with a row not caught by the normalized
@@ -289,7 +327,7 @@ func (s *GoldenStore) countByStatus(ctx context.Context, status string) (int, er
 // query set.
 func (s *GoldenStore) NextQuery(ctx context.Context, judge string) (*GoldenQuery, error) {
 	const q = `
-		SELECT q.id, q.text, q.source, q.status, q.created_at
+		SELECT q.id, q.text, q.source, q.status, q.asked_at, q.created_at
 		FROM golden_queries q
 		LEFT JOIN golden_judgments j ON j.query_id = q.id AND j.judge = $1
 		WHERE q.status = 'open'
@@ -298,7 +336,7 @@ func (s *GoldenStore) NextQuery(ctx context.Context, judge string) (*GoldenQuery
 		LIMIT 1
 	`
 	var out GoldenQuery
-	err := s.pg.pool.QueryRow(ctx, q, judge).Scan(&out.ID, &out.Text, &out.Source, &out.Status, &out.CreatedAt)
+	err := s.pg.pool.QueryRow(ctx, q, judge).Scan(&out.ID, &out.Text, &out.Source, &out.Status, &out.AskedAt, &out.CreatedAt)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, nil
@@ -501,17 +539,22 @@ func (s *GoldenStore) ExportEvalPairs(ctx context.Context, judge string) ([]Eval
 }
 
 // UpsertQueryByText finds an existing golden_queries row whose normalized
-// text matches text, or creates a new one with the given source if none
-// exists. Used by POST /api/v1/golden/feedback (hermes auto-eval, and any
-// other caller that names its query by text rather than by a query_id it
+// text matches text, or creates a new one with the given source and asked_at
+// if none exists. Used by POST /api/v1/golden/feedback (hermes auto-eval, and
+// any other caller that names its query by text rather than by a query_id it
 // already holds) — unlike GenerateQueries, this path must be able to
 // originate a brand-new row for a query that was never staged for review at
 // all, not just look one up among already-staged ones.
 //
+// askedAt zero (time.Time{}) means "let the asked_at column default (now())
+// apply". It is only used on the CREATE path, mirroring the source rule
+// below: a pre-existing row's asked_at is never rewritten by a later
+// feedback call, for the same reason its source is not.
+//
 // A pre-existing row's source is NEVER changed: the first source to name a
 // query owns its provenance, and rewriting it on every subsequent hermes
 // conversation would make "where did this query come from" meaningless.
-func (s *GoldenStore) UpsertQueryByText(ctx context.Context, text, source string) (uuid.UUID, error) {
+func (s *GoldenStore) UpsertQueryByText(ctx context.Context, text, source string, askedAt time.Time) (uuid.UUID, error) {
 	norm := goldenNormalize(text)
 	if norm == "" {
 		return uuid.Nil, fmt.Errorf("golden: query text is empty after normalization")
@@ -524,12 +567,22 @@ func (s *GoldenStore) UpsertQueryByText(ctx context.Context, text, source string
 	}
 
 	var id uuid.UUID
-	err := s.pg.pool.QueryRow(ctx, `
-		INSERT INTO golden_queries (text, source)
-		VALUES ($1, $2)
-		ON CONFLICT (text) DO NOTHING
-		RETURNING id
-	`, text, source).Scan(&id)
+	var err error
+	if askedAt.IsZero() {
+		err = s.pg.pool.QueryRow(ctx, `
+			INSERT INTO golden_queries (text, source)
+			VALUES ($1, $2)
+			ON CONFLICT (text) DO NOTHING
+			RETURNING id
+		`, text, source).Scan(&id)
+	} else {
+		err = s.pg.pool.QueryRow(ctx, `
+			INSERT INTO golden_queries (text, source, asked_at)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (text) DO NOTHING
+			RETURNING id
+		`, text, source, askedAt).Scan(&id)
+	}
 	if err == nil {
 		return id, nil
 	}

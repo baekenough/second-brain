@@ -19,42 +19,68 @@ const MAX_LIMIT = 50;
 
 interface CandidateBody {
   retention?: unknown;
+  stream?: unknown;
+  [key: string]: unknown;
+}
+
+interface QueryBody {
+  window?: unknown;
   [key: string]: unknown;
 }
 
 interface NextBody {
+  query?: unknown;
   candidates?: unknown;
   [key: string]: unknown;
 }
 
+const KNOWN_STREAMS = new Set(["relevance", "recent"]);
+
 /**
- * Normalises `candidates[].retention === ""` to `null` (coordinator
- * confirmation, 2026-09-19): the backend may send an empty string for an
- * untagged document, and the frontend type (RetentionTag) only distinguishes
- * "keep" | "low" | "disposable" | null — an empty string sliding through
- * unnormalised would fail every `retention === null` check on the client and
- * silently render as neither a known tag nor "미태그".
+ * Normalises the golden/next response body (coordinator confirmation,
+ * 2026-09-19):
+ * - `candidates[].retention === ""` → `null` (untagged document; the
+ *   frontend type only distinguishes "keep" | "low" | "disposable" | null and
+ *   an empty string would fail every `retention === null` check downstream).
+ * - `candidates[].stream` missing/unrecognised → `"relevance"` (the older
+ *   retrieval lane; only `"recent"` is a newly introduced value, so anything
+ *   else defaults to the lane that already existed before this field shipped).
+ * - `query.window` missing → `null` (older backend responses/tests may omit
+ *   the field entirely; `null` is already the "no period expression" case the
+ *   client renders, so a missing key collapses into the same state).
  *
  * Parse failures and non-2xx bodies pass through untouched — this function is
  * only ever called after `upstream.ok` is confirmed, and a shape mismatch
  * inside a 2xx body degrades to "leave it as-is" rather than throwing, since
  * a proxy-side bug here must never block the underlying successful response.
  */
-export function normalizeRetention(text: string): string {
+export function normalizeGoldenNext(text: string): string {
   let body: NextBody;
   try {
     body = JSON.parse(text) as NextBody;
   } catch {
     return text;
   }
-  if (!Array.isArray(body.candidates)) {
-    return text;
-  }
-  for (const candidate of body.candidates as CandidateBody[]) {
-    if (candidate && candidate.retention === "") {
-      candidate.retention = null;
+
+  if (body.query && typeof body.query === "object") {
+    const query = body.query as QueryBody;
+    if (query.window === undefined) {
+      query.window = null;
     }
   }
+
+  if (Array.isArray(body.candidates)) {
+    for (const candidate of body.candidates as CandidateBody[]) {
+      if (!candidate || typeof candidate !== "object") continue;
+      if (candidate.retention === "") {
+        candidate.retention = null;
+      }
+      if (typeof candidate.stream !== "string" || !KNOWN_STREAMS.has(candidate.stream)) {
+        candidate.stream = "relevance";
+      }
+    }
+  }
+
   return JSON.stringify(body);
 }
 
@@ -70,7 +96,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       cache: "no-store",
     });
     const text = await upstream.text();
-    const body = upstream.ok && text.length > 0 ? normalizeRetention(text) : text;
+    const body = upstream.ok && text.length > 0 ? normalizeGoldenNext(text) : text;
     return new NextResponse(body.length > 0 ? body : null, {
       status: upstream.status,
       headers: { "Content-Type": "application/json" },

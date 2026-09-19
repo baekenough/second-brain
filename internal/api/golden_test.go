@@ -11,9 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baekenough/second-brain/internal/intent"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
+	"github.com/baekenough/second-brain/internal/timeutil"
 	"github.com/google/uuid"
 )
 
@@ -53,10 +55,11 @@ type stubGoldenSet struct {
 	exportErr      error
 	exportJudgeGot string
 
-	byTextID     uuid.UUID
-	byTextText   string
-	byTextSource string
-	byTextErr    error
+	byTextID      uuid.UUID
+	byTextText    string
+	byTextSource  string
+	byTextAskedAt time.Time
+	byTextErr     error
 }
 
 func (s *stubGoldenSet) GenerateQueries(_ context.Context) (int, int, error) {
@@ -94,9 +97,10 @@ func (s *stubGoldenSet) ExportEvalPairs(_ context.Context, judge string) ([]stor
 	return s.exportPairs, s.exportErr
 }
 
-func (s *stubGoldenSet) UpsertQueryByText(_ context.Context, text, source string) (uuid.UUID, error) {
+func (s *stubGoldenSet) UpsertQueryByText(_ context.Context, text, source string, askedAt time.Time) (uuid.UUID, error) {
 	s.byTextText = text
 	s.byTextSource = source
+	s.byTextAskedAt = askedAt
 	if s.byTextErr != nil {
 		return uuid.Nil, s.byTextErr
 	}
@@ -106,8 +110,12 @@ func (s *stubGoldenSet) UpsertQueryByText(_ context.Context, text, source string
 	return s.byTextID, nil
 }
 
-// goldenStubSearcher is a search.DocumentSearcher fake returning canned
-// results, scoped to this file.
+// goldenStubSearcher is a search.DocumentSearcher fake returning the SAME
+// canned results for every call, scoped to this file. goldenNextHandler
+// issues two searches (relevance stream then recent stream); a stub that
+// answers both identically is fine for tests that only care about one
+// stream's output, since goldenMergeStreams' dedup absorbs the resulting
+// overlap.
 type goldenStubSearcher struct {
 	results []*model.SearchResult
 	err     error
@@ -226,7 +234,11 @@ func TestGoldenNextHandler_NoOpenQuery(t *testing.T) {
 // TestGoldenNextHandler_ExcludesAlreadyJudged verifies that a candidate
 // already judged for this query is filtered out and the remaining
 // candidates are re-ranked from 1, and that IncludeRetention=true reaches
-// the search call (disposable-tagged documents must still be judgeable).
+// BOTH search calls (disposable-tagged documents must still be judgeable on
+// either stream). The query text ("지난주에 누구랑 통화했지") matches no
+// intent.DeterministicWindow phrase, so this also pins the "no explicit
+// period" shape: an unconstrained relevance stream plus a 90-day-fallback
+// recent stream, and a null query.window in the response.
 func TestGoldenNextHandler_ExcludesAlreadyJudged(t *testing.T) {
 	t.Parallel()
 
@@ -234,30 +246,32 @@ func TestGoldenNextHandler_ExcludesAlreadyJudged(t *testing.T) {
 	judgedDocID := uuid.New()
 	freshDocID := uuid.New()
 	occurredAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	askedAt := time.Date(2026, 8, 20, 3, 0, 0, 0, time.UTC)
 
 	stub := &stubGoldenSet{
-		nextQuery: &store.GoldenQuery{ID: queryID, Text: "지난주에 누구랑 통화했지", Source: "seed", Status: "open"},
+		nextQuery: &store.GoldenQuery{ID: queryID, Text: "지난주에 누구랑 통화했지", Source: "seed", Status: "open", AskedAt: askedAt},
 		judgedDocIDs: map[uuid.UUID]struct{}{
 			judgedDocID: {},
 		},
 		progress: store.GoldenProgress{OpenQueries: 1},
 	}
 
-	var capturedQuery model.SearchQuery
-	searcher := &recordingGoldenSearcher{
-		results: []*model.SearchResult{
-			{Document: model.Document{ID: judgedDocID, Title: "already judged", SourceType: model.SourceSMS}},
-			{Document: model.Document{
-				ID:         freshDocID,
-				Title:      "fresh candidate",
-				Content:    "line one\nline two   with   extra   spaces",
-				SourceType: model.SourceCallLog,
-				OccurredAt: &occurredAt,
-				Metadata:   map[string]any{"retention": model.RetentionLow, "segment": "personal"},
-			}},
-		},
-		captured: &capturedQuery,
+	// Both streams answer with the SAME two documents: goldenMergeStreams'
+	// dedup means the second (recent) stream's results are entirely absorbed
+	// as duplicates of the first (relevance) stream's, leaving exactly one
+	// surviving candidate tagged "relevance".
+	sharedResults := []*model.SearchResult{
+		{Document: model.Document{ID: judgedDocID, Title: "already judged", SourceType: model.SourceSMS}},
+		{Document: model.Document{
+			ID:         freshDocID,
+			Title:      "fresh candidate",
+			Content:    "line one\nline two   with   extra   spaces",
+			SourceType: model.SourceCallLog,
+			OccurredAt: &occurredAt,
+			Metadata:   map[string]any{"retention": model.RetentionLow, "segment": "personal"},
+		}},
 	}
+	searcher := &recordingGoldenSearcher{results: sharedResults}
 	srv := newGoldenTestServer(stub, searcher)
 
 	rec := doGoldenRequest(srv, http.MethodGet, "/api/v1/golden/next?limit=5", nil)
@@ -265,11 +279,34 @@ func TestGoldenNextHandler_ExcludesAlreadyJudged(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
 	}
 
-	if !capturedQuery.IncludeRetention {
-		t.Error("search query IncludeRetention = false, want true (disposable docs must be judgeable)")
+	if len(searcher.calls) != 2 {
+		t.Fatalf("Search called %d times, want 2 (relevance stream + recent stream)", len(searcher.calls))
 	}
-	if capturedQuery.Limit != 5 {
-		t.Errorf("search query Limit = %d, want 5 (from ?limit=)", capturedQuery.Limit)
+	relCall, recCall := searcher.calls[0], searcher.calls[1]
+	if !relCall.IncludeRetention || !recCall.IncludeRetention {
+		t.Error("IncludeRetention = false on some stream, want true on both (disposable docs must be judgeable)")
+	}
+	if relCall.Sort != "" {
+		t.Errorf("relevance stream Sort = %q, want \"\" (score-ranked)", relCall.Sort)
+	}
+	if recCall.Sort != model.SortRecent {
+		t.Errorf("recent stream Sort = %q, want %q", recCall.Sort, model.SortRecent)
+	}
+	if relCall.Limit != 3 { // round(5*0.6)
+		t.Errorf("relevance stream Limit = %d, want 3 (round(5*0.6))", relCall.Limit)
+	}
+	if recCall.Limit != 2 { // round(5*0.4)
+		t.Errorf("recent stream Limit = %d, want 2 (round(5*0.4))", recCall.Limit)
+	}
+	if relCall.OccurredFrom != nil || relCall.OccurredTo != nil {
+		t.Errorf("relevance stream window = [%v, %v), want none (no period phrase in the query text)", relCall.OccurredFrom, relCall.OccurredTo)
+	}
+	wantRecentFrom := askedAt.Add(-goldenRecentFallbackWindow)
+	if recCall.OccurredFrom == nil || !recCall.OccurredFrom.Equal(wantRecentFrom) {
+		t.Errorf("recent stream OccurredFrom = %v, want %v (asked_at - 90d fallback)", recCall.OccurredFrom, wantRecentFrom)
+	}
+	if recCall.OccurredTo == nil || !recCall.OccurredTo.Equal(askedAt) {
+		t.Errorf("recent stream OccurredTo = %v, want asked_at %v", recCall.OccurredTo, askedAt)
 	}
 	if stub.nextJudgeGot != "user" {
 		t.Errorf("NextQuery judge = %q, want default 'user' when ?judge= is omitted", stub.nextJudgeGot)
@@ -285,8 +322,14 @@ func TestGoldenNextHandler_ExcludesAlreadyJudged(t *testing.T) {
 	if resp.Query == nil || resp.Query.ID != queryID.String() {
 		t.Fatalf("query = %+v, want id %s", resp.Query, queryID)
 	}
+	if resp.Query.AskedAt != askedAt.Format(time.RFC3339) {
+		t.Errorf("query.asked_at = %q, want %q", resp.Query.AskedAt, askedAt.Format(time.RFC3339))
+	}
+	if resp.Query.Window != nil {
+		t.Errorf("query.window = %+v, want nil (no period phrase in the query text)", resp.Query.Window)
+	}
 	if len(resp.Candidates) != 1 {
-		t.Fatalf("candidates = %v, want exactly 1 (already-judged doc excluded)", resp.Candidates)
+		t.Fatalf("candidates = %v, want exactly 1 (already-judged doc excluded, recent-stream duplicate deduped)", resp.Candidates)
 	}
 	c := resp.Candidates[0]
 	if c.DocumentID != freshDocID.String() {
@@ -294,6 +337,9 @@ func TestGoldenNextHandler_ExcludesAlreadyJudged(t *testing.T) {
 	}
 	if c.Rank != 1 {
 		t.Errorf("candidate rank = %d, want 1 (re-ranked after exclusion)", c.Rank)
+	}
+	if c.Stream != goldenStreamRelevance {
+		t.Errorf("candidate stream = %q, want %q (relevance stream is merged first)", c.Stream, goldenStreamRelevance)
 	}
 	if c.Snippet != "line one line two with extra spaces" {
 		t.Errorf("snippet = %q, want whitespace collapsed", c.Snippet)
@@ -309,15 +355,305 @@ func TestGoldenNextHandler_ExcludesAlreadyJudged(t *testing.T) {
 	}
 }
 
-// recordingGoldenSearcher is a search.DocumentSearcher fake that captures the
-// last model.SearchQuery it received, scoped to this file.
+// TestGoldenNextHandler_PeriodPhraseResolvesWindowFromAskedAt covers a query
+// text carrying an explicit period phrase ("오늘"): both search streams must
+// receive the SAME window, resolved via intent.DeterministicWindow anchored
+// at the query's asked_at (NOT at whenever this test — or any real review —
+// happens to run), and the response must surface that window verbatim.
+func TestGoldenNextHandler_PeriodPhraseResolvesWindowFromAskedAt(t *testing.T) {
+	t.Parallel()
+
+	// Deliberately far from "now" so a window computed off time.Now() instead
+	// of asked_at would fail obviously rather than by coincidence.
+	askedAt := time.Date(2026, 5, 10, 1, 0, 0, 0, time.UTC) // 2026-05-10 10:00 KST
+	wantFrom, wantTo, label, ok := intent.DeterministicWindow("오늘 통화 내역 보여줘", askedAt.In(timeutil.KST()))
+	if !ok {
+		t.Fatalf("test setup: DeterministicWindow did not match %q", label)
+	}
+
+	queryID := uuid.New()
+	stub := &stubGoldenSet{
+		nextQuery: &store.GoldenQuery{ID: queryID, Text: "오늘 통화 내역 보여줘", Source: "seed", Status: "open", AskedAt: askedAt},
+		progress:  store.GoldenProgress{OpenQueries: 1},
+	}
+	// One canned hit on every call so the merge is non-empty and the
+	// window-relaxation fallback (TestGoldenNextHandler_WindowFallback*)
+	// never kicks in here — this test's only concern is that both streams
+	// receive the resolved window, not the fallback behavior.
+	searcher := &recordingGoldenSearcher{results: []*model.SearchResult{
+		{Document: model.Document{ID: uuid.New(), Title: "today's call", SourceType: model.SourceCallLog}},
+	}}
+	srv := newGoldenTestServer(stub, searcher)
+
+	rec := doGoldenRequest(srv, http.MethodGet, "/api/v1/golden/next", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+
+	if len(searcher.calls) != 2 {
+		t.Fatalf("Search called %d times, want 2", len(searcher.calls))
+	}
+	for i, call := range searcher.calls {
+		if call.OccurredFrom == nil || !call.OccurredFrom.Equal(wantFrom) {
+			t.Errorf("call[%d].OccurredFrom = %v, want %v", i, call.OccurredFrom, wantFrom)
+		}
+		if call.OccurredTo == nil || !call.OccurredTo.Equal(wantTo) {
+			t.Errorf("call[%d].OccurredTo = %v, want %v", i, call.OccurredTo, wantTo)
+		}
+	}
+
+	var resp goldenNextResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.Query == nil || resp.Query.Window == nil {
+		t.Fatalf("query.window = %v, want a resolved window", resp.Query)
+	}
+	if resp.Query.Window.From != wantFrom.Format(time.RFC3339) {
+		t.Errorf("window.from = %q, want %q", resp.Query.Window.From, wantFrom.Format(time.RFC3339))
+	}
+	if resp.Query.Window.To != wantTo.Format(time.RFC3339) {
+		t.Errorf("window.to = %q, want %q", resp.Query.Window.To, wantTo.Format(time.RFC3339))
+	}
+}
+
+// TestGoldenNextHandler_MergesStreamsRatioAndDedup pins the merge itself: the
+// relevance stream is exhausted before the recent stream contributes, a
+// document present in both streams keeps its FIRST (relevance) stream label
+// and is not double-counted, and the merged list is capped at the requested
+// limit.
+func TestGoldenNextHandler_MergesStreamsRatioAndDedup(t *testing.T) {
+	t.Parallel()
+
+	docA, docB, docC := uuid.New(), uuid.New(), uuid.New()
+	stub := &stubGoldenSet{
+		nextQuery: &store.GoldenQuery{ID: uuid.New(), Text: "프로젝트 진행 상황 어때", Source: "seed", Status: "open"},
+		progress:  store.GoldenProgress{OpenQueries: 1},
+	}
+	searcher := &recordingGoldenSearcher{
+		streamResults: [][]*model.SearchResult{
+			{ // relevance stream
+				{Document: model.Document{ID: docA, Title: "A", SourceType: model.SourceNote}},
+				{Document: model.Document{ID: docB, Title: "B", SourceType: model.SourceNote}},
+			},
+			{ // recent stream — docB duplicates the relevance stream, docC is new
+				{Document: model.Document{ID: docB, Title: "B", SourceType: model.SourceNote}},
+				{Document: model.Document{ID: docC, Title: "C", SourceType: model.SourceNote}},
+			},
+		},
+	}
+	srv := newGoldenTestServer(stub, searcher)
+
+	rec := doGoldenRequest(srv, http.MethodGet, "/api/v1/golden/next?limit=4", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+
+	if len(searcher.calls) != 2 {
+		t.Fatalf("Search called %d times, want 2", len(searcher.calls))
+	}
+	if searcher.calls[0].Limit != 2 { // round(4*0.6) = 2 (banker's-adjacent .4*4=... actually round(2.4)=2)
+		t.Errorf("relevance stream Limit = %d, want 2 (round(4*0.6))", searcher.calls[0].Limit)
+	}
+	if searcher.calls[1].Limit != 2 { // round(4*0.4) = 2 (round(1.6)=2)
+		t.Errorf("recent stream Limit = %d, want 2 (round(4*0.4))", searcher.calls[1].Limit)
+	}
+
+	var resp goldenNextResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if len(resp.Candidates) != 3 {
+		t.Fatalf("candidates = %+v, want 3 (A, B, C — docB deduped once)", resp.Candidates)
+	}
+	wantOrder := []struct {
+		id     uuid.UUID
+		stream string
+	}{
+		{docA, goldenStreamRelevance},
+		{docB, goldenStreamRelevance},
+		{docC, goldenStreamRecent},
+	}
+	for i, want := range wantOrder {
+		got := resp.Candidates[i]
+		if got.DocumentID != want.id.String() {
+			t.Errorf("candidates[%d].document_id = %s, want %s", i, got.DocumentID, want.id)
+		}
+		if got.Stream != want.stream {
+			t.Errorf("candidates[%d].stream = %q, want %q", i, got.Stream, want.stream)
+		}
+		if got.Rank != i+1 {
+			t.Errorf("candidates[%d].rank = %d, want %d", i, got.Rank, i+1)
+		}
+	}
+}
+
+// TestGoldenNextHandler_WindowFallbackWhenBothStreamsEmpty covers the
+// production scenario that motivated the fallback: a query naming an
+// explicit period ("오늘") whose window has no matching documents at all.
+// goldenNextHandler must retry once with the window relaxed — relevance
+// stream searched with NO window, recent stream falling back to the
+// standard 90-day-before-asked_at window — and report
+// query.window_fallback=true while query.window still reflects the
+// ORIGINALLY resolved (unhelpful) period, not the relaxed one.
+func TestGoldenNextHandler_WindowFallbackWhenBothStreamsEmpty(t *testing.T) {
+	t.Parallel()
+
+	askedAt := time.Date(2026, 5, 10, 1, 0, 0, 0, time.UTC) // 2026-05-10 10:00 KST
+	wantFrom, wantTo, label, ok := intent.DeterministicWindow("오늘 통화 내역 보여줘", askedAt.In(timeutil.KST()))
+	if !ok {
+		t.Fatalf("test setup: DeterministicWindow did not match %q", label)
+	}
+
+	queryID := uuid.New()
+	stub := &stubGoldenSet{
+		nextQuery: &store.GoldenQuery{ID: queryID, Text: "오늘 통화 내역 보여줘", Source: "seed", Status: "open", AskedAt: askedAt},
+		progress:  store.GoldenProgress{OpenQueries: 1},
+	}
+
+	fallbackDocID := uuid.New()
+	searcher := &recordingGoldenSearcher{
+		streamResults: [][]*model.SearchResult{
+			{}, // relevance stream, windowed to today: nothing
+			{}, // recent stream, windowed to today: nothing
+			{ // relevance fallback, no window: one hit
+				{Document: model.Document{ID: fallbackDocID, Title: "fallback hit", SourceType: model.SourceCallLog}},
+			},
+			{}, // recent fallback, 90-day window: nothing new
+		},
+	}
+	srv := newGoldenTestServer(stub, searcher)
+
+	rec := doGoldenRequest(srv, http.MethodGet, "/api/v1/golden/next", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+
+	if len(searcher.calls) != 4 {
+		t.Fatalf("Search called %d times, want 4 (2 windowed + 2 fallback)", len(searcher.calls))
+	}
+	relCall, recCall, fbRelCall, fbRecCall := searcher.calls[0], searcher.calls[1], searcher.calls[2], searcher.calls[3]
+	if relCall.OccurredFrom == nil || !relCall.OccurredFrom.Equal(wantFrom) {
+		t.Errorf("relevance call OccurredFrom = %v, want %v (original window)", relCall.OccurredFrom, wantFrom)
+	}
+	if recCall.OccurredTo == nil || !recCall.OccurredTo.Equal(wantTo) {
+		t.Errorf("recent call OccurredTo = %v, want %v (original window)", recCall.OccurredTo, wantTo)
+	}
+	if fbRelCall.OccurredFrom != nil || fbRelCall.OccurredTo != nil {
+		t.Errorf("relevance fallback call window = [%v, %v), want none (whole corpus)", fbRelCall.OccurredFrom, fbRelCall.OccurredTo)
+	}
+	if fbRelCall.Sort != "" {
+		t.Errorf("relevance fallback call Sort = %q, want \"\" (score-ranked)", fbRelCall.Sort)
+	}
+	wantFbRecentFrom := askedAt.Add(-goldenRecentFallbackWindow)
+	if fbRecCall.OccurredFrom == nil || !fbRecCall.OccurredFrom.Equal(wantFbRecentFrom) {
+		t.Errorf("recent fallback call OccurredFrom = %v, want %v (asked_at - 90d)", fbRecCall.OccurredFrom, wantFbRecentFrom)
+	}
+	if fbRecCall.OccurredTo == nil || !fbRecCall.OccurredTo.Equal(askedAt) {
+		t.Errorf("recent fallback call OccurredTo = %v, want asked_at %v", fbRecCall.OccurredTo, askedAt)
+	}
+	if fbRecCall.Sort != model.SortRecent {
+		t.Errorf("recent fallback call Sort = %q, want %q", fbRecCall.Sort, model.SortRecent)
+	}
+
+	var resp goldenNextResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.Query == nil {
+		t.Fatalf("query = nil, want the open query")
+	}
+	if !resp.Query.WindowFallback {
+		t.Error("query.window_fallback = false, want true when both windowed streams return nothing")
+	}
+	if resp.Query.Window == nil || resp.Query.Window.From != wantFrom.Format(time.RFC3339) || resp.Query.Window.To != wantTo.Format(time.RFC3339) {
+		t.Errorf("query.window = %+v, want the ORIGINAL resolved window %s..%s (fallback must not overwrite it)", resp.Query.Window, wantFrom, wantTo)
+	}
+	if len(resp.Candidates) != 1 || resp.Candidates[0].DocumentID != fallbackDocID.String() {
+		t.Fatalf("candidates = %+v, want exactly the fallback hit %s", resp.Candidates, fallbackDocID)
+	}
+}
+
+// TestGoldenNextHandler_NoWindowFallbackWhenPrimaryStreamsHaveResults covers
+// the non-degenerate case: when the windowed streams already produce at
+// least one candidate, goldenNextHandler must NOT retry with a relaxed
+// window, and query.window_fallback must be omitted (false).
+func TestGoldenNextHandler_NoWindowFallbackWhenPrimaryStreamsHaveResults(t *testing.T) {
+	t.Parallel()
+
+	askedAt := time.Date(2026, 5, 10, 1, 0, 0, 0, time.UTC)
+	docID := uuid.New()
+	stub := &stubGoldenSet{
+		nextQuery: &store.GoldenQuery{ID: uuid.New(), Text: "오늘 통화 내역 보여줘", Source: "seed", Status: "open", AskedAt: askedAt},
+		progress:  store.GoldenProgress{OpenQueries: 1},
+	}
+	searcher := &recordingGoldenSearcher{
+		streamResults: [][]*model.SearchResult{
+			{ // relevance stream: one hit, so no fallback is needed
+				{Document: model.Document{ID: docID, Title: "today's call", SourceType: model.SourceCallLog}},
+			},
+			{}, // recent stream
+		},
+	}
+	srv := newGoldenTestServer(stub, searcher)
+
+	rec := doGoldenRequest(srv, http.MethodGet, "/api/v1/golden/next", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+
+	if len(searcher.calls) != 2 {
+		t.Fatalf("Search called %d times, want 2 (no fallback retry expected)", len(searcher.calls))
+	}
+
+	var resp goldenNextResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.Query == nil {
+		t.Fatalf("query = nil, want the open query")
+	}
+	if resp.Query.WindowFallback {
+		t.Error("query.window_fallback = true, want false (omitted) when the primary streams already had a candidate")
+	}
+	if len(resp.Candidates) != 1 || resp.Candidates[0].DocumentID != docID.String() {
+		t.Fatalf("candidates = %+v, want exactly %s", resp.Candidates, docID)
+	}
+
+	body := rec.Body.String()
+	if strings.Contains(body, "window_fallback") {
+		t.Errorf("response body contains window_fallback despite omitempty: %s", body)
+	}
+}
+
+// recordingGoldenSearcher is a search.DocumentSearcher fake that records
+// every model.SearchQuery it receives, scoped to this file.
+// goldenNextHandler issues exactly two searches per request — a
+// relevance-ranked one followed by a recent-ranked one — so tests read
+// searcher.calls[0] / searcher.calls[1] to inspect each stream independently.
 type recordingGoldenSearcher struct {
-	results  []*model.SearchResult
-	captured *model.SearchQuery
+	// results is returned for every call when streamResults is nil.
+	results []*model.SearchResult
+	// streamResults, when non-nil, is indexed by call order: streamResults[0]
+	// answers the first (relevance-stream) call, streamResults[1] the second
+	// (recent-stream) call.
+	streamResults [][]*model.SearchResult
+	err           error
+	calls         []model.SearchQuery
 }
 
 func (r *recordingGoldenSearcher) Search(_ context.Context, q model.SearchQuery) ([]*model.SearchResult, error) {
-	*r.captured = q
+	idx := len(r.calls)
+	r.calls = append(r.calls, q)
+	if r.err != nil {
+		return nil, r.err
+	}
+	if r.streamResults != nil {
+		if idx < len(r.streamResults) {
+			return r.streamResults[idx], nil
+		}
+		return nil, nil
+	}
 	return r.results, nil
 }
 
@@ -483,6 +819,9 @@ func TestGoldenFeedbackHandler_Success(t *testing.T) {
 	if len(stub.upsertJudgments) != 1 || stub.upsertJudgments[0].Judge != "user" {
 		t.Errorf("upsertJudgments = %+v, want one entry with Judge=user", stub.upsertJudgments)
 	}
+	if !stub.byTextAskedAt.IsZero() {
+		t.Errorf("UpsertQueryByText askedAt = %v, want the zero value (no asked_at in the request body means 'let the store default to now()')", stub.byTextAskedAt)
+	}
 
 	var resp goldenFeedbackResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
@@ -490,6 +829,53 @@ func TestGoldenFeedbackHandler_Success(t *testing.T) {
 	}
 	if resp.QueryID != stub.byTextID.String() || resp.Saved != 1 || resp.FeedbackApplied != 1 {
 		t.Errorf("response = %+v, want query_id=%s saved=1 feedback_applied=1", resp, stub.byTextID)
+	}
+}
+
+// TestGoldenFeedbackHandler_ForwardsAskedAt covers the optional asked_at
+// field: when the hermes caller supplies one, it must reach
+// GoldenStore.UpsertQueryByText exactly as given (RFC3339-parsed), not
+// silently dropped or replaced with "now".
+func TestGoldenFeedbackHandler_ForwardsAskedAt(t *testing.T) {
+	t.Parallel()
+	stub := &stubGoldenSet{upsertSaved: 1}
+	srv := newGoldenTestServer(stub, nil)
+
+	wantAskedAt := time.Date(2026, 6, 15, 8, 30, 0, 0, time.UTC)
+	body, _ := json.Marshal(map[string]any{
+		"query_text": "이번 달 구독료 정리",
+		"source":     "hermes",
+		"judge":      "llm",
+		"judgments":  []map[string]any{},
+		"asked_at":   wantAskedAt.Format(time.RFC3339),
+	})
+
+	rec := doGoldenRequest(srv, http.MethodPost, "/api/v1/golden/feedback", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if !stub.byTextAskedAt.Equal(wantAskedAt) {
+		t.Errorf("UpsertQueryByText askedAt = %v, want %v", stub.byTextAskedAt, wantAskedAt)
+	}
+}
+
+// TestGoldenFeedbackHandler_InvalidAskedAt covers a malformed asked_at value
+// (not RFC3339): the handler must reject the request rather than silently
+// falling back to "now" or passing a garbage timestamp to the store.
+func TestGoldenFeedbackHandler_InvalidAskedAt(t *testing.T) {
+	t.Parallel()
+	srv := newGoldenTestServer(&stubGoldenSet{}, nil)
+
+	body, _ := json.Marshal(map[string]any{
+		"query_text": "질의",
+		"source":     "hermes",
+		"judge":      "llm",
+		"judgments":  []map[string]any{},
+		"asked_at":   "not-a-timestamp",
+	})
+	rec := doGoldenRequest(srv, http.MethodPost, "/api/v1/golden/feedback", body)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for a non-RFC3339 asked_at", rec.Code)
 	}
 }
 
