@@ -201,9 +201,10 @@ func (p *LLMPlanner) nowFunc() time.Time {
 // Exported so callers outside an LLMPlanner instance can reuse the exact
 // phrase list deterministicPlan is held to, instead of maintaining a second
 // list that could drift. Currently used by the golden-set candidate handler
-// (internal/api/golden.go), which must resolve "지난주" relative to when a
-// question was originally asked, not relative to whenever a human happens to
-// review it later.
+// (internal/api/golden.go), which resolves a period phrase like "오늘"
+// relative to REVIEW TIME — the moment a human is actually looking at the
+// candidate list (s.nowFunc()) — not relative to whenever the query text was
+// originally asked or generated.
 //
 // ok is false when no phrase in the pre-pass list matched — callers should
 // then treat the query as carrying no time constraint, exactly like the LLM

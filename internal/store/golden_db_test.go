@@ -195,8 +195,9 @@ func insertAskSession(t *testing.T, pg *Postgres, question string) {
 }
 
 // insertAskSessionAt is insertAskSession with an explicit created_at, for
-// tests that need to control which of several same-question rows is the
-// earliest (GenerateQueries' asked_at = MIN(created_at) rule).
+// tests that need to plant an ask_sessions row with a date far from "now" —
+// e.g. to prove GenerateQueries no longer copies this value into
+// golden_queries.asked_at (TestGoldenStore_GenerateQueries_AskHistoryAskedAtDefaultsNear).
 func insertAskSessionAt(t *testing.T, pg *Postgres, question string, createdAt time.Time) {
 	t.Helper()
 	_, err := pg.pool.Exec(context.Background(), `
@@ -656,37 +657,38 @@ func TestGoldenStore_UpsertQueryByText(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// asked_at (migrations/032_golden_asked_at.sql) — the reference instant GET
-// /api/v1/golden/next resolves a query's period expression ("지난주", "오늘",
-// ...) against. Pinned against a real database because the earliest-vs-latest
-// distinction below (MIN vs MAX of ask_sessions.created_at) is exactly the
-// kind of off-by-one an in-memory stub cannot catch.
+// asked_at (migrations/032_golden_asked_at.sql) — the instant a
+// golden_queries row was created. GET /api/v1/golden/next no longer reads
+// this column to resolve a query's period expression ("지난주", "오늘", ...);
+// that resolution is anchored at review time (the handler's s.nowFunc())
+// instead (see internal/api/golden.go). Every GenerateQueries-inserted row,
+// ask_history included, now gets the column's DEFAULT now() uniformly —
+// ask_history candidates used to be inserted with the EARLIEST
+// ask_sessions.created_at for that question text instead; that override was
+// removed along with the anchor-at-asked_at design it existed to serve.
 // ---------------------------------------------------------------------------
 
-// TestGoldenStore_GenerateQueries_AskedAtIsEarliestAskOccurrence pins
-// GenerateQueries' asked_at rule for source="ask_history": it must be the
-// EARLIEST ask_sessions.created_at recorded for that question text, not the
-// latest (which only decides the recency cutoff for which questions are even
-// considered — see candidateAskHistoryQueries' ORDER BY latest DESC).
-func TestGoldenStore_GenerateQueries_AskedAtIsEarliestAskOccurrence(t *testing.T) {
+// TestGoldenStore_GenerateQueries_AskHistoryAskedAtDefaultsNear pins
+// GenerateQueries' asked_at rule for source="ask_history": it must default to
+// (approximately) the moment GenerateQueries ran, via the column's DEFAULT
+// now() — NOT the original ask_sessions.created_at the question was actually
+// asked at, which GenerateQueries no longer reads for this purpose.
+func TestGoldenStore_GenerateQueries_AskHistoryAskedAtDefaultsNear(t *testing.T) {
 	pg := goldenTestDB(t)
 	s := NewGoldenStore(pg)
 	ctx := context.Background()
 
 	question := goldenTestSentinel + "지난주에 배송된 물건 확인해줘"
-	earliest := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
-	middle := time.Date(2026, 3, 10, 9, 0, 0, 0, time.UTC)
-	latest := time.Date(2026, 3, 20, 9, 0, 0, 0, time.UTC)
-	// Inserted out of chronological order on purpose: a query keyed off
-	// insertion order rather than the created_at values themselves would
-	// pass by accident.
-	insertAskSessionAt(t, pg, question, middle)
-	insertAskSessionAt(t, pg, question, latest)
-	insertAskSessionAt(t, pg, question, earliest)
+	// Deliberately far in the past: if GenerateQueries still copied
+	// ask_sessions.created_at into asked_at, this assertion would fail
+	// obviously rather than by coincidence.
+	insertAskSessionAt(t, pg, question, time.Date(2020, 3, 1, 9, 0, 0, 0, time.UTC))
 
+	before := time.Now().Add(-time.Minute)
 	if _, _, err := s.GenerateQueries(ctx); err != nil {
 		t.Fatalf("GenerateQueries: %v", err)
 	}
+	after := time.Now().Add(time.Minute)
 
 	var gotAskedAt time.Time
 	if err := pg.pool.QueryRow(ctx,
@@ -694,8 +696,8 @@ func TestGoldenStore_GenerateQueries_AskedAtIsEarliestAskOccurrence(t *testing.T
 	).Scan(&gotAskedAt); err != nil {
 		t.Fatalf("read asked_at: %v", err)
 	}
-	if !gotAskedAt.Equal(earliest) {
-		t.Errorf("asked_at = %v, want the EARLIEST ask_sessions.created_at %v (not latest %v)", gotAskedAt, earliest, latest)
+	if gotAskedAt.Before(before) || gotAskedAt.After(after) {
+		t.Errorf("ask_history asked_at = %v, want within [%v, %v] (DEFAULT now(), not the 2020 ask_sessions.created_at)", gotAskedAt, before, after)
 	}
 }
 

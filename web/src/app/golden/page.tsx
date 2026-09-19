@@ -400,7 +400,7 @@ export default function GoldenPage() {
             </p>
             <p className="mt-1 text-base font-semibold text-foreground">{query.text}</p>
             <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-foreground-muted">
-              <span>질문 시점: {formatAskedAtLabel(query.asked_at)}</span>
+              <span>기준 시점: {formatAskedAtLabel(query.asked_at)}</span>
               <span>{formatWindowLabel(query.window)}</span>
             </div>
           </Card>

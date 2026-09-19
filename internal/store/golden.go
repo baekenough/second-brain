@@ -74,13 +74,17 @@ type GoldenQuery struct {
 	Text   string
 	Source string // "ask_history" | "seed" | "manual" | "hermes"
 	Status string // "open" | "done" | "skipped"
-	// AskedAt is the instant a period expression in Text ("지난주", "오늘",
-	// ...) must be resolved against (migrations/032_golden_asked_at.sql). For
-	// source="ask_history" it is the earliest ask_sessions.created_at the
-	// question was actually asked at; for "seed"/"manual"/"hermes" — which
-	// carry no original asking context — it is the instant the row was
-	// created. See GET /api/v1/golden/next's use of
-	// internal/intent.DeterministicWindow.
+	// AskedAt is the instant golden_queries row was created
+	// (migrations/032_golden_asked_at.sql), for every source including
+	// ask_history — it is NO LONGER the original ask_sessions moment the
+	// question was actually asked. GET /api/v1/golden/next does not read this
+	// field to resolve a query's period expression ("지난주", "오늘", ...);
+	// that resolution is anchored at REVIEW TIME (the request handler's
+	// s.nowFunc()) instead, so a stale generation timestamp here can never
+	// silently reinterpret what "지난주" means for a reviewer. A caller of
+	// UpsertQueryByText (POST /api/v1/golden/feedback) may still supply an
+	// explicit value for its own provenance record-keeping; GenerateQueries
+	// never does.
 	AskedAt   time.Time
 	CreatedAt time.Time
 }
@@ -126,6 +130,18 @@ func NewGoldenStore(pg *Postgres) *GoldenStore {
 // above (source="seed") — and returns how many were newly created plus the
 // resulting total count of status='open' queries.
 //
+// Every inserted row's asked_at is left to the column's DEFAULT now()
+// (migrations/032_golden_asked_at.sql) — i.e. the moment THIS call runs —
+// for both sources uniformly. ask_history candidates used to be inserted
+// with the EARLIEST ask_sessions.created_at recorded for that question text
+// instead (the moment it was actually asked), to anchor GET
+// /api/v1/golden/next's period-phrase resolution against the asker's
+// original intent. That anchor point moved to review time (the handler's
+// s.nowFunc()) instead, so carrying the original ask moment through this
+// column would now be dead data with no reader — it is discarded rather than
+// stored. The underlying ask_sessions row (and its created_at) is not
+// deleted; only this copy of it is no longer taken.
+//
 // Deduplication happens in two layers: an exact match on `text` is rejected
 // by the table's UNIQUE constraint (ON CONFLICT DO NOTHING, so a repeat call
 // is a no-op), and a normalized-form match (internal/dataset.Normalize — the
@@ -150,14 +166,7 @@ func (s *GoldenStore) GenerateQueries(ctx context.Context) (created int, totalOp
 		return 0, 0, fmt.Errorf("golden: insert ask_history queries: %w", err)
 	}
 
-	seedCandidates := make([]goldenCandidateQuery, len(goldenSeedQueries))
-	for i, text := range goldenSeedQueries {
-		// AskedAt left zero: seed queries carry no original asking context,
-		// so insertQueries lets the column default (now(), migration 032)
-		// apply instead.
-		seedCandidates[i] = goldenCandidateQuery{Text: text}
-	}
-	seedCreated, err := s.insertQueries(ctx, seedCandidates, "seed", seen)
+	seedCreated, err := s.insertQueries(ctx, goldenSeedQueries, "seed", seen)
 	if err != nil {
 		return 0, 0, fmt.Errorf("golden: insert seed queries: %w", err)
 	}
@@ -190,23 +199,15 @@ func (s *GoldenStore) normalizedExistingTexts(ctx context.Context) (map[string]s
 	return out, rows.Err()
 }
 
-// goldenCandidateQuery pairs a candidate query text with the instant its
-// period expressions ("지난주", "오늘", ...) should be resolved against
-// (migrations/032_golden_asked_at.sql). AskedAt zero (time.Time{}) means "let
-// the golden_queries.asked_at column default (now()) apply" — used for
-// sources that carry no original asking context (seed/manual).
-type goldenCandidateQuery struct {
-	Text    string
-	AskedAt time.Time
-}
-
 // candidateAskHistoryQueries reads the most recent distinct ask_sessions
-// questions, filters out ones too short to carry retrievable intent, and
-// deduplicates by normalized form against `seen` (and against each other),
-// returning at most goldenAskHistoryCap results ordered by recency. Each
-// result's AskedAt is the EARLIEST ask_sessions.created_at recorded for that
-// question text — the moment it was actually first asked, not the most
-// recent repeat of it (which only decides the ORDER BY recency cutoff below).
+// question texts, filters out ones too short to carry retrievable intent,
+// and deduplicates by normalized form against `seen` (and against each
+// other), returning at most goldenAskHistoryCap results ordered by recency
+// (MAX(created_at) DESC — the most recently repeated questions first). The
+// original ask_sessions.created_at moment(s) a question was asked are used
+// only for this recency ordering; insertQueries always lets golden_queries'
+// asked_at column default to now() regardless of when the question was
+// originally asked (see GenerateQueries' doc comment).
 //
 // `seen` is read-only here: this function works against a local copy rather
 // than mutating the caller's map. If it mutated `seen` directly, every
@@ -215,9 +216,9 @@ type goldenCandidateQuery struct {
 // afterwards, and insertQueries would skip every one of them as a
 // false-positive duplicate — the caller (GenerateQueries) mutates `seen`
 // itself, incrementally, as each candidate is actually inserted.
-func (s *GoldenStore) candidateAskHistoryQueries(ctx context.Context, seen map[string]struct{}) ([]goldenCandidateQuery, error) {
+func (s *GoldenStore) candidateAskHistoryQueries(ctx context.Context, seen map[string]struct{}) ([]string, error) {
 	rows, err := s.pg.pool.Query(ctx, `
-		SELECT question, MIN(created_at) AS asked_at, MAX(created_at) AS latest
+		SELECT question, MAX(created_at) AS latest
 		FROM ask_sessions
 		GROUP BY question
 		ORDER BY latest DESC
@@ -233,11 +234,11 @@ func (s *GoldenStore) candidateAskHistoryQueries(ctx context.Context, seen map[s
 		local[k] = struct{}{}
 	}
 
-	var out []goldenCandidateQuery
+	var out []string
 	for rows.Next() {
 		var question string
-		var askedAt, latest time.Time
-		if err := rows.Scan(&question, &askedAt, &latest); err != nil {
+		var latest time.Time
+		if err := rows.Scan(&question, &latest); err != nil {
 			return nil, err
 		}
 		trimmed := strings.TrimSpace(question)
@@ -252,7 +253,7 @@ func (s *GoldenStore) candidateAskHistoryQueries(ctx context.Context, seen map[s
 			continue
 		}
 		local[norm] = struct{}{}
-		out = append(out, goldenCandidateQuery{Text: question, AskedAt: askedAt})
+		out = append(out, question)
 		if len(out) >= goldenAskHistoryCap {
 			break
 		}
@@ -260,15 +261,18 @@ func (s *GoldenStore) candidateAskHistoryQueries(ctx context.Context, seen map[s
 	return out, rows.Err()
 }
 
-// insertQueries inserts each candidate as a new golden_queries row with the
-// given source, skipping any whose normalized text form is already present
-// in `seen`. `seen` is updated for every text considered (inserted or not)
-// so a second call in the same GenerateQueries invocation cannot admit a
-// near-duplicate. Returns the number of rows actually created.
-func (s *GoldenStore) insertQueries(ctx context.Context, candidates []goldenCandidateQuery, source string, seen map[string]struct{}) (int, error) {
+// insertQueries inserts each candidate text as a new golden_queries row with
+// the given source, skipping any whose normalized text form is already
+// present in `seen`. asked_at is always left to the column's DEFAULT now()
+// (migrations/032_golden_asked_at.sql) — see GenerateQueries' doc comment for
+// why no candidate here carries an explicit asked_at override. `seen` is
+// updated for every text considered (inserted or not) so a second call in
+// the same GenerateQueries invocation cannot admit a near-duplicate. Returns
+// the number of rows actually created.
+func (s *GoldenStore) insertQueries(ctx context.Context, candidates []string, source string, seen map[string]struct{}) (int, error) {
 	created := 0
-	for _, c := range candidates {
-		norm := goldenNormalize(c.Text)
+	for _, text := range candidates {
+		norm := goldenNormalize(text)
 		if norm == "" {
 			continue
 		}
@@ -278,22 +282,12 @@ func (s *GoldenStore) insertQueries(ctx context.Context, candidates []goldenCand
 		seen[norm] = struct{}{}
 
 		var id uuid.UUID
-		var err error
-		if c.AskedAt.IsZero() {
-			err = s.pg.pool.QueryRow(ctx, `
-				INSERT INTO golden_queries (text, source)
-				VALUES ($1, $2)
-				ON CONFLICT (text) DO NOTHING
-				RETURNING id
-			`, c.Text, source).Scan(&id)
-		} else {
-			err = s.pg.pool.QueryRow(ctx, `
-				INSERT INTO golden_queries (text, source, asked_at)
-				VALUES ($1, $2, $3)
-				ON CONFLICT (text) DO NOTHING
-				RETURNING id
-			`, c.Text, source, c.AskedAt).Scan(&id)
-		}
+		err := s.pg.pool.QueryRow(ctx, `
+			INSERT INTO golden_queries (text, source)
+			VALUES ($1, $2)
+			ON CONFLICT (text) DO NOTHING
+			RETURNING id
+		`, text, source).Scan(&id)
 		if err != nil {
 			if err == pgx.ErrNoRows {
 				// Exact-text conflict with a row not caught by the normalized

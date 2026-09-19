@@ -134,12 +134,14 @@ export function nextFocusIndex(current: number, direction: FocusDirection, lengt
 
 // ── asked_at / window display formatting ────────────────────────────────────
 //
-// A judge must weigh candidate relevance against the moment the query was
-// *asked*, not against "now" — a historical ask_history query from three
-// months ago should be judged by what was true then, not by what's freshest
-// today. These helpers live here (not in lib/dates.ts) because they take an
-// explicit `now` reference instead of reading Date.now() themselves, which is
-// what makes them testable without faking the system clock.
+// query.asked_at is the backend's REVIEW-TIME reference instant (resolved at
+// request time — see internal/api/golden.go), not the moment a historical
+// ask_history query was originally asked: a period phrase like "지난주"
+// always resolves against what "지난주" means right now, when a judge is
+// actually looking at the candidate list. These helpers live here (not in
+// lib/dates.ts) because they take an explicit `now` reference instead of
+// reading Date.now() themselves, which is what makes them testable without
+// faking the system clock.
 
 /** `YYYY-MM-DD`, no time component. Used for both the asked_at label and as
  * a building block for testing — kept separate from lib/dates.ts's
@@ -165,9 +167,12 @@ export function formatMonthDay(iso: string): string {
 }
 
 /**
- * "질문 시점" label: `YYYY-MM-DD (N개월 전)`. The relative part uses the same
- * day-bucket thresholds as lib/dates.ts's formatRelative, but is reimplemented
- * here (rather than imported) so `now` can be injected — formatRelative reads
+ * "기준 시점" label: `YYYY-MM-DD (N개월 전)`. askedAt is the backend's
+ * REVIEW-TIME reference instant (query.asked_at, resolved server-side at
+ * request time — see internal/api/golden.go), not the moment the query text
+ * was originally asked. The relative part uses the same day-bucket
+ * thresholds as lib/dates.ts's formatRelative, but is reimplemented here
+ * (rather than imported) so `now` can be injected — formatRelative reads
  * `new Date()` internally, which would make this function's output
  * time-dependent and untestable.
  */

@@ -30,10 +30,12 @@ const goldenNextDefaultLimit = 10
 
 // goldenRecentFallbackWindow is the trailing window GET /api/v1/golden/next's
 // "recent" candidate stream searches when the query names no explicit period
-// at all (intent.DeterministicWindow returns ok=false). Anchored at the
-// query's asked_at (migrations/032_golden_asked_at.sql), not at review time —
-// otherwise a query reviewed months after it was generated would treat
-// "recent" as relative to the reviewer's clock instead of the asker's.
+// at all (intent.DeterministicWindow returns ok=false). Anchored at REVIEW
+// TIME (the moment the request is served, via s.nowFunc()), not at the
+// query's stored asked_at (migrations/032_golden_asked_at.sql) — a query like
+// "지난주 회의" must resolve against what "지난주" means right now, when a
+// reviewer is actually looking at it, not against whenever the query text
+// happened to be generated. See goldenNextHandler's doc comment.
 const goldenRecentFallbackWindow = 90 * 24 * time.Hour
 
 // goldenRelevanceStreamRatio / goldenRecentStreamRatio split
@@ -122,9 +124,14 @@ type goldenQueryResponse struct {
 	ID     string `json:"id"`
 	Text   string `json:"text"`
 	Source string `json:"source"`
-	// AskedAt is store.GoldenQuery.AskedAt (RFC3339) — the instant a period
-	// expression in Text was resolved against, NOT the instant this response
-	// was generated. See migrations/032_golden_asked_at.sql.
+	// AskedAt is the REFERENCE instant (RFC3339) that any period expression in
+	// Text ("지난주", "오늘", ...) was resolved against — i.e. review time, the
+	// moment this response was generated (s.nowFunc()). It is NOT
+	// store.GoldenQuery.AskedAt (the instant the query row was created,
+	// migrations/032_golden_asked_at.sql): that stored value no longer drives
+	// window resolution, so surfacing it here would show a reviewer a period
+	// anchored to a moment other than the one the returned Window/Candidates
+	// were actually computed against.
 	AskedAt string `json:"asked_at"`
 	// Window is the half-open [from, to) period GET /api/v1/golden/next
 	// resolved from Text via intent.DeterministicWindow, or nil when Text
@@ -136,9 +143,9 @@ type goldenQueryResponse struct {
 	// period's search returned no candidates at all, so goldenNextHandler
 	// re-ran both streams with the window relaxed (see the handler's doc
 	// comment) — Candidates below came from the WHOLE corpus (relevance
-	// stream) plus the standard 90-day-before-asked_at trailing window
-	// (recent stream), not from Window. Omitted (not false) in the common
-	// case so existing clients that don't know this field see no change.
+	// stream) plus the standard 90-day-before-now trailing window (recent
+	// stream), not from Window. Omitted (not false) in the common case so
+	// existing clients that don't know this field see no change.
 	WindowFallback bool `json:"window_fallback,omitempty"`
 }
 
@@ -235,12 +242,18 @@ func (s *Server) goldenGenerateHandler(w http.ResponseWriter, r *http.Request) {
 //     relevance score alone.
 //
 // Both streams apply the SAME event-time window, resolved from the query's
-// text via intent.DeterministicWindow and anchored at store.GoldenQuery.
-// AskedAt — the instant the question was actually asked, not whenever a
-// human happens to open the review queue (migrations/032_golden_asked_at.sql)
-// — except that the "recent" stream falls back to a trailing 90-day window
-// ending at AskedAt when the text names no explicit period at all, so it
-// still means something narrower than "the entire corpus, newest first".
+// text via intent.DeterministicWindow and anchored at REVIEW TIME — s.nowFunc(),
+// the instant THIS request is served — not at store.GoldenQuery.AskedAt (the
+// instant the query row was created, migrations/032_golden_asked_at.sql).
+// Anchoring at asked_at was the original design (see that migration's doc
+// comment for the future-leakage rationale it was chasing), but it means a
+// period phrase like "지난주 회의" reviewed weeks after the query was
+// generated resolves against a "지난주" the reviewer never meant, silently
+// surfacing stale candidates from whenever the query happened to be created
+// instead of the week the reviewer is actually judging against — the "recent"
+// stream falls back to a trailing 90-day window ending at review time when
+// the text names no explicit period at all, so it still means something
+// narrower than "the entire corpus, newest first".
 //
 // This two-stream design exists because a single relevance-ranked search
 // with no time constraint lets one heavily over-represented period (observed:
@@ -261,11 +274,11 @@ func (s *Server) goldenGenerateHandler(w http.ResponseWriter, r *http.Request) {
 // they can only skip. Instead, the handler retries once with the window
 // relaxed: the relevance stream searches the whole corpus (no window at
 // all) and the recent stream falls back to the same trailing 90-day window
-// used for text with no period phrase. The response then reports
-// WindowFallback=true (goldenQueryResponse.WindowFallback) while Window
-// itself still reflects the ORIGINALLY resolved period, so a caller can
-// still show what was asked even though the candidates it got came from
-// wider search.
+// (still anchored at review time) used for text with no period phrase. The
+// response then reports WindowFallback=true (goldenQueryResponse.WindowFallback)
+// while Window itself still reflects the ORIGINALLY resolved period, so a
+// caller can still show what was asked even though the candidates it got
+// came from wider search.
 // goldenSearchStream issues one search call on behalf of goldenNextHandler
 // and, on error, logs it tagged with label (e.g. "relevance", "recent
 // fallback") so ops can tell which of the handler's up-to-four search calls
@@ -323,7 +336,10 @@ func (s *Server) goldenNextHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	windowResp, periodFrom, periodTo, matched := goldenResolveWindow(q)
+	// now anchors every window computed below at REVIEW TIME rather than
+	// q.AskedAt — see goldenNextHandler's doc comment.
+	now := s.nowFunc()
+	windowResp, periodFrom, periodTo, matched := goldenResolveWindow(q, now)
 
 	var relFrom, relTo *time.Time
 	if matched {
@@ -331,8 +347,8 @@ func (s *Server) goldenNextHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	recFrom, recTo := relFrom, relTo
 	if !matched {
-		fallbackFrom := q.AskedAt.Add(-goldenRecentFallbackWindow)
-		fallbackTo := q.AskedAt
+		fallbackFrom := now.Add(-goldenRecentFallbackWindow)
+		fallbackTo := now
 		recFrom, recTo = &fallbackFrom, &fallbackTo
 	}
 
@@ -379,8 +395,8 @@ func (s *Server) goldenNextHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		fbRecentFrom := q.AskedAt.Add(-goldenRecentFallbackWindow)
-		fbRecentTo := q.AskedAt
+		fbRecentFrom := now.Add(-goldenRecentFallbackWindow)
+		fbRecentTo := now
 		fbRecResults, err := s.goldenSearchStream(r.Context(), "recent fallback", model.SearchQuery{
 			Query:            q.Text,
 			Limit:            goldenStreamLimit(limit, goldenRecentStreamRatio),
@@ -403,7 +419,7 @@ func (s *Server) goldenNextHandler(w http.ResponseWriter, r *http.Request) {
 			ID:             q.ID.String(),
 			Text:           q.Text,
 			Source:         q.Source,
-			AskedAt:        q.AskedAt.Format(time.RFC3339),
+			AskedAt:        now.Format(time.RFC3339),
 			Window:         windowResp,
 			WindowFallback: windowFallback,
 		},
@@ -413,12 +429,13 @@ func (s *Server) goldenNextHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // goldenResolveWindow resolves q's period expression ("지난주", "오늘", ...), if
-// any, to a half-open [from, to) window anchored at q.AskedAt rather than at
-// review time — see goldenNextHandler's doc comment. matched is false, and
-// window/from/to are the zero value, when q.Text names no explicit period.
-func goldenResolveWindow(q *store.GoldenQuery) (window *goldenWindowResponse, from, to time.Time, matched bool) {
-	askedAtKST := q.AskedAt.In(timeutil.KST())
-	from, to, _, matched = intent.DeterministicWindow(q.Text, askedAtKST)
+// any, to a half-open [from, to) window anchored at now (REVIEW TIME) rather
+// than at q.AskedAt — see goldenNextHandler's doc comment. matched is false,
+// and window/from/to are the zero value, when q.Text names no explicit
+// period.
+func goldenResolveWindow(q *store.GoldenQuery, now time.Time) (window *goldenWindowResponse, from, to time.Time, matched bool) {
+	nowKST := now.In(timeutil.KST())
+	from, to, _, matched = intent.DeterministicWindow(q.Text, nowKST)
 	if !matched {
 		return nil, time.Time{}, time.Time{}, false
 	}
