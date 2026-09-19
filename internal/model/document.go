@@ -422,6 +422,16 @@ func (q SearchQuery) RecencyAscending(now time.Time) bool {
 //
 // The returned slice never aliases the caller's SourceTypes backing array, so
 // filter steps may sort or truncate it freely.
+//
+// Every value passes through NormalizeSourceType before being added, so a
+// caller-supplied pre-migration-033 alias (call-log, call-transcript — see
+// that function's doc comment) resolves to the value documents are actually
+// stored under (call) instead of silently matching nothing. This is the ONE
+// point that does so: every retrieval lane (the store's SQL WHERE clauses,
+// the OpenSearch lane, the chunk-lane post-filter) reads its include set
+// through this method rather than the raw fields, so normalizing here alone
+// covers all of them — REST /api/v1/search, the MCP search tool, /ask's
+// retrieval assembly, GraphQL, and the Discord gateway.
 func (q SearchQuery) IncludeSourceTypes() []SourceType {
 	if q.SourceType == nil && len(q.SourceTypes) == 0 {
 		return nil
@@ -429,6 +439,7 @@ func (q SearchQuery) IncludeSourceTypes() []SourceType {
 	out := make([]SourceType, 0, len(q.SourceTypes)+1)
 	seen := make(map[SourceType]struct{}, len(q.SourceTypes)+1)
 	add := func(st SourceType) {
+		st = NormalizeSourceType(st)
 		if _, dup := seen[st]; dup {
 			return
 		}

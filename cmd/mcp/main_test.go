@@ -604,6 +604,67 @@ func TestSearchTool_OccurredRange_ToNotAfterFrom_Rejected(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Legacy call-log/call-transcript "source" parameter alias normalization.
+//
+// Migration 033 (2026-09-19) rewrote every call-log/call-transcript document
+// to source_type='call' (model.SourceCall's doc comment). allowedSourceTypes
+// still accepts the two retired values (kept for hermes and other pre-033
+// clients), but accepting the value is not the same as MATCHING anything with
+// it: before this fix, a caller-supplied "call-transcript" reached
+// svc.Search unchanged and matched zero rows, indistinguishable from "no such
+// documents". These tests pin that the tool passes a query whose EFFECTIVE
+// include set (model.SearchQuery.IncludeSourceTypes) resolves to {call}.
+// ---------------------------------------------------------------------------
+
+func TestSearchTool_LegacyCallTranscriptSource_NormalizedToCall(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeOccurredDocSearcher{}
+	s := newOccurredTestServer(docs, false)
+
+	result := callTool(t, s, "search", authorizedCtx(), map[string]any{
+		"query":  "test",
+		"source": "call-transcript",
+	})
+
+	if isErrorResult(result) {
+		t.Fatalf("unexpected error result: %s", resultText(result))
+	}
+	if !docs.called {
+		t.Fatal("expected the document searcher to be called")
+	}
+
+	got := docs.lastQuery.IncludeSourceTypes()
+	if len(got) != 1 || got[0] != model.SourceCall {
+		t.Errorf("IncludeSourceTypes() = %v, want [call]; source=call-transcript must normalize to call", got)
+	}
+}
+
+func TestSearchTool_LegacyCallLogSource_NormalizedToCall(t *testing.T) {
+	t.Parallel()
+
+	docs := &fakeOccurredDocSearcher{}
+	s := newOccurredTestServer(docs, false)
+
+	result := callTool(t, s, "search", authorizedCtx(), map[string]any{
+		"query":  "test",
+		"source": "call-log",
+	})
+
+	if isErrorResult(result) {
+		t.Fatalf("unexpected error result: %s", resultText(result))
+	}
+	if !docs.called {
+		t.Fatal("expected the document searcher to be called")
+	}
+
+	got := docs.lastQuery.IncludeSourceTypes()
+	if len(got) != 1 || got[0] != model.SourceCall {
+		t.Errorf("IncludeSourceTypes() = %v, want [call]; source=call-log must normalize to call", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // parseOccurredBound unit tests
 // ---------------------------------------------------------------------------
 

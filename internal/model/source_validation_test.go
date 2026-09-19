@@ -121,3 +121,54 @@ func TestSourceAgentNote_StringValue(t *testing.T) {
 		t.Errorf("SourceAgentNote = %q, want %q", SourceAgentNote, "agent-note")
 	}
 }
+
+// TestNormalizeSourceType_LegacyCallAliases verifies both pre-migration-033
+// values resolve to the value migration 033 unified them into. This is the
+// exact bug this function exists to fix: a filter still spelled with either
+// old value matched zero rows post-migration (see NormalizeSourceType's doc
+// comment) with no error signal distinguishing it from "no such documents".
+func TestNormalizeSourceType_LegacyCallAliases(t *testing.T) {
+	t.Parallel()
+
+	for _, st := range []SourceType{SourceCallLog, SourceCallTranscript} {
+		if got := NormalizeSourceType(st); got != SourceCall {
+			t.Errorf("NormalizeSourceType(%q) = %q, want %q", st, got, SourceCall)
+		}
+	}
+}
+
+// TestNormalizeSourceType_NonAliasesPassThrough verifies every other value —
+// current source types AND the one deprecated value with no replacement
+// (SourceLLMMemory, decommissioned rather than merged) — returns unchanged.
+// A regression that widened the alias map to match unrelated values would
+// silently rewrite a caller's request to a different source type.
+func TestNormalizeSourceType_NonAliasesPassThrough(t *testing.T) {
+	t.Parallel()
+
+	for _, st := range []SourceType{
+		SourceCall, SourceGmail, SourceSMS, SourceCalendar, SourceNote,
+		SourceUpload, SourceAgentNote, SourceInsight, SourceLLMMemory,
+		SourceSecretary, SourceType("unknown-source"),
+	} {
+		if got := NormalizeSourceType(st); got != st {
+			t.Errorf("NormalizeSourceType(%q) = %q, want unchanged %q", st, got, st)
+		}
+	}
+}
+
+// TestNormalizeSourceType_Idempotent verifies re-normalizing an already
+// normalized value is a no-op — several callers (SearchQuery.IncludeSourceTypes
+// plus internal/intent/plan.go's parseSourceTypes) may both normalize the same
+// value on one request, and a non-idempotent mapping would make that layering
+// order-sensitive.
+func TestNormalizeSourceType_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	for _, st := range []SourceType{SourceCallLog, SourceCallTranscript, SourceCall, SourceGmail} {
+		once := NormalizeSourceType(st)
+		twice := NormalizeSourceType(once)
+		if once != twice {
+			t.Errorf("NormalizeSourceType(%q) = %q, but NormalizeSourceType(that) = %q, want idempotent", st, once, twice)
+		}
+	}
+}

@@ -110,3 +110,45 @@ func IsDeprecatedSourceType(st SourceType) bool {
 	}
 	return false
 }
+
+// legacySourceTypeAliases maps a pre-migration-033 SourceType (see
+// SourceCallLog's doc comment in document.go) to the value migration 033
+// unified it into. NormalizeSourceType is the only reader — nowhere else
+// should compare a caller-supplied SourceType against this map directly.
+//
+// SourceLLMMemory is deliberately NOT an entry here: it was decommissioned
+// (documents purged, collector stopped), not merged into a replacement value,
+// so there is nothing to alias it to.
+var legacySourceTypeAliases = map[SourceType]SourceType{
+	SourceCallLog:        SourceCall,
+	SourceCallTranscript: SourceCall,
+}
+
+// NormalizeSourceType maps a caller-supplied SourceType to the value the
+// corpus actually stores documents under today, so a filter written against a
+// since-merged alias matches real rows instead of silently matching none.
+//
+// Motivating bug: migration 033 (2026-09-19) rewrote every "call-log"/
+// "call-transcript" document in Postgres to source_type='call' (see
+// SourceCallLog's doc comment). SourceCallLog/SourceCallTranscript stayed in
+// this package only so ValidateSourceType-style guards keep recognising the
+// value on old rows — but a caller (REST /api/v1/search, the MCP search
+// tool's "source" parameter, a query-planner LLM output that has not been
+// told about the rename) that still filters BY one of the old values passed
+// that guard and then matched zero documents. No error, no warning — a
+// caller reading only the HTTP status or the MCP tool result cannot tell
+// "this source has no matches" apart from "you spelled it correctly but it
+// doesn't exist anymore".
+//
+// Every place a SearchQuery's include/exclude filter turns into a SQL or
+// OpenSearch predicate must resolve a raw SourceType through here first (see
+// SearchQuery.IncludeSourceTypes, the single point that currently does).
+// Values with no alias — including every other DeprecatedSourceTypes() entry
+// and every ordinary, current SourceType — are returned unchanged, so calling
+// this on an already-normalized value is a no-op.
+func NormalizeSourceType(st SourceType) SourceType {
+	if alias, ok := legacySourceTypeAliases[st]; ok {
+		return alias
+	}
+	return st
+}

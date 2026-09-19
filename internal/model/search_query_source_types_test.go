@@ -96,6 +96,68 @@ func TestIncludeSourceTypes_Deduplicates(t *testing.T) {
 	}
 }
 
+// TestIncludeSourceTypes_NormalizesLegacyCallAlias_Singular pins the fix for
+// the "filter with a pre-migration-033 value silently matches nothing" bug:
+// migration 033 rewrote every call-log/call-transcript document to
+// source_type='call' (model.SourceCall's doc comment), so an include filter
+// still naming the old value must resolve to 'call' — the value documents
+// actually carry — or every retrieval lane that reads this method (the
+// store's SQL WHERE, the OpenSearch lane, the chunk-lane post-filter) matches
+// zero rows with no error.
+func TestIncludeSourceTypes_NormalizesLegacyCallAlias_Singular(t *testing.T) {
+	t.Parallel()
+
+	for _, legacy := range []SourceType{SourceCallLog, SourceCallTranscript} {
+		st := legacy
+		q := SearchQuery{Query: "q", SourceType: &st}
+
+		got := q.IncludeSourceTypes()
+		if len(got) != 1 || got[0] != SourceCall {
+			t.Errorf("IncludeSourceTypes() with SourceType=%q = %v, want [%q]", legacy, got, SourceCall)
+		}
+	}
+}
+
+// TestIncludeSourceTypes_NormalizesLegacyCallAlias_Plural mirrors the singular
+// case above for the plural field, which is what a query planner (or an MCP
+// caller passing multiple sources) actually populates.
+func TestIncludeSourceTypes_NormalizesLegacyCallAlias_Plural(t *testing.T) {
+	t.Parallel()
+
+	q := SearchQuery{Query: "q", SourceTypes: []SourceType{SourceCallTranscript, SourceGmail}}
+
+	got := q.IncludeSourceTypes()
+	if len(got) != 2 {
+		t.Fatalf("IncludeSourceTypes() = %v, want 2 entries", got)
+	}
+	seen := map[SourceType]bool{}
+	for _, s := range got {
+		seen[s] = true
+	}
+	if !seen[SourceCall] || !seen[SourceGmail] {
+		t.Errorf("IncludeSourceTypes() = %v, want {call, gmail} (call-transcript normalized to call)", got)
+	}
+	if seen[SourceCallTranscript] {
+		t.Errorf("IncludeSourceTypes() = %v, still contains the un-normalized alias call-transcript", got)
+	}
+}
+
+// TestIncludeSourceTypes_NormalizedAliasesDeduplicate verifies that a legacy
+// alias and its current replacement named together collapse into ONE entry —
+// normalization happens before dedup, not after, so call-log and call are not
+// treated as two different sources.
+func TestIncludeSourceTypes_NormalizedAliasesDeduplicate(t *testing.T) {
+	t.Parallel()
+
+	st := SourceCallLog
+	q := SearchQuery{Query: "q", SourceType: &st, SourceTypes: []SourceType{SourceCall, SourceCallTranscript}}
+
+	got := q.IncludeSourceTypes()
+	if len(got) != 1 || got[0] != SourceCall {
+		t.Errorf("IncludeSourceTypes() = %v, want exactly [call] (call-log/call/call-transcript all normalize to the same value)", got)
+	}
+}
+
 // TestIncludeSourceTypes_DoesNotAliasCallerSlice guards the boundary-copy rule:
 // the returned slice must not share backing storage with the caller's field, or
 // a downstream filter step could mutate the request it was given.

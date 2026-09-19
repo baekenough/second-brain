@@ -436,6 +436,16 @@ func parseWindow(fromStr, toStr string) (from, to *time.Time, ok bool) {
 // remaining entries it meant is how a plan quietly becomes wrong instead of
 // visibly absent. model.SourceInsight is accepted here and removed by
 // stripInsight, because it is a real source type, just not a plannable one.
+//
+// Each name passes through model.NormalizeSourceType before the allow-list
+// check. planSourceTypes' doc comment above notes that the prompt is
+// regenerated from that list on every call, so the LLM is never TOLD
+// "call-log"/"call-transcript" — but the model's training data predates
+// migration 033, and a plan built from that data could still name one of the
+// retired values from memory rather than from the prompt it was just given.
+// Without normalizing first, that single unrecognised name would fail the
+// whole plan closed (fallbackPlan: no source filter at all, i.e. the entire
+// corpus) instead of the caller's evident intent of "just the call source".
 func parseSourceTypes(names []string) ([]model.SourceType, bool) {
 	if len(names) == 0 {
 		return nil, true
@@ -449,7 +459,7 @@ func parseSourceTypes(names []string) ([]model.SourceType, bool) {
 	out := make([]model.SourceType, 0, len(names))
 	seen := make(map[model.SourceType]struct{}, len(names))
 	for _, n := range names {
-		st := model.SourceType(strings.TrimSpace(n))
+		st := model.NormalizeSourceType(model.SourceType(strings.TrimSpace(n)))
 		if _, okType := allowed[st]; !okType {
 			return nil, false
 		}

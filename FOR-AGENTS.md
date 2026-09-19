@@ -340,7 +340,7 @@ curl -X POST https://<your-tunnel-host>/api/v1/ingest/file \
 | `calendar` | 캘린더 일정 | 직접 수집 (2026-05-30 이후) |
 | `sms` | SMS 메시지 | 직접 수집 (2026-05-30 이후) |
 | `call` | 통화 1건 = 문서 1건 (발신·수신·부재중, 녹음 유무 무관). `metadata.transcription`이 `none`(녹음 없음)/`pending`(녹음 있으나 아직 미전사)/`done`(전사 완료, 본문이 전사 텍스트)을 구분합니다. `call-log`/`call-transcript` 통합(마이그레이션 033, 2026-09-19) | 직접 수집 (2026-05-30 이후) |
-| `call-log` / `call-transcript` | **폐기됨** — `call`로 통합. `source` 필터에는 하위호환으로 여전히 허용되지만, 신규 문서는 절대 이 값으로 저장되지 않습니다 | 폐기 (레거시 문서만 존재) |
+| `call-log` / `call-transcript` | **폐기됨** — `call`로 통합. `source` 필터에 이 구 값을 넣어도 `call`로 자동 매핑되어 정상적으로 매칭됩니다(`model.NormalizeSourceType`). 신규 문서는 절대 이 값으로 저장되지 않습니다 | 폐기 (레거시 문서만 존재) |
 | `secretary` | Gmail·SMS·통화기록·통화녹취·캘린더 **통합 아카이브** (2026-05-30 이전 레거시 데이터) | 레거시 (이관 완료 후 점진 축소) |
 | `llm-memory` | LLM 세션 메모리. 이전 Claude/GPT 대화 중 저장된 메모, 작업 로그, 프로젝트 노트. `add_note`로 추가된 노트 포함. | MCP 쓰기 / 자동 수집 |
 | `upload` | 에이전트·사용자가 `POST /api/v1/ingest/file`로 업로드한 파일 | HTTP 업로드 |
