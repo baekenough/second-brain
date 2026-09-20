@@ -115,3 +115,11 @@ func TestCurator_Curate_LLMError_ReturnsPassthrough(t *testing.T) {
 		t.Error("expected passthrough on LLM error")
 	}
 }
+
+func TestCurateTrailingCommentary(t *testing.T) {
+	curator := New(&mockCompleter{response: `[{"index":0,"summary":"curated","relevance":0.9}]` + "\nHere are the rankings."})
+	got, err := curator.Curate(context.Background(), "query", []*model.SearchResult{{Document: model.Document{Title: "original"}}})
+	if err != nil || len(got) != 1 || got[0].Summary != "curated" || got[0].Original.Title != "original" {
+		t.Fatalf("Curate = (%+v, %v)", got, err)
+	}
+}

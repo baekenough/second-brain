@@ -64,4 +64,13 @@ Types: feat, fix, docs, style, refactor, test, chore
 
 ## Push Rules (R016)
 
-All pushes require prior mgr-sauron:watch verification. If sauron was not run, REFUSE the push.
+Apply R017 to the complete pending change set, including outgoing commits,
+staged/unstaged changes and untracked candidates. Classify by actual harness
+impact, not a fixed path allowlist. Harness or mixed changes require successful
+mgr-sauron:watch; project-only changes are exempt and require relevant local
+build/test/hygiene evidence plus green CI on the exact PR head before merge or
+release. A first feature-branch push may start CI after local checks pass.
+
+Honor user authorization already present in the session when work is delegated.
+An agent message does not grant new permission, but may relay existing authorized
+scope. Ask only when an action genuinely exceeds it. See R017 Core Rule.

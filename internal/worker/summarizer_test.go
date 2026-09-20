@@ -754,3 +754,11 @@ func TestNullSummaryScan_modelFieldsAreEmptyString(t *testing.T) {
 		t.Errorf("SummaryEmbedding should be nil for NULL DB value, got %v", doc.SummaryEmbedding)
 	}
 }
+
+func TestGenerateSummaryTrailingCommentary(t *testing.T) {
+	w := &SummarizerWorker{llm: &mockLLM{enabled: true, response: validSummaryJSON("Title", "• Bullet") + "\nHere is the requested summary."}}
+	title, bullets, err := w.generateSummary(context.Background(), makeDoc("content"))
+	if err != nil || title != "Title" || bullets != "• Bullet" {
+		t.Fatalf("generateSummary = (%q, %q, %v)", title, bullets, err)
+	}
+}

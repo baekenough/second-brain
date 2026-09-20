@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
@@ -90,9 +91,9 @@ Respond with a JSON array only, no markdown fencing:
 	}
 
 	var rankings []llmRankEntry
-	if err := json.Unmarshal([]byte(response), &rankings); err != nil {
+	if err := json.NewDecoder(strings.NewReader(response)).Decode(&rankings); err != nil {
 		slog.Warn("curation: failed to parse LLM response, returning passthrough",
-			"error", err, "response", response)
+			"response_bytes", len(response))
 		return passthrough(results), nil
 	}
 

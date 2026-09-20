@@ -41,64 +41,11 @@ func srcTestDB(t *testing.T) *Postgres {
 	}
 	t.Cleanup(pg.Close)
 
-	ensureSrcTestSchema(t, pg)
 	t.Cleanup(func() {
 		_, _ = pg.pool.Exec(context.Background(),
 			`DELETE FROM documents WHERE source_id LIKE $1`, srcTestPrefix+"%")
 	})
 	return pg
-}
-
-// ensureSrcTestSchema creates the minimum needed to execute the search
-// statements, and ONLY what is missing.
-//
-// It deliberately does not apply migrations/: 006 requires the pg_bigm
-// extension, which the pgvector images do not ship, so a full migration run
-// fails before it reaches anything relevant here. The hybrid statement calls
-// bigm_similarity(), so a no-op stub stands in when the real extension is
-// absent — the ranking expression is not what these tests assert, the WHERE
-// predicates are. Both guards are conditional so that a database which DOES
-// have the real schema/extension is left untouched.
-func ensureSrcTestSchema(t *testing.T, pg *Postgres) {
-	t.Helper()
-	ctx := context.Background()
-
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS documents (
-			id uuid PRIMARY KEY,
-			source_type text NOT NULL,
-			source_id text NOT NULL,
-			title text NOT NULL DEFAULT '',
-			content text NOT NULL DEFAULT '',
-			metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
-			embedding vector(3),
-			status text NOT NULL DEFAULT 'active',
-			deleted_at timestamptz,
-			occurred_at timestamptz,
-			collected_at timestamptz NOT NULL DEFAULT now(),
-			created_at timestamptz NOT NULL DEFAULT now(),
-			updated_at timestamptz NOT NULL DEFAULT now(),
-			title_summary text,
-			bullet_summary text,
-			summary_embedding vector(3),
-			tsv tsvector GENERATED ALWAYS AS (
-				to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(content,''))
-			) STORED
-		)`,
-		`DO $do$
-		BEGIN
-			IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'bigm_similarity') THEN
-				EXECUTE $f$CREATE FUNCTION bigm_similarity(text, text)
-					RETURNS float8 LANGUAGE sql IMMUTABLE AS 'SELECT 0.0::float8'$f$;
-			END IF;
-		END
-		$do$;`,
-	}
-	for _, s := range stmts {
-		if _, err := pg.pool.Exec(ctx, s); err != nil {
-			t.Fatalf("prepare test schema: %v", err)
-		}
-	}
 }
 
 // seedSrcDoc inserts one throwaway document. Content is nonsense filler — no
@@ -111,7 +58,7 @@ func seedSrcDoc(t *testing.T, pg *Postgres, src model.SourceType, occurredAt *ti
 		INSERT INTO documents (id, source_type, source_id, title, content, embedding, occurred_at, collected_at)
 		VALUES ($1, $2, $3, 'zzdummy title', 'zzdummy sentinel body', $4, $5, now())`,
 		id, string(src), srcTestPrefix+id.String(),
-		pgvector.NewVector([]float32{0.1, 0.2, 0.3}), occurredAt,
+		pgvector.NewVector(testEmbedding()), occurredAt,
 	)
 	if err != nil {
 		t.Fatalf("seed document (%s): %v", src, err)
@@ -162,7 +109,7 @@ func TestDB_HybridSearch_MultiSourceInclude(t *testing.T) {
 	got, err := store.Search(context.Background(), model.SearchQuery{
 		Query:       "zzdummy",
 		Limit:       50,
-		Embedding:   []float32{0.1, 0.2, 0.3},
+		Embedding:   testEmbedding(),
 		SourceTypes: []model.SourceType{model.SourceGmail},
 	})
 	if err != nil {

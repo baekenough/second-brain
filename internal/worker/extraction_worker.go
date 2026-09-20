@@ -281,6 +281,8 @@ func (w *ExtractionWorker) persistExtraction(base context.Context, doc *model.Do
 	}
 
 	relations := make([]model.EntityRelation, 0, len(result.Relations))
+	downgradedRelations := 0
+	explicitRelatedTo := 0
 	for _, r := range result.Relations {
 		fromID, err := resolve(r.FromName, r.FromType)
 		if err != nil {
@@ -292,10 +294,18 @@ func (w *ExtractionWorker) persistExtraction(base context.Context, doc *model.Do
 			slog.Warn("extraction worker: resolve to-entity failed", "doc_id", doc.ID, "name", r.ToName, "error", err)
 			continue
 		}
+		relationType := model.DowngradeRelationType(r.RawType)
+		if relationType == model.RelationRelatedTo {
+			if r.RawType == string(model.RelationRelatedTo) {
+				explicitRelatedTo++
+			} else {
+				downgradedRelations++
+			}
+		}
 		relations = append(relations, model.EntityRelation{
 			FromEntityID:       fromID,
 			ToEntityID:         toID,
-			Type:               model.DowngradeRelationType(r.RawType),
+			Type:               relationType,
 			EvidenceDocumentID: doc.ID,
 			Confidence:         r.Confidence,
 			ObservedAt:         time.Now().UTC(),
@@ -308,6 +318,13 @@ func (w *ExtractionWorker) persistExtraction(base context.Context, doc *model.Do
 			return
 		}
 	}
+
+	// Count only successful relation writes (per attempt, not unique rows).
+	// The document ID allows retries to be correlated. Never log arbitrary model
+	// output: an invalid type may itself contain source-document content.
+	slog.Info("extraction worker: relation type distribution",
+		"doc_id", doc.ID, "relations", len(relations), "downgraded", downgradedRelations,
+		"explicit_related_to", explicitRelatedTo)
 
 	for _, a := range result.Actions {
 		if err := w.persistAction(persistCtx, doc, a, resolve); err != nil {

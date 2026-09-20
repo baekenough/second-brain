@@ -1,7 +1,7 @@
 ---
 title: mgr-sauron
 type: agent
-updated: 2026-04-12
+updated: 2026-09-20
 sources:
   - .claude/agents/mgr-sauron.md
 related:
@@ -52,3 +52,7 @@ Additional capabilities: spec density analysis (detecting agents with excessive 
 ## Sources
 
 - `.claude/agents/mgr-sauron.md`
+
+## Ontology freshness
+
+Watch and quick modes run `python3 scripts/build-ontology-graphs.py --check`. Update canonical YAML catalogs and regenerate all four graphs; missing source references or stale output fail verification.

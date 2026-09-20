@@ -660,7 +660,8 @@ func buildFulltextSearchQuery(query model.SearchQuery) (string, []interface{}) {
 		WHERE (tsv @@ plainto_tsquery('simple', $1)
 		   OR tsv @@ plainto_tsquery('english', $1)
 		   OR content LIKE '%%' || $1 || '%%'
-		   OR title   LIKE '%%' || $1 || '%%')
+		   OR title   LIKE '%%' || $1 || '%%'
+		   OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
 		%s
 		%s
 		%s
@@ -1035,11 +1036,13 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 			       row_number() OVER (ORDER BY
 			           GREATEST(
 			               bigm_similarity(content, $1),
-			               bigm_similarity(title,   $1)
+			               bigm_similarity(title,   $1),
+			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
 			           ) DESC, id ASC) AS rank
 			FROM documents
 			WHERE (content LIKE '%%%%' || $1 || '%%%%'
-			    OR title   LIKE '%%%%' || $1 || '%%%%')
+			    OR title   LIKE '%%%%' || $1 || '%%%%'
+			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
 			%s
 			%s
 			%s

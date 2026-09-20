@@ -223,7 +223,7 @@ func DeterministicWindow(question string, now time.Time) (from, to time.Time, la
 		from, to = monthRange(year, month)
 		label = fmt.Sprintf("%d년 %d월", year, month)
 	case lastMonthRe.MatchString(question):
-		lm := now.AddDate(0, -1, 0)
+		lm := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).AddDate(0, -1, 0)
 		from, to = monthRange(lm.Year(), int(lm.Month()))
 		label = "지난달"
 	case weekendRe.MatchString(question):

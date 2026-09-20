@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -22,12 +23,20 @@ type Postgres struct {
 // NewPostgres opens a pgx pool, registers pgvector types, and enables the
 // pgvector extension. The caller must call Close when done.
 func NewPostgres(ctx context.Context, databaseURL string) (*Postgres, error) {
+	// Parse before connecting so driver parse errors can never escape to logs.
+	// Their nested causes may contain credentials, even when the outer DSN is
+	// redacted. Do not wrap or retain the original error.
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, errors.New("invalid database connection configuration; check DATABASE_URL and PG* settings")
+	}
+
 	// Create a temporary single connection to install the pgvector extension
 	// before the pool is created. AfterConnect calls pgvecpgx.RegisterTypes,
 	// which requires the extension to already exist. If we relied on the pool's
 	// first connection (triggered by Ping) to create the extension, it would be
 	// a chicken-and-egg problem: AfterConnect fires before Exec can run.
-	tmpConn, err := pgxstd.Connect(ctx, databaseURL)
+	tmpConn, err := pgxstd.ConnectConfig(ctx, cfg.ConnConfig.Copy())
 	if err != nil {
 		return nil, fmt.Errorf("open temporary connection: %w", err)
 	}
@@ -39,9 +48,15 @@ func NewPostgres(ctx context.Context, databaseURL string) (*Postgres, error) {
 		return nil, fmt.Errorf("close temporary connection: %w", err)
 	}
 
-	cfg, err := pgxpool.ParseConfig(databaseURL)
-	if err != nil {
-		return nil, fmt.Errorf("parse database URL: %w", err)
+	// pgvector >= 0.8 supports iterative scans: keep scanning when status or
+	// source filters discard the initial HNSW candidates. Preserve explicit
+	// operator overrides in the DSN, while giving every pool connection the
+	// same recall-oriented defaults (documents, summaries, and chunks).
+	if _, ok := cfg.ConnConfig.RuntimeParams["hnsw.ef_search"]; !ok {
+		cfg.ConnConfig.RuntimeParams["hnsw.ef_search"] = "100"
+	}
+	if _, ok := cfg.ConnConfig.RuntimeParams["hnsw.iterative_scan"]; !ok {
+		cfg.ConnConfig.RuntimeParams["hnsw.iterative_scan"] = "strict_order"
 	}
 
 	// Register pgvector types for every new connection.

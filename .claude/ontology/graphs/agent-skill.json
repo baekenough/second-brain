@@ -2,101 +2,251 @@
   "description": "Agent to Skill dependency mapping",
   "version": "1.0.0",
   "edges": {
-    "lang-golang-expert": ["go-best-practices"],
-    "lang-python-expert": ["python-best-practices"],
-    "lang-rust-expert": ["rust-best-practices"],
-    "lang-kotlin-expert": ["kotlin-best-practices"],
-    "lang-typescript-expert": ["typescript-best-practices"],
-    "lang-java21-expert": [],
-    "be-fastapi-expert": ["fastapi-best-practices"],
-    "be-springboot-expert": ["springboot-best-practices"],
-    "be-go-backend-expert": ["go-backend-best-practices"],
-    "be-express-expert": [],
-    "be-nestjs-expert": [],
-    "fe-vercel-agent": ["react-best-practices", "web-design-guidelines", "vercel-deploy"],
-    "fe-vuejs-agent": [],
-    "fe-svelte-agent": [],
-    "fe-flutter-agent": ["flutter-best-practices"],
-    "de-airflow-expert": ["airflow-best-practices"],
-    "de-dbt-expert": ["dbt-best-practices"],
-    "de-spark-expert": ["spark-best-practices"],
-    "de-kafka-expert": ["kafka-best-practices"],
-    "de-snowflake-expert": ["snowflake-best-practices"],
-    "de-pipeline-expert": ["pipeline-architecture-patterns"],
-    "db-postgres-expert": ["postgres-best-practices"],
-    "db-redis-expert": ["redis-best-practices"],
-    "db-supabase-expert": ["supabase-postgres-best-practices"],
-    "tool-npm-expert": ["npm-audit", "npm-publish", "npm-version"],
-    "tool-optimizer": ["optimize-analyze", "optimize-bundle", "optimize-report"],
-    "tool-bun-expert": [],
     "arch-documenter": [],
     "arch-speckit-agent": [],
-    "infra-docker-expert": ["docker-best-practices"],
-    "infra-aws-expert": ["aws-best-practices"],
+    "be-express-expert": [],
+    "be-fastapi-expert": [
+      "fastapi-best-practices"
+    ],
+    "be-go-backend-expert": [
+      "go-backend-best-practices"
+    ],
+    "be-nestjs-expert": [],
+    "be-springboot-expert": [
+      "springboot-best-practices"
+    ],
+    "db-neo4j-expert": [
+      "neo4j-best-practices"
+    ],
+    "db-postgres-expert": [
+      "postgres-best-practices"
+    ],
+    "db-redis-expert": [
+      "redis-best-practices"
+    ],
+    "db-supabase-expert": [
+      "supabase-postgres-best-practices"
+    ],
+    "de-airflow-expert": [
+      "airflow-best-practices"
+    ],
+    "de-dbt-expert": [
+      "dbt-best-practices"
+    ],
+    "de-kafka-expert": [
+      "kafka-best-practices"
+    ],
+    "de-pipeline-expert": [
+      "pipeline-architecture-patterns"
+    ],
+    "de-snowflake-expert": [
+      "snowflake-best-practices"
+    ],
+    "de-spark-expert": [
+      "spark-best-practices"
+    ],
+    "fe-flutter-agent": [
+      "flutter-best-practices"
+    ],
+    "fe-svelte-agent": [],
+    "fe-vercel-agent": [
+      "react-best-practices",
+      "vercel-deploy",
+      "web-design-guidelines"
+    ],
+    "fe-vuejs-agent": [],
+    "infra-aws-expert": [
+      "aws-best-practices"
+    ],
+    "infra-docker-expert": [
+      "docker-best-practices"
+    ],
+    "lang-golang-expert": [
+      "go-best-practices"
+    ],
+    "lang-java-expert": [],
+    "lang-kotlin-expert": [
+      "kotlin-best-practices"
+    ],
+    "lang-python-expert": [
+      "python-best-practices"
+    ],
+    "lang-rust-expert": [
+      "rust-best-practices"
+    ],
+    "lang-typescript-expert": [
+      "typescript-best-practices"
+    ],
+    "mgr-claude-code-bible": [
+      "claude-code-bible"
+    ],
+    "mgr-creator": [
+      "create-agent"
+    ],
+    "mgr-gitnerd": [],
+    "mgr-sauron": [
+      "sauron-watch"
+    ],
+    "mgr-supplier": [
+      "audit-agents"
+    ],
+    "mgr-updater": [
+      "update-docs",
+      "update-external"
+    ],
+    "qa-engineer": [],
     "qa-planner": [],
     "qa-writer": [],
-    "qa-engineer": [],
-    "mgr-creator": ["create-agent"],
-    "mgr-updater": ["update-external"],
-    "mgr-supplier": ["audit-agents"],
-    "mgr-gitnerd": [],
-    "mgr-sauron": ["sauron-watch"],
-    "mgr-claude-code-bible": ["claude-code-bible"],
-    "sys-memory-keeper": ["memory-management", "memory-save", "memory-recall"],
-    "sys-naggy": []
+    "sys-memory-keeper": [
+      "memory-management",
+      "memory-recall",
+      "memory-save"
+    ],
+    "sys-naggy": [],
+    "tool-bun-expert": [],
+    "tool-npm-expert": [
+      "npm-audit",
+      "npm-publish",
+      "npm-version"
+    ],
+    "tool-optimizer": [
+      "optimize-analyze",
+      "optimize-bundle",
+      "optimize-report"
+    ]
   },
   "reverse": {
-    "go-best-practices": ["lang-golang-expert"],
-    "python-best-practices": ["lang-python-expert"],
-    "rust-best-practices": ["lang-rust-expert"],
-    "kotlin-best-practices": ["lang-kotlin-expert"],
-    "typescript-best-practices": ["lang-typescript-expert"],
-    "fastapi-best-practices": ["be-fastapi-expert"],
-    "springboot-best-practices": ["be-springboot-expert"],
-    "go-backend-best-practices": ["be-go-backend-expert"],
-    "react-best-practices": ["fe-vercel-agent"],
-    "web-design-guidelines": ["fe-vercel-agent"],
-    "vercel-deploy": ["fe-vercel-agent"],
-    "flutter-best-practices": ["fe-flutter-agent"],
-    "airflow-best-practices": ["de-airflow-expert"],
-    "dbt-best-practices": ["de-dbt-expert"],
-    "spark-best-practices": ["de-spark-expert"],
-    "kafka-best-practices": ["de-kafka-expert"],
-    "snowflake-best-practices": ["de-snowflake-expert"],
-    "pipeline-architecture-patterns": ["de-pipeline-expert"],
-    "postgres-best-practices": ["db-postgres-expert"],
-    "redis-best-practices": ["db-redis-expert"],
-    "supabase-postgres-best-practices": ["db-supabase-expert"],
-    "npm-audit": ["tool-npm-expert"],
-    "npm-publish": ["tool-npm-expert"],
-    "npm-version": ["tool-npm-expert"],
-    "optimize-analyze": ["tool-optimizer"],
-    "optimize-bundle": ["tool-optimizer"],
-    "optimize-report": ["tool-optimizer"],
-    "docker-best-practices": ["infra-docker-expert"],
-    "aws-best-practices": ["infra-aws-expert"],
-    "create-agent": ["mgr-creator"],
-    "update-external": ["mgr-updater"],
-    "audit-agents": ["mgr-supplier"],
-    "update-docs": ["mgr-updater"],
-    "sauron-watch": ["mgr-sauron"],
-    "claude-code-bible": ["mgr-claude-code-bible"],
-    "memory-management": ["sys-memory-keeper"],
-    "memory-save": ["sys-memory-keeper"],
-    "memory-recall": ["sys-memory-keeper"],
-    "secretary-routing": [],
-    "dev-lead-routing": [],
+    "airflow-best-practices": [
+      "de-airflow-expert"
+    ],
+    "audit-agents": [
+      "mgr-supplier"
+    ],
+    "aws-best-practices": [
+      "infra-aws-expert"
+    ],
+    "claude-code-bible": [
+      "mgr-claude-code-bible"
+    ],
+    "create-agent": [
+      "mgr-creator"
+    ],
+    "dbt-best-practices": [
+      "de-dbt-expert"
+    ],
     "de-lead-routing": [],
-    "qa-lead-routing": [],
-    "dev-review": [],
+    "dev-lead-routing": [],
     "dev-refactor": [],
+    "dev-review": [],
+    "docker-best-practices": [
+      "infra-docker-expert"
+    ],
+    "fastapi-best-practices": [
+      "be-fastapi-expert"
+    ],
     "fix-refs": [],
+    "flutter-best-practices": [
+      "fe-flutter-agent"
+    ],
+    "go-backend-best-practices": [
+      "be-go-backend-expert"
+    ],
+    "go-best-practices": [
+      "lang-golang-expert"
+    ],
     "help": [],
     "intent-detection": [],
+    "kafka-best-practices": [
+      "de-kafka-expert"
+    ],
+    "kotlin-best-practices": [
+      "lang-kotlin-expert"
+    ],
     "lists": [],
+    "memory-management": [
+      "sys-memory-keeper"
+    ],
+    "memory-recall": [
+      "sys-memory-keeper"
+    ],
+    "memory-save": [
+      "sys-memory-keeper"
+    ],
     "monitoring-setup": [],
+    "neo4j-best-practices": [
+      "db-neo4j-expert"
+    ],
+    "npm-audit": [
+      "tool-npm-expert"
+    ],
+    "npm-publish": [
+      "tool-npm-expert"
+    ],
+    "npm-version": [
+      "tool-npm-expert"
+    ],
+    "optimize-analyze": [
+      "tool-optimizer"
+    ],
+    "optimize-bundle": [
+      "tool-optimizer"
+    ],
+    "optimize-report": [
+      "tool-optimizer"
+    ],
+    "pipeline-architecture-patterns": [
+      "de-pipeline-expert"
+    ],
+    "postgres-best-practices": [
+      "db-postgres-expert"
+    ],
+    "python-best-practices": [
+      "lang-python-expert"
+    ],
+    "qa-lead-routing": [],
+    "react-best-practices": [
+      "fe-vercel-agent"
+    ],
+    "redis-best-practices": [
+      "db-redis-expert"
+    ],
     "result-aggregation": [],
+    "rust-best-practices": [
+      "lang-rust-expert"
+    ],
+    "sauron-watch": [
+      "mgr-sauron"
+    ],
+    "secretary-routing": [],
+    "skills-sh-search": [],
+    "snowflake-best-practices": [
+      "de-snowflake-expert"
+    ],
+    "spark-best-practices": [
+      "de-spark-expert"
+    ],
+    "springboot-best-practices": [
+      "be-springboot-expert"
+    ],
     "status": [],
+    "supabase-postgres-best-practices": [
+      "db-supabase-expert"
+    ],
+    "typescript-best-practices": [
+      "lang-typescript-expert"
+    ],
+    "update-docs": [
+      "mgr-updater"
+    ],
+    "update-external": [
+      "mgr-updater"
+    ],
+    "vercel-deploy": [
+      "fe-vercel-agent"
+    ],
+    "web-design-guidelines": [
+      "fe-vercel-agent"
+    ],
     "writing-clearly-and-concisely": []
   }
 }
