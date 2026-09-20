@@ -417,7 +417,7 @@ export interface ActionsResponse {
 }
 
 /** Filter arguments for listActions. `counterpart` is a person's name and is
- * therefore never written into the page URL (see /actions page). */
+ * therefore sent only in the POST body, never a page or request URL. */
 export interface ActionListParams {
   kinds?: ActionKind[];
   counterpart?: string;

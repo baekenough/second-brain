@@ -321,8 +321,13 @@ export async function listActions(params: ActionListParams = {}): Promise<Action
   if (params.limit !== undefined) qs.set("limit", String(params.limit));
   if (params.includeArchived) qs.set("include_archived", "true");
 
-  const search = qs.toString();
-  const response = await fetch(`${getApiBase()}/actions${search ? `?${search}` : ""}`);
+  // Names belong in the body, never URLs recorded by proxies/access logs.
+  const response = await fetch(`${getApiBase()}/actions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: qs.toString(),
+    cache: "no-store",
+  });
   if (response.status === 404) {
     throw new ActionsDisabledError();
   }

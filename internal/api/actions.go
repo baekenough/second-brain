@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"mime"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -77,13 +78,25 @@ func (s *Server) WithActions(lister ActionLister, setter ActionStateSetter) *Ser
 	return s
 }
 
-// parseActionFilter converts query parameters into a store.ActionFilter.
+// parseActionFilter converts query parameters and POST form fields into a store.ActionFilter.
 //
 // The returned message is a fixed string chosen from this function; it never
 // interpolates the submitted value, because a counterpart filter can contain a
 // real person's name and error bodies are logged by intermediaries.
 func parseActionFilter(r *http.Request) (store.ActionFilter, string) {
-	q := r.URL.Query()
+	if r.URL.Query().Has("counterpart") {
+		return store.ActionFilter{}, "counterpart filter requires a POST body"
+	}
+	if r.Method == http.MethodPost {
+		mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if err != nil || mediaType != "application/x-www-form-urlencoded" {
+			return store.ActionFilter{}, "invalid action filters"
+		}
+	}
+	if err := r.ParseForm(); err != nil {
+		return store.ActionFilter{}, "invalid action filters"
+	}
+	q := r.Form
 	f := store.ActionFilter{}
 
 	for _, raw := range q["kind"] {
@@ -138,8 +151,10 @@ func parseActionFilter(r *http.Request) (store.ActionFilter, string) {
 	return f, ""
 }
 
-// listActionsHandler handles GET /api/v1/actions.
+// listActionsHandler handles GET and POST /api/v1/actions.
+// Name filters are accepted only in the POST body to avoid access-log leaks.
 func (s *Server) listActionsHandler(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	f, msg := parseActionFilter(r)
 	if msg != "" {
 		writeError(w, http.StatusBadRequest, msg)

@@ -6,7 +6,22 @@
 
 After modifying agents, skills, or guides: run full verification before committing AND pushing. Never ask to commit/push before `mgr-sauron:watch` passes.
 
-Every `git push` requires: `mgr-sauron:watch` → all pass → `git push`
+Classify the COMPLETE pending diff before each commit/push: staged + unstaged +
+untracked candidates and all commits not yet on the target branch. Determine scope
+by what each change affects, not by a fixed file-extension or directory allowlist.
+
+- Harness changes (agent definitions, skills, rules, routing, ontology, guides,
+  wiki, hooks, or their generators/verification contracts): run full
+  `mgr-sauron:watch` and resolve findings before commit/push.
+- Project-only changes with no harness impact: sauron is exempt. Require the
+  relevant project build, vet/lint, tests, and hygiene checks instead. Record the
+  checked commands and results. CI must pass for the exact PR head before merge
+  or release; the first feature-branch push may trigger that CI after local checks.
+- Mixed or uncertain scope: use full harness verification plus project checks.
+
+User authorization already provided for the task remains valid when delegated to
+mgr-gitnerd. Delegation conveys that existing scope; it cannot expand authorization.
+Do not invent a second approval gate solely because work arrived through an agent.
 
 ## Verification Phases
 
@@ -43,9 +58,11 @@ Wiki verification is also enforced by CI (`.github/workflows/wiki-sync.yml`).
 
 ### Phase 5: Commit via mgr-gitnerd
 
-### Phase 6: Push via mgr-gitnerd (only after sauron passes)
+### Phase 6: Push via mgr-gitnerd (after the applicable scope gate passes)
 
-## Self-Check — 6-point commit check + 3-point push check. See full checklist via Read tool.
+## Self-Check — harness/mixed changes only
+
+Project-only changes use the Core Rule gate. The following sauron checklist applies to harness/mixed changes.
 
 <!-- DETAIL: Self-Check Before Commit and Push
 
@@ -72,14 +89,17 @@ Wiki verification is also enforced by CI (`.github/workflows/wiki-sync.yml`).
 ║                                                                   ║
 ║  If NO to any → wait until sauron verification passes            ║
 ║                                                                   ║
-║  Sauron verification is required for all pushes.                 ║
+║  Harness/mixed changes require sauron; project-only uses CI.     ║
 ╚══════════════════════════════════════════════════════════════════╝
 ```
 -->
 
 ## When Required
 
-Any change to: agents, agent frontmatter, skills, guides, routing patterns, rules, wiki pages.
+Any change affecting the harness requires these phases, including changes outside
+`.claude/` that generate or validate its configuration. Pure product changes use
+the project-only gate in Core Rule. For ontology edits, verify all derived graphs
+with `python3 scripts/build-ontology-graphs.py --check` before completion.
 
 ## Quick Verification Commands — agent/skill/guide/wiki counts via ls/find/wc. See commands via Read tool.
 

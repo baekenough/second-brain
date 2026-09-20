@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -376,19 +377,14 @@ func (w *SummarizerWorker) generateSummary(ctx context.Context, doc *model.Docum
 	}
 
 	var sr summaryResponse
-	if jsonErr := json.Unmarshal([]byte(response), &sr); jsonErr != nil {
-		// Truncate response to 200 chars to avoid large/sensitive log entries.
-		truncated := response
-		if len(truncated) > 200 {
-			truncated = truncated[:200] + "...[truncated]"
-		}
+	if jsonErr := json.NewDecoder(strings.NewReader(response)).Decode(&sr); jsonErr != nil {
 		slog.Warn("summarizer: failed to parse LLM JSON response, will retry next tick",
-			"doc_id", doc.ID, "error", jsonErr, "response", truncated)
+			"doc_id", doc.ID, "response_bytes", len(response))
 		// Return error so the document remains title_summary=NULL and is
 		// re-queued by ListUnsummarized on the next tick. Storing raw LLM
 		// output would permanently exclude the document from re-processing
 		// and contaminate the summary embedding index.
-		return "", "", fmt.Errorf("parse LLM response: %w", jsonErr)
+		return "", "", fmt.Errorf("parse LLM response: invalid summary JSON")
 	}
 
 	return sr.TitleSummary, sr.BulletSummary, nil

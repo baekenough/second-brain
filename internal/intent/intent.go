@@ -116,7 +116,7 @@ func (c *LLMClassifier) Classify(ctx context.Context, question string) (Params, 
 	}
 
 	if lastMonthRe.MatchString(question) {
-		lm := now.AddDate(0, -1, 0)
+		lm := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).AddDate(0, -1, 0)
 		from, to := monthRange(lm.Year(), int(lm.Month()))
 		return Params{RawQuery: question, Kind: KindTemporal, OccurredFrom: &from, OccurredTo: &to, Confidence: 1.0}, nil
 	}

@@ -1,5 +1,5 @@
-# Auto-generated from templates/.claude/agents/
-# Do not edit manually — regenerate with: omcustom ontology build
+# Canonical agents ontology catalog; update alongside source definitions.
+# Regenerate derived graphs: python3 scripts/build-ontology-graphs.py
 version: "1.0.0"
 generated_at: "2026-02-12T00:00:00Z"
 

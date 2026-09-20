@@ -15,15 +15,7 @@ import (
 // 033's call-unify live counterpart — internal/collector/whisper.go merges a
 // transcript into an existing call-log document through this method).
 //
-// Uses the lightweight srcTestDB/ensureSrcTestSchema harness (same file as
-// document_source_types_db_test.go) rather than the full migration set:
-// AttachTranscript only ever touches the documents table, which that harness
-// already creates with every column this method reads/writes. That harness's
-// hand-rolled table has no UNIQUE(source_type, source_id) though (it was only
-// ever exercised by plain-INSERT search tests) — attachTestDB adds one via a
-// CREATE UNIQUE INDEX IF NOT EXISTS, since AttachTranscript's ON CONFLICT
-// clause requires it. Skipped (not failed) when TEST_DATABASE_URL is unset —
-// see srcTestDB's doc comment.
+// Uses the full migration set bootstrapped by TestMain.
 //
 // This project has already shipped SQL that compiled, passed stub tests, and
 // failed at runtime (EXCLUDED referenced inside RETURNING — see agent memory
@@ -37,33 +29,7 @@ const attachTestPrefix = "zz-dummy-attach033-"
 
 func attachTestDB(t *testing.T) *Postgres {
 	t.Helper()
-	pg := srcTestDB(t) // ensures schema exists; registers its own cleanup for srcTestPrefix rows
-
-	// ensureSrcTestSchema's hand-rolled documents table (document_source_types_db_test.go)
-	// declares no UNIQUE(source_type, source_id) — it was only ever exercised
-	// by plain-INSERT search tests. AttachTranscript's ON CONFLICT
-	// (source_type, source_id) clause requires one. CREATE UNIQUE INDEX IF
-	// NOT EXISTS is safe against a real, already-migrated database too: that
-	// schema already carries an equivalent constraint under a different
-	// name, so this merely adds a redundant (harmless) index in a throwaway
-	// test database.
-	if _, err := pg.pool.Exec(context.Background(),
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_attach033_test_source_type_source_id ON documents (source_type, source_id)`,
-	); err != nil {
-		t.Fatalf("ensure (source_type, source_id) unique index: %v", err)
-	}
-
-	// Same gap, different column: ensureSrcTestSchema's `id uuid PRIMARY KEY`
-	// has no DEFAULT (its own tests always supply an explicit id), but
-	// AttachTranscript's INSERT (like Upsert's) relies on the real schema's
-	// `DEFAULT gen_random_uuid()` for the insert-branch path. SET DEFAULT is
-	// idempotent against a real, already-migrated table that already has the
-	// same default.
-	if _, err := pg.pool.Exec(context.Background(),
-		`ALTER TABLE documents ALTER COLUMN id SET DEFAULT gen_random_uuid()`,
-	); err != nil {
-		t.Fatalf("ensure id column default: %v", err)
-	}
+	pg := srcTestDB(t)
 
 	t.Cleanup(func() {
 		_, _ = pg.pool.Exec(context.Background(),

@@ -1,7 +1,7 @@
 ---
 title: mgr-gitnerd
 type: agent
-updated: 2026-04-12
+updated: 2026-09-20
 sources:
   - .claude/agents/mgr-gitnerd.md
 related:
@@ -17,7 +17,7 @@ Git operations specialist for commits, branches, PRs, history management, and Gi
 
 ## Overview
 
-`mgr-gitnerd` is the sole agent authorized to execute git operations per R010 (orchestrator never runs git commands directly). Its push rule is critical: all pushes require prior `mgr-sauron:watch` verification — it will REFUSE a push if sauron was not run.
+`mgr-gitnerd` is the sole agent authorized to execute git operations per R010 (orchestrator never runs git commands directly). Its push rule is critical: harness/mixed changes require `mgr-sauron:watch`; project-only changes use local checks and exact-PR-head CI before merge/release. Existing user authorization remains valid through delegation.
 
 The agent cannot modify source code or create agents — it is strictly a git workflow specialist.
 
@@ -51,7 +51,7 @@ Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
 
 ## Relationships
 
-- **Required before push**: [[mgr-sauron]] verification gate
+- **Required before push**: R017 scope gate; [[mgr-sauron]] for harness/mixed changes
 - **Version commits**: [[tool-npm-expert]] delegates version tag commits
 - **R010 delegation**: all git operations must route through this agent
 - **R017**: verification flow ends here with commit and push

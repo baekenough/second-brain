@@ -15,34 +15,12 @@ import (
 // ---------------------------------------------------------------------------
 // Real-database verification of migrations/033_call_unify.sql.
 //
-// Unlike the other *_db_test.go files in this package, this test does not use
-// ensureSrcTestSchema's minimal hand-rolled schema — that helper deliberately
-// skips real migrations because pg_bigm (migration 006) is unavailable on a
-// vanilla pgvector/pgvector image (see its doc comment). Migration 033
-// touches six real tables (documents, chunks, actions, feedback,
-// document_entities, entity_relations, golden_judgments, transcription_ledger)
-// with real FK/UNIQUE constraints, so this test instead runs the FULL
-// migration set via (*Postgres).RunMigrations against a database that
-// actually has pg_bigm — e.g. a container built from
-// deploy/postgres/Dockerfile (pgvector/pgvector:0.8.2-pg16 + pg_bigm compiled
-// from source):
-//
-//	docker build -t sb-migration-test-pg -f deploy/postgres/Dockerfile deploy/postgres/
-//	docker run -d --name sb-call-unify-test -e POSTGRES_PASSWORD=testpass \
-//	    -e POSTGRES_DB=testdb -p 15544:5432 sb-migration-test-pg
-//	TEST_DATABASE_URL='postgres://postgres:testpass@localhost:15544/testdb?sslmode=disable' \
-//	    go test ./internal/store/... -run TestDB_Migration033 -v
-//
-// Skipped (not failed) when TEST_DATABASE_URL is unset OR when pg_bigm is not
-// installable on the target database — this keeps `go test ./...` green on a
-// vanilla postgres/pgvector instance while still giving a fully automated,
-// reproducible check against the real migration file whenever the right
-// container is available.
+// TestMain applies the full migration set once before any tests run. These
+// tests seed legacy rows and explicitly reapply migrations to verify upgrades.
+// TEST_DATABASE_URL must point to a throwaway database with pgvector + pg_bigm
+// (deploy/postgres/Dockerfile). An incompatible database fails bootstrap.
 // ---------------------------------------------------------------------------
 
-// migration033TestDB connects to TEST_DATABASE_URL, runs the FULL migration
-// set (migrations/ — not a hand-rolled schema), and returns the *Postgres.
-// Skips when TEST_DATABASE_URL is unset or pg_bigm cannot be installed.
 func migration033TestDB(t *testing.T) *Postgres {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
@@ -55,43 +33,6 @@ func migration033TestDB(t *testing.T) *Postgres {
 		t.Fatalf("connect to TEST_DATABASE_URL: %v", err)
 	}
 	t.Cleanup(pg.Close)
-
-	// Preflight 1: migration 006 requires pg_bigm. A vanilla pgvector image
-	// does not ship it — skip cleanly rather than fail every run of
-	// `go test ./...` on a database that was never meant to run this test.
-	var available bool
-	if err := pg.pool.QueryRow(context.Background(),
-		`SELECT EXISTS(SELECT 1 FROM pg_available_extensions WHERE name = 'pg_bigm')`,
-	).Scan(&available); err != nil || !available {
-		t.Skip("pg_bigm not available on TEST_DATABASE_URL; run against deploy/postgres/Dockerfile's image to exercise migration 033 end-to-end")
-	}
-
-	// Preflight 2: ensureSrcTestSchema (document_source_types_db_test.go,
-	// used by this package's OTHER db tests, including
-	// document_attach_transcript_db_test.go) installs a STUB bigm_similarity
-	// function so its hand-rolled minimal schema can run without the real
-	// extension. That stub's CREATE FUNCTION has no OR REPLACE, so migration
-	// 006's own CREATE FUNCTION collides with it ("already exists with same
-	// argument types") if a test using that lightweight bootstrap has
-	// already touched this same database earlier in this test run — the two
-	// schema-bootstrap conventions are mutually exclusive within one shared
-	// database. Detect the stub by its exact (distinctive, always-zero)
-	// function body and skip rather than fail: this combination genuinely
-	// cannot be tested together, and failing loudly here would make an
-	// unrelated test's run order decide whether this one passes. Run this
-	// test in isolation (`-run TestDB_Migration033`) or against its own
-	// dedicated database to avoid the conflict entirely.
-	var stubPresent bool
-	if err := pg.pool.QueryRow(context.Background(),
-		`SELECT EXISTS(SELECT 1 FROM pg_proc WHERE proname = 'bigm_similarity' AND prosrc = 'SELECT 0.0::float8')`,
-	).Scan(&stubPresent); err == nil && stubPresent {
-		t.Skip("ensureSrcTestSchema's stub bigm_similarity is already installed on TEST_DATABASE_URL (another test in this run used the lightweight schema bootstrap) — migration 033's real-DB test needs a database untouched by that bootstrap; run with -run TestDB_Migration033 in isolation, or point TEST_DATABASE_URL at a dedicated database")
-	}
-
-	migrationsDir := filepath.Join("..", "..", "migrations")
-	if err := pg.RunMigrations(context.Background(), migrationsDir, 1536); err != nil {
-		t.Fatalf("run full migration set: %v", err)
-	}
 
 	return pg
 }

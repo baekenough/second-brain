@@ -1,7 +1,7 @@
 ---
 title: pipeline
 type: skill
-updated: 2026-04-12
+updated: 2026-09-20
 sources:
   - .claude/skills/pipeline/SKILL.md
 related:
@@ -41,3 +41,7 @@ The `auto-dev` pipeline is the primary use case: a full release workflow from is
 ## Sources
 
 - `.claude/skills/pipeline/SKILL.md`
+
+## second-brain verification and deployment
+
+The repository workflow verifies Go, real PostgreSQL store tests, web and Docker. Security fixes trace sensitive inputs through every reachable sink, and each parallel specialist verifies its own packages. Docker daemon absence requires exact-commit green Docker CI. The deployment step reads `ubuntu1-deploy/SKILL.md`, then follows rsync, remote image builds, backup and image-ID verification for ubuntu1. Deployment requires task authorization.

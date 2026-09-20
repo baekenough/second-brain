@@ -75,8 +75,10 @@ func TestListActionsHandlerParsesFilters(t *testing.T) {
 	srv := newActionsTestServer(lister, nil)
 
 	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
-		"/api/v1/actions?kind=my_commitment&kind=scheduled&sort=confidence&limit=10&min_confidence=0.5&include_archived=true&counterpart=zz-dummy", nil))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/actions", strings.NewReader(
+		"kind=my_commitment&kind=scheduled&sort=confidence&limit=10&min_confidence=0.5&include_archived=true&counterpart=zz-dummy"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	srv.Handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
@@ -353,5 +355,33 @@ func TestListActionsHandlerNotRegisteredWithoutDependency(t *testing.T) {
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/actions", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status=%d, want 404 when the actions feature is not wired", rec.Code)
+	}
+}
+
+func TestListActionsRejectsCounterpartInURL(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		lister := &stubActionLister{}
+		rec := httptest.NewRecorder()
+		newActionsTestServer(lister, nil).Handler().ServeHTTP(rec,
+			httptest.NewRequest(method, "/api/v1/actions?counterpart=private-name", nil))
+		if rec.Code != http.StatusBadRequest || lister.calls != 0 {
+			t.Fatalf("%s: status=%d calls=%d", method, rec.Code, lister.calls)
+		}
+		if strings.Contains(rec.Body.String(), "private-name") {
+			t.Fatal("error echoed name")
+		}
+	}
+}
+
+func TestListActionsRejectsInvalidBody(t *testing.T) {
+	for _, body := range []string{"counterpart=%ZZ", "counterpart=" + strings.Repeat("x", 4096)} {
+		lister := &stubActionLister{}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/actions", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		newActionsTestServer(lister, nil).Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest || lister.calls != 0 {
+			t.Fatalf("status=%d calls=%d", rec.Code, lister.calls)
+		}
 	}
 }

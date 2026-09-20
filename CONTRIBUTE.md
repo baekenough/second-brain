@@ -52,6 +52,13 @@ go run ./cmd/server/
 # 기동 시 migrations/ 의 SQL 마이그레이션이 자동 적용됩니다.
 ```
 
+### Database connection and deployment checks
+
+- Generate database passwords from a cryptographically secure source. For URL-based configuration, use a long alphanumeric password or percent-encode reserved characters in the URL userinfo. In Go, assemble credentials with `url.UserPassword(user, password)` and `url.URL`; do not concatenate raw passwords or use query-string escaping for userinfo.
+- Treat `DATABASE_URL` as a secret: never print it, pass it as a command-line argument, or paste it into logs/issues. Supply it through the existing protected environment/secret configuration.
+- Before cutover, start the candidate application with the exact `DATABASE_URL` and environment intended for deployment. Confirm the `database connected` log, completed migrations, and a successful `/health` response. The application uses `store.NewPostgres` and the pgx parser; a local-socket check or `psql -h/-U/-d` check alone does not exercise this path. Run this against the staging database first, since startup installs extensions and applies migrations.
+- Repeat the application startup/health check after switching to the target environment. If configuration parsing fails, inspect the secret configuration privately; application diagnostics intentionally omit the original driver parse error because it can contain credentials.
+
 ### 수집 데몬 (`cmd/collector`)
 
 ```bash

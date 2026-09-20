@@ -3,8 +3,7 @@ description: "Automated development pipeline — from issue triage to release"
 version: "2.1.0"
 
 # Design rule: each pipeline run produces ONE bounded release unit (3-7 issues), not all open issues.
-# This pipeline is a project-agnostic template. Project-specific overrides belong in
-# the project's own workflows/auto-dev.yaml (e.g., AgentNav, second-brain).
+# This repository workflow targets second-brain (Go + Next.js, ubuntu1 Compose).
 
 steps:
   - name: pre-triage
@@ -176,6 +175,24 @@ steps:
       - All Agent tool calls MUST pass mode: "bypassPermissions" to prevent permission prompts during unattended execution
 
 
+      ## Security fixes — trace the complete data flow
+
+      Trace each sensitive input from entry to every reachable sink, including
+      helper calls, fallback/error paths, files, logs, titles/content, metadata,
+      external requests, metrics and durable storage. This list is illustrative,
+      not a scope limit: discover every sink from the actual call graph. Record
+      which outputs are intentionally raw and why; redact or hash all unintended
+      disclosure paths. Test representative success, fallback and error paths.
+      An issue's named lines are examples, not the whole implementation scope.
+
+      ## Parallel verification ownership
+
+      Each specialist runs tests for its own affected packages before reporting
+      done. Independent package checks may run concurrently; coordinate shared
+      databases, generated files and build outputs. Then run aggregate verification
+      once all edits settle. Never mark another specialist's package verified from
+      a partial or earlier test run.
+
       ## Sensitive Path Handling (CC v2.1.121+)
 
       Direct Write/Edit/Bash on `.claude/**` is permitted under `mode: "bypassPermissions"` as of CC v2.1.121 (#1101). The legacy `/tmp/*.sh` bypass is no longer required. Structural changes (new agents/skills) still go through mgr-creator with R017 verification.
@@ -184,17 +201,12 @@ steps:
 
       ## Local CI-mimic verification (MUST run before marking implement done)
 
-      After all implementation tasks complete, run these scripts in sequence and halt on failure:
-
-      1. bash .github/scripts/verify-template-sync.sh
-      2. bash .github/scripts/verify-wiki-sync.sh
-
-      If either fails:
-      - For wiki-sync failures: delegate to wiki-curator to generate missing pages (`/omcustom:wiki ingest <path>`)
-      - For template-sync failures: delegate to mgr-updater to sync `.claude/` -> `templates/.claude/`
-      - After fixes, re-run the scripts until both pass
-
-      This mirrors CI and prevents the known 1-2 wasted push cycles per release (ref: issue #927, v0.98.0 PR #925).
+      After implementation, inspect this repository's CI workflows and execute
+      their applicable local gates. For second-brain run bash scripts/ci-checks.sh.
+      Harness changes also require R017 and ontology graph freshness checks.
+      Run template/wiki sync scripts when present; do not invoke nonexistent
+      upstream template scripts. Check changed harness wiki pages against sources.
+      Resolve failures and rerun affected gates before marking implement done.
     description: "Per-issue implementation with lifecycle, specialist routing, and CI-mimic verification"
     depends_on: deep-plan
 
@@ -202,19 +214,17 @@ steps:
     prompt: |
       Project-specific build + test verification.
 
-      For Node/Bun projects (this repo):
-      1. bun install — verify lockfile sync (halt on lockfile drift)
-      2. bun run lint (if package.json has lint script)
-      3. bun run typecheck (if available)
-      4. bun test — MANDATORY, no silent skip
-         - Baseline reference: #1156 historically documented 86 failures; v0.136.2 fixes resolved them → current baseline = 0
-         - Each release: adopt prior version's test result as baseline (dynamic, not hardcoded)
-         - Compute current pass/fail counts
-         - If current FAIL count > baseline → NEW regression detected → halt + report failure list
-         - If current FAIL count <= baseline → continue with advisory log "X failures (baseline {n}, delta {d})"
-      5. Build verification (if package has build script)
-
-      For Python/Go/Docker/static-site projects: auto-detect and run equivalent (py_compile + pytest / go build + go vet + go test / docker build / file validation).
+      For this repository:
+      1. go build ./... and go vet ./...
+      2. go test -race -count=1 ./...
+      3. Run the store integration CI job with a disposable pgvector + pg_bigm
+         database (deploy/postgres/Dockerfile); require no skipped DB coverage.
+      4. In web/: bun install --frozen-lockfile and bun run build.
+      5. bash scripts/ci-checks.sh and applicable R017 gates.
+      6. Build the Docker targets changed by this release. If the local Docker
+         daemon is unavailable, explicitly record the fallback and require the
+         docker-build-multiarch CI job to succeed for this exact commit before
+         merge/release/deploy. A queued job or earlier green run is not evidence.
 
       Halt conditions:
       - Lint errors (exit != 0)
@@ -224,7 +234,7 @@ steps:
       - Lockfile drift
 
       Halt → report exact command + stderr + delta details. Do NOT proceed to release on any halt.
-    description: "Auto-detected build + test verification (bun test with baseline delta guard)"
+    description: "Go, store DB, web and Docker checks with exact-commit CI fallback"
     depends_on: implement
 
   - name: deep-verify
@@ -293,7 +303,23 @@ steps:
     description: "Post-release CI verification and fix loop"
     depends_on: release
 
+  - name: deploy-ubuntu1
+    prompt: |
+      Apply the released and CI-verified revision using
+      .claude/skills/ubuntu1-deploy/SKILL.md. Read the complete skill first.
+      Target: ubuntu1:~/second-brain-app (rsync copy, not a git checkout).
+      Follow its separate Go/web rsync commands, remote image builds using
+      second-brain-<service>:ubuntu1 tags, backup requirements, compose startup,
+      running-versus-built image ID checks and user-facing functional verification.
+      Backups precede startup when migrations mutate data. Verify the exact release
+      revision and changed services, and record evidence without personal content.
+      Deploy only when deployment is included in the user's authorized task scope;
+      otherwise report deployment pending rather than claiming application is live.
+      Any failed image match, health or functional check blocks completion.
+    description: "Verified ubuntu1 deployment through the repository deployment skill"
+    depends_on: ci-check
+
   - name: post-release-followup
     skill: post-release-followup
     description: "Register follow-ups from this release as new issues"
-    depends_on: ci-check
+    depends_on: deploy-ubuntu1

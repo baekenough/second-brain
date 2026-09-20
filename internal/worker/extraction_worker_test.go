@@ -1,8 +1,12 @@
 package worker
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -611,4 +615,42 @@ func TestExtractionWorker_AwaitingMyReply_CarriesCounterpartLabel(t *testing.T) 
 	if got.IdentityKey != wantKey {
 		t.Errorf("IdentityKey = %q, want %q (the raw From header, not the display label, is hashed)", got.IdentityKey, wantKey)
 	}
+}
+
+func TestExtractionWorkerRelationDowngradeCounts(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer slog.SetDefault(previous)
+	lister := &fakeExtractionLister{docs: []*model.Document{newExtractionDoc(uuid.New(), 0)}}
+	writer := &fakeRelationWriter{}
+	w := newTestExtractionWorker(lister, &fakeRelationEntityResolver{}, writer, &fakeActionWriter{},
+		func(context.Context, llm.Completer, *model.Document, []string) (*ExtractionResult, error) {
+			var relations []rawRelation
+			for _, kind := range []string{"related_to", "committed_to", "private-invalid-type"} {
+				relations = append(relations, rawRelation{FromName: "Alice", FromType: model.EntityTypePerson, ToName: "Bob", ToType: model.EntityTypePerson, RawType: kind})
+			}
+			return &ExtractionResult{Relations: relations}, nil
+		})
+	w.tick(context.Background())
+	if strings.Contains(logs.String(), "private-invalid-type") {
+		t.Fatal("raw invalid relation type leaked")
+	}
+	for _, line := range strings.Split(logs.String(), "\n") {
+		var event map[string]any
+		if json.Unmarshal([]byte(line), &event) != nil || event["msg"] != "extraction worker: relation type distribution" {
+			continue
+		}
+		if event["relations"] != float64(3) || event["downgraded"] != float64(1) || event["explicit_related_to"] != float64(1) {
+			t.Fatalf("unexpected distribution: %v", event)
+		}
+		logs.Reset()
+		writer.err = errors.New("test write failure")
+		w.persistExtraction(context.Background(), lister.docs[0], &ExtractionResult{Relations: []rawRelation{{FromName: "Alice", ToName: "Bob", RawType: "unknown"}}})
+		if strings.Contains(logs.String(), "relation type distribution") {
+			t.Fatal("failed relation write emitted a successful distribution")
+		}
+		return
+	}
+	t.Fatal("missing relation distribution event")
 }

@@ -173,3 +173,12 @@ Works with:
 - **mgr-updater**: Documentation updates and sync
 - **mgr-claude-code-bible**: Official spec compliance
 - **secretary**: Orchestration coordination
+
+## Deterministic Ontology Verification (R017)
+
+Run `python3 -m pip install -r scripts/ontology-requirements.txt` and
+`python3 scripts/build-ontology-graphs.py --check` in watch and quick mode.
+A stale graph or missing source/reference fails verification. Update the canonical
+`.claude/ontology/{agents,skills,rules}.yaml` catalogs with source changes, then
+run `python3 scripts/build-ontology-graphs.py` and recheck all four graphs.
+Do not repair only a stale JSON node by hand.

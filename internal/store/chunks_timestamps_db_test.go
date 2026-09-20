@@ -28,35 +28,15 @@ import (
 
 const chunkTSPrefix = "zz-dummy-chunkts-"
 
-// chunkTSTestDB reuses the documents schema helper from
-// document_source_types_db_test.go and adds the chunks table the chunk lanes
-// join against.
+// chunkTSTestDB uses the migrated schema and cleans only its own fixtures.
 func chunkTSTestDB(t *testing.T) *Postgres {
 	t.Helper()
-	pg := srcTestDB(t) // skips without TEST_DATABASE_URL; creates `documents`
-
-	ctx := context.Background()
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS chunks (
-			id bigserial PRIMARY KEY,
-			document_id uuid NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-			chunk_index int NOT NULL,
-			content text NOT NULL,
-			byte_size int NOT NULL DEFAULT 0,
-			embedding vector(3),
-			created_at timestamptz NOT NULL DEFAULT now(),
-			content_tsv tsvector GENERATED ALWAYS AS (
-				to_tsvector('simple', coalesce(content,''))
-			) STORED
-		)`,
-	}
-	for _, s := range stmts {
-		if _, err := pg.pool.Exec(ctx, s); err != nil {
-			t.Fatalf("prepare chunks schema: %v", err)
+	pg := srcTestDB(t)
+	t.Cleanup(func() {
+		if _, err := pg.pool.Exec(context.Background(), `DELETE FROM documents WHERE source_id LIKE $1`, chunkTSPrefix+"%"); err != nil {
+			t.Errorf("cleanup chunk documents: %v", err)
 		}
-	}
-	// documents rows are removed by srcTestDB's cleanup; ON DELETE CASCADE
-	// takes the chunks with them.
+	})
 	return pg
 }
 
@@ -70,14 +50,14 @@ func seedChunkDoc(t *testing.T, pg *Postgres, occurredAt *time.Time, collectedAt
 		INSERT INTO documents (id, source_type, source_id, title, content, embedding, occurred_at, collected_at)
 		VALUES ($1, $2, $3, 'zzdummy chunk title', 'zzdummy chunk body', $4, $5, $6)`,
 		id, string(model.SourceCalendar), chunkTSPrefix+id.String(),
-		pgvector.NewVector([]float32{0.1, 0.2, 0.3}), occurredAt, collectedAt,
+		pgvector.NewVector(testEmbedding()), occurredAt, collectedAt,
 	); err != nil {
 		t.Fatalf("seed document: %v", err)
 	}
 	if _, err := pg.pool.Exec(ctx, `
 		INSERT INTO chunks (document_id, chunk_index, content, byte_size, embedding)
 		VALUES ($1, 0, 'zzdummychunkneedle filler text', 30, $2)`,
-		id, pgvector.NewVector([]float32{0.1, 0.2, 0.3}),
+		id, pgvector.NewVector(testEmbedding()),
 	); err != nil {
 		t.Fatalf("seed chunk: %v", err)
 	}
@@ -146,7 +126,7 @@ func TestDB_ChunkSearch_ReturnsDocumentTimestamps(t *testing.T) {
 	})
 
 	t.Run("SearchVector", func(t *testing.T) {
-		rows, err := cs.SearchVector(context.Background(), []float32{0.1, 0.2, 0.3}, 50)
+		rows, err := cs.SearchVector(context.Background(), testEmbedding(), 50)
 		if err != nil {
 			t.Fatalf("SearchVector: %v", err)
 		}

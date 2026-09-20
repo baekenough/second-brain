@@ -407,6 +407,7 @@ func (s *Server) buildHandler() http.Handler {
 		}
 		if s.actionLister != nil {
 			r.Get("/api/v1/actions", s.listActionsHandler)
+			r.Post("/api/v1/actions", s.listActionsHandler)
 		}
 		if s.actionSetter != nil {
 			r.Post("/api/v1/actions/{identity_key}/status", s.setActionStateHandler)
