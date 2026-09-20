@@ -184,12 +184,14 @@ export default function GoldenPage() {
   const [focusIndex, setFocusIndex] = useState(0);
   const [submitting, setSubmitting] = useState(false);
   const [generating, setGenerating] = useState(false);
+  const generatingRef = useRef(false);
+  const [generationMessage, setGenerationMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // Read inside the keydown handler without re-subscribing the listener on
   // every keystroke — the handler is registered once on mount.
-  const stateRef = useRef({ query, candidates, selections, focusIndex, submitting });
-  stateRef.current = { query, candidates, selections, focusIndex, submitting };
+  const stateRef = useRef({ query, candidates, selections, focusIndex, submitting, status });
+  stateRef.current = { query, candidates, selections, focusIndex, submitting, status };
 
   const loadNext = useCallback(async () => {
     setStatus("loading");
@@ -223,7 +225,7 @@ export default function GoldenPage() {
       selections: currentSelections,
       submitting: alreadySubmitting,
     } = stateRef.current;
-    if (!currentQuery || alreadySubmitting) return;
+    if (!currentQuery || alreadySubmitting || generatingRef.current) return;
     const inputs = buildJudgmentInputs(currentCandidates, currentSelections);
     if (inputs.length === 0) return;
     setSubmitting(true);
@@ -244,7 +246,7 @@ export default function GoldenPage() {
 
   const handleSkip = useCallback(async () => {
     const { query: currentQuery, submitting: alreadySubmitting } = stateRef.current;
-    if (!currentQuery || alreadySubmitting) return;
+    if (!currentQuery || alreadySubmitting || generatingRef.current) return;
     setSubmitting(true);
     setErrorMessage(null);
     try {
@@ -257,15 +259,32 @@ export default function GoldenPage() {
     }
   }, [loadNext]);
 
+  // Generation is an explicit user action. A synchronous ref also blocks a
+  // second click before React has committed the loading/disabled state.
   const handleGenerate = useCallback(async () => {
+    if (generatingRef.current || stateRef.current.submitting) return;
+    generatingRef.current = true;
     setGenerating(true);
     setErrorMessage(null);
+    setGenerationMessage(null);
     try {
-      await generateGoldenQueries();
-      await loadNext();
+      const result = await generateGoldenQueries();
+      setGenerationMessage(
+        result.created > 0
+          ? `질의 ${result.created}개를 생성했습니다.`
+          : "새로 생성할 질의가 없습니다. 질문 이력이 쌓인 뒤 다시 생성해 주세요.",
+      );
+      // Keep the current question and unsaved judgments intact. Newly created
+      // questions join the queue and are loaded by the normal next action.
+      if (stateRef.current.status === "ok" && stateRef.current.query) {
+        setProgress((current) => current && { ...current, open_queries: result.total_open });
+      } else {
+        await loadNext();
+      }
     } catch {
-      setErrorMessage("후보 질의를 생성하지 못했습니다.");
+      setErrorMessage("질의를 생성하지 못했습니다. 생성 버튼을 눌러 다시 시도해 주세요.");
     } finally {
+      generatingRef.current = false;
       setGenerating(false);
     }
   }, [loadNext]);
@@ -279,7 +298,8 @@ export default function GoldenPage() {
       const target = event.target;
       if (
         target instanceof HTMLElement &&
-        (target.tagName === "INPUT" || target.tagName === "TEXTAREA")
+        (target.closest("input, textarea, select, [contenteditable=true]") ||
+          (event.key === "Enter" && target.closest("button, a")))
       ) {
         return;
       }
@@ -338,7 +358,7 @@ export default function GoldenPage() {
             variant="secondary"
             size="sm"
             onClick={() => void handleSkip()}
-            disabled={submitting || !query}
+            disabled={submitting || generating || !query}
           >
             건너뛰기 (S)
           </Button>
@@ -346,12 +366,23 @@ export default function GoldenPage() {
             variant="secondary"
             size="sm"
             loading={generating}
+            disabled={submitting || status === "loading"}
             onClick={() => void handleGenerate()}
           >
-            후보 질의 생성
+            생성
           </Button>
         </div>
       </div>
+
+      <p className="text-sm text-foreground-muted">
+        새 질의는 생성 버튼을 눌렀을 때만 추가됩니다. 기존 질의와 판정은 유지됩니다.
+      </p>
+
+      {generationMessage && (
+        <p role="status" className="text-sm text-foreground-muted">
+          {generationMessage}
+        </p>
+      )}
 
       {progress && <ProgressBar progress={progress} />}
 
@@ -372,12 +403,10 @@ export default function GoldenPage() {
 
       {status === "empty" && (
         <Card padding="lg" className="text-center">
-          <p className="text-sm text-foreground-muted">열린 질의가 없습니다.</p>
-          <div className="mt-4">
-            <Button loading={generating} onClick={() => void handleGenerate()}>
-              후보 질의 생성
-            </Button>
-          </div>
+          <p className="text-sm text-foreground-muted">판정할 질의가 없습니다.</p>
+          <p className="mt-2 text-sm text-foreground-muted">
+            위의 생성 버튼을 눌러 질의를 추가해 주세요.
+          </p>
         </Card>
       )}
 
@@ -426,7 +455,7 @@ export default function GoldenPage() {
           <div className="flex justify-end">
             <Button
               loading={submitting}
-              disabled={judgedCount === 0}
+              disabled={generating || judgedCount === 0}
               onClick={() => void handleSubmit()}
             >
               제출하고 다음으로 (Enter)

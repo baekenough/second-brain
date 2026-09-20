@@ -105,7 +105,7 @@ type GoldenSet interface {
 	UpsertJudgments(ctx context.Context, queryID uuid.UUID, judgments []store.GoldenJudgmentInput, finishQuery bool) (saved int, feedbackApplied int, err error)
 	SkipQuery(ctx context.Context, queryID uuid.UUID) (bool, error)
 	ExportEvalPairs(ctx context.Context, judge string) ([]store.EvalPair, error)
-	UpsertQueryByText(ctx context.Context, text, source string, askedAt time.Time) (uuid.UUID, error)
+	FindQueryByText(ctx context.Context, text string) (uuid.UUID, bool, error)
 }
 
 // WithGolden wires the golden-set store and registers the six
@@ -542,21 +542,16 @@ func (s *Server) goldenJudgmentsHandler(w http.ResponseWriter, r *http.Request) 
 
 // goldenFeedbackRequest is the JSON body of POST /api/v1/golden/feedback —
 // the hermes auto-eval entry point. Unlike goldenJudgmentsRequest, it names
-// its query by TEXT rather than by a query_id the caller already holds,
-// because hermes originates the query from its own conversation rather than
-// pulling one from the human-review queue (GET /api/v1/golden/next).
+// its query by TEXT rather than by a query_id. The text must already exist
+// in the user-generated review queue; feedback cannot add new questions.
 type goldenFeedbackRequest struct {
-	QueryText string                      `json:"query_text"`
+	QueryText string `json:"query_text"`
+	// Source is validated for compatibility but never overwrites provenance.
 	Source    string                      `json:"source"` // "ask_history" | "seed" | "manual" | "hermes"
 	Judge     string                      `json:"judge"`  // "user" | "llm"
 	Judgments []goldenJudgmentRequestItem `json:"judgments"`
-	// AskedAt (RFC3339, optional) is the instant this query was actually
-	// asked in the hermes conversation it came from — passed through to
-	// GoldenStore.UpsertQueryByText as the reference instant a period
-	// expression in QueryText ("지난주", "오늘", ...) must later be resolved
-	// against (migrations/032_golden_asked_at.sql). Empty means "now": a
-	// hermes conversation happening live has no better anchor than the
-	// moment the feedback call itself is made.
+	// AskedAt is accepted and validated for existing clients, but feedback
+	// never changes a question's provenance or creates a new question.
 	AskedAt string `json:"asked_at,omitempty"`
 	// Note is accepted but never persisted or logged: it is free-form text
 	// from a hermes conversation and may carry personal content, and no
@@ -574,9 +569,9 @@ type goldenFeedbackResponse struct {
 
 // goldenFeedbackHandler handles POST /api/v1/golden/feedback.
 //
-// It resolves query_text to a golden_queries row (creating one with `source`
-// if no matching row — exact OR normalized-duplicate — already exists; see
-// GoldenStore.UpsertQueryByText) and then upserts the judgments exactly like
+// It resolves query_text to an EXISTING golden_queries row. Missing queries
+// return 404: only the explicit generation endpoint may create questions.
+// Existing rows receive judgments exactly like
 // goldenJudgmentsHandler, except finishQuery is always false: a hermes
 // conversation judging one or two documents does not mean the query is done
 // being reviewed by a human.
@@ -604,14 +599,12 @@ func (s *Server) goldenFeedbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var askedAt time.Time
 	if s := strings.TrimSpace(req.AskedAt); s != "" {
-		parsed, err := time.Parse(time.RFC3339, s)
+		_, err := time.Parse(time.RFC3339, s)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "asked_at must be RFC3339")
 			return
 		}
-		askedAt = parsed
 	}
 
 	inputs := make([]store.GoldenJudgmentInput, 0, len(req.Judgments))
@@ -635,10 +628,15 @@ func (s *Server) goldenFeedbackHandler(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	queryID, err := s.golden.UpsertQueryByText(r.Context(), req.QueryText, req.Source, askedAt)
+	queryID, found, err := s.golden.FindQueryByText(r.Context(), req.QueryText)
 	if err != nil {
-		slog.Error("golden: upsert query by text failed", "error", err)
+		slog.Error("golden: find query by text failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
+	if !found {
+		writeError(w, http.StatusNotFound, "query not found; generate queries before submitting feedback")
 		return
 	}
 
