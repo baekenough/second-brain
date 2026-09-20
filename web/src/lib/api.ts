@@ -471,7 +471,8 @@ export async function skipGoldenQuery(id: string): Promise<void> {
   }
 }
 
-/** Asks the backend to synthesize more open queries to label. */
+/** Explicit user action only: synthesize more open queries to label. Never call
+ * from page-load, next-query, feedback, or judgment flows. */
 export async function generateGoldenQueries(): Promise<GoldenGenerateResponse> {
   return fetchJson<GoldenGenerateResponse>(`${getApiBase()}/golden/queries/generate`, {
     method: "POST",

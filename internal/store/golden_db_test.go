@@ -596,63 +596,54 @@ func TestGoldenStore_UpsertJudgments_UserAndLLMCoexistOnSameDocument(t *testing.
 	}
 }
 
-// TestGoldenStore_UpsertQueryByText covers POST /api/v1/golden/feedback's
-// query-resolution step: a normalized-duplicate of an existing query must
-// resolve to the SAME id without changing its original source, while a
-// genuinely new query text must create a fresh row with the given source.
-func TestGoldenStore_UpsertQueryByText(t *testing.T) {
+// Feedback lookups never create queries or rewrite existing provenance.
+func TestGoldenStore_FindQueryByTextIsReadOnly(t *testing.T) {
 	pg := goldenTestDB(t)
 	s := NewGoldenStore(pg)
 	ctx := context.Background()
-
-	existingID := seedGoldenQuery(t, pg, goldenTestSentinel+"기존 질의", "seed", "open")
-
-	// Exact normalized duplicate (extra trailing space) of an existing query
-	// created by a completely different source ("seed") must resolve to the
-	// SAME id, and must NOT rewrite that row's source to "hermes".
-	gotID, err := s.UpsertQueryByText(ctx, goldenTestSentinel+"기존 질의 ", "hermes", time.Time{})
-	if err != nil {
-		t.Fatalf("UpsertQueryByText (duplicate): %v", err)
+	text := goldenTestSentinel + "기존 질의"
+	id := seedGoldenQuery(t, pg, text, "seed", "done")
+	wantAskedAt := time.Date(2026, 6, 15, 8, 30, 0, 0, time.UTC)
+	if _, err := pg.pool.Exec(ctx, `UPDATE golden_queries SET asked_at=$2 WHERE id=$1`, id, wantAskedAt); err != nil {
+		t.Fatal(err)
 	}
-	if gotID != existingID {
-		t.Errorf("UpsertQueryByText (duplicate) = %s, want existing id %s", gotID, existingID)
+	docID := seedGoldenDocument(t, pg, nil)
+	if _, _, err := s.UpsertJudgments(ctx, id, []GoldenJudgmentInput{{DocumentID: docID, Judgment: "relevant", Judge: "user", Rank: 1}}, false); err != nil {
+		t.Fatal(err)
 	}
-	var source string
-	if err := pg.pool.QueryRow(ctx, `SELECT source FROM golden_queries WHERE id = $1`, existingID).Scan(&source); err != nil {
-		t.Fatalf("read source: %v", err)
+	for _, query := range []string{text + "  ", goldenTestSentinel + "새로운 질문", "  "} {
+		got, found, err := s.FindQueryByText(ctx, query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantFound := goldenNormalize(query) == goldenNormalize(text)
+		if found != wantFound || (found && got != id) {
+			t.Fatalf("lookup = %v/%v for %q", got, found, query)
+		}
 	}
-	if source != "seed" {
-		t.Errorf("source = %q, want unchanged 'seed' (UpsertQueryByText must never rewrite an existing row's source)", source)
+	if _, err := s.NextQuery(ctx, "user"); err != nil {
+		t.Fatal(err)
 	}
-
-	// A genuinely new query text must create a new row with the given source.
-	newText := goldenTestSentinel + "완전히 새로운 질의"
-	newID, err := s.UpsertQueryByText(ctx, newText, "hermes", time.Time{})
-	if err != nil {
-		t.Fatalf("UpsertQueryByText (new): %v", err)
+	if _, err := s.Progress(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if newID == existingID {
-		t.Error("UpsertQueryByText (new) reused the existing id, want a fresh row")
+	if _, err := s.ExportEvalPairs(ctx, "user"); err != nil {
+		t.Fatal(err)
 	}
-	var newSource, newStatus string
-	if err := pg.pool.QueryRow(ctx, `SELECT source, status FROM golden_queries WHERE id = $1`, newID).Scan(&newSource, &newStatus); err != nil {
-		t.Fatalf("read new row: %v", err)
+	var queries, judgments int
+	var source, status string
+	var askedAt time.Time
+	if err := pg.pool.QueryRow(ctx, `SELECT count(*) FROM golden_queries`).Scan(&queries); err != nil {
+		t.Fatal(err)
 	}
-	if newSource != "hermes" {
-		t.Errorf("new row source = %q, want 'hermes'", newSource)
+	if err := pg.pool.QueryRow(ctx, `SELECT count(*) FROM golden_judgments`).Scan(&judgments); err != nil {
+		t.Fatal(err)
 	}
-	if newStatus != "open" {
-		t.Errorf("new row status = %q, want default 'open'", newStatus)
+	if err := pg.pool.QueryRow(ctx, `SELECT source,status,asked_at FROM golden_queries WHERE id=$1`, id).Scan(&source, &status, &askedAt); err != nil {
+		t.Fatal(err)
 	}
-
-	// Calling it again with the exact same text must be idempotent (resolve
-	// to the same new row, not create a second one).
-	againID, err := s.UpsertQueryByText(ctx, newText, "hermes", time.Time{})
-	if err != nil {
-		t.Fatalf("UpsertQueryByText (repeat): %v", err)
-	}
-	if againID != newID {
-		t.Errorf("UpsertQueryByText (repeat) = %s, want the same id %s", againID, newID)
+	if queries != 1 || judgments != 1 || source != "seed" || status != "done" || !askedAt.Equal(wantAskedAt) {
+		t.Fatalf("lookup mutated stored data: queries=%d judgments=%d source=%s status=%s askedAt=%v", queries, judgments, source, status, askedAt)
 	}
 }
 
@@ -756,50 +747,5 @@ func TestGoldenStore_NextQuery_ReturnsAskedAt(t *testing.T) {
 	}
 	if !next.AskedAt.Equal(wantAskedAt) {
 		t.Errorf("NextQuery.AskedAt = %v, want %v", next.AskedAt, wantAskedAt)
-	}
-}
-
-// TestGoldenStore_UpsertQueryByText_PersistsGivenAskedAt covers the
-// POST /api/v1/golden/feedback path: a caller-supplied askedAt must be
-// persisted on a NEWLY created row, and — mirroring the source-provenance
-// rule already pinned above — must NOT be rewritten on a normalized-duplicate
-// call against a pre-existing row.
-func TestGoldenStore_UpsertQueryByText_PersistsGivenAskedAt(t *testing.T) {
-	pg := goldenTestDB(t)
-	s := NewGoldenStore(pg)
-	ctx := context.Background()
-
-	text := goldenTestSentinel + "이번 달 구독료 정리"
-	wantAskedAt := time.Date(2026, 6, 15, 8, 30, 0, 0, time.UTC)
-
-	id, err := s.UpsertQueryByText(ctx, text, "hermes", wantAskedAt)
-	if err != nil {
-		t.Fatalf("UpsertQueryByText: %v", err)
-	}
-
-	var gotAskedAt time.Time
-	if err := pg.pool.QueryRow(ctx, `SELECT asked_at FROM golden_queries WHERE id = $1`, id).Scan(&gotAskedAt); err != nil {
-		t.Fatalf("read asked_at: %v", err)
-	}
-	if !gotAskedAt.Equal(wantAskedAt) {
-		t.Errorf("asked_at = %v, want the given %v", gotAskedAt, wantAskedAt)
-	}
-
-	// A second call with a DIFFERENT askedAt against the same normalized text
-	// must resolve to the same row without moving its asked_at.
-	otherAskedAt := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
-	againID, err := s.UpsertQueryByText(ctx, text+" ", "hermes", otherAskedAt)
-	if err != nil {
-		t.Fatalf("UpsertQueryByText (duplicate): %v", err)
-	}
-	if againID != id {
-		t.Fatalf("UpsertQueryByText (duplicate) = %s, want existing id %s", againID, id)
-	}
-	var stillAskedAt time.Time
-	if err := pg.pool.QueryRow(ctx, `SELECT asked_at FROM golden_queries WHERE id = $1`, id).Scan(&stillAskedAt); err != nil {
-		t.Fatalf("read asked_at after duplicate call: %v", err)
-	}
-	if !stillAskedAt.Equal(wantAskedAt) {
-		t.Errorf("asked_at after duplicate call = %v, want unchanged %v (got instead %v)", stillAskedAt, wantAskedAt, otherAskedAt)
 	}
 }

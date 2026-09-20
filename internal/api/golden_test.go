@@ -28,6 +28,7 @@ import (
 type stubGoldenSet struct {
 	generateCreated, generateTotalOpen int
 	generateErr                        error
+	generateCalls                      int
 
 	nextQuery    *store.GoldenQuery
 	nextErr      error
@@ -55,14 +56,14 @@ type stubGoldenSet struct {
 	exportErr      error
 	exportJudgeGot string
 
-	byTextID      uuid.UUID
-	byTextText    string
-	byTextSource  string
-	byTextAskedAt time.Time
-	byTextErr     error
+	byTextID    uuid.UUID
+	byTextText  string
+	byTextFound bool
+	byTextErr   error
 }
 
 func (s *stubGoldenSet) GenerateQueries(_ context.Context) (int, int, error) {
+	s.generateCalls++
 	return s.generateCreated, s.generateTotalOpen, s.generateErr
 }
 
@@ -97,17 +98,9 @@ func (s *stubGoldenSet) ExportEvalPairs(_ context.Context, judge string) ([]stor
 	return s.exportPairs, s.exportErr
 }
 
-func (s *stubGoldenSet) UpsertQueryByText(_ context.Context, text, source string, askedAt time.Time) (uuid.UUID, error) {
+func (s *stubGoldenSet) FindQueryByText(_ context.Context, text string) (uuid.UUID, bool, error) {
 	s.byTextText = text
-	s.byTextSource = source
-	s.byTextAskedAt = askedAt
-	if s.byTextErr != nil {
-		return uuid.Nil, s.byTextErr
-	}
-	if s.byTextID == uuid.Nil {
-		s.byTextID = uuid.New()
-	}
-	return s.byTextID, nil
+	return s.byTextID, s.byTextFound, s.byTextErr
 }
 
 // goldenStubSearcher is a search.DocumentSearcher fake returning the SAME
@@ -863,13 +856,13 @@ func TestGoldenExportHandler_Success(t *testing.T) {
 
 // TestGoldenFeedbackHandler_Success covers the hermes auto-eval entry point:
 // the query is resolved by TEXT (not a pre-existing query_id), the source is
-// forwarded to UpsertQueryByText unchanged, and every judgment carries the
+// used only for validation, and every judgment carries the
 // request's judge value through to UpsertJudgments with finishQuery always
 // false (a hermes conversation judging documents does not close out human
 // review of that query).
 func TestGoldenFeedbackHandler_Success(t *testing.T) {
 	t.Parallel()
-	stub := &stubGoldenSet{upsertSaved: 1, upsertFeedback: 1}
+	stub := &stubGoldenSet{upsertSaved: 1, upsertFeedback: 1, byTextFound: true, byTextID: uuid.New()}
 	srv := newGoldenTestServer(stub, nil)
 
 	docID := uuid.New()
@@ -889,22 +882,16 @@ func TestGoldenFeedbackHandler_Success(t *testing.T) {
 	}
 
 	if stub.byTextText != "지난주 통화 기록 보여줘" {
-		t.Errorf("UpsertQueryByText text = %q, want the request's query_text", stub.byTextText)
-	}
-	if stub.byTextSource != "hermes" {
-		t.Errorf("UpsertQueryByText source = %q, want 'hermes'", stub.byTextSource)
+		t.Errorf("FindQueryByText text = %q, want the request's query_text", stub.byTextText)
 	}
 	if stub.upsertQueryID != stub.byTextID {
-		t.Errorf("UpsertJudgments queryID = %s, want the id UpsertQueryByText resolved (%s)", stub.upsertQueryID, stub.byTextID)
+		t.Errorf("UpsertJudgments queryID = %s, want the id FindQueryByText resolved (%s)", stub.upsertQueryID, stub.byTextID)
 	}
 	if stub.upsertFinish {
 		t.Error("upsertFinish = true, want false — POST /golden/feedback must never close out the query")
 	}
 	if len(stub.upsertJudgments) != 1 || stub.upsertJudgments[0].Judge != "user" {
 		t.Errorf("upsertJudgments = %+v, want one entry with Judge=user", stub.upsertJudgments)
-	}
-	if !stub.byTextAskedAt.IsZero() {
-		t.Errorf("UpsertQueryByText askedAt = %v, want the zero value (no asked_at in the request body means 'let the store default to now()')", stub.byTextAskedAt)
 	}
 
 	var resp goldenFeedbackResponse
@@ -916,13 +903,11 @@ func TestGoldenFeedbackHandler_Success(t *testing.T) {
 	}
 }
 
-// TestGoldenFeedbackHandler_ForwardsAskedAt covers the optional asked_at
-// field: when the hermes caller supplies one, it must reach
-// GoldenStore.UpsertQueryByText exactly as given (RFC3339-parsed), not
-// silently dropped or replaced with "now".
-func TestGoldenFeedbackHandler_ForwardsAskedAt(t *testing.T) {
+// Legacy asked_at input remains accepted, but lookup-only feedback cannot
+// rewrite the existing question's source or original timestamp.
+func TestGoldenFeedbackHandler_AcceptsLegacyAskedAt(t *testing.T) {
 	t.Parallel()
-	stub := &stubGoldenSet{upsertSaved: 1}
+	stub := &stubGoldenSet{upsertSaved: 1, byTextFound: true, byTextID: uuid.New()}
 	srv := newGoldenTestServer(stub, nil)
 
 	wantAskedAt := time.Date(2026, 6, 15, 8, 30, 0, 0, time.UTC)
@@ -938,8 +923,8 @@ func TestGoldenFeedbackHandler_ForwardsAskedAt(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
 	}
-	if !stub.byTextAskedAt.Equal(wantAskedAt) {
-		t.Errorf("UpsertQueryByText askedAt = %v, want %v", stub.byTextAskedAt, wantAskedAt)
+	if stub.upsertQueryID != stub.byTextID {
+		t.Fatal("feedback did not use the existing question")
 	}
 }
 
@@ -977,7 +962,7 @@ func TestGoldenFeedbackHandler_LLMJudgeDoesNotApplyRetentionTag(t *testing.T) {
 	// feedbackApplied=0 simulates what the real store does for an all-"llm"
 	// batch (see UpsertJudgments' doc comment) — the stub does not
 	// re-implement that rule, it only proves the handler passes it through.
-	stub := &stubGoldenSet{upsertSaved: 2, upsertFeedback: 0}
+	stub := &stubGoldenSet{upsertSaved: 2, upsertFeedback: 0, byTextFound: true, byTextID: uuid.New()}
 	srv := newGoldenTestServer(stub, nil)
 
 	docA, docB := uuid.New(), uuid.New()
@@ -1043,5 +1028,55 @@ func TestGoldenFeedbackHandler_InvalidJudge(t *testing.T) {
 	rec := doGoldenRequest(srv, http.MethodPost, "/api/v1/golden/feedback", body)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400 for an unrecognised judge", rec.Code)
+	}
+}
+
+func TestGoldenFeedbackHandlerMissingQuestionDoesNotGenerate(t *testing.T) {
+	for _, judge := range []string{"user", "llm"} {
+		t.Run(judge, func(t *testing.T) {
+			stub := &stubGoldenSet{}
+			body, _ := json.Marshal(map[string]any{"query_text": "새로운 질문", "source": "hermes", "judge": judge, "judgments": []any{}})
+			rec := doGoldenRequest(newGoldenTestServer(stub, nil), http.MethodPost, "/api/v1/golden/feedback", body)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status=%d want404", rec.Code)
+			}
+			if stub.generateCalls != 0 || stub.upsertQueryID != uuid.Nil {
+				t.Fatal("missing-question feedback wrote data")
+			}
+		})
+	}
+}
+
+func TestGoldenReadAndReviewNeverGenerate(t *testing.T) {
+	stub := &stubGoldenSet{skipFound: true}
+	srv := newGoldenTestServer(stub, nil)
+	for _, path := range []string{"/api/v1/golden/next", "/api/v1/golden/next?judge=llm", "/api/v1/golden/export"} {
+		rec := doGoldenRequest(srv, http.MethodGet, path, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s=%d", path, rec.Code)
+		}
+	}
+	id := uuid.New()
+	body, _ := json.Marshal(map[string]any{"query_id": id.String(), "judgments": []any{}, "finish_query": true})
+	if rec := doGoldenRequest(srv, http.MethodPost, "/api/v1/golden/judgments", body); rec.Code != http.StatusOK {
+		t.Fatalf("judgments=%d", rec.Code)
+	}
+	if rec := doGoldenRequest(srv, http.MethodPost, "/api/v1/golden/queries/"+id.String()+"/skip", nil); rec.Code != http.StatusOK {
+		t.Fatalf("skip=%d", rec.Code)
+	}
+	if stub.generateCalls != 0 || stub.byTextText != "" {
+		t.Fatal("read/review path generated a question")
+	}
+	if rec := doGoldenRequest(srv, http.MethodGet, "/api/v1/golden/queries/generate", nil); rec.Code == http.StatusOK {
+		t.Fatal("GET must not generate")
+	}
+	if stub.generateCalls != 0 {
+		t.Fatal("GET generated questions")
+	}
+	if rec := doGoldenRequest(srv, http.MethodPost, "/api/v1/golden/queries/generate", nil); rec.Code != http.StatusOK {
+		t.Fatalf("generate=%d", rec.Code)
+	}
+	if stub.generateCalls != 1 {
+		t.Fatalf("explicit generation calls=%d", stub.generateCalls)
 	}
 }

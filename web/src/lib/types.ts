@@ -522,7 +522,7 @@ export interface GoldenProgress {
 }
 
 /** `query: null` means there is nothing left to label — the screen offers
- * "후보 질의 생성" instead of a candidate list. */
+ * "생성" button instead of generating questions automatically. */
 export interface GoldenNextResponse {
   query: GoldenQuery | null;
   candidates: GoldenCandidate[];
