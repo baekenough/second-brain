@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -12,12 +13,19 @@ import (
 
 // EvalMetricsRecord represents a single eval run stored in the eval_metrics table.
 type EvalMetricsRecord struct {
-	ID     int64
-	NDCG5  float64
-	NDCG10 float64
-	MRR10  float64
-	Pairs  int
-	RunAt  time.Time
+	ConfigHash   string
+	LabelHash    string
+	CodeRevision string
+	RunConfig    json.RawMessage
+	Attempted    int
+	Failed       int
+	FPPenalty10  float64
+	ID           int64
+	NDCG5        float64
+	NDCG10       float64
+	MRR10        float64
+	Pairs        int
+	RunAt        time.Time
 
 	// Read-path (search) latency profiling (nullable — zero when not measured).
 	// Added by migration 016.
@@ -39,15 +47,20 @@ func NewEvalMetricsStore(pg *Postgres) *EvalMetricsStore {
 // Save inserts a new eval metrics record. The RunAt field is set by the database
 // DEFAULT (NOW()) so callers do not need to populate it.
 func (s *EvalMetricsStore) Save(ctx context.Context, rec EvalMetricsRecord) error {
+	if len(rec.RunConfig) == 0 {
+		rec.RunConfig = json.RawMessage(`{}`)
+	}
 	_, err := s.pg.Pool().Exec(ctx,
 		`INSERT INTO eval_metrics
 		    (ndcg5, ndcg10, mrr10, pairs,
-		     search_latency_p50_ms, search_latency_p95_ms, search_latency_mean_ms)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		     search_latency_p50_ms, search_latency_p95_ms, search_latency_mean_ms,
+ config_hash,label_hash,code_revision,run_config,attempted,failed,fp_penalty10)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7,$8,$9,$10,$11,$12,$13,$14)`,
 		rec.NDCG5, rec.NDCG10, rec.MRR10, rec.Pairs,
 		nullableFloat(rec.SearchLatencyP50Ms),
 		nullableFloat(rec.SearchLatencyP95Ms),
 		nullableFloat(rec.SearchLatencyMeanMs),
+		rec.ConfigHash, rec.LabelHash, rec.CodeRevision, rec.RunConfig, rec.Attempted, rec.Failed, rec.FPPenalty10,
 	)
 	if err != nil {
 		return fmt.Errorf("eval metrics: save: %w", err)
@@ -75,7 +88,8 @@ func (s *EvalMetricsStore) List(ctx context.Context, limit int) ([]EvalMetricsRe
 		`SELECT id, ndcg5, ndcg10, mrr10, pairs, run_at,
 		        COALESCE(search_latency_p50_ms,  0),
 		        COALESCE(search_latency_p95_ms,  0),
-		        COALESCE(search_latency_mean_ms, 0)
+		        COALESCE(search_latency_mean_ms, 0),
+ config_hash,label_hash,code_revision,run_config,attempted,failed,fp_penalty10
 		 FROM eval_metrics
 		 ORDER BY run_at DESC
 		 LIMIT $1`,
@@ -89,6 +103,7 @@ func (s *EvalMetricsStore) List(ctx context.Context, limit int) ([]EvalMetricsRe
 		return rec, row.Scan(
 			&rec.ID, &rec.NDCG5, &rec.NDCG10, &rec.MRR10, &rec.Pairs, &rec.RunAt,
 			&rec.SearchLatencyP50Ms, &rec.SearchLatencyP95Ms, &rec.SearchLatencyMeanMs,
+			&rec.ConfigHash, &rec.LabelHash, &rec.CodeRevision, &rec.RunConfig, &rec.Attempted, &rec.Failed, &rec.FPPenalty10,
 		)
 	})
 	if err != nil {
@@ -105,19 +120,53 @@ func (s *EvalMetricsStore) Latest(ctx context.Context) (*EvalMetricsRecord, erro
 		`SELECT id, ndcg5, ndcg10, mrr10, pairs, run_at,
 		        COALESCE(search_latency_p50_ms,  0),
 		        COALESCE(search_latency_p95_ms,  0),
-		        COALESCE(search_latency_mean_ms, 0)
+		        COALESCE(search_latency_mean_ms, 0),
+ config_hash,label_hash,code_revision,run_config,attempted,failed,fp_penalty10
 		 FROM eval_metrics
 		 ORDER BY run_at DESC
 		 LIMIT 1`,
 	).Scan(
 		&rec.ID, &rec.NDCG5, &rec.NDCG10, &rec.MRR10, &rec.Pairs, &rec.RunAt,
 		&rec.SearchLatencyP50Ms, &rec.SearchLatencyP95Ms, &rec.SearchLatencyMeanMs,
+		&rec.ConfigHash, &rec.LabelHash, &rec.CodeRevision, &rec.RunConfig, &rec.Attempted, &rec.Failed, &rec.FPPenalty10,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("eval metrics: latest: %w", err)
+	}
+	return &rec, nil
+}
+
+// LatestMatching excludes legacy/incomplete runs and unlike label/configuration
+// snapshots. Code revision is recorded, but intentionally not matched so a
+// regression can be detected across revisions of the same scoring protocol.
+func (s *EvalMetricsStore) LatestMatching(ctx context.Context, configHash, labelHash string) (*EvalMetricsRecord, error) {
+	if configHash == "" || labelHash == "" {
+		return nil, nil
+	}
+	var available bool
+	if err := s.pg.Pool().QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='eval_metrics' AND column_name='config_hash')`).Scan(&available); err != nil {
+		return nil, err
+	}
+	if !available {
+		return nil, nil
+	} // old-schema read-only comparisons have no compatible baseline
+	var rec EvalMetricsRecord
+	err := s.pg.Pool().QueryRow(ctx, `SELECT id,ndcg5,ndcg10,mrr10,pairs,run_at,
+ COALESCE(search_latency_p50_ms,0),COALESCE(search_latency_p95_ms,0),COALESCE(search_latency_mean_ms,0),
+ config_hash,label_hash,code_revision,run_config,attempted,failed,fp_penalty10
+ FROM eval_metrics WHERE config_hash=$1 AND label_hash=$2 AND failed=0 AND attempted>0
+ ORDER BY run_at DESC,id DESC LIMIT 1`, configHash, labelHash).Scan(
+		&rec.ID, &rec.NDCG5, &rec.NDCG10, &rec.MRR10, &rec.Pairs, &rec.RunAt,
+		&rec.SearchLatencyP50Ms, &rec.SearchLatencyP95Ms, &rec.SearchLatencyMeanMs,
+		&rec.ConfigHash, &rec.LabelHash, &rec.CodeRevision, &rec.RunConfig, &rec.Attempted, &rec.Failed, &rec.FPPenalty10)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("eval matching baseline: %w", err)
 	}
 	return &rec, nil
 }

@@ -104,3 +104,26 @@ func TestHTTPReranker_APIError(t *testing.T) {
 		t.Fatal("expected error from 500 response, got nil")
 	}
 }
+
+func TestHTTPRerankerRanksEntireCandidatePoolAndRedactsErrors(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var request struct {
+			Documents []string `json:"documents"`
+			TopN      int      `json:"top_n"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+		}
+		if request.TopN != len(request.Documents) {
+			t.Errorf("top_n=%d candidate count=%d", request.TopN, len(request.Documents))
+		}
+		http.Error(w, "private echoed document", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+	_, err := NewHTTPReranker(srv.URL, "", "test", 1).Rerank(context.Background(), "q", []string{"a", "b", "c"})
+	if err == nil || err.Error() != "rerank API status 502" || calls != 1 {
+		t.Fatalf("unsafe API error: %v", err)
+	}
+}

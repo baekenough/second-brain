@@ -641,6 +641,7 @@ type WhisperCollector struct {
 	// no mutex is required as long as the scheduler does not call Collect()
 	// concurrently on the same collector instance (confirmed by scheduler
 	// design). Initialised in NewWhisperCollector.
+	nameRedactor     *NameRedactor
 	failedQuarantine map[string]struct{}
 }
 
@@ -1522,7 +1523,7 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 		title = smsmap.RedactPII(strings.ReplaceAll(item.title, "_", " "))
 	}
 
-	return model.Document{
+	doc := model.Document{
 		ID:          uuid.New(),
 		SourceType:  model.SourceCall,
 		SourceID:    docSourceID,
@@ -1531,7 +1532,14 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 		Metadata:    meta,
 		OccurredAt:  &occurredAt,
 		CollectedAt: now,
-	}, true
+	}
+	if c.cfg.PIINameRedactionEnabled {
+		if err := c.nameRedactor.Redact(ctx, &doc); err != nil {
+			slog.Warn("whisper: name redaction failed; document withheld for retry", "source_id_bytes", len(doc.SourceID))
+			return model.Document{}, false
+		}
+	}
+	return doc, true
 }
 
 // recordingSidecarRaw mirrors the JSON shape written by
@@ -2180,4 +2188,10 @@ func quarantineCorruptAudio(path, audioDir string, sizeBytes int64, reason error
 		}
 	}
 	return true
+}
+
+// WithNameRedactor injects the approved remote protection step.
+func (c *WhisperCollector) WithNameRedactor(redactor *NameRedactor) *WhisperCollector {
+	c.nameRedactor = redactor
+	return c
 }

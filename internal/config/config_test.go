@@ -881,3 +881,21 @@ func TestLoad_RerankTopN(t *testing.T) {
 		})
 	}
 }
+
+func TestNameRedactionDefaultOffAndRequiresAPI(t *testing.T) {
+	t.Setenv("PII_NAME_REDACTION_ENABLED", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PIINameRedactionEnabled {
+		t.Fatal("must default off")
+	}
+	t.Setenv("PII_NAME_REDACTION_ENABLED", "true")
+	for _, key := range []string{"LLM_API_KEY", "LLM_CLIPROXY_AUTH_FILE", "CLIPROXY_AUTH_FILE", "EMBEDDING_API_KEY"} {
+		t.Setenv(key, "")
+	}
+	if _, err := Load(); err == nil {
+		t.Fatal("enabled without authenticated API must fail")
+	}
+}

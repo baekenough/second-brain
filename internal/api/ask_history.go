@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/baekenough/second-brain/internal/store"
@@ -42,13 +43,18 @@ const askMaxHistoryTurns = 6
 // AskSessionStore.ListConversationTurns) down to the most recent max
 // entries and projects them to askHistoryTurn.
 func recentAskHistory(turns []store.AskSession, max int) []askHistoryTurn {
-	if max > 0 && len(turns) > max {
-		turns = turns[len(turns)-max:]
-	}
 	history := make([]askHistoryTurn, 0, len(turns))
 	for _, t := range turns {
+		if (t.FinishReason != "stop" && t.FinishReason != "no_evidence") || strings.TrimSpace(t.Answer) == "" {
+			continue
+		}
 		history = append(history, askHistoryTurn{Question: t.Question, Answer: t.Answer})
 	}
+	if max > 0 && len(history) > max {
+		history = history[len(history)-max:]
+	}
+	history = budgetAskHistory(history)
+
 	return history
 }
 

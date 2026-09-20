@@ -247,3 +247,35 @@ func TestDB_AttachTranscript_DuplicateContentDifferentSourceID_Rejected(t *testi
 		t.Errorf("AttachTranscript with duplicate content under a different source_id: err = %v, want ErrDuplicateTranscript", err)
 	}
 }
+
+func TestDB_AttachTranscriptRedactedFieldsReplaceLegacyContact(t *testing.T) {
+	pg := attachTestDB(t)
+	s := NewDocumentStore(pg)
+	ctx := context.Background()
+	seed := &model.Document{SourceType: model.SourceCall, SourceID: attachTestPrefix + uuid.NewString(), Title: "legacy person", Content: "old transcript", Metadata: map[string]any{"contact_name": "legacy person", "number": "01012345678", "direction": "incoming"}, CollectedAt: time.Now()}
+	if err := s.Upsert(ctx, seed); err != nil {
+		t.Fatal(err)
+	}
+	_, err := pg.pool.Exec(ctx, `UPDATE documents SET title_summary='legacy person' WHERE id=$1`, seed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcript := &model.Document{SourceType: model.SourceCall, SourceID: seed.SourceID, Title: "protected title", Content: "protected transcript", Metadata: map[string]any{"pii_name_redacted": true, "contact_name": "[REDACTED]", "number": "[REDACTED]"}, CollectedAt: time.Now()}
+	if _, err := s.AttachTranscript(ctx, transcript); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := s.AttachTranscript(ctx, transcript); err != nil || !changed {
+		t.Fatalf("protected identical body must trigger downstream rebuild: changed=%v err=%v", changed, err)
+	}
+	got, err := s.GetByID(ctx, transcript.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "protected title" || got.Metadata["contact_name"] != "[REDACTED]" || got.Metadata["number"] != "[REDACTED]" || got.Metadata["direction"] != "incoming" {
+		t.Fatalf("protected merge mismatch: title=%q", got.Title)
+	}
+	var cleared bool
+	if err := pg.pool.QueryRow(ctx, `SELECT title_summary IS NULL AND summary_embedding IS NULL FROM documents WHERE id=$1`, got.ID).Scan(&cleared); err != nil || !cleared {
+		t.Fatalf("legacy summary retained: %v", err)
+	}
+}

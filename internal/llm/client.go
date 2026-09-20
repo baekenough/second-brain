@@ -249,6 +249,8 @@ func (e *TruncatedError) Unwrap() error { return ErrTruncated }
 // streamChunk is a single OpenAI-compatible streaming SSE data payload:
 // {"choices":[{"delta":{"content":"..."},"finish_reason":null}]}
 type streamChunk struct {
+	Error   json.RawMessage `json:"error"`
+	Usage   json.RawMessage `json:"usage"`
 	Choices []struct {
 		Delta struct {
 			Content string `json:"content"`
@@ -482,6 +484,7 @@ func (c *Client) StreamWithMessages(ctx context.Context, system string, messages
 	// report a length without retaining the content itself.
 	var contentLen int
 	var sawDone bool
+	var hasText bool
 
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
@@ -489,10 +492,11 @@ func (c *Client) StreamWithMessages(ctx context.Context, system string, messages
 		if line == "" {
 			continue
 		}
-		data, ok := strings.CutPrefix(line, "data: ")
+		data, ok := strings.CutPrefix(line, "data:")
 		if !ok {
 			continue
 		}
+		data = strings.TrimSpace(data)
 		if data == "[DONE]" {
 			sawDone = true
 			break
@@ -500,11 +504,15 @@ func (c *Client) StreamWithMessages(ctx context.Context, system string, messages
 
 		var chunk streamChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			// Skip a single malformed chunk rather than aborting a stream
-			// that has already delivered good tokens to the caller.
-			continue
+			return fmt.Errorf("llm: malformed stream event")
+		}
+		if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
+			return fmt.Errorf("llm: provider stream error")
 		}
 		if len(chunk.Choices) == 0 {
+			if len(chunk.Usage) == 0 || string(chunk.Usage) == "null" {
+				return fmt.Errorf("llm: stream event has no choices or usage")
+			}
 			continue
 		}
 		if fr := chunk.Choices[0].FinishReason; fr != nil && *fr != "" {
@@ -512,6 +520,7 @@ func (c *Client) StreamWithMessages(ctx context.Context, system string, messages
 		}
 		if content := chunk.Choices[0].Delta.Content; content != "" {
 			contentLen += len(content)
+			hasText = hasText || strings.TrimSpace(content) != ""
 			onDelta(content)
 		}
 	}
@@ -539,6 +548,15 @@ func (c *Client) StreamWithMessages(ctx context.Context, system string, messages
 			FinishReason:  finishReason,
 			ContentLength: contentLen,
 		}
+	}
+	if !sawDone && finishReason == "" {
+		return fmt.Errorf("llm: incomplete stream: missing completion marker")
+	}
+	if finishReason != "" && finishReason != "stop" {
+		return fmt.Errorf("llm: unsuccessful stream finish reason")
+	}
+	if !hasText {
+		return fmt.Errorf("llm: empty stream response")
 	}
 	return nil
 }

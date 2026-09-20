@@ -23,6 +23,16 @@ type Postgres struct {
 // NewPostgres opens a pgx pool, registers pgvector types, and enables the
 // pgvector extension. The caller must call Close when done.
 func NewPostgres(ctx context.Context, databaseURL string) (*Postgres, error) {
+	return newPostgres(ctx, databaseURL, false)
+}
+
+// NewReadOnlyPostgres opens an existing migrated database without installing
+// extensions. Every pooled connection enforces read-only transactions.
+func NewReadOnlyPostgres(ctx context.Context, databaseURL string) (*Postgres, error) {
+	return newPostgres(ctx, databaseURL, true)
+}
+
+func newPostgres(ctx context.Context, databaseURL string, readOnly bool) (*Postgres, error) {
 	// Parse before connecting so driver parse errors can never escape to logs.
 	// Their nested causes may contain credentials, even when the outer DSN is
 	// redacted. Do not wrap or retain the original error.
@@ -36,16 +46,21 @@ func NewPostgres(ctx context.Context, databaseURL string) (*Postgres, error) {
 	// which requires the extension to already exist. If we relied on the pool's
 	// first connection (triggered by Ping) to create the extension, it would be
 	// a chicken-and-egg problem: AfterConnect fires before Exec can run.
-	tmpConn, err := pgxstd.ConnectConfig(ctx, cfg.ConnConfig.Copy())
-	if err != nil {
-		return nil, fmt.Errorf("open temporary connection: %w", err)
-	}
-	if _, err := tmpConn.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS vector"); err != nil {
-		_ = tmpConn.Close(ctx)
-		return nil, fmt.Errorf("create vector extension: %w", err)
-	}
-	if err := tmpConn.Close(ctx); err != nil {
-		return nil, fmt.Errorf("close temporary connection: %w", err)
+	if !readOnly {
+		tmpConn, err := pgxstd.ConnectConfig(ctx, cfg.ConnConfig.Copy())
+		if err != nil {
+			return nil, fmt.Errorf("open temporary connection: %w", err)
+		}
+		if _, err := tmpConn.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS vector"); err != nil {
+			_ = tmpConn.Close(ctx)
+			return nil, fmt.Errorf("create vector extension: %w", err)
+		}
+		if err := tmpConn.Close(ctx); err != nil {
+			return nil, fmt.Errorf("close temporary connection: %w", err)
+		}
+
+	} else {
+		cfg.ConnConfig.RuntimeParams["default_transaction_read_only"] = "on"
 	}
 
 	// pgvector >= 0.8 supports iterative scans: keep scanning when status or

@@ -105,13 +105,8 @@ func parseExtractionResponse(raw string) ([]model.Entity, error) {
 
 	var resp extractionResponse
 	if err := json.Unmarshal([]byte(trimmed), &resp); err != nil {
-		// Truncate response to 200 chars to avoid large log entries.
-		truncated := raw
-		if len(truncated) > 200 {
-			truncated = truncated[:200] + "...[truncated]"
-		}
 		slog.Warn("entity extractor: failed to parse LLM JSON",
-			"error", err, "response", truncated)
+			"response_bytes", len(raw))
 		return nil, fmt.Errorf("parse entity extraction response: %w", err)
 	}
 

@@ -258,7 +258,7 @@ function AssistantBubble({
     <div className="flex justify-start">
       <div className="max-w-[90%] space-y-2">
         <div className="rounded-2xl rounded-bl-sm border border-border bg-surface px-4 py-2.5">
-          {turn.answer && <MarkdownContent source={turn.answer} />}
+          {turn.answer && <MarkdownContent source={turn.answer} citationIds={turn.sources.map((source) => source.id)} />}
           {showTyping && (
             <div className="flex items-center gap-1 py-1" aria-label="답변 생성 중">
               <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-foreground-subtle [animation-delay:-0.3s]" />

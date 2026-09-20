@@ -1167,3 +1167,38 @@ func TestSanitizePhoneNumber(t *testing.T) {
 		})
 	}
 }
+
+func TestIngestRecordingNameRedactionProtectsInitialDocumentAndSidecar(t *testing.T) {
+	upserter := &stubIngestUpserter{}
+	srv, dir := newRecordingTestServer(t, upserter, "", 0, time.Time{})
+	srv.WithPIINumberHashing(false).WithPIINameRedaction(true)
+	body, ct := buildRecordingForm(t, "recording.m4a", validM4ABytes(32), "01012345678", time.Now().Add(-time.Hour).UnixMilli(), "contact_name", "홍길동", "duration_sec", "60")
+	rr := doRecordingPost(t, srv, body, ct, "Bearer test-key")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status %d: %s", rr.Code, rr.Body.String())
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".json") {
+			b, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(b), "홍길동") || strings.Contains(string(b), "01012345678") {
+				t.Fatal("raw fields in sidecar")
+			}
+		}
+	}
+	if len(upserter.upserted) != 1 {
+		t.Fatal("expected one protected document")
+	}
+	for _, doc := range upserter.upserted {
+		data, _ := json.Marshal(doc)
+		if strings.Contains(string(data), "홍길동") || strings.Contains(string(data), "01012345678") {
+			t.Fatal("raw fields in initial document")
+		}
+	}
+}

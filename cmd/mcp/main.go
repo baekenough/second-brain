@@ -34,6 +34,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/baekenough/second-brain/internal/config"
+	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/note"
 	"github.com/baekenough/second-brain/internal/search"
@@ -99,9 +100,10 @@ func run() error {
 	}
 
 	// --- Search service (same assembly as cmd/server) ---
-	searchSvc := search.NewService(docStore, embedClient).
-		WithChunkStore(chunkStore).
-		WithReranker(reranker)
+	llmClient := llm.New(llm.Config{BaseURL: cfg.LLMAPIURL, Model: cfg.LLMModel, APIKey: cfg.LLMAPIKey, AuthFile: cfg.LLMAuthFile, MaxTokens: cfg.LLMMaxTokens, Temperature: cfg.LLMTemperature, Thinking: cfg.LLMThinking}, nil)
+	searchSvc := search.AssembleService(docStore, embedClient, chunkStore, reranker,
+		store.NewEntityStore(pg), search.NewOpenSearchLane(cfg), llmClient,
+		store.NewWeightsHistoryStore(pg), cfg.SearchActiveWeightsEnabled)
 
 	// --- MCP server ---
 	mcpPort := os.Getenv("MCP_PORT")

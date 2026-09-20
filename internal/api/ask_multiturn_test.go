@@ -428,9 +428,10 @@ func TestRecentAskHistory_CapsAtMax(t *testing.T) {
 	var turns []store.AskSession
 	for i := 0; i < askMaxHistoryTurns+3; i++ {
 		turns = append(turns, store.AskSession{
-			TurnIndex: i,
-			Question:  fmtTurnLabel("Q", i),
-			Answer:    fmtTurnLabel("A", i),
+			TurnIndex:    i,
+			FinishReason: "stop",
+			Question:     fmtTurnLabel("Q", i),
+			Answer:       fmtTurnLabel("A", i),
 		})
 	}
 

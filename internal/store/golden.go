@@ -489,7 +489,7 @@ func (s *GoldenStore) SkipQuery(ctx context.Context, queryID uuid.UUID) (bool, e
 }
 
 // ExportEvalPairs returns one EvalPair per golden query that has at least one
-// "relevant" judgment FROM THE GIVEN judge, in the exact shape
+// relevant or negative judgment FROM THE GIVEN judge, in the exact shape
 // internal/dataset.Source and cmd/eval expect (see EvalStore.BuildFromFeedback
 // for the sibling feedback-derived version in eval.go). Source is "golden" so
 // a downstream metric or log can tell which half of the eval set a pair came
@@ -502,11 +502,12 @@ func (s *GoldenStore) SkipQuery(ctx context.Context, queryID uuid.UUID) (bool, e
 func (s *GoldenStore) ExportEvalPairs(ctx context.Context, judge string) ([]EvalPair, error) {
 	rows, err := s.pg.pool.Query(ctx, `
 		SELECT q.text,
-		       ARRAY_AGG(DISTINCT j.document_id::text) AS doc_ids,
+		       COALESCE(ARRAY_AGG(DISTINCT j.document_id::text) FILTER (WHERE j.judgment='relevant'), ARRAY[]::text[]) AS doc_ids,
+		       COALESCE(ARRAY_AGG(DISTINCT j.document_id::text) FILTER (WHERE j.judgment IN ('irrelevant','noise')), ARRAY[]::text[]) AS negative_ids,
 		       MIN(j.judged_at) AS judged_at
 		FROM golden_judgments j
 		JOIN golden_queries q ON q.id = j.query_id
-		WHERE j.judgment = 'relevant' AND j.judge = $1
+		WHERE j.judge = $1
 		GROUP BY q.text
 		ORDER BY MIN(j.judged_at) DESC
 	`, judge)
@@ -519,7 +520,7 @@ func (s *GoldenStore) ExportEvalPairs(ctx context.Context, judge string) ([]Eval
 	idx := int64(0)
 	for rows.Next() {
 		var p EvalPair
-		if err := rows.Scan(&p.Query, &p.RelevantDocIDs, &p.CreatedAt); err != nil {
+		if err := rows.Scan(&p.Query, &p.RelevantDocIDs, &p.IrrelevantDocIDs, &p.CreatedAt); err != nil {
 			return nil, fmt.Errorf("golden: scan eval pair: %w", err)
 		}
 		idx++

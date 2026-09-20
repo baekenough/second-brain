@@ -46,7 +46,7 @@ func Expand(ctx context.Context, client llm.Completer, query string) string {
 		"expanded_len", len(expanded),
 	)
 
-	// Combine the original query with the hypothetical document so that FTS
-	// matches both the user's own keywords and the LLM-generated vocabulary.
+	// Combine the query and hypothetical document for dense embedding only.
+	// Lexical retrieval and reranking retain the original user query.
 	return query + "\n\n" + expanded
 }
