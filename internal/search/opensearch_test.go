@@ -409,7 +409,7 @@ func TestServiceSearch_OpenSearchLaneFusesAdditiveResults(t *testing.T) {
 			makeSearchResult(osOnlyDoc, "opensearch-only hit", 5.0),
 		},
 	}
-	svc := NewService(store, disabledEmbedder{}).WithOpenSearch(os)
+	svc := NewService(&hydratingDocSearcher{mockDocSearcher: store, documents: map[uuid.UUID]*model.Document{osOnlyDoc: {ID: osOnlyDoc, Status: "active", SourceType: model.SourceGmail, Content: "authoritative content"}}}, disabledEmbedder{}).WithOpenSearch(os)
 
 	results, err := svc.Search(context.Background(), model.SearchQuery{Query: "test"})
 	if err != nil {

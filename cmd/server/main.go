@@ -195,6 +195,7 @@ func run() error {
 		)).
 		WithIngestFile(docStore, chunkStore, embedClient, cfg.IngestMaxFileBytes).
 		WithPIINumberHashing(cfg.PIINumberHashingEnabled).
+		WithPIINameRedaction(cfg.PIINameRedactionEnabled).
 		WithIngestMessages(docStore, chunkStore, embedClient, cfg.IngestMaxBatchMessages, cfg.CollectorCutover).
 		WithIngestRecording(docStore, cfg.IngestRecordingDir, cfg.IngestMaxFileBytes, cfg.CollectorCutover).
 		WithNotes(docStore, chunkStore, embedClient).
@@ -307,13 +308,8 @@ func buildSearchService(
 	weightsHistoryStore search.ActiveWeightsReader,
 	activeWeightsEnabled bool,
 ) *search.Service {
-	return search.NewService(docStore, embedClient).
-		WithChunkStore(chunkStore).
-		WithReranker(reranker).
-		WithEntityFetcher(entityStore).
-		WithOpenSearch(osLane).
-		WithActiveWeights(weightsHistoryStore, activeWeightsEnabled).
-		WithLLM(llmClient)
+	return search.AssembleService(docStore, embedClient, chunkStore, reranker,
+		entityStore, osLane, llmClient, weightsHistoryStore, activeWeightsEnabled)
 }
 
 // wireActionsAndBriefing conditionally registers the /api/v1/actions and

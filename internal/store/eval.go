@@ -11,13 +11,13 @@ import (
 // EvalPair is a single (query, relevant_document) evaluation pair
 // derived from positive feedback or explicit ratings.
 type EvalPair struct {
-	ID              int64          `json:"id"`
-	Query           string         `json:"query"`
-	RelevantDocIDs  []string       `json:"relevant_doc_ids"`
-	IrrelevantDocIDs []string      `json:"irrelevant_doc_ids,omitempty"` // thumbs=-1 docs for this query
-	Source          string         `json:"source"` // "feedback", "manual"
-	CreatedAt       time.Time      `json:"created_at"`
-	Metadata        map[string]any `json:"metadata,omitempty"`
+	ID               int64          `json:"id"`
+	Query            string         `json:"query"`
+	RelevantDocIDs   []string       `json:"relevant_doc_ids"`
+	IrrelevantDocIDs []string       `json:"irrelevant_doc_ids,omitempty"` // thumbs=-1 docs for this query
+	Source           string         `json:"source"`                       // "feedback", "manual"
+	CreatedAt        time.Time      `json:"created_at"`
+	Metadata         map[string]any `json:"metadata,omitempty"`
 }
 
 // EvalStore derives evaluation pairs from feedback data.
@@ -41,9 +41,8 @@ func NewEvalStore(pg *Postgres) *EvalStore {
 // thumbs = -1 are added as IrrelevantDocIDs. These are used to compute
 // FalsePositivePenalty in the eval pipeline.
 //
-// Manual source: rows with source = 'manual' are always included regardless
-// of thumbs value. This expands the eval pool beyond already-shown documents,
-// addressing self-confirming bias.
+// Manual rows obey the same positive/negative vote semantics. Conflicting
+// historical votes resolve to negative, never both labels.
 //
 // Results are ordered by the earliest positive feedback creation time (DESC)
 // and capped at 5 000 pairs to bound memory usage.
@@ -164,63 +163,21 @@ func (s *EvalStore) buildFromFeedback(ctx context.Context, split string) ([]Eval
 		return nil, fmt.Errorf("eval: iterate negative rows: %w", err)
 	}
 
-	// --- Step 3: Manual source pairs (expand eval pool beyond shown docs) ---
-	// The 'manual' source is reserved for hand-curated judgements (eval.go:17).
-	// These expand the eval pool beyond "documents already shown by the search"
-	// and break the self-confirming bias caused by relying solely on thumbs>=1.
-	manualRows, err := s.pg.Pool().Query(ctx, `
-		SELECT query,
-		       ARRAY_AGG(DISTINCT document_id) FILTER (WHERE document_id IS NOT NULL) AS doc_ids,
-		       MIN(created_at) AS created_at
-		FROM feedback
-		WHERE source = 'manual'
-		  AND query IS NOT NULL
-		  AND query != ''
-		  AND ($1 = '' OR split = $1)
-		GROUP BY query
-		HAVING COUNT(DISTINCT document_id) FILTER (WHERE document_id IS NOT NULL) > 0
-		ORDER BY created_at DESC
-		LIMIT 1000
-	`, split)
-	if err != nil {
-		return nil, fmt.Errorf("eval: build manual pairs: %w", err)
-	}
-	defer manualRows.Close()
-
-	for manualRows.Next() {
-		var query string
-		var docIDs []string
-		var createdAt time.Time
-		if err := manualRows.Scan(&query, &docIDs, &createdAt); err != nil {
-			return nil, fmt.Errorf("eval: scan manual row: %w", err)
+	// Manual votes already participate in the signed feedback queries above.
+	// Never reinterpret manual negative votes as positive relevance labels.
+	// If historical votes conflict, the explicit negative wins deterministically.
+	for i := range pairs {
+		negative := make(map[string]bool, len(pairs[i].IrrelevantDocIDs))
+		for _, id := range pairs[i].IrrelevantDocIDs {
+			negative[id] = true
 		}
-		if i, ok := queryIndex[query]; ok {
-			// Merge manual doc IDs into existing pair (deduplicate).
-			existing := make(map[string]struct{}, len(pairs[i].RelevantDocIDs))
-			for _, id := range pairs[i].RelevantDocIDs {
-				existing[id] = struct{}{}
+		positive := pairs[i].RelevantDocIDs[:0]
+		for _, id := range pairs[i].RelevantDocIDs {
+			if !negative[id] {
+				positive = append(positive, id)
 			}
-			for _, id := range docIDs {
-				if _, seen := existing[id]; !seen {
-					pairs[i].RelevantDocIDs = append(pairs[i].RelevantDocIDs, id)
-					existing[id] = struct{}{}
-				}
-			}
-		} else {
-			// New query from manual judgements.
-			idx++
-			pairs = append(pairs, EvalPair{
-				ID:             idx,
-				Query:          query,
-				RelevantDocIDs: docIDs,
-				Source:         "manual",
-				CreatedAt:      createdAt,
-			})
-			queryIndex[query] = len(pairs) - 1
 		}
-	}
-	if err := manualRows.Err(); err != nil {
-		return nil, fmt.Errorf("eval: iterate manual rows: %w", err)
+		pairs[i].RelevantDocIDs = positive
 	}
 
 	return pairs, nil

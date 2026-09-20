@@ -83,7 +83,7 @@ func TestApplyRerank_RerankerError(t *testing.T) {
 }
 
 // TestApplyRerank_OutOfBoundsIndex verifies that out-of-bounds indices returned
-// by the reranker are silently skipped and do not cause a panic.
+// by the reranker reject the response, enabling the original-order fallback.
 func TestApplyRerank_OutOfBoundsIndex(t *testing.T) {
 	t.Parallel()
 
@@ -94,23 +94,17 @@ func TestApplyRerank_OutOfBoundsIndex(t *testing.T) {
 			return []RerankResult{
 				{Index: 0, Score: 0.9},
 				{Index: len(docs) + 5, Score: 0.5}, // out of bounds
-				{Index: -1, Score: 0.3},             // negative, also out of bounds
+				{Index: -1, Score: 0.3},            // negative, also out of bounds
 			}, nil
 		},
 	})
 
 	results := makeResults("only doc")
-	got, err := svc.applyRerank(context.Background(), "query", results)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	_, err := svc.applyRerank(context.Background(), "query", results)
+	if err == nil {
+		t.Fatal("invalid provider indices must reject the response so Search preserves its original candidates")
 	}
-	// Only the valid index 0 should appear in the output.
-	if len(got) != 1 {
-		t.Fatalf("want 1 result (out-of-bounds skipped), got %d", len(got))
-	}
-	if got[0].Content != "only doc" {
-		t.Errorf("unexpected content: %q", got[0].Content)
-	}
+
 }
 
 // TestApplyRerank_NormalFlow verifies that results are reordered according to

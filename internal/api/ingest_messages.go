@@ -152,7 +152,7 @@ func (s *Server) ingestMessagesHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		doc := smsmap.MapSMS(rec.Address, rec.Body, rec.DateMs, rec.Type, rec.ContactName, s.piiNumberHashingEnabled)
+		doc := smsmap.MapSMS(rec.Address, rec.Body, rec.DateMs, rec.Type, rec.ContactName, s.piiNumberHashingEnabled, s.piiNameRedactionEnabled)
 
 		// Cutover floor: skip records that pre-date the cutover.
 		if !s.messagesCutover.IsZero() && doc.OccurredAt != nil && doc.OccurredAt.Before(s.messagesCutover) {
@@ -181,7 +181,7 @@ func (s *Server) ingestMessagesHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		doc := smsmap.MapCall(rec.Number, rec.DateMs, rec.DurationSec, rec.Type, rec.ContactName, s.piiNumberHashingEnabled)
+		doc := smsmap.MapCall(rec.Number, rec.DateMs, rec.DurationSec, rec.Type, rec.ContactName, s.piiNumberHashingEnabled, s.piiNameRedactionEnabled)
 
 		// Cutover floor: skip records that pre-date the cutover.
 		if !s.messagesCutover.IsZero() && doc.OccurredAt != nil && doc.OccurredAt.Before(s.messagesCutover) {
@@ -270,4 +270,3 @@ func (s *Server) upsertAndEmbedMessage(ctx context.Context, doc *model.Document)
 	}
 	return nil
 }
-

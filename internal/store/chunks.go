@@ -8,6 +8,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/baekenough/second-brain/internal/model"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	pgvector "github.com/pgvector/pgvector-go"
@@ -143,6 +144,12 @@ func (s *ChunkStore) ReplaceDocument(ctx context.Context, documentID uuid.UUID, 
 //   - ts_rank is computed only for matching rows (post-filter).
 //   - The JOIN on documents uses the primary key (idx scan).
 func (s *ChunkStore) SearchFTS(ctx context.Context, query string, limit int) ([]ChunkSearchResult, error) {
+	return s.SearchFTSFiltered(ctx, model.SearchQuery{Query: query}, limit)
+}
+
+// SearchFTSFiltered applies document eligibility before the chunk candidate LIMIT.
+func (s *ChunkStore) SearchFTSFiltered(ctx context.Context, filter model.SearchQuery, limit int) ([]ChunkSearchResult, error) {
+	query := filter.Query
 	if limit <= 0 {
 		limit = 20
 	}
@@ -155,7 +162,8 @@ func (s *ChunkStore) SearchFTS(ctx context.Context, query string, limit int) ([]
 	// so bigm-only matches rank above zero but well below true FTS hits.
 	// 0.01 (not 0.1) avoids over-weighting bigm-only matches relative to the
 	// ts_rank distribution, which typically ranges from 0.01 to ~0.5 (#146).
-	const q = `
+	args, filters := chunkEligibilitySQL([]interface{}{query, limit}, filter)
+	q := `
 		SELECT
 			c.id,
 			c.document_id,
@@ -177,11 +185,11 @@ func (s *ChunkStore) SearchFTS(ctx context.Context, query string, limit int) ([]
 		JOIN documents d ON d.id = c.document_id
 		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
 		   OR c.content LIKE '%%' || $1 || '%%')
-		  AND d.status = 'active'
+		  AND d.status = 'active' ` + filters + `
 		ORDER BY rank DESC
 		LIMIT $2`
 
-	rows, err := s.pg.pool.Query(ctx, q, query, limit)
+	rows, err := s.pg.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("chunks search FTS: %w", err)
 	}
@@ -416,6 +424,12 @@ func (s *ChunkStore) ListUnembeddedChunks(ctx context.Context, limit int) ([]Une
 // queryVec must have the same dimension as the stored vectors; mismatches result
 // in a pgvector error. The caller is responsible for truncating/padding if needed.
 func (s *ChunkStore) SearchVector(ctx context.Context, queryVec []float32, limit int) ([]ChunkSearchResult, error) {
+	return s.SearchVectorFiltered(ctx, model.SearchQuery{Embedding: queryVec}, limit)
+}
+
+// SearchVectorFiltered applies document eligibility before the ANN candidate LIMIT.
+func (s *ChunkStore) SearchVectorFiltered(ctx context.Context, filter model.SearchQuery, limit int) ([]ChunkSearchResult, error) {
+	queryVec := filter.Embedding
 	if limit <= 0 {
 		limit = 20
 	}
@@ -425,7 +439,8 @@ func (s *ChunkStore) SearchVector(ctx context.Context, queryVec []float32, limit
 
 	// cosine distance operator <=> returns 0 (identical) to 2 (opposite).
 	// Score = 1 - distance maps it to [−1, 1] with 1 being perfect match.
-	const q = `
+	args, filters := chunkEligibilitySQL([]interface{}{pgvector.NewVector(queryVec), limit}, filter)
+	q := `
 		SELECT
 			c.id,
 			c.document_id,
@@ -443,11 +458,11 @@ func (s *ChunkStore) SearchVector(ctx context.Context, queryVec []float32, limit
 		FROM chunks c
 		JOIN documents d ON d.id = c.document_id
 		WHERE c.embedding IS NOT NULL
-		  AND d.status = 'active'
+		  AND d.status = 'active' ` + filters + `
 		ORDER BY c.embedding <=> $1::vector
 		LIMIT $2`
 
-	rows, err := s.pg.pool.Query(ctx, q, pgvector.NewVector(queryVec), limit)
+	rows, err := s.pg.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("chunks search vector: %w", err)
 	}
@@ -481,4 +496,21 @@ func (s *ChunkStore) SearchVector(ctx context.Context, queryVec []float32, limit
 		return nil, fmt.Errorf("chunks search vector iter: %w", err)
 	}
 	return results, nil
+}
+
+// chunkEligibilitySQL shares the document lane's bound filter semantics.
+func chunkEligibilitySQL(args []interface{}, q model.SearchQuery) ([]interface{}, string) {
+	filters := ""
+	if sources := q.IncludeSourceTypes(); len(sources) > 0 {
+		args = append(args, sources)
+		filters += fmt.Sprintf(" AND d.source_type = ANY($%d)", len(args))
+	}
+	if len(q.ExcludeSourceTypes) > 0 {
+		args = append(args, q.ExcludeSourceTypes)
+		filters += fmt.Sprintf(" AND d.source_type <> ALL($%d)", len(args))
+	}
+	var occurred, retention string
+	args, _, occurred = appendOccurredRangeFilters(args, q.OccurredFrom, q.OccurredTo)
+	args, _, retention = appendRetentionFilter(args, q.ExcludeRetention)
+	return args, filters + " " + occurred + " " + retention
 }

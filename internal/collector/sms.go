@@ -45,6 +45,7 @@ type SMSCollector struct {
 	// WithNumberHashingEnabled. Does NOT affect SourceID hashing, which stays
 	// unconditional (see smsmap.MapSMS / smsmap.MapCall doc comments).
 	numberHashingEnabled bool
+	nameRedactionEnabled bool
 }
 
 // NewSMSCollector returns an SMSCollector that reads XML exports from sourceDir.
@@ -252,7 +253,7 @@ func (c *SMSCollector) streamSMSFile(ctx context.Context, path string, since tim
 			continue
 		}
 
-		doc := smsmap.MapSMS(rec.Address, rec.Body, rec.Date, rec.Type, rec.ContactName, c.numberHashingEnabled)
+		doc := smsmap.MapSMS(rec.Address, rec.Body, rec.Date, rec.Type, rec.ContactName, c.numberHashingEnabled, c.nameRedactionEnabled)
 		batch = append(batch, doc)
 
 		if len(batch) >= smsStreamBatchSize {
@@ -334,7 +335,7 @@ func (c *SMSCollector) streamCallsFile(ctx context.Context, path string, since t
 			continue
 		}
 
-		doc := smsmap.MapCall(rec.Number, rec.Date, int(rec.Duration), rec.Type, rec.ContactName, c.numberHashingEnabled)
+		doc := smsmap.MapCall(rec.Number, rec.Date, int(rec.Duration), rec.Type, rec.ContactName, c.numberHashingEnabled, c.nameRedactionEnabled)
 		batch = append(batch, doc)
 
 		if len(batch) >= smsStreamBatchSize {
@@ -359,8 +360,8 @@ func (c *SMSCollector) streamCallsFile(ctx context.Context, path string, since t
 // smsRecord mirrors the <sms> element from SMS Backup & Restore XML exports.
 type smsRecord struct {
 	Address      string `xml:"address,attr"`
-	Date         int64  `xml:"date,attr"`         // Unix milliseconds
-	Type         int    `xml:"type,attr"`          // 1=received,2=sent,3=draft,4=outbox,5=failed,6=queued
+	Date         int64  `xml:"date,attr"` // Unix milliseconds
+	Type         int    `xml:"type,attr"` // 1=received,2=sent,3=draft,4=outbox,5=failed,6=queued
 	Body         string `xml:"body,attr"`
 	ReadableDate string `xml:"readable_date,attr"` // human-readable; informational only
 	ContactName  string `xml:"contact_name,attr"`
@@ -369,9 +370,9 @@ type smsRecord struct {
 // callRecord mirrors the <call> element from SMS Backup & Restore XML exports.
 type callRecord struct {
 	Number       string `xml:"number,attr"`
-	Duration     int64  `xml:"duration,attr"`      // seconds
-	Date         int64  `xml:"date,attr"`          // Unix milliseconds
-	Type         int    `xml:"type,attr"`          // 1=incoming,2=outgoing,3=missed,4=voicemail,5=rejected,6=blocked
+	Duration     int64  `xml:"duration,attr"` // seconds
+	Date         int64  `xml:"date,attr"`     // Unix milliseconds
+	Type         int    `xml:"type,attr"`     // 1=incoming,2=outgoing,3=missed,4=voicemail,5=rejected,6=blocked
 	ContactName  string `xml:"contact_name,attr"`
 	ReadableDate string `xml:"readable_date,attr"` // human-readable; informational only
 }
@@ -441,7 +442,7 @@ func isTransientFUSEError(err error) bool {
 //  2. Watermark / index-aware gate (OR of a or b):
 //     a. OccurredAt is after since (normal incremental case).
 //     b. sourceID is NOT in the indexed set AND the set is non-nil (index-aware
-//        case: rescues late-arriving and post-truncation records).
+//     case: rescues late-arriving and post-truncation records).
 //
 // When indexedIDs is nil (legacy/test mode), only criterion 2a applies.
 func (c *SMSCollector) shouldEmitSMS(occurredAt time.Time, sourceID string, since time.Time) bool {
@@ -543,7 +544,7 @@ func (c *SMSCollector) parseSMSFile(ctx context.Context, path string, since time
 			continue
 		}
 
-		doc := smsmap.MapSMS(rec.Address, rec.Body, rec.Date, rec.Type, rec.ContactName, c.numberHashingEnabled)
+		doc := smsmap.MapSMS(rec.Address, rec.Body, rec.Date, rec.Type, rec.ContactName, c.numberHashingEnabled, c.nameRedactionEnabled)
 		docs = append(docs, doc)
 	}
 	return docs, nil
@@ -622,7 +623,7 @@ func (c *SMSCollector) parseCallsFile(ctx context.Context, path string, since ti
 			continue
 		}
 
-		doc := smsmap.MapCall(rec.Number, rec.Date, int(rec.Duration), rec.Type, rec.ContactName, c.numberHashingEnabled)
+		doc := smsmap.MapCall(rec.Number, rec.Date, int(rec.Duration), rec.Type, rec.ContactName, c.numberHashingEnabled, c.nameRedactionEnabled)
 		docs = append(docs, doc)
 	}
 	return docs, nil
@@ -721,3 +722,8 @@ func smsDirectionStr(t int) string {
 	}
 }
 
+// WithNameRedactionEnabled protects known contact fields before indexing.
+func (c *SMSCollector) WithNameRedactionEnabled(enabled bool) *SMSCollector {
+	c.nameRedactionEnabled = enabled
+	return c
+}

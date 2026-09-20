@@ -13,7 +13,6 @@ import (
 	"context"
 	"encoding/json"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -106,34 +105,7 @@ func (c *LLMClassifier) Classify(ctx context.Context, question string) (Params, 
 		return Params{RawQuery: question, Kind: KindExactToken, Confidence: 1.0}, nil
 	}
 
-	if m := yearMonthRe.FindStringSubmatch(question); m != nil {
-		year, errY := strconv.Atoi(m[1])
-		month, errM := strconv.Atoi(m[2])
-		if errY == nil && errM == nil && month >= 1 && month <= 12 {
-			from, to := monthRange(year, month)
-			return Params{RawQuery: question, Kind: KindTemporal, OccurredFrom: &from, OccurredTo: &to, Confidence: 1.0}, nil
-		}
-	}
-
-	if lastMonthRe.MatchString(question) {
-		lm := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).AddDate(0, -1, 0)
-		from, to := monthRange(lm.Year(), int(lm.Month()))
-		return Params{RawQuery: question, Kind: KindTemporal, OccurredFrom: &from, OccurredTo: &to, Confidence: 1.0}, nil
-	}
-
-	if thisWeekRe.MatchString(question) {
-		from, to := weekRange(now)
-		return Params{RawQuery: question, Kind: KindTemporal, OccurredFrom: &from, OccurredTo: &to, Confidence: 1.0}, nil
-	}
-
-	if todayRe.MatchString(question) {
-		from, to := dayRange(now)
-		return Params{RawQuery: question, Kind: KindTemporal, OccurredFrom: &from, OccurredTo: &to, Confidence: 1.0}, nil
-	}
-
-	if yesterdayRe.MatchString(question) {
-		y := now.AddDate(0, 0, -1)
-		from, to := dayRange(y)
+	if from, to, _, ok := DeterministicWindow(question, now); ok {
 		return Params{RawQuery: question, Kind: KindTemporal, OccurredFrom: &from, OccurredTo: &to, Confidence: 1.0}, nil
 	}
 

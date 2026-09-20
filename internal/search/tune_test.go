@@ -319,3 +319,14 @@ func TestAggregateFPPenalty_Empty(t *testing.T) {
 		t.Fatalf("empty: want 0, got %f", got)
 	}
 }
+
+func TestNDCGK_MissingResultsDoNotShrinkIdealRanking(t *testing.T) {
+	relevant := map[string]bool{"a": true, "b": true, "c": true}
+	want := 1 / (1 + 1/math.Log2(3) + 1/math.Log2(4))
+	if got := search.NDCGK([]string{"a"}, relevant, 5); !almostEqual(got, want) {
+		t.Fatalf("truncated retrieval scored %v, want %v", got, want)
+	}
+	if got := search.NDCGK(nil, relevant, 5); got != 0 {
+		t.Fatalf("empty retrieval scored %v", got)
+	}
+}

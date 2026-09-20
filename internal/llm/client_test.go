@@ -501,3 +501,32 @@ func TestClient_StreamWithMessages_NotEnabled(t *testing.T) {
 		t.Fatal("onDelta must not be called when the client is not enabled")
 	}
 }
+
+func TestClient_StreamRejectsIncompleteMalformedEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		wantError  bool
+	}{
+		{"clean EOF partial", sseChunk("partial"), true},
+		{"malformed after content", sseChunk("partial") + "data: {broken}\n\ndata: [DONE]\n\n", true},
+		{"provider error", sseChunk("partial") + "data: {\"error\":{\"message\":\"private\"}}\n\ndata: [DONE]\n\n", true},
+		{"invalid shape", sseChunk("partial") + "data: {}\n\ndata: [DONE]\n\n", true},
+		{"empty done", "data: [DONE]\n\n", true},
+		{"whitespace", sseChunk(" \n ") + "data: [DONE]\n\n", true},
+		{"complete marker", sseChunk("complete") + "data:[DONE]\n\n", false},
+		{"complete reason", sseChunk("complete") + "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n", false},
+		{"filtered partial", sseChunk("partial") + "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			err := newClient(t, srv.URL, "key").StreamWithMessages(context.Background(), "system", nil, func(string) {})
+			if (err != nil) != tc.wantError {
+				t.Fatalf("error=%v wantError=%v", err, tc.wantError)
+			}
+		})
+	}
+}

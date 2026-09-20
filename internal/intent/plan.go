@@ -128,6 +128,62 @@ var (
 	calendarKwR = regexp.MustCompile(`일정|스케줄|캘린더|약속`)
 )
 
+// Only unambiguous single-period questions belong in the regex cache.
+// Comparisons, qualified weekdays, and messages ABOUT events require semantic
+// planning: a message's sent time is not the date of the event it discusses.
+var exactDayRe = regexp.MustCompile(`(\d{4})(?:년\s*|-)(\d{1,2})(?:월\s*|-)(\d{1,2})(?:일)?`)
+var complexTimeRe = regexp.MustCompile(`비교|대비|차이|부터|까지|[월화수목금토일]요일|\d{1,2}[/-]\d{1,2}|\d{1,2}일|이번\s*달|다음\s*달|지난\s*주`)
+var recordOccurredRe = regexp.MustCompile(`받|보낸|보냈|수신|발신|통화했|전화했`)
+var recordSourceRe = regexp.MustCompile(`메일|이메일|문자|메시지|메세지|통화|전화|슬랙|노션|문서|노트|기록|대화`)
+
+func requiresSemanticWindow(question string) bool {
+	if complexTimeRe.MatchString(question) {
+		return true
+	}
+	// Count distinct period mentions, while ignoring overlapping alternatives
+	// (이번 주/이번 주말, 내일/내일모레).
+	rest := strings.ReplaceAll(question, "내일모레", "모레")
+	count := 0
+	for _, re := range []*regexp.Regexp{yearMonthRe, lastMonthRe, weekendRe, nextWeekRe, thisWeekRe, dayAfterRe, tomorrowRe, todayRe, yesterdayRe} {
+		matches := re.FindAllStringIndex(rest, -1)
+		count += len(matches)
+		rest = re.ReplaceAllString(rest, " ")
+	}
+	return count > 1
+}
+
+func hasPeriodMention(s string) bool {
+	for _, re := range []*regexp.Regexp{yearMonthRe, lastMonthRe, weekendRe, nextWeekRe, thisWeekRe, dayAfterRe, tomorrowRe, todayRe, yesterdayRe} {
+		if re.MatchString(s) {
+			return true
+		}
+	}
+	return false
+}
+
+func explicitRecordSources(question string) []model.SourceType {
+	var out []model.SourceType
+	for _, entry := range []struct {
+		words  []string
+		source model.SourceType
+	}{
+		{[]string{"메일", "이메일"}, model.SourceGmail},
+		{[]string{"문자", "SMS"}, model.SourceSMS},
+		{[]string{"통화", "전화"}, model.SourceCall},
+		{[]string{"슬랙"}, model.SourceSlack},
+		{[]string{"노션"}, model.SourceNotion},
+		{[]string{"노트"}, model.SourceNote},
+	} {
+		for _, word := range entry.words {
+			if strings.Contains(question, word) {
+				out = append(out, entry.source)
+				break
+			}
+		}
+	}
+	return out
+}
+
 // planSourceTypes is the enumeration the LLM is allowed to choose from and the
 // validator for what it returns. One list serves both so the prompt and the
 // check cannot drift apart.
@@ -212,6 +268,40 @@ func (p *LLMPlanner) nowFunc() time.Time {
 // "오늘", ...), useful for a Reason-style rendering; callers that don't need
 // it can discard it.
 func DeterministicWindow(question string, now time.Time) (from, to time.Time, label string, ok bool) {
+	// Exact days must win over their year/month prefix. Reject invalid dates
+	// rather than allowing time.Date to normalize them into another month.
+	if matches := exactDayRe.FindAllStringSubmatch(question, -1); len(matches) > 0 {
+		if len(matches) != 1 {
+			return time.Time{}, time.Time{}, "", false
+		}
+		m := matches[0]
+		rest := exactDayRe.ReplaceAllString(question, "")
+		if requiresSemanticWindow(rest) || hasPeriodMention(rest) {
+			return time.Time{}, time.Time{}, "", false
+		}
+		year, _ := strconv.Atoi(m[1])
+		month, _ := strconv.Atoi(m[2])
+		day, _ := strconv.Atoi(m[3])
+		date := time.Date(year, time.Month(month), day, 0, 0, 0, 0, timeutil.KST())
+		if date.Year() != year || int(date.Month()) != month || date.Day() != day {
+			return time.Time{}, time.Time{}, "", false
+		}
+		from, to = dayRange(date)
+		return from, to, date.Format("2006-01-02"), true
+	}
+	// These two adjacent days have an exact, contiguous union.
+	if strings.Contains(question, "어제") && strings.Contains(question, "오늘") && strings.Contains(question, "비교") {
+		rest := strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(question, "어제", ""), "오늘", ""), "비교", "")
+		if !requiresSemanticWindow(rest) && !hasPeriodMention(rest) {
+			from, _ = dayRange(now.AddDate(0, 0, -1))
+			_, to = dayRange(now)
+			return from, to, "어제와 오늘", true
+		}
+	}
+
+	if requiresSemanticWindow(question) {
+		return time.Time{}, time.Time{}, "", false
+	}
 	switch {
 	case yearMonthRe.MatchString(question):
 		m := yearMonthRe.FindStringSubmatch(question)
@@ -265,6 +355,18 @@ func (p *LLMPlanner) deterministicPlan(question string, now time.Time) (QueryPla
 		return QueryPlan{}, false
 	}
 
+	// Record dates are safe only when the single identified window is not in
+	// the future. Complex event-vs-sent-time questions have already missed the
+	// deterministic window and go to the semantic planner.
+	if recordSourceRe.MatchString(question) {
+		if calendarKwR.MatchString(question) && !recordOccurredRe.MatchString(question) {
+			return QueryPlan{}, false
+		}
+		tomorrow, _ := dayRange(now.AddDate(0, 0, 1))
+		if !from.Before(tomorrow) || len(explicitRecordSources(question)) == 0 {
+			return QueryPlan{}, false
+		}
+	}
 	sources := p.deterministicSources(question, from, now)
 	return QueryPlan{
 		OccurredFrom: &from,
@@ -276,20 +378,14 @@ func (p *LLMPlanner) deterministicPlan(question string, now time.Time) (QueryPla
 	}, true
 }
 
-// deterministicSources decides the include set for a date-matched question.
-//
-// It narrows in only two situations, both of which are safe to state without a
-// model, because narrowing is destructive: an over-narrow include set turns a
-// good answer into zero results, and the pre-planner behaviour (no filter) is
-// always a valid, merely-wider plan. Everything more nuanced is left to the
-// LLM path.
-//
-//  1. The question names a calendar concept outright (일정/스케줄/캘린더/약속).
-//  2. The window lies entirely in the future. Nothing that has not happened yet
-//     can be observed in a message, a call, or a mail thread; the only source
-//     that records future events is the calendar. This is what makes
-//     "이번 주말에 뭐 하지" — which names no source at all — a calendar question.
+// deterministicSources gives an explicit record source priority over topic
+// words such as 일정 or 약속. Complex record/event-time questions never reach
+// this fast path. Otherwise direct calendar topics and future periods select
+// calendar; unknown source intent stays unconstrained.
 func (p *LLMPlanner) deterministicSources(question string, from, now time.Time) []model.SourceType {
+	if sources := explicitRecordSources(question); len(sources) > 0 {
+		return sources
+	}
 	if calendarKwR.MatchString(question) {
 		return []model.SourceType{model.SourceCalendar}
 	}
@@ -316,8 +412,9 @@ Rules:
 1. occurred_from/occurred_to describe a HALF-OPEN date window [from, to) in KST: occurred_to is the day AFTER the last day you want. One single day D is {"occurred_from":"D","occurred_to":"D+1"}.
 2. If the question contains NO explicit time expression, set BOTH to "". Vague words such as "최근", "요즘", "예전에" are NOT explicit: do not invent a window for them. An invented window hides documents the user asked for.
 3. source_types may only contain values from this list: %s. Use it only when the question clearly names a kind of record. Leave it [] when unsure — an empty list means "search everything", and a wrong narrow list returns nothing at all.
-4. Questions about the future (tomorrow, this weekend, next week) can only be answered by "calendar" documents; nothing that has not happened yet appears in messages, calls or mail.
-5. reason: one short Korean sentence stating what will be searched, e.g. "내일(8/20) 캘린더만 조회".`
+4. Distinguish the time a record occurred from an event discussed inside it. Calendar-only is appropriate for a direct future schedule question. Past messages, calls, and mail CAN discuss future events: for "내일 일정에 대해 어제 받은 메일", choose gmail and yesterday's sent-time window; for "내일 일정에 관한 메일", choose gmail and leave BOTH bounds empty because the sent date is unknown. Do not narrow to calendar merely because 일정/약속 appears.
+5. Respect the most specific date (a named day within a week/month). For comparisons or multiple periods, use a window covering ALL requested periods, never only the first mention. If no single safe occurred-time window exists, leave BOTH bounds empty.
+6. reason: one short Korean sentence stating what will be searched, e.g. "내일(8/20) 캘린더만 조회".`
 
 // planResponse is the LLM path's wire schema. Field names are the contract
 // stated in planSystemPrompt.

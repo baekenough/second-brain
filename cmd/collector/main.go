@@ -171,6 +171,14 @@ func run() error {
 		Thinking:    cfg.LLMThinking,
 	}, nil)
 
+	var nameRedactor *collector.NameRedactor
+	if cfg.PIINameRedactionEnabled {
+		nameRedactor, err = collector.NewNameRedactor(llmClient)
+		if err != nil {
+			return err
+		}
+	}
+
 	// --- Summarizer worker ---
 	// Backfills LLM-generated title_summary / bullet_summary / summary_embedding
 	// for documents that have not yet been summarized.  The worker uses
@@ -505,8 +513,8 @@ func run() error {
 		collector.NewGmailCollector(cfg),
 		collector.NewCalendarCollector(cfg).WithCancellationStore(docStore),
 		collector.NewSMSCollector(cfg.SMSSourceDir, cfg.SMSMaxFileBytes).
-			WithNumberHashingEnabled(cfg.PIINumberHashingEnabled),
-		collector.NewWhisperCollector(cfg),
+			WithNumberHashingEnabled(cfg.PIINumberHashingEnabled).WithNameRedactionEnabled(cfg.PIINameRedactionEnabled),
+		collector.NewWhisperCollector(cfg).WithNameRedactor(nameRedactor),
 	}
 	if cfg.FilesystemEnabled && cfg.FilesystemPath != "" {
 		// Attempt to initialise the Drive exporter via ADC. If ADC is not

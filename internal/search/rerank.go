@@ -28,21 +28,18 @@ type HTTPReranker struct {
 	apiURL string
 	apiKey string
 	model  string
-	topN   int
 	client *http.Client
 }
 
 // NewHTTPReranker creates a reranker backed by the given endpoint.
-// Pass empty apiURL to get a disabled (no-op) reranker.
-func NewHTTPReranker(apiURL, apiKey, model string, topN int) *HTTPReranker {
-	if topN <= 0 {
-		topN = 10
-	}
+// Pass empty apiURL to get a disabled (no-op) reranker. The last argument is
+// retained for constructor compatibility; top_n now follows the bounded input
+// candidate pool so a legacy fixed value cannot silently shrink result pages.
+func NewHTTPReranker(apiURL, apiKey, model string, _ int) *HTTPReranker {
 	return &HTTPReranker{
 		apiURL: apiURL,
 		apiKey: apiKey,
 		model:  model,
-		topN:   topN,
 		client: &http.Client{Timeout: 30 * time.Second},
 	}
 }
@@ -77,7 +74,7 @@ func (r *HTTPReranker) Rerank(ctx context.Context, query string, docs []string) 
 		Model:     r.model,
 		Query:     query,
 		Documents: docs,
-		TopN:      r.topN,
+		TopN:      len(docs),
 	}
 
 	body, err := json.Marshal(payload)
@@ -106,7 +103,7 @@ func (r *HTTPReranker) Rerank(ctx context.Context, query string, docs []string) 
 		return nil, fmt.Errorf("rerank read response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("rerank API status %d: %s", resp.StatusCode, b)
+		return nil, fmt.Errorf("rerank API status %d", resp.StatusCode)
 	}
 
 	var apiResp struct {

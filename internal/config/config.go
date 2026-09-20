@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -442,7 +443,10 @@ type Config struct {
 	// resident-registration numbers, phone numbers, bank-account-shaped digit
 	// runs — see smsmap.RedactPII) from whisper call-transcript Content and
 	// Title (internal/collector/whisper.go buildDocument). Default false.
-	PIIRedactionEnabled bool // PII_REDACTION_ENABLED — default false
+	// PIINameRedactionEnabled protects known contacts at ingestion and enables
+	// bounded remote API NER before transcript indexing. Forward-only, default false.
+	PIINameRedactionEnabled bool
+	PIIRedactionEnabled     bool // PII_REDACTION_ENABLED — default false
 
 	// PII_NUMBER_HASHING_ENABLED: set "true" to hash the counterpart phone
 	// number (via smsmap.ShortHash) before it is written to:
@@ -744,6 +748,9 @@ func Load() (*Config, error) {
 		}
 	}
 
+	if os.Getenv("PII_NAME_REDACTION_ENABLED") == "true" && (llmAPIURL == "" || (llmAPIKey == "" && llmAuthFile == "")) {
+		return nil, fmt.Errorf("PII_NAME_REDACTION_ENABLED requires a configured approved LLM API")
+	}
 	return &Config{
 		Port:        getenv("PORT", "8080"),
 		DatabaseURL: getenv("DATABASE_URL", "postgres://brain:brain@localhost:5432/second_brain?sslmode=disable"),
@@ -865,6 +872,7 @@ func Load() (*Config, error) {
 
 		// #163/#164/#165/#167 policy reversal: both default false. See the
 		// PIIRedactionEnabled / PIINumberHashingEnabled doc comments above.
+		PIINameRedactionEnabled: os.Getenv("PII_NAME_REDACTION_ENABLED") == "true",
 		PIIRedactionEnabled:     os.Getenv("PII_REDACTION_ENABLED") == "true",
 		PIINumberHashingEnabled: os.Getenv("PII_NUMBER_HASHING_ENABLED") == "true",
 

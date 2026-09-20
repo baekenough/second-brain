@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 	"unicode/utf8"
 
@@ -33,6 +34,13 @@ type ChunkSearcher interface {
 	SearchVector(ctx context.Context, queryVec []float32, limit int) ([]store.ChunkSearchResult, error)
 }
 
+// FilteredChunkSearcher applies source, occurred-time and retention predicates
+// before its SQL LIMIT. Legacy adapters retain conservative post-filtering.
+type FilteredChunkSearcher interface {
+	SearchFTSFiltered(context.Context, model.SearchQuery, int) ([]store.ChunkSearchResult, error)
+	SearchVectorFiltered(context.Context, model.SearchQuery, int) ([]store.ChunkSearchResult, error)
+}
+
 // OpenSearchSearcher is the subset of the OpenSearch client used for the
 // BM25 (nori-analyzed) full-text lane. It is satisfied by
 // *OpenSearchClient (see opensearch.go).
@@ -47,23 +55,9 @@ type OpenSearchSearcher interface {
 	Search(ctx context.Context, q model.SearchQuery, limit int) ([]*model.SearchResult, error)
 }
 
-// OccurredRangeChecker verifies that a set of candidate document IDs falls
-// inside an event-time window. It is satisfied by *store.DocumentStore.
-//
-// It exists for the chunk lanes. Those lanes cannot carry the window into their
-// own SQL (ChunkSearcher takes only a query/vector and a limit), so the service
-// used to switch them off entirely whenever a window was set. That was safe but
-// expensive: it deleted chunk-level recall from every temporal query, and a
-// query planner sets a window on most temporal questions. Joining the
-// candidates back to `documents` on id restores the recall while keeping the
-// window a real constraint.
-//
-// Selecting occurred_at in the chunk join (#215) does NOT make this redundant.
-// The window must be a WHERE predicate: the chunk lanes truncate at their own
-// LIMIT before the service sees a single row, so filtering afterwards on a
-// timestamp the row now carries would shrink the page instead of narrowing the
-// candidate pool. The join gives those rows an ORDER; this interface is what
-// gives them a MEMBERSHIP test.
+// OccurredRangeChecker verifies event-time membership for legacy chunk adapters
+// which cannot accept SQL filters. Production ChunkStore instead implements
+// FilteredChunkSearcher and narrows candidates before LIMIT.
 type OccurredRangeChecker interface {
 	FilterIDsByOccurredRange(ctx context.Context, ids []uuid.UUID, from, to *time.Time) (map[uuid.UUID]struct{}, error)
 }
@@ -566,16 +560,16 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 		q.Weights = s.defaultWeights(ctx)
 	}
 
-	// HyDE query expansion: replace the effective query with the original
-	// query plus a LLM-generated hypothetical answer. The Expand function
-	// is a no-op when the client is nil/disabled or on LLM error.
-	if q.UseHyDE {
-		q.Query = Expand(ctx, s.llmClient, q.Query)
+	// Hypothetical text belongs only in the dense embedding input. Keep the
+	// user's original words for lexical retrieval and cross-encoder reranking.
+	embeddingQuery := q.Query
+	if q.UseHyDE && s.embed.Enabled() {
+		embeddingQuery = Expand(ctx, s.llmClient, q.Query)
 	}
 
 	var queryVec []float32
 	if s.embed.Enabled() {
-		vec, err := s.embed.Embed(ctx, q.Query)
+		vec, err := s.embed.Embed(ctx, embeddingQuery)
 		if err != nil {
 			// Degrade gracefully — log and fall back to full-text only.
 			slog.Warn("search: embedding failed, falling back to full-text",
@@ -609,7 +603,8 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	// this function's own trailing truncate cuts down to q.Limit.
 	fusionPossible := s.chunkStore != nil || (s.opensearch != nil && s.opensearch.Enabled())
 	laneLimit := q.Limit
-	if fusionPossible {
+	rerankEnabled := q.UseRerank && !q.SortsByRecency() && s.reranker != nil && s.reranker.Enabled()
+	if fusionPossible || rerankEnabled {
 		laneLimit = overfetchLimit(q.Limit)
 	}
 
@@ -627,27 +622,11 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	// lane has been fused — see applyLowRetentionPenalty below.
 	results = applyRetentionExclusion(q, results)
 
-	// An event-time window is a hard constraint on WHICH documents may be
-	// returned. The document store enforces it in SQL inside every lane; the
-	// chunk lanes cannot, because ChunkSearcher takes no date range — the rows
-	// it returns now carry occurred_at (#215), but only after their own LIMIT
-	// has already been applied, so reading it cannot substitute for the
-	// predicate.
-	//
-	// Previously the chunk lanes were skipped outright whenever a window was
-	// set. That was correct — an unfiltered lane fills exactly the slots the
-	// narrowed store result left empty, and the FTS fallback would turn
-	// "nothing happened today" into matches from other days — but it also meant
-	// a windowed query lost chunk-level recall entirely. That cost scales with
-	// how often a window is set, and a query planner sets one on most temporal
-	// questions.
-	//
-	// So the lanes now run under a window WHEN their candidates can be verified
-	// against that same window (verifyWindow joins them back to `documents` on
-	// id). With no verifier available the original skip stands: this must fail
-	// closed, never open.
+	// Production chunk SQL applies window/source/retention predicates before
+	// LIMIT. Legacy adapters still need a fail-closed membership verifier.
 	windowed := q.OccurredFrom != nil || q.OccurredTo != nil
-	chunkLanesEnabled := !windowed || s.occurredRangeChecker() != nil
+	_, filteredChunks := s.chunkStore.(FilteredChunkSearcher)
+	chunkLanesEnabled := filteredChunks || !windowed || s.occurredRangeChecker() != nil
 
 	// Set when a chunk lane changed the result set, i.e. when the ORDER the
 	// store applied in SQL no longer describes `results`. See the recency
@@ -662,10 +641,10 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	// RRF. This is an ADDITIVE signal — the full-document path above always
 	// runs first, and chunk results are merged in rather than replacing it.
 	if s.chunkStore != nil && len(queryVec) > 0 && chunkLanesEnabled {
-		chunkVecResults, cerr := s.searchChunksVector(ctx, queryVec, laneLimit)
+		chunkVecResults, cerr := s.searchChunksVector(ctx, queryVec, laneLimit, q)
 		if cerr != nil {
 			slog.Warn("search: chunk vector search failed, skipping",
-				"error", cerr, "query", q.Query)
+				"error", cerr)
 		} else {
 			chunkVecResults = applySourceTypeFilters(q, chunkVecResults)
 			if windowed {
@@ -689,12 +668,8 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	// WithOpenSearch), in which case this block is a no-op and the rest of
 	// Search() is byte-for-byte the pre-existing code path.
 	//
-	// The window/source-type filters do not need chunkLanesEnabled's gate
-	// here: OpenSearchSearcher.Search takes the whole query and applies both
-	// filters server-side (see buildOpenSearchRequest in opensearch.go), so
-	// what comes back already satisfies them. applySourceTypeFilters is still
-	// run below as cheap defense in depth, not because the server-side filter
-	// is expected to fail.
+	// Index-side filters improve retrieval, but every hit must be hydrated from
+	// PostgreSQL before fusion: stale indexes cannot authorize content or status.
 	if s.opensearch != nil && s.opensearch.Enabled() {
 		osResults, oerr := s.opensearch.Search(ctx, q, laneLimit)
 		if oerr != nil {
@@ -702,8 +677,9 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 			// fail the whole search request. Log and drop this lane's
 			// contribution, exactly like the chunk vector lane above.
 			slog.Warn("search: opensearch lane failed, skipping",
-				"error", oerr, "query", q.Query)
+				"error", oerr)
 		} else {
+			osResults = s.hydrateExternalCandidates(ctx, q, osResults)
 			osResults = applySourceTypeFilters(q, osResults)
 			osResults = applyRetentionExclusion(q, osResults)
 			if len(osResults) > 0 {
@@ -719,19 +695,15 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	// verified like the vector lane's; unverifiable hits are dropped, so an
 	// empty answer stays empty rather than silently widening the window.
 	if len(results) == 0 && s.chunkStore != nil && chunkLanesEnabled {
-		chunkResults, cerr := s.searchChunksFTS(ctx, q.Query, laneLimit)
+		chunkResults, cerr := s.searchChunksFTS(ctx, q.Query, laneLimit, q)
 		if cerr != nil {
 			// Non-fatal: log and return the empty primary result set.
 			slog.Warn("search: chunk FTS fallback failed",
 				"error", cerr,
-				"query", q.Query,
 			)
 			return results, nil
 		}
 		results = applySourceTypeFilters(q, chunkResults)
-		if windowed {
-			results = s.verifyWindow(ctx, q, results)
-		}
 		results = applyRetentionExclusion(q, results)
 		chunkFused = true
 	}
@@ -782,28 +754,20 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 		sortByRecency(results, q.RecencyAscending(time.Now()))
 	}
 
-	// Final truncation to the caller's requested page size. `results` may
-	// carry up to laneLimit entries at this point — every lane above may have
-	// overfetched (see the comment on laneLimit, above s.store.Search) so that
-	// mergeRRF and applyLowRetentionPenalty had room to keep a keep-tagged
-	// document in play instead of losing it to a premature LIMIT. Both
-	// ordering branches above (score, via applyLowRetentionPenalty's own
-	// sortByScore; recency, via sortByRecency just above) have already put
-	// `results` in its final order by the time this runs, so truncating here
-	// is a plain cut, not a re-decision of what belongs in the page.
-	if len(results) > q.Limit {
-		results = results[:q.Limit]
-	}
-
 	// Cross-encoder reranking: opt-in per-request via UseRerank.
 	// Failure is non-fatal — original order is preserved on error.
-	if q.UseRerank && s.reranker != nil && s.reranker.Enabled() && len(results) > 1 {
+	if rerankEnabled && len(results) > 1 {
 		reranked, rerr := s.applyRerank(ctx, q.Query, results)
 		if rerr != nil {
 			slog.Warn("search: rerank failed, using original order", "error", rerr)
 		} else {
 			results = reranked
 		}
+	}
+
+	// Apply the page limit only after reranking the candidate pool.
+	if len(results) > q.Limit {
+		results = results[:q.Limit]
 	}
 
 	// Entity surfacing (issue #77): populate Entities on each result.
@@ -832,6 +796,9 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 // text for each result and returns results reordered by descending score.
 // Documents are truncated to 1000 runes to stay within typical API limits.
 func (s *Service) applyRerank(ctx context.Context, query string, results []*model.SearchResult) ([]*model.SearchResult, error) {
+	if len(results) == 0 {
+		return nil, nil
+	}
 	const maxDocRunes = 1000
 
 	docs := make([]string, len(results))
@@ -849,14 +816,28 @@ func (s *Service) applyRerank(ctx context.Context, query string, results []*mode
 		return nil, err
 	}
 
-	out := make([]*model.SearchResult, 0, len(ranked))
+	if len(ranked) == 0 {
+		return nil, fmt.Errorf("rerank returned no results")
+	}
+	out := make([]*model.SearchResult, 0, len(results))
+	seen := make(map[int]bool, len(ranked))
 	for _, rr := range ranked {
-		if rr.Index < 0 || rr.Index >= len(results) {
-			continue
+		if rr.Index < 0 || rr.Index >= len(results) || seen[rr.Index] || math.IsNaN(rr.Score) || math.IsInf(rr.Score, 0) {
+			return nil, fmt.Errorf("rerank returned invalid results")
 		}
+		seen[rr.Index] = true
 		res := *results[rr.Index] // shallow copy to avoid mutating original
 		res.Score = rr.Score
 		out = append(out, &res)
+	}
+	// Providers may return only top_n; preserve the remaining candidates in
+	// original order instead of silently shrinking the caller's page.
+	for i, result := range results {
+		if !seen[i] {
+			cp := *result
+			cp.Score = 0
+			out = append(out, &cp)
+		}
 	}
 	return out, nil
 }
@@ -864,8 +845,16 @@ func (s *Service) applyRerank(ctx context.Context, query string, results []*mode
 // searchChunksVector queries the chunks table for the nearest neighbours to
 // queryVec using the HNSW index. Results are aggregated per document (keeping
 // the highest-scoring chunk per document) and converted to SearchResult.
-func (s *Service) searchChunksVector(ctx context.Context, queryVec []float32, limit int) ([]*model.SearchResult, error) {
-	raw, err := s.chunkStore.SearchVector(ctx, queryVec, limit*3) // over-fetch for dedup
+func (s *Service) searchChunksVector(ctx context.Context, queryVec []float32, limit int, filters ...model.SearchQuery) ([]*model.SearchResult, error) {
+	var raw []store.ChunkSearchResult
+	var err error
+	if cs, ok := s.chunkStore.(FilteredChunkSearcher); ok && len(filters) > 0 {
+		q := filters[0]
+		q.Embedding = queryVec
+		raw, err = cs.SearchVectorFiltered(ctx, q, limit*3)
+	} else {
+		raw, err = s.chunkStore.SearchVector(ctx, queryVec, limit*3)
+	} // over-fetch for dedup
 	if err != nil {
 		return nil, fmt.Errorf("chunk vector: %w", err)
 	}
@@ -887,6 +876,13 @@ func (s *Service) searchChunksVector(ctx context.Context, queryVec []float32, li
 	out := make([]*model.SearchResult, 0, len(seen))
 	for _, e := range seen {
 		out = append(out, e.result)
+	}
+	if len(filters) > 0 {
+		out = applySourceTypeFilters(filters[0], out)
+		out = applyRetentionExclusion(filters[0], out)
+		if _, ok := s.chunkStore.(FilteredChunkSearcher); !ok && (filters[0].OccurredFrom != nil || filters[0].OccurredTo != nil) {
+			out = s.verifyWindow(ctx, filters[0], out)
+		}
 	}
 	sortByScore(out)
 	if len(out) > limit {
@@ -977,8 +973,14 @@ func mergeRRF(primary, secondary []*model.SearchResult, limit int) []*model.Sear
 // searchChunksFTS queries the chunks table for matching text chunks, then
 // aggregates results per document keeping the highest-ranked chunk per document.
 // The returned SearchResult list is ordered by descending chunk rank.
-func (s *Service) searchChunksFTS(ctx context.Context, query string, limit int) ([]*model.SearchResult, error) {
-	raw, err := s.chunkStore.SearchFTS(ctx, query, limit*3) // over-fetch for dedup
+func (s *Service) searchChunksFTS(ctx context.Context, query string, limit int, filters ...model.SearchQuery) ([]*model.SearchResult, error) {
+	var raw []store.ChunkSearchResult
+	var err error
+	if cs, ok := s.chunkStore.(FilteredChunkSearcher); ok && len(filters) > 0 {
+		raw, err = cs.SearchFTSFiltered(ctx, filters[0], limit*3)
+	} else {
+		raw, err = s.chunkStore.SearchFTS(ctx, query, limit*3)
+	} // over-fetch for dedup
 	if err != nil {
 		return nil, fmt.Errorf("chunk FTS: %w", err)
 	}
@@ -1003,6 +1005,13 @@ func (s *Service) searchChunksFTS(ctx context.Context, query string, limit int) 
 		out = append(out, e.result)
 	}
 	// Sort by score descending (insertion order from seen map is non-deterministic).
+	if len(filters) > 0 {
+		out = applySourceTypeFilters(filters[0], out)
+		out = applyRetentionExclusion(filters[0], out)
+		if _, ok := s.chunkStore.(FilteredChunkSearcher); !ok && (filters[0].OccurredFrom != nil || filters[0].OccurredTo != nil) {
+			out = s.verifyWindow(ctx, filters[0], out)
+		}
+	}
 	sortByScore(out)
 	if len(out) > limit {
 		out = out[:limit]

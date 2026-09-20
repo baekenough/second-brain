@@ -100,10 +100,10 @@ type IngestRecordingResponse struct {
 //  5. The upsert is idempotent: same inputs → same SourceID.
 //     - call:       call-log:{date_ms}:{numHash}:{durHash}  (mirrors smsmap.MapCall)
 //     - voice-memo: call-log:voice-memo:{hash(originalFilename)}
-//       Hash is over the original upload filename only — dateMs is excluded so
-//       that the same file re-uploaded with a different timestamp produces the
-//       same SourceID (fully idempotent). Different filenames still produce
-//       distinct IDs.
+//     Hash is over the original upload filename only — dateMs is excluded so
+//     that the same file re-uploaded with a different timestamp produces the
+//     same SourceID (fully idempotent). Different filenames still produce
+//     distinct IDs.
 //
 // Returns 201 Created on success, 200 when skipped by cutover floor, appropriate
 // error codes otherwise.
@@ -318,7 +318,7 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 		// cutover / watermark logic and to isTPhoneCallPath's diarization
 		// heuristic.
 		filenamePrefix := numHash
-		if !s.piiNumberHashingEnabled {
+		if !(s.piiNumberHashingEnabled || s.piiNameRedactionEnabled) {
 			filenamePrefix = sanitizePhoneNumber(number)
 		}
 		audioFilename = fmt.Sprintf("%s_%s%s",
@@ -347,7 +347,7 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 		// audioFilename regardless, so restricting the log to the basename would
 		// only hide the directory context without protecting anything — log the
 		// full destPath instead.
-		if s.piiNumberHashingEnabled {
+		if s.piiNumberHashingEnabled || s.piiNameRedactionEnabled {
 			slog.Error("ingest_recording: write audio file", "filename", filepath.Base(destPath), "error", err)
 		} else {
 			slog.Error("ingest_recording: write audio file", "path", destPath, "error", err)
@@ -390,21 +390,24 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 		DateMs:          dateMs,
 		Kind:            kind,
 	}
-	if s.piiNumberHashingEnabled {
+	if s.piiNumberHashingEnabled || s.piiNameRedactionEnabled {
 		sidecar.NumberHash = numHash
 	} else if kind == "call" {
 		sidecar.Number = number
 	}
+	if s.piiNameRedactionEnabled && sidecar.ContactName != "" {
+		sidecar.ContactName = smsmap.PIIRedactionToken
+	}
 	if sidecarData, marshalErr := json.Marshal(sidecar); marshalErr != nil {
 		// Security: basename only when hashing is enabled — see the
 		// write-audio-file log above for the same disabled-hashing rationale.
-		if s.piiNumberHashingEnabled {
+		if s.piiNumberHashingEnabled || s.piiNameRedactionEnabled {
 			slog.Warn("ingest_recording: marshal sidecar", "filename", filepath.Base(destPath), "error", marshalErr)
 		} else {
 			slog.Warn("ingest_recording: marshal sidecar", "path", destPath, "error", marshalErr)
 		}
 	} else if writeErr := os.WriteFile(destPath+".meta.json", sidecarData, 0o644); writeErr != nil {
-		if s.piiNumberHashingEnabled {
+		if s.piiNumberHashingEnabled || s.piiNameRedactionEnabled {
 			slog.Warn("ingest_recording: write sidecar", "filename", filepath.Base(destPath)+".meta.json", "error", writeErr)
 		} else {
 			slog.Warn("ingest_recording: write sidecar", "path", destPath+".meta.json", "error", writeErr)
@@ -448,7 +451,7 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 		// disabling the flag.
 		contact := contactName
 		if contact == "" {
-			if s.piiNumberHashingEnabled {
+			if s.piiNumberHashingEnabled || s.piiNameRedactionEnabled {
 				contact = "상대 " + numHash[:8]
 			} else {
 				contact = number
@@ -479,7 +482,7 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 		// hashing off. Verified against prod: 0 of 1,759 existing call/sms
 		// documents carry "number" or "number_hash" in Metadata today, so this
 		// is a forward-only addition with no backfill implication.
-		if !s.piiNumberHashingEnabled {
+		if !(s.piiNumberHashingEnabled || s.piiNameRedactionEnabled) {
 			meta["number"] = number
 		}
 	}
@@ -496,6 +499,13 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 		CollectedAt: time.Now().UTC(),
 	}
 
+	if s.piiNameRedactionEnabled {
+		smsmap.RedactKnownContact(doc)
+		if kind == "voice-memo" {
+			doc.Title = "음성메모"
+			doc.Content = fmt.Sprintf("녹음 시간: %ds\n[TRANSCRIPTION PENDING]", durationSec)
+		}
+	}
 	if err := s.recordingUpserter.Upsert(r.Context(), doc); err != nil {
 		// Audio is already written — log the doc failure but don't lose the file.
 		slog.Error("ingest_recording: upsert failed",

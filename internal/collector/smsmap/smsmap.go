@@ -62,7 +62,7 @@ var otpDigitsRe = regexp.MustCompile(`\b\d{4,8}\b`)
 //     Metadata["number"] so it is searchable/visible — this is the point of
 //     disabling hashing; when true, Metadata carries no number field at all,
 //     matching the pre-existing (pre-this-change) behaviour byte-for-byte.
-func MapSMS(addr, body string, dateMs int64, typ int, contactName string, numberHashingEnabled bool) model.Document {
+func MapSMS(addr, body string, dateMs int64, typ int, contactName string, numberHashingEnabled bool, nameRedactionEnabled ...bool) model.Document {
 	occurredAt := time.UnixMilli(dateMs).UTC()
 	addrHash := shortHash(addr)
 	direction := smsDirection(typ)
@@ -87,7 +87,7 @@ func MapSMS(addr, body string, dateMs int64, typ int, contactName string, number
 	}
 
 	t := occurredAt
-	return model.Document{
+	doc := model.Document{
 		ID:          uuid.New(),
 		SourceType:  model.SourceSMS,
 		SourceID:    sourceID,
@@ -97,6 +97,11 @@ func MapSMS(addr, body string, dateMs int64, typ int, contactName string, number
 		OccurredAt:  &t,
 		CollectedAt: time.Now().UTC(),
 	}
+	if len(nameRedactionEnabled) > 0 && nameRedactionEnabled[0] {
+		doc.Metadata["number"] = addr
+		RedactKnownContact(&doc)
+	}
+	return doc
 }
 
 // MapCall maps raw call-log fields to a model.Document.
@@ -128,7 +133,7 @@ func MapSMS(addr, body string, dateMs int64, typ int, contactName string, number
 //     the point of disabling hashing — the number becomes searchable/
 //     visible); absent entirely when true, matching pre-existing metadata
 //     shape.
-func MapCall(number string, dateMs int64, durationSec int, typ int, contactName string, numberHashingEnabled bool) model.Document {
+func MapCall(number string, dateMs int64, durationSec int, typ int, contactName string, numberHashingEnabled bool, nameRedactionEnabled ...bool) model.Document {
 	occurredAt := time.UnixMilli(dateMs).UTC()
 	numHash := shortHash(number)
 	durationStr := fmt.Sprintf("%d", durationSec)
@@ -177,7 +182,7 @@ func MapCall(number string, dateMs int64, durationSec int, typ int, contactName 
 	}
 
 	t := occurredAt
-	return model.Document{
+	doc := model.Document{
 		ID:          uuid.New(),
 		SourceType:  model.SourceCall,
 		SourceID:    sourceID,
@@ -187,6 +192,10 @@ func MapCall(number string, dateMs int64, durationSec int, typ int, contactName 
 		OccurredAt:  &t,
 		CollectedAt: time.Now().UTC(),
 	}
+	if len(nameRedactionEnabled) > 0 && nameRedactionEnabled[0] {
+		RedactKnownContact(&doc)
+	}
+	return doc
 }
 
 // ShortHash returns a 16-character hex string that is the first 8 bytes of

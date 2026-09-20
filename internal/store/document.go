@@ -375,8 +375,14 @@ func (s *DocumentStore) AttachTranscript(ctx context.Context, doc *model.Documen
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (source_type, source_id) DO UPDATE SET
 			content      = EXCLUDED.content,
-			metadata     = documents.metadata || EXCLUDED.metadata,
-			embedding    = COALESCE(EXCLUDED.embedding, documents.embedding),
+			title        = CASE WHEN EXCLUDED.metadata->>'pii_name_redacted' = 'true' THEN EXCLUDED.title ELSE documents.title END,
+            metadata     = CASE WHEN EXCLUDED.metadata->>'pii_name_redacted' = 'true'
+                           THEN (documents.metadata - 'contact_name' - 'number') || EXCLUDED.metadata
+                           ELSE documents.metadata || EXCLUDED.metadata END,
+            title_summary = CASE WHEN EXCLUDED.metadata->>'pii_name_redacted' = 'true' THEN NULL ELSE documents.title_summary END,
+            bullet_summary = CASE WHEN EXCLUDED.metadata->>'pii_name_redacted' = 'true' THEN NULL ELSE documents.bullet_summary END,
+            summary_embedding = CASE WHEN EXCLUDED.metadata->>'pii_name_redacted' = 'true' THEN NULL ELSE documents.summary_embedding END,
+			embedding    = CASE WHEN EXCLUDED.metadata->>'pii_name_redacted' = 'true' THEN EXCLUDED.embedding ELSE COALESCE(EXCLUDED.embedding, documents.embedding) END,
 			occurred_at  = COALESCE(documents.occurred_at, EXCLUDED.occurred_at),
 			collected_at = EXCLUDED.collected_at,
 			status       = 'active',
@@ -384,7 +390,8 @@ func (s *DocumentStore) AttachTranscript(ctx context.Context, doc *model.Documen
 			updated_at   = now()
 		RETURNING id, created_at, updated_at,
 		          (xmax::text::bigint = 0) AS was_insert,
-		          COALESCE((SELECT old_content FROM prev), '') IS DISTINCT FROM $4 AS content_changed`
+		          (COALESCE((SELECT old_content FROM prev), '') IS DISTINCT FROM $4
+                   OR COALESCE(($5::jsonb)->>'pii_name_redacted' = 'true', false)) AS content_changed`
 
 	var wasInsert bool
 	row := s.pg.pool.QueryRow(ctx, q,

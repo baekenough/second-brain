@@ -26,17 +26,18 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/baekenough/second-brain/internal/config"
+	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
 	"github.com/baekenough/second-brain/internal/telemetry"
 	"github.com/joho/godotenv"
-	"golang.org/x/sync/errgroup"
 )
 
 // otelShutdownTimeout bounds how long the deferred telemetry shutdown may
@@ -74,18 +75,27 @@ func main() {
 
 // evalOutput is the JSON report written to stdout.
 type evalOutput struct {
-	Current    metricsSnapshot               `json:"current"`
-	Baseline   *metricsSnapshot              `json:"baseline"`
-	Regression bool                          `json:"regression"`
-	Deltas     map[string]float64            `json:"deltas,omitempty"`
-	Reindex    *search.ReindexRecommendation `json:"reindex,omitempty"` // populated when --check-reindex is set
+	ConfigHash     string                        `json:"config_hash"`
+	LabelHash      string                        `json:"label_hash"`
+	CodeRevision   string                        `json:"code_revision"`
+	RunConfig      map[string]any                `json:"run_config"`
+	ExcludedLabels store.EvalExclusions          `json:"excluded_labels"`
+	Current        metricsSnapshot               `json:"current"`
+	Baseline       *metricsSnapshot              `json:"baseline"`
+	Regression     bool                          `json:"regression"`
+	Deltas         map[string]float64            `json:"deltas,omitempty"`
+	Reindex        *search.ReindexRecommendation `json:"reindex,omitempty"` // populated when --check-reindex is set
 }
 
 type metricsSnapshot struct {
-	NDCG5  float64 `json:"ndcg5"`
-	NDCG10 float64 `json:"ndcg10"`
-	MRR10  float64 `json:"mrr10"`
-	Pairs  int     `json:"pairs"`
+	Attempted       int     `json:"attempted"`
+	Failed          int     `json:"failed"`
+	PositiveQueries int     `json:"positive_queries"`
+	NegativeQueries int     `json:"negative_queries"`
+	NDCG5           float64 `json:"ndcg5"`
+	NDCG10          float64 `json:"ndcg10"`
+	MRR10           float64 `json:"mrr10"`
+	Pairs           int     `json:"pairs"`
 
 	// FPPenalty10 is the macro-average false-positive penalty at rank 10.
 	// It measures the fraction of top-10 results that are explicitly irrelevant
@@ -99,17 +109,8 @@ type metricsSnapshot struct {
 	SearchLatencyP95Ms  float64 `json:"search_latency_p95_ms"`
 	SearchLatencyMeanMs float64 `json:"search_latency_mean_ms"`
 
-	// Reranked records whether --rerank was set for THIS run (model.
-	// SearchQuery.UseRerank on every eval query). It is a CLI-output-only
-	// tag, deliberately NOT added to store.EvalMetricsRecord/eval_metrics —
-	// no schema change for this comparison feature. Consequence: Baseline's
-	// Reranked is always the zero value (false), never the flag the baseline
-	// run was actually taken with, because eval_metrics carries no such
-	// column to read it back from. To compare rerank on vs off, run this
-	// binary twice (once with --rerank, once without) and diff the two JSON
-	// reports' Current.NDCG10/MRR10/SearchLatency* — do not rely on
-	// Baseline/Deltas for that comparison.
-	Reranked bool `json:"reranked"`
+	// Requested is not proof that an optional remote reranker succeeded.
+	Reranked bool `json:"rerank_requested"`
 }
 
 func run() error {
@@ -122,13 +123,17 @@ func run() error {
 			"judgment='relevant') instead of positive feedback (thumbs>=1); "+
 			"see internal/store.GoldenStore.ExportEvalPairs and "+
 			"GET /api/v1/golden/export for the same data over HTTP")
-	rerank := flag.Bool("rerank", false,
-		"apply cross-encoder reranking (model.SearchQuery.UseRerank) to every eval "+
-			"query. Default false, matching the nightly baseline's historical "+
-			"behaviour. No-op when RERANKER_URL is unconfigured. Run once with and "+
-			"once without to compare NDCG/MRR/latency — see metricsSnapshot.Reranked "+
-			"for why this is not persisted as a new eval_metrics column.")
+	rerank := flag.Bool("rerank", true, "request reranking; defaults to SEARCH_RERANK_DEFAULT when flag omitted")
+	noPersist := flag.Bool("no-persist", false, "read-only database connection; no migrations, metrics, reindex state, telemetry or alerts")
+	split := flag.String("split", "all", "feedback split: all, train, or holdout (use train for development comparisons)")
+	pairLimit := flag.Int("limit", 0, "deterministic query subset size; zero evaluates all eligible labels")
 	flag.Parse()
+	if *pairLimit < 0 || (*split != "all" && *split != "train" && *split != "holdout") {
+		return errors.New("invalid eval --split or --limit")
+	}
+	if *useGolden && *split != "all" {
+		return errors.New("--split is supported only for feedback labels")
+	}
 
 	// wg tracks any background goroutines (e.g. webhook alert) so that deferred
 	// cleanup waits for them before run() returns and os.Exit may be called.
@@ -143,6 +148,23 @@ func run() error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
+	}
+
+	explicitRerank := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "rerank" {
+			explicitRerank = true
+		}
+	})
+	if !explicitRerank {
+		*rerank = cfg.RerankDefault
+	}
+	if *noPersist && *checkReindex {
+		return errors.New("--no-persist cannot be combined with --check-reindex (writes state)")
+	}
+	if *noPersist {
+		cfg.LangfuseOTLPEndpoint = ""
+		cfg.AlertWebhookURL = ""
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -168,15 +190,21 @@ func run() error {
 	}()
 
 	// --- Database ---
-	pg, err := store.NewPostgres(ctx, cfg.DatabaseURL)
+	var pg *store.Postgres
+	if *noPersist {
+		pg, err = store.NewReadOnlyPostgres(ctx, cfg.DatabaseURL)
+	} else {
+		pg, err = store.NewPostgres(ctx, cfg.DatabaseURL)
+	}
 	if err != nil {
 		return err
 	}
 	defer pg.Close()
 
-	migrationsDir := migrationsPath()
-	if err := pg.RunMigrations(ctx, migrationsDir, cfg.EmbeddingDim); err != nil {
-		return err
+	if !*noPersist {
+		if err := pg.RunMigrations(ctx, migrationsPath(), cfg.EmbeddingDim); err != nil {
+			return err
+		}
 	}
 
 	// --- Stores ---
@@ -195,15 +223,49 @@ func run() error {
 	// --- Reranker (optional) ---
 	reranker := search.NewHTTPReranker(cfg.RerankURL, cfg.RerankAPIKey, cfg.RerankModel, cfg.RerankTopN)
 	if reranker.Enabled() && *rerank {
-		slog.Info("eval: reranking enabled for this run", "url", cfg.RerankURL, "model", cfg.RerankModel, "top_n", cfg.RerankTopN)
+		slog.Info("eval: reranking enabled for this run", "model", cfg.RerankModel, "top_n", "candidate_count")
 	} else if *rerank {
 		slog.Warn("eval: --rerank set but RERANKER_URL is unconfigured — every query.UseRerank=true is a no-op")
 	}
 
-	// --- Search service ---
-	searchSvc := search.NewService(docStore, embedClient).
-		WithChunkStore(chunkStore).
-		WithReranker(reranker)
+	// Use the same lane assembly as the HTTP and MCP services.
+	weightsStore := store.NewWeightsHistoryStore(pg)
+	llmClient := llm.New(llm.Config{BaseURL: cfg.LLMAPIURL, Model: cfg.LLMModel, APIKey: cfg.LLMAPIKey, AuthFile: cfg.LLMAuthFile, MaxTokens: cfg.LLMMaxTokens, Temperature: cfg.LLMTemperature, Thinking: cfg.LLMThinking}, nil)
+	searchSvc := search.AssembleService(docStore, embedClient, chunkStore, reranker,
+		store.NewEntityStore(pg), search.NewOpenSearchLane(cfg), llmClient, weightsStore, cfg.SearchActiveWeightsEnabled)
+	// Freeze the effective weights for the entire evaluation snapshot.
+	weights := (model.SearchWeights{}).Defaults()
+	if cfg.SearchActiveWeightsEnabled {
+		active, err := weightsStore.Active(ctx)
+		if err != nil {
+			return fmt.Errorf("load eval weights: %w", err)
+		}
+		if active != nil && active.Weights != (model.SearchWeights{}) {
+			weights = active.Weights
+		}
+	}
+	searchSvc.WithActiveWeights(nil, false).WithWeights(weights)
+	hnsw := map[string]string{}
+	for _, setting := range []string{"hnsw.ef_search", "hnsw.iterative_scan"} {
+		var value string
+		if err := pg.Pool().QueryRow(ctx, "SELECT current_setting($1)", setting).Scan(&value); err != nil {
+			return fmt.Errorf("read HNSW setting: %w", err)
+		}
+		hnsw[setting] = value
+	}
+	profile := runConfiguration(cfg, *rerank, *useGolden, weights, hnsw)
+	coverage, err := docStore.SummaryCoverageRatio(ctx)
+	if err != nil {
+		return fmt.Errorf("summary coverage: %w", err)
+	}
+	profile["split"] = *split
+	profile["pair_limit"] = *pairLimit
+	profile["summary_vector_gate_enabled"] = coverage >= model.SummaryVecCoverageThreshold()
+	profile["summary_vector_threshold"] = model.SummaryVecCoverageThreshold()
+	entityFlag := strings.ToLower(strings.TrimSpace(os.Getenv("ENTITY_EXTRACTION_ENABLED")))
+	profile["entity_vector_enabled"] = entityFlag == "true" || entityFlag == "1" || entityFlag == "yes"
+	revision := currentCodeRevision()
+	configHash := digest(profile)
 
 	// --- Build eval pairs ---
 	// --golden swaps the source from positive-feedback pairs (self-confirming:
@@ -223,127 +285,35 @@ func run() error {
 			return fmt.Errorf("build golden eval pairs: %w", err)
 		}
 	} else {
-		pairs, err = evalStore.BuildFromFeedback(ctx)
+		if *split == "all" {
+			pairs, err = evalStore.BuildFromFeedback(ctx)
+		} else {
+			pairs, err = evalStore.EvalPairsBySplit(ctx, *split)
+		}
 		if err != nil {
 			return fmt.Errorf("build eval pairs: %w", err)
 		}
 	}
 	if len(pairs) == 0 {
-		slog.Warn("eval: no eval pairs found — skipping evaluation")
-		return nil
+		return errors.New("eval: no labeled queries; generate and judge questions explicitly first")
 	}
-	slog.Info("eval: pairs loaded", "count", len(pairs))
-
-	// Load baseline BEFORE running the current eval so we compare against the
-	// previous run, not the one we are about to save.
-	baseline, err := metricsStore.Latest(ctx)
+	pairs, excluded, err := evalStore.FilterSearchEligible(ctx, pairs)
 	if err != nil {
-		return fmt.Errorf("load baseline metrics: %w", err)
+		return err
 	}
-
-	// --- Run search for each pair (bounded parallel) ---
-	//
-	// evalResult carries a queryIdx so results can be re-sorted into the
-	// original pairs order after parallel collection. Without this the channel
-	// receive order is non-deterministic, causing results[i] / irrelevantSets[i]
-	// to map to the wrong query and producing incorrect AggregateFPPenalty (#140).
-	type evalResult struct {
-		queryIdx   int
-		docIDs     []string
-		relevant   map[string]bool
-		irrelevant map[string]bool // populated from IrrelevantDocIDs (thumbs=-1)
-		latencyMs  float64         // wall-clock latency of searchSvc.Search in milliseconds
+	if len(pairs) == 0 {
+		return errors.New("eval: no eligible labels remain under production retrieval policy")
 	}
-
-	resultsCh := make(chan evalResult, len(pairs))
-
-	g, gCtx := errgroup.WithContext(ctx)
-	g.SetLimit(10) // max 10 concurrent searches
-
-	for i, pair := range pairs {
-		i, pair := i, pair // capture loop variables
-		g.Go(func() error {
-			q := model.SearchQuery{
-				Query:     pair.Query,
-				Limit:     10, // evaluate top-10
-				UseRerank: *rerank,
-			}
-
-			start := time.Now()
-			searchResults, err := searchSvc.Search(gCtx, q)
-			latencyMs := float64(time.Since(start).Nanoseconds()) / 1e6
-
-			if err != nil {
-				// Non-fatal: log and skip the pair rather than aborting the whole run.
-				slog.Warn("eval: search failed for pair", "query", pair.Query, "error", err)
-				return nil
-			}
-
-			docIDs := make([]string, 0, len(searchResults))
-			for _, r := range searchResults {
-				docIDs = append(docIDs, r.ID.String())
-			}
-
-			relevant := make(map[string]bool, len(pair.RelevantDocIDs))
-			for _, id := range pair.RelevantDocIDs {
-				relevant[id] = true
-			}
-
-			// Build irrelevant set from negative feedback (thumbs=-1).
-			irrelevant := make(map[string]bool, len(pair.IrrelevantDocIDs))
-			for _, id := range pair.IrrelevantDocIDs {
-				irrelevant[id] = true
-			}
-
-			resultsCh <- evalResult{
-				queryIdx:   i,
-				docIDs:     docIDs,
-				relevant:   relevant,
-				irrelevant: irrelevant,
-				latencyMs:  latencyMs,
-			}
-			return nil
-		})
+	pairs = deterministicSubset(pairs, *pairLimit)
+	labelHash := labelFingerprint(pairs)
+	baseline, err := metricsStore.LatestMatching(ctx, configHash, labelHash)
+	if err != nil {
+		return fmt.Errorf("load matching baseline: %w", err)
 	}
-
-	// Close the channel once all goroutines finish.
-	if err := g.Wait(); err != nil {
-		return fmt.Errorf("eval search: %w", err)
-	}
-	close(resultsCh)
-
-	// Collect results and sort by queryIdx to restore the original pairs order.
-	// Goroutines deliver to the channel in completion order, which is
-	// non-deterministic, so we must re-sort before computing per-query metrics.
-	collected := make([]evalResult, 0, len(pairs))
-	for r := range resultsCh {
-		collected = append(collected, r)
-	}
-	sort.Slice(collected, func(a, b int) bool {
-		return collected[a].queryIdx < collected[b].queryIdx
-	})
-
-	results := make([][]string, 0, len(collected))
-	relevantSets := make([]map[string]bool, 0, len(collected))
-	irrelevantSets := make([]map[string]bool, 0, len(collected))
-	latencies := make([]float64, 0, len(collected))
-	for _, r := range collected {
-		results = append(results, r.docIDs)
-		relevantSets = append(relevantSets, r.relevant)
-		irrelevantSets = append(irrelevantSets, r.irrelevant)
-		latencies = append(latencies, r.latencyMs)
-	}
-
-	if len(results) == 0 {
-		slog.Warn("eval: all searches failed — no metrics to compute")
-		return nil
-	}
-
-	// --- Compute aggregate metrics ---
-	metrics := search.Aggregate(results, relevantSets)
-
-	// Compute false-positive penalty (top-10 ranked but thumbs=-1).
-	fpPenalty10 := search.AggregateFPPenalty(results, irrelevantSets, 10)
+	evaluated := evaluatePairs(ctx, searchSvc, pairs, *rerank)
+	metrics := evaluated.Metrics
+	fpPenalty10 := evaluated.FPPenalty10
+	latencies := evaluated.Latencies
 
 	// --- Compute read-path latency statistics (observational only) ---
 	p50Ms := percentile(latencies, 50)
@@ -359,45 +329,29 @@ func run() error {
 		"search_latency_p50_ms", p50Ms,
 		"search_latency_p95_ms", p95Ms,
 		"search_latency_mean_ms", meanMs,
-		"rerank", *rerank, // the only durable record of which run this was — see metricsSnapshot.Reranked
+		"rerank", *rerank, // request setting; execution success is separate
 	)
 
-	// --- Persist current run ---
-	//
-	// CAVEAT (resolved by NOT persisting — see metricsSnapshot.Reranked):
-	// eval_metrics has no column to tell a rerank-on run apart from a
-	// rerank-off run, and this change does not add one. Saving a
-	// --rerank=true run anyway would make it the "latest" row
-	// metricsStore.Latest returns, so the NEXT default (rerank-off) run
-	// would diff itself against it — an apples-to-oranges comparison that
-	// can look like a false regression (or a false improvement) in
-	// Deltas/out.Regression above and in --check-reindex's
-	// CheckWithBaseline path. So a --rerank run is never persisted to
-	// eval_metrics at all: it is NOT part of the automated regression
-	// baseline. The JSON report (Current.Reranked) and the "rerank" log
-	// field above are the only record of it — see shouldPersistEvalRun.
-	if shouldPersistEvalRun(*rerank) {
+	// Failed runs remain visible, but LatestMatching never selects them.
+	if shouldPersistEvalRun(*noPersist) {
+		profileJSON, _ := json.Marshal(profile)
 		if err := metricsStore.Save(ctx, store.EvalMetricsRecord{
-			NDCG5:               metrics.NDCG5,
-			NDCG10:              metrics.NDCG10,
-			MRR10:               metrics.MRR10,
-			Pairs:               metrics.Pairs,
-			SearchLatencyP50Ms:  p50Ms,
-			SearchLatencyP95Ms:  p95Ms,
-			SearchLatencyMeanMs: meanMs,
+			NDCG5: metrics.NDCG5, NDCG10: metrics.NDCG10, MRR10: metrics.MRR10, Pairs: evaluated.Attempted,
+			SearchLatencyP50Ms: p50Ms, SearchLatencyP95Ms: p95Ms, SearchLatencyMeanMs: meanMs,
+			ConfigHash: configHash, LabelHash: labelHash, CodeRevision: revision, RunConfig: profileJSON,
+			Attempted: evaluated.Attempted, Failed: evaluated.Failed, FPPenalty10: fpPenalty10,
 		}); err != nil {
 			return fmt.Errorf("save eval metrics: %w", err)
 		}
-	} else {
-		slog.Info("eval: skipping eval_metrics persistence for this --rerank run — not part of the regression baseline")
 	}
 
 	// --- Build output ---
 	current := metricsSnapshot{
+		Attempted: evaluated.Attempted, Failed: evaluated.Failed, PositiveQueries: evaluated.PositiveQueries, NegativeQueries: evaluated.NegativeQueries,
 		NDCG5:               metrics.NDCG5,
 		NDCG10:              metrics.NDCG10,
 		MRR10:               metrics.MRR10,
-		Pairs:               metrics.Pairs,
+		Pairs:               evaluated.Attempted,
 		FPPenalty10:         fpPenalty10,
 		SearchLatencyP50Ms:  p50Ms,
 		SearchLatencyP95Ms:  p95Ms,
@@ -405,9 +359,9 @@ func run() error {
 		Reranked:            *rerank,
 	}
 
-	out := evalOutput{Current: current}
+	out := evalOutput{Current: current, ConfigHash: configHash, LabelHash: labelHash, CodeRevision: revision, RunConfig: profile, ExcludedLabels: excluded}
 
-	if baseline != nil {
+	if baseline != nil && evaluated.Failed == 0 {
 		base := metricsSnapshot{
 			NDCG5:  baseline.NDCG5,
 			NDCG10: baseline.NDCG10,
@@ -419,7 +373,7 @@ func run() error {
 	}
 
 	// --- Optional: reindex threshold check ---
-	if *checkReindex {
+	if *checkReindex && evaluated.Failed == 0 {
 		stateStore := store.NewReindexStateStore(pg)
 		checker := search.NewReindexChecker(
 			search.DefaultReindexConfig(),
@@ -491,6 +445,9 @@ func run() error {
 	// --- Determine exit condition ---
 	// Check reindex recommendation and regression AFTER all output is written and
 	// all deferred cleanup (pg.Close, cancel) can run via normal return paths.
+	if err := evaluated.completionError(); err != nil {
+		return err
+	}
 	if out.Regression {
 		slog.Error("eval: regression detected", "deltas", out.Deltas)
 		return errRegression
@@ -618,18 +575,8 @@ func computeDeltas(current, baseline metricsSnapshot) (map[string]float64, bool)
 	return deltas, regression
 }
 
-// shouldPersistEvalRun reports whether this run's metrics should be saved to
-// eval_metrics — pulled out as a pure function (no I/O), the same technique
-// cmd/server/main.go's buildSearchService/wireActionsAndBriefing use, so the
-// decision is unit-testable without a live Postgres connection.
-//
-// A --rerank=true run must never be saved: eval_metrics has no rerank column
-// (see the CAVEAT comment at the Save call site), so persisting it would
-// silently become the next default run's regression baseline. Only a
-// rerank-off run (the nightly cron's only mode) is allowed to persist.
-func shouldPersistEvalRun(rerank bool) bool {
-	return !rerank
-}
+// shouldPersistEvalRun gates every database mutation in comparison mode.
+func shouldPersistEvalRun(noPersist bool) bool { return !noPersist }
 
 // percentile returns the p-th percentile (0–100) of vals using the nearest-rank
 // method on a sorted copy of the input.  Returns 0 for an empty slice.

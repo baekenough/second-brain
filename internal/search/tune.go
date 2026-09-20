@@ -57,7 +57,7 @@ func AggregateFPPenalty(results [][]string, irrelevant []map[string]bool, k int)
 // NDCGK computes Normalised Discounted Cumulative Gain at rank K for a single
 // query. results contains document IDs in ranked order (position 0 = rank 1).
 // relevant is the ground-truth set of relevant document IDs. k is the cutoff;
-// if k <= 0 or k > len(results), the full results slice is used.
+// k <= 0 means no cutoff. Missing results do not shrink the ideal ranking.
 //
 // Returns 0 when relevant is empty or no relevant result appears in the top-K.
 func NDCGK(results []string, relevant map[string]bool, k int) float64 {
@@ -80,8 +80,8 @@ func NDCGK(results []string, relevant map[string]bool, k int) float64 {
 
 	// Ideal DCG: top-K filled with as many relevant docs as possible.
 	idealLen := len(relevant)
-	if limit < idealLen {
-		idealLen = limit
+	if k > 0 && k < idealLen {
+		idealLen = k
 	}
 	idcg := 0.0
 	for i := 0; i < idealLen; i++ {

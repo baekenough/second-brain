@@ -240,29 +240,32 @@ func (stubHyDECompleter) CompleteWithMessages(context.Context, string, []llm.Mes
 	return "hypothetical document text", nil
 }
 
-// TestBuildSearchService_WiresLLMClientForHyDE is the regression test for the
-// defect this file fixes: llmClient used to be constructed AFTER the
-// search.Service .With*() chain ran in run(), so nothing could pass it to
-// WithLLM and every UseHyDE request silently returned unexpanded results with
-// no error and no log line. If buildSearchService's chain ever drops
-// .WithLLM again, this test fails instead of shipping another silent no-op.
+type recordingHyDEEmbedder struct{ input string }
+
+func (e *recordingHyDEEmbedder) Embed(_ context.Context, text string) ([]float32, error) {
+	e.input = text
+	return []float32{1, 0, 0}, nil
+}
+func (e *recordingHyDEEmbedder) EmbedBatch(context.Context, []string) ([][]float32, error) {
+	return nil, nil
+}
+func (e *recordingHyDEEmbedder) Enabled() bool  { return true }
+func (e *recordingHyDEEmbedder) Dimension() int { return 3 }
+
+// Shared service wiring must attach the LLM for dense-only HyDE expansion.
 func TestBuildSearchService_WiresLLMClientForHyDE(t *testing.T) {
 	docs := &fakeSearchDocStore{}
-	svc := buildSearchService(
-		docs, disabledSearchEmbedder{}, nil, nil, nil, nil,
-		stubHyDECompleter{}, nil, false,
-	)
-
+	embed := &recordingHyDEEmbedder{}
+	svc := buildSearchService(docs, embed, nil, nil, nil, nil, stubHyDECompleter{}, nil, false)
 	const query = "what changed in the postgres migration?"
 	if _, err := svc.Search(context.Background(), model.SearchQuery{Query: query, UseHyDE: true}); err != nil {
-		t.Fatalf("Search returned unexpected error: %v", err)
+		t.Fatal(err)
 	}
-
-	if !strings.Contains(docs.gotQuery.Query, "hypothetical document text") {
-		t.Fatalf("store received query %q, want it to contain the HyDE-expanded text — WithLLM is not wired", docs.gotQuery.Query)
+	if !strings.Contains(embed.input, "hypothetical document text") || !strings.HasPrefix(embed.input, query) {
+		t.Fatal("LLM expansion was not wired into dense embeddings")
 	}
-	if !strings.HasPrefix(docs.gotQuery.Query, query) {
-		t.Fatalf("store received query %q, want it to start with the original query %q", docs.gotQuery.Query, query)
+	if docs.gotQuery.Query != query {
+		t.Fatal("hypothetical text leaked into lexical retrieval")
 	}
 }
 

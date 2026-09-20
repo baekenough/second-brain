@@ -173,6 +173,7 @@ type Server struct {
 	// Metadata["number"] so it stays searchable. Set via
 	// WithPIINumberHashing before calling Handler().
 	piiNumberHashingEnabled bool
+	piiNameRedactionEnabled bool
 
 	// actionLister and actionSetter are optional. When actionLister is non-nil
 	// the GET /api/v1/actions route is registered; when actionSetter is non-nil
@@ -475,4 +476,10 @@ func recoverer(next http.Handler) http.Handler {
 		}()
 		next.ServeHTTP(w, r)
 	})
+}
+
+// WithPIINameRedaction opts into forward-only protection of known contacts.
+func (s *Server) WithPIINameRedaction(enabled bool) *Server {
+	s.piiNameRedactionEnabled = enabled
+	return s
 }
