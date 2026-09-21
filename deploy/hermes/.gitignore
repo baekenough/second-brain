@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+calendar_client_secret.json
+calendar_token.json
+calendar_oauth_pending.json
+calendar_redirect.txt

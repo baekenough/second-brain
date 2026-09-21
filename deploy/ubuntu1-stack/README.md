@@ -277,3 +277,47 @@ ubuntu1의 systemd user 타이머 `sb-data-sync.timer`가 10분 주기로 macmin
 
 - [`deploy/postgres-ubuntu1/`](../postgres-ubuntu1/) — 이 스택이 참조하는
   postgres 컴포즈 프로젝트 (2026-08-19 이전 완료)
+
+
+## Forward-only automatic calendar registration
+
+Enable `CALENDAR_AUTOMATION_ENABLED=true` only after applying migration 035 and
+installing write-scoped Google Desktop OAuth credentials in
+`~/.second-brain/calendar-write/{calendar_client_secret,calendar_token}.json`.
+Use the Hermes calendar authorization procedure (`deploy/hermes/README.md`);
+the existing collector token is read-only and is intentionally left unchanged.
+The collector mounts the write credentials read-only and refreshes access tokens
+in memory. Files must be readable by the collector UID 1000 (0600, owned by 1000).
+Set `CALENDAR_WRITE_ID=primary`, `CALENDAR_WRITE_CREDENTIALS_JSON` and
+`CALENDAR_WRITE_TOKEN_JSON` to the paths in `.env.local.example`.
+
+The first enabled startup persists `calendar_automation_state.activated_at`.
+Only active `gmail`, `sms`, and `call` documents with **both** `created_at` and
+`occurred_at` at/after that cutoff qualify. Existing documents being re-collected
+never become candidates. Calls wait until transcription is `done`; calls with no
+transcript have no appointment evidence. Restarts keep the original cutoff.
+
+Eligible documents receive a persisted Jev create/skip/uncertain decision.
+Documents over 24,000 characters go directly to review to avoid truncating evidence.
+Only create probability >=0.9 proceeds to LLM extraction and deterministic future,
+timezone, source-evidence checks. Ambiguous, change-only or cancellation messages
+are not written. Missing end gets an explicit 60-minute placeholder annotation;
+missing start is held for review. Overlapping appointments with different titles
+are held for review; identical title/start links to the existing event. Google
+IDs are deterministic, so write-success/DB-failure retries cannot duplicate events.
+No attendees are added or notified, and no events are automatically deleted.
+
+Operational checks (no message contents):
+
+```sql
+SELECT activated_at FROM calendar_automation_state;
+SELECT status, count(*) FROM calendar_automation_jobs GROUP BY status;
+SELECT retry_reason, count(*) FROM calendar_automation_jobs
+WHERE status IN ('retry', 'failed') GROUP BY retry_reason;
+```
+
+Jobs retry at most eight times with bounded backoff. `review` and `failed` are
+retained for operator inspection, not automatically approved. Disable the env
+flag to pause without losing decisions or moving the cutoff. Do not delete/reset
+the state row as a routine deployment operation. Collector logging contains IDs
+and status/error codes only; source bodies and tokens must not be logged.
