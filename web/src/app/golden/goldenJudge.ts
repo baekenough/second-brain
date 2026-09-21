@@ -106,6 +106,7 @@ const GOLDEN_SOURCE_LABELS: Record<GoldenQuerySource, string> = {
   ask_history: "실제 질문 이력",
   seed: "시드 질의",
   manual: "직접 입력",
+  document: "저장 문서 기반",
 };
 
 /** Returns the Korean label for a query's source, or the raw value if it is

@@ -272,7 +272,9 @@ export default function GoldenPage() {
       setGenerationMessage(
         result.created > 0
           ? `질의 ${result.created}개를 생성했습니다.`
-          : "새로 생성할 질의가 없습니다. 질문 이력이 쌓인 뒤 다시 생성해 주세요.",
+          : result.total_open > 0
+            ? "남아 있는 질의를 먼저 판정해 주세요."
+            : "추가로 만들 수 있는 질의가 없습니다. 새로운 문서나 질문이 쌓이면 다시 생성해 주세요.",
       );
       // Keep the current question and unsaved judgments intact. Newly created
       // questions join the queue and are loaded by the normal next action.
@@ -375,7 +377,7 @@ export default function GoldenPage() {
       </div>
 
       <p className="text-sm text-foreground-muted">
-        새 질의는 생성 버튼을 눌렀을 때만 추가됩니다. 기존 질의와 판정은 유지됩니다.
+        생성 버튼을 누르면 질문 이력과 저장 문서를 바탕으로 새 질의를 만듭니다. 기존 판정은 유지됩니다.
       </p>
 
       {generationMessage && (

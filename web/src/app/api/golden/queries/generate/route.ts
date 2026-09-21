@@ -7,6 +7,8 @@
  */
 import { NextResponse } from "next/server";
 
+export const maxDuration = 90;
+
 const BACKEND_URL =
   process.env.BRAIN_API_URL ?? process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:9200";
 const API_KEY = process.env.API_KEY ?? "";
@@ -15,6 +17,7 @@ export async function POST(): Promise<NextResponse> {
   try {
     const upstream = await fetch(`${BACKEND_URL}/api/v1/golden/queries/generate`, {
       method: "POST",
+      signal: AbortSignal.timeout(75_000),
       headers: { ...(API_KEY && { Authorization: `Bearer ${API_KEY}` }) },
     });
     const text = await upstream.text();

@@ -92,6 +92,7 @@ var goldenAllowedSources = map[string]bool{
 	"seed":        true,
 	"manual":      true,
 	"hermes":      true,
+	"document":    true,
 }
 
 // GoldenSet is the subset of store.GoldenStore used by the golden-set
@@ -226,6 +227,15 @@ func (s *Server) goldenGenerateHandler(w http.ResponseWriter, r *http.Request) {
 		slog.Error("golden: generate queries failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal server error")
 		return
+	}
+	if created == 0 && totalOpen == 0 {
+		if corpus, ok := s.golden.(goldenGenerationStore); ok {
+			created, totalOpen, err = s.generateGoldenFromDocuments(r.Context(), corpus)
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, err.Error())
+				return
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, goldenGenerateResponse{Created: created, TotalOpen: totalOpen})
 }
@@ -591,7 +601,7 @@ func (s *Server) goldenFeedbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !goldenAllowedSources[req.Source] {
-		writeError(w, http.StatusBadRequest, "source must be one of ask_history, seed, manual, hermes")
+		writeError(w, http.StatusBadRequest, "source must be one of ask_history, seed, manual, hermes, document")
 		return
 	}
 	if !isGoldenJudge(req.Judge) {

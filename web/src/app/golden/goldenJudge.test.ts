@@ -150,6 +150,7 @@ describe("goldenSourceLabel", () => {
     expect(goldenSourceLabel("ask_history")).toBe("실제 질문 이력");
     expect(goldenSourceLabel("seed")).toBe("시드 질의");
     expect(goldenSourceLabel("manual")).toBe("직접 입력");
+    expect(goldenSourceLabel("document")).toBe("저장 문서 기반");
   });
 
   it("알 수 없는 값은 원문을 그대로 노출한다", () => {
