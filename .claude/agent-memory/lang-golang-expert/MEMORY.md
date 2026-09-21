@@ -5,7 +5,7 @@
 - [project_whisper_transcription_ledger.md](project_whisper_transcription_ledger.md) — whisper infinite re-transcription fix: ledger table, authoritative index-skip, worker pool; do-not-run store DB tests
 - [project_note_capture_enrichment.md](project_note_capture_enrichment.md) — note/insight pipeline: the three-budget deadline model + the four insight echo-chamber gates
 - [project_search_rrf_relevance.md](project_search_rrf_relevance.md) — mergeRRF equal-weight fix (fixed) + unfixed HNSW ef_search relevance bug (follow-up needed)
-- [project_temporal_window_retrieval.md](project_temporal_window_retrieval.md) — sort hints can't filter: occurred_at must be a per-lane WHERE; chunk lanes ignore the include source filter
+- [project_temporal_window_retrieval.md](project_temporal_window_retrieval.md) — sort hints can't filter: occurred_at must be a per-lane WHERE; chunk lanes ignore the include filter; eval harness searched a different pool than the golden screen → fake ndcg 0
 - [project_query_planner.md](project_query_planner.md) — /ask QueryPlan: plan owns retrieval, Params owns ranking (direction derived, not planned); LLM_THINKING=disabled is a hard dependency
 - [project_action_surface.md](project_action_surface.md) — /actions cards: constant summary + counterpart never resolved for awaiting_my_reply; rows self-heal via worker re-tick, no migration
 - [project_llm_reasoning_budget.md](project_llm_reasoning_budget.md) — reasoning_content eats max_tokens → empty completions; measured option table, reasoning_effort=low rejected
