@@ -357,6 +357,106 @@ func TestGoldenStore_UpsertJudgments_AppliesRetentionFeedbackAndIsIdempotent(t *
 	}
 }
 
+// TestGoldenStore_UpsertJudgments_KeepWinsAcrossQueries pins the keep-wins
+// conflict rule: a document already judged "relevant" by a human on one
+// query must not be downgraded to disposable by a later "noise" judgment on
+// a DIFFERENT query for the same document — see UpsertJudgments' doc
+// comment. The noise judgment row must still be recorded (review history is
+// never suppressed), only the retention-tag side effect is skipped.
+func TestGoldenStore_UpsertJudgments_KeepWinsAcrossQueries(t *testing.T) {
+	pg := goldenTestDB(t)
+	s := NewGoldenStore(pg)
+	ctx := context.Background()
+
+	queryA := seedGoldenQuery(t, pg, goldenTestSentinel+"keep-wins query A", "manual", "open")
+	queryB := seedGoldenQuery(t, pg, goldenTestSentinel+"keep-wins query B", "manual", "open")
+	doc := seedGoldenDocument(t, pg, nil)
+
+	saved1, feedbackApplied1, err := s.UpsertJudgments(ctx, queryA, []GoldenJudgmentInput{
+		{DocumentID: doc, Judgment: "relevant", Rank: 1},
+	}, false)
+	if err != nil {
+		t.Fatalf("UpsertJudgments (relevant on queryA): %v", err)
+	}
+	if saved1 != 1 || feedbackApplied1 != 1 {
+		t.Fatalf("saved/feedbackApplied (queryA) = %d/%d, want 1/1", saved1, feedbackApplied1)
+	}
+	meta := documentMetadata(t, pg, doc)
+	if meta["retention"] != model.RetentionKeep {
+		t.Fatalf("retention after relevant judgment = %v, want %q", meta["retention"], model.RetentionKeep)
+	}
+
+	// A later "noise" judgment on a DIFFERENT query must be recorded but
+	// must NOT flip retention to disposable — keep wins.
+	saved2, feedbackApplied2, err := s.UpsertJudgments(ctx, queryB, []GoldenJudgmentInput{
+		{DocumentID: doc, Judgment: "noise", Rank: 1},
+	}, false)
+	if err != nil {
+		t.Fatalf("UpsertJudgments (noise on queryB): %v", err)
+	}
+	if saved2 != 1 {
+		t.Errorf("saved (queryB) = %d, want 1 (judgment row still recorded)", saved2)
+	}
+	if feedbackApplied2 != 0 {
+		t.Errorf("feedbackApplied (queryB) = %d, want 0 (keep-wins must suppress the retention write)", feedbackApplied2)
+	}
+
+	metaAfter := documentMetadata(t, pg, doc)
+	if metaAfter["retention"] != model.RetentionKeep {
+		t.Errorf("retention after conflicting noise judgment = %v, want unchanged %q (keep wins)", metaAfter["retention"], model.RetentionKeep)
+	}
+
+	// Both judgment rows must exist — the noise judgment's suppression is a
+	// retention-write skip, not a silent drop of the review record itself.
+	var judgmentCount int
+	if err := pg.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM golden_judgments WHERE document_id = $1 AND judge = 'user'`, doc,
+	).Scan(&judgmentCount); err != nil {
+		t.Fatalf("count judgment rows: %v", err)
+	}
+	if judgmentCount != 2 {
+		t.Errorf("judgment row count = %d, want 2 (relevant on queryA + noise on queryB, both recorded)", judgmentCount)
+	}
+	var noiseJudgment string
+	if err := pg.pool.QueryRow(ctx,
+		`SELECT judgment FROM golden_judgments WHERE document_id = $1 AND query_id = $2 AND judge = 'user'`,
+		doc, queryB,
+	).Scan(&noiseJudgment); err != nil {
+		t.Fatalf("read queryB judgment: %v", err)
+	}
+	if noiseJudgment != "noise" {
+		t.Errorf("queryB judgment = %q, want 'noise' (the label itself is stored as submitted, only retention was suppressed)", noiseJudgment)
+	}
+}
+
+// TestGoldenStore_UpsertJudgments_NoiseWithoutPriorRelevantStillDisposes
+// pins the non-conflicting case: a "noise" judgment on a document that has
+// NEVER been judged "relevant" by a human must still apply
+// retention=disposable as before — the keep-wins guard must not become a
+// blanket suppression of every noise judgment.
+func TestGoldenStore_UpsertJudgments_NoiseWithoutPriorRelevantStillDisposes(t *testing.T) {
+	pg := goldenTestDB(t)
+	s := NewGoldenStore(pg)
+	ctx := context.Background()
+
+	queryID := seedGoldenQuery(t, pg, goldenTestSentinel+"no-conflict noise query", "manual", "open")
+	doc := seedGoldenDocument(t, pg, nil)
+
+	saved, feedbackApplied, err := s.UpsertJudgments(ctx, queryID, []GoldenJudgmentInput{
+		{DocumentID: doc, Judgment: "noise", Rank: 1},
+	}, false)
+	if err != nil {
+		t.Fatalf("UpsertJudgments: %v", err)
+	}
+	if saved != 1 || feedbackApplied != 1 {
+		t.Fatalf("saved/feedbackApplied = %d/%d, want 1/1 (no prior relevant judgment exists)", saved, feedbackApplied)
+	}
+	meta := documentMetadata(t, pg, doc)
+	if meta["retention"] != model.RetentionDisposable {
+		t.Errorf("retention = %v, want %q", meta["retention"], model.RetentionDisposable)
+	}
+}
+
 func TestGoldenStore_JudgedDocumentIDs(t *testing.T) {
 	pg := goldenTestDB(t)
 	s := NewGoldenStore(pg)

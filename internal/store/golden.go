@@ -392,6 +392,23 @@ func (s *GoldenStore) Progress(ctx context.Context) (GoldenProgress, error) {
 // THIS query" — it says nothing about the document's general retention
 // value, so it leaves the tag untouched regardless of judge.
 //
+// "keep" wins across queries: a document a human has EVER judged "relevant"
+// (judge="user", any query) must never be downgraded to disposable by a
+// later "noise" judgment on the same document FROM A DIFFERENT QUERY — a
+// document can legitimately be the right answer to one query and unrelated
+// noise for another, and last-write-wins would let whichever query happens
+// to be reviewed last silently erase the earlier "this document matters"
+// signal. hasUserRelevantJudgment checks golden_judgments (not the
+// document's current metadata) as the source of truth for this, since a
+// collector re-sync can wipe classifier="user" out of a document's metadata
+// wholesale (internal/store.Upsert/UpsertTracked's `metadata =
+// EXCLUDED.metadata` ON CONFLICT clause replaces the whole jsonb blob rather
+// than merging it — see this package's operator-facing report for the
+// out-of-scope follow-up this implies for document.go). The judgment row
+// itself is still upserted either way — only the retention-tag side effect
+// is skipped — so the review history stays accurate even when the retention
+// write is suppressed.
+//
 // judge="llm" judgments (hermes's own in-conversation relevance calls,
 // POST /api/v1/golden/feedback) are recorded ONLY — never applied to
 // retention. An unreviewed model opinion silently retagging a document (or
@@ -404,7 +421,8 @@ func (s *GoldenStore) Progress(ctx context.Context) (GoldenProgress, error) {
 // open (or vice versa) if the connection drops mid-request.
 //
 // Returns saved (judgment rows upserted) and feedbackApplied (of those, how
-// many carried a retention-tag update — always 0 for an all-"llm" batch).
+// many carried a retention-tag update — always 0 for an all-"llm" batch, and
+// excludes a "noise" judgment suppressed by the keep-wins rule above).
 func (s *GoldenStore) UpsertJudgments(ctx context.Context, queryID uuid.UUID, judgments []GoldenJudgmentInput, finishQuery bool) (saved int, feedbackApplied int, err error) {
 	if len(judgments) == 0 && !finishQuery {
 		return 0, 0, nil
@@ -448,6 +466,21 @@ func (s *GoldenStore) UpsertJudgments(ctx context.Context, queryID uuid.UUID, ju
 			continue // "irrelevant": no retention change (see doc comment above)
 		}
 
+		if retention == model.RetentionDisposable {
+			// keep 우선 정책 (UpsertJudgments 상단 doc comment 참고): 이 문서가
+			// 다른 질의에서든 사람에게 "relevant" 로 판정된 적이 있다면, 이번
+			// "noise" 판정으로 disposable 로 내리지 않는다. 판정 행 자체는
+			// 바로 위에서 이미 저장됐으므로 리뷰 이력은 그대로 남고, retention
+			// 태그 반영만 건너뛴다.
+			hasKeep, err := s.hasUserRelevantJudgment(ctx, tx, j.DocumentID)
+			if err != nil {
+				return saved, feedbackApplied, fmt.Errorf("golden: check prior relevant judgment: %w", err)
+			}
+			if hasKeep {
+				continue
+			}
+		}
+
 		if _, err := tx.Exec(ctx, `
 			UPDATE documents
 			SET metadata = metadata || jsonb_build_object(
@@ -473,6 +506,31 @@ func (s *GoldenStore) UpsertJudgments(ctx context.Context, queryID uuid.UUID, ju
 		return saved, feedbackApplied, fmt.Errorf("golden: commit: %w", err)
 	}
 	return saved, feedbackApplied, nil
+}
+
+// hasUserRelevantJudgment reports whether documentID has EVER been judged
+// "relevant" by a human ("user") reviewer, across ANY query — the source of
+// truth for UpsertJudgments' keep-wins rule (see its doc comment). It reads
+// golden_judgments (the append-only review history), not the document's
+// current documents.metadata, because metadata is not a reliable witness
+// here: a collector re-sync can strip classifier="user"/retention out of a
+// document's metadata wholesale (internal/store.Upsert/UpsertTracked's ON
+// CONFLICT clause replaces metadata entirely rather than merging it), while
+// the judgment row a human actually submitted stays intact regardless. Runs
+// inside the caller's transaction so it also sees any row that transaction
+// itself just inserted/updated earlier in the same UpsertJudgments call.
+func (s *GoldenStore) hasUserRelevantJudgment(ctx context.Context, tx pgx.Tx, documentID uuid.UUID) (bool, error) {
+	var exists bool
+	err := tx.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM golden_judgments
+			WHERE document_id = $1 AND judge = 'user' AND judgment = 'relevant'
+		)
+	`, documentID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("golden: has user relevant judgment for %s: %w", documentID, err)
+	}
+	return exists, nil
 }
 
 // SkipQuery marks a query 'skipped' so GET /api/v1/golden/next never surfaces
@@ -502,11 +560,18 @@ func (s *GoldenStore) SkipQuery(ctx context.Context, queryID uuid.UUID) (bool, e
 // answer key it is later scored against would make the metric measure hermes
 // agreeing with itself, not correctness.
 func (s *GoldenStore) ExportEvalPairs(ctx context.Context, judge string) ([]EvalPair, error) {
+	// q.id/q.source 는 GROUP BY 키가 아니라 집계로 읽는다. 묶음 단위는
+	// 예전 그대로 q.text 이며(같은 문구의 행이 둘이면 여전히 한 쌍으로 합쳐
+	// 진다), 여기서 키를 넓히면 라벨 집합 자체가 달라져 label_hash 가
+	// 흔들린다. 합쳐진 행이 여럿일 때 돌아오는 값은 사전순 최솟값 하나 —
+	// 진단용 출처 표기이지 식별자 계약이 아니다.
 	rows, err := s.pg.pool.Query(ctx, `
 		SELECT q.text,
 		       COALESCE(ARRAY_AGG(DISTINCT j.document_id::text) FILTER (WHERE j.judgment='relevant'), ARRAY[]::text[]) AS doc_ids,
 		       COALESCE(ARRAY_AGG(DISTINCT j.document_id::text) FILTER (WHERE j.judgment IN ('irrelevant','noise')), ARRAY[]::text[]) AS negative_ids,
-		       MIN(j.judged_at) AS judged_at
+		       MIN(j.judged_at) AS judged_at,
+		       MIN(q.id::text) AS query_id,
+		       MIN(q.source) AS query_source
 		FROM golden_judgments j
 		JOIN golden_queries q ON q.id = j.query_id
 		WHERE j.judge = $1
@@ -522,7 +587,8 @@ func (s *GoldenStore) ExportEvalPairs(ctx context.Context, judge string) ([]Eval
 	idx := int64(0)
 	for rows.Next() {
 		var p EvalPair
-		if err := rows.Scan(&p.Query, &p.RelevantDocIDs, &p.IrrelevantDocIDs, &p.CreatedAt); err != nil {
+		if err := rows.Scan(&p.Query, &p.RelevantDocIDs, &p.IrrelevantDocIDs, &p.CreatedAt,
+			&p.GoldenQueryID, &p.GoldenQuerySource); err != nil {
 			return nil, fmt.Errorf("golden: scan eval pair: %w", err)
 		}
 		idx++

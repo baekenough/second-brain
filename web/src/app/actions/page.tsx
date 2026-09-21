@@ -5,7 +5,7 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { ActionList, ACTION_KIND_LABELS } from "./ActionList";
 import { BriefingPanel } from "./BriefingPanel";
 import { ActionsDisabledError, listActions, setActionState } from "@/lib/api";
-import { ACTION_KINDS, type ActionItem, type ActionKind } from "@/lib/types";
+import { ACTION_FILTER_KINDS, ACTION_KINDS, type ActionItem, type ActionKind } from "@/lib/types";
 import { Button, Spinner } from "@/components/ui";
 import { DEFAULT_SORT, parseSort, type SortMode } from "./actionsSort";
 
@@ -178,7 +178,10 @@ function ActionsPageInner() {
       {/* ── Filter bar ─────────────────────────────────────────────────── */}
       <section aria-label="필터" className="space-y-3 rounded-lg border border-border p-3">
         <div className="flex flex-wrap gap-1.5">
-          {ACTION_KINDS.map((kind) => {
+          {/* awaiting_my_reply(응답 대기)는 선택지에서 제외 — ACTION_FILTER_KINDS
+              참고. parseKinds는 ACTION_KINDS 전체를 허용해 두어, 그 kind로
+              북마크된 옛 URL이 있어도 파싱 자체는 깨지지 않는다. */}
+          {ACTION_FILTER_KINDS.map((kind) => {
             const on = kinds.includes(kind);
             return (
               <Button

@@ -385,6 +385,19 @@ export const ACTION_KINDS = [
 ] as const;
 export type ActionKind = (typeof ACTION_KINDS)[number];
 
+/** Kinds offered as a choice in the /actions filter bar.
+ *
+ * `awaiting_my_reply` is deliberately left out: 메일·SMS에 "답장하지 않았다"로
+ * 자동 생성되던 응답 대기 항목은 할일이 아니라 잡음이라고 판단해 2026-09-21에
+ * 은퇴시켰다(backend: migrations/038_retire_awaiting_my_reply.sql,
+ * internal/store/actions_query.go's default kind exclusion). `ACTION_KINDS`
+ * itself keeps the full four-value union so `ActionItem.kind` and
+ * `ACTION_KIND_LABELS` (ActionList.tsx) still type-check against any
+ * pre-existing row that still carries the old kind. */
+export const ACTION_FILTER_KINDS = ACTION_KINDS.filter(
+  (k): k is Exclude<ActionKind, "awaiting_my_reply"> => k !== "awaiting_my_reply",
+);
+
 export const ACTION_DETECTED_BY = ["structural", "llm", "both"] as const;
 export type ActionDetectedBy = (typeof ACTION_DETECTED_BY)[number];
 

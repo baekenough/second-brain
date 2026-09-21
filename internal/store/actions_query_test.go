@@ -173,6 +173,50 @@ func TestListOpenActionsExcludesResolved(t *testing.T) {
 	}
 }
 
+// TestListOpenActionsDefaultExcludesAwaitingMyReply pins the 2026-09-21
+// retirement decision at the read side: even an awaiting_my_reply action
+// left in state='open' (the shape a stray write, made before
+// migrations/038 ran, could still leave behind) must not appear in the
+// default (no kind filter) view — 메일·SMS 미회신은 할일이 아니라 잡음이므로
+// 목록에서 항상 숨긴다.
+func TestListOpenActionsDefaultExcludesAwaitingMyReply(t *testing.T) {
+	pg := actionTestDB(t)
+	ctx := context.Background()
+	docID, entityID := seedActionFixtures(t, pg)
+
+	now := time.Now().UTC()
+	insertTestAction(t, pg, docID, entityID, actionTestKeyPrefix+"awaiting", model.KindAwaitingMyReply, 1.00, now)
+	insertTestStatus(t, pg, actionTestKeyPrefix+"awaiting", model.StateOpen)
+	insertTestAction(t, pg, docID, entityID, actionTestKeyPrefix+"commitment", model.KindMyCommitment, 1.00, now)
+	insertTestStatus(t, pg, actionTestKeyPrefix+"commitment", model.StateOpen)
+
+	got, err := NewActionQueryStore(pg).ListOpenActions(ctx, ActionFilter{Counterpart: actionTestCounterpart})
+	if err != nil {
+		t.Fatalf("ListOpenActions: %v", err)
+	}
+	mine := keysWithTestPrefix(got)
+	if len(mine) != 1 {
+		t.Fatalf("want only the non-awaiting_my_reply action, got %d rows: %v", len(mine), identityKeysOf(mine))
+	}
+	if mine[0].IdentityKey != actionTestKeyPrefix+"commitment" {
+		t.Fatalf("returned key = %q, want %q", mine[0].IdentityKey, actionTestKeyPrefix+"commitment")
+	}
+
+	// An explicit kind filter naming it is still honoured — a caller that
+	// asks for it on purpose (admin tooling, auditing) is not second-guessed.
+	got, err = NewActionQueryStore(pg).ListOpenActions(ctx, ActionFilter{
+		Counterpart: actionTestCounterpart,
+		Kinds:       []model.ActionKind{model.KindAwaitingMyReply},
+	})
+	if err != nil {
+		t.Fatalf("ListOpenActions (explicit kind): %v", err)
+	}
+	mine = keysWithTestPrefix(got)
+	if len(mine) != 1 || mine[0].IdentityKey != actionTestKeyPrefix+"awaiting" {
+		t.Fatalf("explicit Kinds=[awaiting_my_reply] = %v, want only %q", identityKeysOf(mine), actionTestKeyPrefix+"awaiting")
+	}
+}
+
 // TestListOpenActionsKeepsStatuslessAction pins that an action with NO
 // action_status row survives. Part A inserts the status row separately from the
 // action row, so a crash between the two writes leaves exactly this shape; an

@@ -7,21 +7,18 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/baekenough/second-brain/internal/action"
-	"github.com/baekenough/second-brain/internal/model"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // ThreadLatestMessage is one row of StructuralSignalLister.ListLatestPerThread's
-// result: the most recent document in a conversation thread, plus what's
-// needed to determine whether it is an "awaiting my reply" candidate (spec
-// §7.1) and to describe it on an action card.
-//
-// Title and EventAt exist only for the card: the summary this worker writes
-// used to be a fixed constant, which made every awaiting_my_reply row read
-// identically. They are the two document columns that carry conversation
-// context without carrying the message body.
+// result: the most recent document in a conversation thread. It used to also
+// carry what StructuralSignalWorker needed to decide whether the thread was
+// an "awaiting my reply" candidate (spec §7.1) and to describe it on an
+// action card; that consumer is gone (see StructuralSignalWorker's doc
+// comment), but the struct and the query below are read-only and still
+// correct, so they are kept as-is rather than deleted along with their only
+// caller.
 type ThreadLatestMessage struct {
 	DocumentID uuid.UUID
 	SourceType string
@@ -33,8 +30,10 @@ type ThreadLatestMessage struct {
 	EventAt time.Time
 }
 
-// StructuralSignalLister provides the thread-grouped SQL query consumed by
-// StructuralSignalWorker (PgStructuralSignalLister satisfies this).
+// StructuralSignalLister provides the thread-grouped SQL query PgStructuralSignalLister
+// implements. StructuralSignalWorker no longer calls it (see the worker's doc
+// comment) — the interface remains so PgStructuralSignalLister keeps a typed
+// contract and cmd/collector/main.go's wiring keeps compiling unchanged.
 type StructuralSignalLister interface {
 	ListLatestPerThread(ctx context.Context, limit int) ([]ThreadLatestMessage, error)
 }
@@ -68,9 +67,8 @@ func NewPgStructuralSignalLister(pool *pgxpool.Pool) *PgStructuralSignalLister {
 // (one document per call), so the ELSE branch below now also covers 'call'
 // without needing a dedicated WHEN; 'call-log'/'call-transcript' remain in
 // the WHERE IN list defensively for the brief pre-migration window. sms
-// documents flagged is_auth_like are excluded at the source (spec §7.4) —
-// StructuralSignalWorker also re-checks this defensively.
-// No LLM call — pure SQL, safe to run far more often than ExtractionWorker.
+// documents flagged is_auth_like are excluded at the source (spec §7.4).
+// No LLM call — pure SQL.
 const listLatestPerThreadQuery = `
 	WITH ranked AS (
 		SELECT id, source_type, metadata, title,
@@ -121,29 +119,39 @@ func (l *PgStructuralSignalLister) ListLatestPerThread(ctx context.Context, limi
 // StructuralSignalWorkerConfig holds configuration for StructuralSignalWorker.
 type StructuralSignalWorkerConfig struct {
 	// Store lists the latest document per active thread. Typically
-	// *PgStructuralSignalLister.
+	// *PgStructuralSignalLister. Kept for wiring compatibility — Tick no
+	// longer calls it (see StructuralSignalWorker's doc comment) — and is
+	// still validated non-nil so a caller does not silently depend on a
+	// zero-value StructuralSignalLister that would panic differently later.
 	Store StructuralSignalLister
 	// Actions is the write side of the actions table (reused from Task 11).
 	Actions ActionWriter
-	// UserAddresses is config.UserEmailAddresses — used to infer gmail
-	// direction, since gmail documents carry no "direction" metadata key.
+	// UserAddresses is config.UserEmailAddresses. Unused now that Tick no
+	// longer infers gmail direction, but kept so cmd/collector/main.go's
+	// existing wiring does not need to change.
 	UserAddresses []string
 	// Interval controls how often the worker polls. Defaults to 10 minutes.
 	Interval time.Duration
-	// BatchSize is the number of threads inspected per tick. Defaults to 500
-	// (this is cheap SQL-only work, so the default batch is generous).
+	// BatchSize is the number of threads inspected per tick. Defaults to 500.
 	BatchSize int
-	// Now supplies the current instant used to age each thread ("3일째
-	// 미응답"). Defaults to time.Now. Injectable so a test can assert the
-	// rendered card without racing the wall clock.
+	// Now supplies the current instant. Unused now that Tick writes nothing,
+	// kept for wiring compatibility.
 	Now func() time.Time
 }
 
-// StructuralSignalWorker computes the "awaiting my reply" candidate action
-// (spec §7.1) — the ONLY structural signal this plan implements; §7.2's
-// merge display and §7.3's briefing generation are Part C, out of scope.
-// It makes NO LLM call, so it can and should run more often than
-// ExtractionWorker; a short default interval reflects that.
+// StructuralSignalWorker used to compute the "awaiting my reply" candidate
+// action (spec §7.1) — the only structural signal this plan implemented.
+//
+// 2026-09-21 결정: 메일·SMS에 "답장하지 않았다"로 자동 생성되는 awaiting_my_reply
+// 항목은 할일이 아니라 잡음이라고 판단해 더 이상 만들지 않기로 했다(migrations/038
+// 이 기존에 열려 있던 행도 무시 처리한다). 이 워커가 만들던 신호는 그것 하나뿐이었
+// 으므로, 생성 경로(스레드 조회 → 상대방/스레드 식별 → identity_key 계산 →
+// UpsertAction/EnsureOpenStatus 호출)를 통째로 들어냈다 — Tick은 이제 아무 SQL도
+// 실행하지 않고 아무 액션도 쓰지 않는다.
+//
+// 타입·생성자·Run 시그니처는 cmd/collector/main.go의 배선을 건드리지 않기 위해
+// 그대로 남겨 두었다. 배선 자체(고루틴 기동 여부)를 정리하는 것은 이번 변경의
+// 범위가 아니다.
 type StructuralSignalWorker struct {
 	store         StructuralSignalLister
 	actions       ActionWriter
@@ -184,10 +192,11 @@ func NewStructuralSignalWorker(cfg StructuralSignalWorkerConfig) *StructuralSign
 	}
 }
 
-// Run blocks until ctx is cancelled. Unlike ExtractionWorker, there is no
-// LLM.Enabled() gate — this worker is pure SQL and always runs.
+// Run blocks until ctx is cancelled. Tick is now a no-op (see the type's doc
+// comment), so this loop no longer does any work — it is kept only so
+// cmd/collector/main.go's existing goroutine wiring stays valid.
 func (w *StructuralSignalWorker) Run(ctx context.Context) {
-	slog.Info("structural signal worker started", "interval", w.interval, "batch_size", w.batchSize)
+	slog.Info("structural signal worker started (awaiting_my_reply generation retired, tick is a no-op)")
 	w.Tick(ctx)
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
@@ -202,203 +211,25 @@ func (w *StructuralSignalWorker) Run(ctx context.Context) {
 	}
 }
 
-// tickOutcome is the single bucket one listed message falls into. Every
-// early return in processMessage must name one: the buckets are what make a
-// tick's work visible, and an unnamed return is invisible by construction.
-type tickOutcome int
-
-const (
-	outcomeWritten tickOutcome = iota
-	outcomeSkippedAuthLike
-	outcomeSkippedOutbound
-	outcomeSkippedNoCounterpart
-	outcomeSkippedNoThreadKey
-	outcomeFailed
-	outcomeStatusFailed
-)
-
-// tickStats accounts for one Tick pass.
-//
-// It exists because this worker had exactly two observable states — "started"
-// and "errored" — and a tick that wrote 419 actions logged the same thing as
-// a tick that silently skipped all 419: nothing. When the actions table was
-// found empty after a deploy, no log could say whether the worker had run,
-// had run and skipped everything, or had never listed a row; the question was
-// only settleable by dating rows against the actions_id_seq sequence. That
-// blind spot, not the write path, is what turned a nine-minute wait for the
-// next tick into a production DELETE of 447 rows.
-//
-// Counts only. A message's contents, its document id, its counterpart and its
-// metadata values are all personal data and none of them belong in an
-// operational log line that exists to answer "did the worker do its job?".
+// tickStats is what one Tick pass produced. Every field is always zero now
+// that the worker generates nothing — the type is kept (rather than
+// collapsing Tick to return nothing) so its signature does not change and a
+// test can still assert "nothing was written" positively.
 type tickStats struct {
-	// ListFailed reports that the read failed, so no message was ever seen.
-	// Distinct from Listed == 0, which means the query legitimately returned
-	// nothing — identical symptoms, opposite causes.
-	ListFailed           bool
-	Listed               int
-	Written              int
-	SkippedAuthLike      int
-	SkippedOutbound      int
-	SkippedNoCounterpart int
-	SkippedNoThreadKey   int
-	Failed               int
-	// StatusFailed counts actions that were written but left without an
-	// 'open' action_status row. Those rows exist in the table and yet never
-	// reach the /actions screen, which joins action_status — a full table
-	// behind an empty screen.
-	StatusFailed int
-}
-
-// accountedFor totals the outcome buckets. It must equal Listed; a shortfall
-// means some path returns without being counted, which is the exact defect
-// tickStats was introduced to prevent from recurring. StatusFailed is not
-// added: those messages are already counted in Written (the action row was
-// persisted), and StatusFailed is a second, narrower fact about them.
-func (s tickStats) accountedFor() int {
-	return s.Written + s.SkippedAuthLike + s.SkippedOutbound +
-		s.SkippedNoCounterpart + s.SkippedNoThreadKey + s.Failed
-}
-
-func (s *tickStats) record(o tickOutcome) {
-	switch o {
-	case outcomeWritten:
-		s.Written++
-	case outcomeSkippedAuthLike:
-		s.SkippedAuthLike++
-	case outcomeSkippedOutbound:
-		s.SkippedOutbound++
-	case outcomeSkippedNoCounterpart:
-		s.SkippedNoCounterpart++
-	case outcomeSkippedNoThreadKey:
-		s.SkippedNoThreadKey++
-	case outcomeFailed:
-		s.Failed++
-	case outcomeStatusFailed:
-		s.Written++
-		s.StatusFailed++
-	}
+	Listed  int
+	Written int
 }
 
 // Tick is exported (unlike ExtractionWorker's unexported tick) so tests can
-// drive one pass deterministically without a ticker. It returns what the pass
-// did so a test can assert the accounting the log line reports.
-func (w *StructuralSignalWorker) Tick(ctx context.Context) tickStats {
-	var stats tickStats
-	messages, err := w.store.ListLatestPerThread(ctx, w.batchSize)
-	if err != nil {
-		stats.ListFailed = true
-		slog.Warn("structural signal worker: list failed", "error", err)
-		return stats
-	}
-	stats.Listed = len(messages)
-	for _, m := range messages {
-		stats.record(w.processMessage(ctx, m))
-	}
-
-	// Logged at INFO on every tick, including the all-zero one: the absence of
-	// work is the observation that was missing, so it cannot be the case that
-	// the quiet tick is also the silent one.
-	slog.Info("structural signal worker: tick complete",
-		"listed", stats.Listed,
-		"written", stats.Written,
-		"failed", stats.Failed,
-		"status_failed", stats.StatusFailed,
-		"skipped_auth_like", stats.SkippedAuthLike,
-		"skipped_outbound", stats.SkippedOutbound,
-		"skipped_no_counterpart", stats.SkippedNoCounterpart,
-		"skipped_no_thread_key", stats.SkippedNoThreadKey,
-	)
-	return stats
-}
-
-func (w *StructuralSignalWorker) processMessage(ctx context.Context, m ThreadLatestMessage) tickOutcome {
-	doc := &model.Document{
-		ID:         m.DocumentID,
-		SourceType: model.SourceType(m.SourceType),
-		Metadata:   m.Metadata,
-		Title:      m.Title,
-	}
-	if !m.EventAt.IsZero() {
-		eventAt := m.EventAt
-		doc.OccurredAt = &eventAt
-	}
-
-	// Defense in depth: ListLatestPerThread's SQL already excludes
-	// is_auth_like sms documents at the source (spec §7.4), but this Go-level
-	// check protects any future caller of StructuralSignalLister that does
-	// not pre-filter.
-	if authLike, _ := doc.Metadata["is_auth_like"].(bool); authLike {
-		return outcomeSkippedAuthLike
-	}
-
-	if isOutbound(doc) {
-		return outcomeSkippedOutbound
-	}
-
-	counterpart, ok := action.CounterpartIdentity(doc, func(addr string) bool { return action.IsUserAddress(w.userAddresses, addr) })
-	if !ok {
-		return outcomeSkippedNoCounterpart
-	}
-
-	threadKey, ok := threadKeyForDocument(doc)
-	if !ok {
-		return outcomeSkippedNoThreadKey
-	}
-
-	identityKey := action.BuildIdentityKey(threadKey, string(model.KindAwaitingMyReply), counterpart, "")
-
-	// displayName is the label a human reads; counterpart (above) is the
-	// hash input. They are intentionally different strings — see
-	// action.CounterpartDisplay. An unresolvable display name leaves both the
-	// card label and counterpart_entity_id empty rather than inventing one.
-	displayName, entityType, hasDisplay := action.CounterpartDisplay(doc)
-	if !hasDisplay {
-		displayName, entityType = "", ""
-	}
-
-	if err := w.actions.UpsertAction(ctx, model.Action{
-		IdentityKey: identityKey,
-		DocumentID:  doc.ID,
-		ThreadKey:   threadKey,
-		Kind:        model.KindAwaitingMyReply,
-		// Generated per thread, NOT a fixed template: a constant made all 434
-		// of these rows render as the same card. The text is still never
-		// hashed — NormalizeSummary discards it for this kind — so it may
-		// change on every tick (it reports the thread's age) without moving
-		// identity_key.
-		Summary:         action.AwaitingReplySummary(doc, displayName, w.now()),
-		CounterpartName: displayName,
-		CounterpartType: entityType,
-		DetectedBy:      model.DetectedStructural,
-		Confidence:      1.0, // deterministic rule, not a probabilistic guess
-		ObservedAt:      w.now().UTC(),
-	}); err != nil {
-		slog.Warn("structural signal worker: upsert action failed", "doc_id", doc.ID, "error", err)
-		return outcomeFailed
-	}
-	if err := w.actions.EnsureOpenStatus(ctx, identityKey); err != nil {
-		slog.Warn("structural signal worker: ensure open status failed", "doc_id", doc.ID, "error", err)
-		return outcomeStatusFailed
-	}
-	return outcomeWritten
-}
-
-// isOutbound reports whether doc's direction indicates the ACCOUNT OWNER
-// sent it — sms "sent"/"draft", call "outgoing". gmail direction is not
-// checked here: it has no direction key at all, so it is handled entirely
-// by CounterpartIdentity (which returns ok=false when "from" is the user's
-// own address). Folding both concerns into one function per source type
-// would blur CounterpartIdentity's "who is the counterpart" contract.
-func isOutbound(doc *model.Document) bool {
-	switch doc.SourceType {
-	case model.SourceSMS:
-		d, _ := doc.Metadata["direction"].(string)
-		return d == "sent" || d == "draft"
-	case model.SourceCall, model.SourceCallLog, model.SourceCallTranscript:
-		d, _ := doc.Metadata["direction"].(string)
-		return d == "outgoing"
-	default:
-		return false
-	}
+// drive one pass deterministically without a ticker.
+//
+// It performs no read and no write: the only signal this worker ever
+// produced was awaiting_my_reply, and that generation path — thread listing,
+// counterpart/thread-key resolution, identity_key construction, and the
+// UpsertAction/EnsureOpenStatus calls — has been removed entirely (see the
+// type's doc comment). Calling w.store.ListLatestPerThread here would only
+// spend a database round trip on behalf of a candidate this worker will
+// never write, so it is skipped rather than kept as dead instrumentation.
+func (w *StructuralSignalWorker) Tick(_ context.Context) tickStats {
+	return tickStats{}
 }

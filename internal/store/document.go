@@ -63,6 +63,62 @@ const callDupCheckQuery = `
 	  AND source_id   <> $2
 	LIMIT 1`
 
+// classificationProtectedMetadataKeys lists every documents.metadata key the
+// classification pipeline owns — internal/classify.Result.Metadata
+// (segment/retention/classifier/classifier_p/classified_at/
+// classifier_gate_checked_at/needs_review/gate),
+// IncrementClassificationAttempts (classifier_attempts), and golden.go's
+// UpsertJudgments (retention/classifier/classified_at, a subset already
+// covered above) — see upsertMetadataMergeSQL's doc comment for why these
+// specifically must survive a collector re-upsert. Anyone adding a new
+// classification-owned metadata key MUST add it here too, or a future
+// re-collection will silently erase it (the exact bug this constant fixes).
+const classificationProtectedMetadataKeys = `'segment', 'retention', 'classifier', 'classifier_p', 'classified_at', 'classifier_gate_checked_at', 'needs_review', 'gate', 'classifier_attempts'`
+
+// upsertMetadataMergeSQL is the `metadata` assignment shared by Upsert and
+// UpsertTracked's ON CONFLICT DO UPDATE SET clause.
+//
+// Collector re-upserts (Upsert/UpsertTracked) treat metadata as a FULL
+// REPLACEMENT snapshot for every key the collector itself owns (sender,
+// content, direction, label_ids, ...) — a re-synced SMS/Gmail/call document's
+// metadata should reflect exactly what the collector observed this time, not
+// an accumulation of every value ever seen. A plain `metadata =
+// EXCLUDED.metadata` therefore used to also silently discard whatever this
+// package's OWN classification pipeline had written onto that same row
+// (retention/classifier/...) between collections, since EXCLUDED.metadata
+// only ever contains collector-owned keys — the classifier's tags are simply
+// absent from it, not intentionally cleared. That is the root cause of a
+// golden-set "relevant"→retention=keep judgment reverting to disposable
+// after the document's next re-collection: the classifier="user" key that
+// protected it (see mergeClassificationMetadataQuery's WHERE guard) was
+// wiped before the guard ever got a chance to see it.
+//
+// The fix: overlay ONLY classificationProtectedMetadataKeys from the
+// EXISTING (pre-conflict) row onto EXCLUDED.metadata, so those specific keys
+// survive untouched while every other key (collector-owned) is replaced
+// wholesale by the incoming value, exactly as before this fix. `documents.
+// metadata` here reads the PRE-update row, the same established idiom
+// AttachTranscript already relies on for its own metadata merge (ON
+// CONFLICT DO UPDATE SET expressions evaluate against the OLD row, not the
+// RETURNING clause's POST-update value — see UpsertTracked's doc comment on
+// why RETURNING itself cannot use this trick).
+//
+// This is deliberately NOT the same shape as AttachTranscript's `documents.
+// metadata || EXCLUDED.metadata` (see its doc comment): AttachTranscript's
+// incoming metadata is always a deliberate PATCH of a few transcript-only
+// keys, so merging the whole existing object underneath it is correct and
+// leaves nothing stale. Upsert/UpsertTracked's incoming metadata is the
+// collector's full snapshot, so doing the same full merge there would leave
+// every collector-owned key the collector no longer reports (e.g. a removed
+// label, a corrected sender) stuck at its stale value forever — only the
+// finite classification-owned key set above needs protecting, not the whole
+// object.
+const upsertMetadataMergeSQL = `EXCLUDED.metadata || COALESCE((
+			SELECT jsonb_object_agg(kv.key, kv.value)
+			FROM jsonb_each(documents.metadata) AS kv(key, value)
+			WHERE kv.key = ANY (ARRAY[` + classificationProtectedMetadataKeys + `])
+		), '{}'::jsonb)`
+
 // UpsertTracked is identical to Upsert but additionally returns a bool that
 // indicates whether the document's content actually changed. Callers that
 // perform post-upsert work (chunking, embedding) can use this to skip
@@ -76,6 +132,12 @@ const callDupCheckQuery = `
 //  2. `documents.col` in RETURNING reflects the post-update value, so a naive
 //     `documents.content IS DISTINCT FROM EXCLUDED.content` would always be
 //     false after the UPDATE overwrites the column.
+//
+// metadata on conflict is EXCLUDED.metadata with classificationProtectedMetadataKeys
+// overlaid back from the existing row — see upsertMetadataMergeSQL's doc
+// comment for why a bare `metadata = EXCLUDED.metadata` used to silently
+// erase a golden-set "user" retention judgment on the document's next
+// re-collection.
 //
 // *DocumentStore satisfies the api.IngestMessagesUpserter interface via this method.
 func (s *DocumentStore) UpsertTracked(ctx context.Context, doc *model.Document) (contentChanged bool, err error) {
@@ -121,6 +183,14 @@ func (s *DocumentStore) UpsertTracked(ctx context.Context, doc *model.Document) 
 		embeddingArg = pgvector.NewVector(doc.Embedding)
 	}
 
+	// embedding_version: 빈 문자열이면 NULL 을 보내고, SQL 쪽에서 기존 값을
+	// 유지한다(마이그레이션 037 참고). 임베딩을 만들지 않은 재수집 upsert 가
+	// 이미 기록된 버전을 지우면 안 되기 때문이다.
+	var embeddingVersionArg interface{}
+	if doc.EmbeddingVersion != "" {
+		embeddingVersionArg = doc.EmbeddingVersion
+	}
+
 	// Change detection via CTE pre-update snapshot.
 	//
 	// Why CTE and not RETURNING + EXCLUDED:
@@ -146,13 +216,16 @@ func (s *DocumentStore) UpsertTracked(ctx context.Context, doc *model.Document) 
 			WHERE source_type = $1 AND source_id = $2
 		)
 		INSERT INTO documents
-			(source_type, source_id, title, content, metadata, embedding, occurred_at, collected_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			(source_type, source_id, title, content, metadata, embedding, occurred_at, collected_at, embedding_version)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (source_type, source_id) DO UPDATE SET
 			title        = EXCLUDED.title,
 			content      = EXCLUDED.content,
-			metadata     = EXCLUDED.metadata,
+			metadata     = ` + upsertMetadataMergeSQL + `,
 			embedding    = COALESCE(EXCLUDED.embedding, documents.embedding),
+			embedding_version = CASE WHEN EXCLUDED.embedding IS NOT NULL
+			                    THEN EXCLUDED.embedding_version
+			                    ELSE documents.embedding_version END,
 			occurred_at  = COALESCE(EXCLUDED.occurred_at, documents.occurred_at),
 			collected_at = EXCLUDED.collected_at,
 			status       = 'active',
@@ -172,6 +245,7 @@ func (s *DocumentStore) UpsertTracked(ctx context.Context, doc *model.Document) 
 		embeddingArg,
 		doc.OccurredAt,
 		doc.CollectedAt,
+		embeddingVersionArg,
 	)
 	if err := row.Scan(&doc.ID, &doc.CreatedAt, &doc.UpdatedAt, &wasInsert, &contentChanged); err != nil {
 		return false, err
@@ -194,6 +268,11 @@ func (s *DocumentStore) UpsertTracked(ctx context.Context, doc *model.Document) 
 // skipped and ErrDuplicateTranscript is returned (the caller may safely ignore
 // or log it). A same-source_id re-upsert is NOT affected: the ON CONFLICT path
 // handles it normally even when the content is identical.
+//
+// metadata on conflict is EXCLUDED.metadata with classificationProtectedMetadataKeys
+// overlaid back from the existing row (see upsertMetadataMergeSQL's doc
+// comment) — every other metadata key is replaced wholesale by the incoming
+// collector snapshot, same as before this protection was added.
 func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
 	// Recurrence guards (migration 027 background): warn on a container or
 	// deprecated source_type, and warn on a possible cross-source duplicate
@@ -239,6 +318,14 @@ func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
 		embeddingArg = pgvector.NewVector(doc.Embedding)
 	}
 
+	// embedding_version: 빈 문자열이면 NULL 을 보내고, SQL 쪽에서 기존 값을
+	// 유지한다(마이그레이션 037 참고). 임베딩을 만들지 않은 재수집 upsert 가
+	// 이미 기록된 버전을 지우면 안 되기 때문이다.
+	var embeddingVersionArg interface{}
+	if doc.EmbeddingVersion != "" {
+		embeddingVersionArg = doc.EmbeddingVersion
+	}
+
 	// occurred_at is the original event time (email date, calendar start, etc.).
 	// NULL is stored when the collector has no event-time concept; COALESCE
 	// in ORDER BY clauses falls back to collected_at for those rows.
@@ -247,13 +334,16 @@ func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
 	// parsed value.
 	const q = `
 		INSERT INTO documents
-			(source_type, source_id, title, content, metadata, embedding, occurred_at, collected_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			(source_type, source_id, title, content, metadata, embedding, occurred_at, collected_at, embedding_version)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (source_type, source_id) DO UPDATE SET
 			title        = EXCLUDED.title,
 			content      = EXCLUDED.content,
-			metadata     = EXCLUDED.metadata,
+			metadata     = ` + upsertMetadataMergeSQL + `,
 			embedding    = COALESCE(EXCLUDED.embedding, documents.embedding),
+			embedding_version = CASE WHEN EXCLUDED.embedding IS NOT NULL
+			                    THEN EXCLUDED.embedding_version
+			                    ELSE documents.embedding_version END,
 			occurred_at  = COALESCE(EXCLUDED.occurred_at, documents.occurred_at),
 			collected_at = EXCLUDED.collected_at,
 			status       = 'active',
@@ -270,6 +360,7 @@ func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
 		embeddingArg,
 		doc.OccurredAt,
 		doc.CollectedAt,
+		embeddingVersionArg,
 	)
 	return row.Scan(&doc.ID, &doc.CreatedAt, &doc.UpdatedAt)
 }
@@ -302,7 +393,15 @@ func isNoRows(err error) bool {
 //     speaker_count, ...), so call-log-only keys the transcript never knows
 //     about (contact_name/direction/duration_seconds from smsmap.MapCall,
 //     any later retention tag) survive the merge. On key collision the
-//     patch's value wins (jsonb `||` is right-biased).
+//     patch's value wins (jsonb `||` is right-biased). This full merge is
+//     safe here specifically because doc.Metadata is always a small,
+//     deliberate patch — it is NOT the same shape as Upsert/UpsertTracked's
+//     merge (upsertMetadataMergeSQL), whose incoming metadata is the
+//     collector's FULL replacement snapshot; a full `||` merge there would
+//     leave every collector-owned key the collector no longer reports (a
+//     removed label, a corrected sender) stuck at its stale value forever,
+//     so those two protect only the classification-owned key set instead of
+//     merging the whole object.
 //   - Does NOT touch title on conflict — the call-log title ("incoming 통화
 //     상대") stays more useful than the transcript's raw filename-stem
 //     title. collected_at IS still refreshed to EXCLUDED, matching Upsert's
@@ -360,6 +459,14 @@ func (s *DocumentStore) AttachTranscript(ctx context.Context, doc *model.Documen
 		embeddingArg = pgvector.NewVector(doc.Embedding)
 	}
 
+	// embedding_version: 빈 문자열이면 NULL 을 보내고, SQL 쪽에서 기존 값을
+	// 유지한다(마이그레이션 037 참고). 임베딩을 만들지 않은 재수집 upsert 가
+	// 이미 기록된 버전을 지우면 안 되기 때문이다.
+	var embeddingVersionArg interface{}
+	if doc.EmbeddingVersion != "" {
+		embeddingVersionArg = doc.EmbeddingVersion
+	}
+
 	// Change detection mirrors UpsertTracked's CTE pattern — see that
 	// method's doc comment for why EXCLUDED cannot be referenced in RETURNING
 	// and why documents.content in RETURNING would already hold the
@@ -371,8 +478,8 @@ func (s *DocumentStore) AttachTranscript(ctx context.Context, doc *model.Documen
 			WHERE source_type = $1 AND source_id = $2
 		)
 		INSERT INTO documents
-			(source_type, source_id, title, content, metadata, embedding, occurred_at, collected_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			(source_type, source_id, title, content, metadata, embedding, occurred_at, collected_at, embedding_version)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (source_type, source_id) DO UPDATE SET
 			content      = EXCLUDED.content,
 			title        = CASE WHEN EXCLUDED.metadata->>'pii_name_redacted' = 'true' THEN EXCLUDED.title ELSE documents.title END,
@@ -383,6 +490,9 @@ func (s *DocumentStore) AttachTranscript(ctx context.Context, doc *model.Documen
             bullet_summary = CASE WHEN EXCLUDED.metadata->>'pii_name_redacted' = 'true' THEN NULL ELSE documents.bullet_summary END,
             summary_embedding = CASE WHEN EXCLUDED.metadata->>'pii_name_redacted' = 'true' THEN NULL ELSE documents.summary_embedding END,
 			embedding    = CASE WHEN EXCLUDED.metadata->>'pii_name_redacted' = 'true' THEN EXCLUDED.embedding ELSE COALESCE(EXCLUDED.embedding, documents.embedding) END,
+			embedding_version = CASE WHEN EXCLUDED.metadata->>'pii_name_redacted' = 'true' OR EXCLUDED.embedding IS NOT NULL
+			                    THEN EXCLUDED.embedding_version
+			                    ELSE documents.embedding_version END,
 			occurred_at  = COALESCE(documents.occurred_at, EXCLUDED.occurred_at),
 			collected_at = EXCLUDED.collected_at,
 			status       = 'active',
@@ -403,6 +513,7 @@ func (s *DocumentStore) AttachTranscript(ctx context.Context, doc *model.Documen
 		embeddingArg,
 		doc.OccurredAt,
 		doc.CollectedAt,
+		embeddingVersionArg,
 	)
 	if err := row.Scan(&doc.ID, &doc.CreatedAt, &doc.UpdatedAt, &wasInsert, &contentChanged); err != nil {
 		return false, err
@@ -1632,6 +1743,58 @@ func (s *DocumentStore) ListUnembedded(ctx context.Context, limit int) ([]*model
 	return collectDocuments(rows)
 }
 
+// ListDocumentsNeedingEmbedding 은 "임베딩을 (다시) 만들어야 하는" 활성 문서를
+// 최대 limit 건 돌려준다. 대상은 두 부류다:
+//
+//  1. embedding IS NULL — 아직 임베딩되지 않은 문서(ListUnembedded 와 동일).
+//  2. embedding_version 이 currentVersion 과 다른 문서 — 다른 모델/차원/입력
+//     구성으로 만들어진 옛 벡터. NULL(마이그레이션 037 이전 레거시)도 포함된다.
+//
+// currentVersion 이 빈 문자열이면 2번 조건을 적용하지 않는다(= ListUnembedded
+// 와 같은 동작). 임베딩 버전이 배선되지 않았거나 재임베딩이 꺼져 있을 때
+// 기존 동작을 한 치도 바꾸지 않기 위한 안전 기본값이다.
+//
+// 정렬은 collected_at ASC — 오래된 문서부터 앞으로 진행한다.
+func (s *DocumentStore) ListDocumentsNeedingEmbedding(ctx context.Context, limit int, currentVersion string) ([]*model.Document, error) {
+	if currentVersion == "" {
+		return s.ListUnembedded(ctx, limit)
+	}
+
+	const q = `
+		SELECT id, source_type, source_id, title, content, metadata, embedding,
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding
+		FROM documents
+		WHERE status = 'active'
+		  AND (embedding IS NULL OR embedding_version IS DISTINCT FROM $2)
+		ORDER BY collected_at ASC
+		LIMIT $1`
+
+	rows, err := s.pg.pool.Query(ctx, q, limit, currentVersion)
+	if err != nil {
+		return nil, fmt.Errorf("list documents needing embedding: %w", err)
+	}
+	defer rows.Close()
+
+	return collectDocuments(rows)
+}
+
+// CountDocumentsNeedingEmbedding 은 재임베딩 대상 활성 문서 수를 센다.
+// 진행 상황 로그용이며, 검색 경로에서는 호출하지 않는다.
+func (s *DocumentStore) CountDocumentsNeedingEmbedding(ctx context.Context, currentVersion string) (int, error) {
+	var n int
+	err := s.pg.pool.QueryRow(ctx, `
+		SELECT count(*) FROM documents
+		WHERE status = 'active'
+		  AND (embedding IS NULL OR ($1 <> '' AND embedding_version IS DISTINCT FROM $1))`,
+		currentVersion,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count documents needing embedding: %w", err)
+	}
+	return n, nil
+}
+
 // listWithoutEntitiesQuery backs ListWithoutEntities.
 //
 // The source_type filter is load-bearing, not cosmetic: without it the
@@ -2054,12 +2217,18 @@ func (s *DocumentStore) UpdateEmbedding(ctx context.Context, doc *model.Document
 	if len(doc.Embedding) == 0 {
 		return fmt.Errorf("UpdateEmbedding: empty embedding for document %s", doc.ID)
 	}
+	// embedding_version 은 $3 이 빈 문자열일 때만 기존 값을 유지한다.
+	// 버전을 남기지 않으면 재임베딩 선별 쿼리가 같은 행을 영원히 다시 집어
+	// 가므로(무한 재임베딩), 벡터와 버전은 반드시 같은 UPDATE 에서 쓴다.
 	_, err := s.pg.pool.Exec(ctx, `
 		UPDATE documents
-		SET embedding = $1, updated_at = now()
+		SET embedding = $1,
+		    embedding_version = CASE WHEN $3 = '' THEN embedding_version ELSE $3 END,
+		    updated_at = now()
 		WHERE id = $2`,
 		pgvector.NewVector(doc.Embedding),
 		doc.ID,
+		doc.EmbeddingVersion,
 	)
 	if err != nil {
 		return fmt.Errorf("update embedding %s: %w", doc.ID, err)

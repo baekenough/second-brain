@@ -36,7 +36,7 @@ const systemPrompt = `당신은 사용자의 열린 액션 목록을 한국어�
 - document_ids가 비어 있는 문장도 폐기된다.
 - identity_keys에는 그 문장이 다루는 액션의 identity_key를 복사한다.
 - 문장은 최대 6개, 각 문장은 400자 이내의 한 문장으로 쓴다.
-- 우선순위: 기한이 임박한 것 > awaiting_my_reply > my_commitment > 나머지.`
+- 우선순위: 기한이 임박한 것 > my_commitment > 나머지.`
 
 // promptAction is the per-action shape sent to the model. Field names are
 // snake_case so they match the vocabulary used in the system prompt.
