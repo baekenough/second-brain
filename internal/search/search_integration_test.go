@@ -51,7 +51,7 @@ func TestApplyRerank_EmptyResults(t *testing.T) {
 		},
 	})
 
-	got, err := svc.applyRerank(context.Background(), "query", nil)
+	got, err := svc.applyRerank(context.Background(), "query", nil, model.SearchTuning{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestApplyRerank_RerankerError(t *testing.T) {
 	})
 
 	results := makeResults("doc a", "doc b")
-	_, err := svc.applyRerank(context.Background(), "query", results)
+	_, err := svc.applyRerank(context.Background(), "query", results, model.SearchTuning{})
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -100,7 +100,7 @@ func TestApplyRerank_OutOfBoundsIndex(t *testing.T) {
 	})
 
 	results := makeResults("only doc")
-	_, err := svc.applyRerank(context.Background(), "query", results)
+	_, err := svc.applyRerank(context.Background(), "query", results, model.SearchTuning{})
 	if err == nil {
 		t.Fatal("invalid provider indices must reject the response so Search preserves its original candidates")
 	}
@@ -125,7 +125,7 @@ func TestApplyRerank_NormalFlow(t *testing.T) {
 	})
 
 	results := makeResults("doc-0", "doc-1", "doc-2")
-	got, err := svc.applyRerank(context.Background(), "query", results)
+	got, err := svc.applyRerank(context.Background(), "query", results, model.SearchTuning{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
