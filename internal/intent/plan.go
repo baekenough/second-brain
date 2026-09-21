@@ -126,15 +126,75 @@ var (
 	tomorrowRe  = regexp.MustCompile(`내일`)
 	dayAfterRe  = regexp.MustCompile(`모레`)
 	calendarKwR = regexp.MustCompile(`일정|스케줄|캘린더|약속`)
+
+	// 아래부터는 "지난 주"류의 과거·상대 표현 확장분. 마찬가지로 겹치는 표현은
+	// 접두어가 더 구체적인 쪽(주말)을 먼저 매치해야 하므로 lastWeekendRe가
+	// lastWeekRe보다 항상 먼저 검사된다 — periodMentionRegexes와 switch 양쪽 모두
+	// 이 순서를 지킨다.
+	lastWeekendRe        = regexp.MustCompile(`(지난|저번)\s*주말`)
+	lastWeekRe           = regexp.MustCompile(`(지난|저번)\s*주`)
+	thisMonthRe          = regexp.MustCompile(`이번\s*달`)
+	nextMonthRe          = regexp.MustCompile(`다음\s*달`)
+	dayBeforeYesterdayRe = regexp.MustCompile(`그제|그저께`)
+	thisYearRe           = regexp.MustCompile(`올해`)
+	lastYearRe           = regexp.MustCompile(`작년`)
+
+	// bareMonthRe는 "올해 8월"처럼 연도 단어(올해/작년) 뒤에 숫자로 된 달이 남아
+	// 있는지 보는 가드다. 4자리 연도가 있는 "2026년 8월"은 yearMonthRe가 먼저
+	// 잡아내므로 이 가드는 필요 없지만, "올해"/"작년"은 그 자체로 1년 전체를
+	// 뜻하는 표현이라 숫자 달이 딸려 오면 사용자가 실제로는 그 달만 원하는
+	// 것일 수 있다 — 이 경우 창을 만들지 않고 LLM 경로로 넘긴다.
+	bareMonthRe = regexp.MustCompile(`\d{1,2}월`)
 )
 
 // Only unambiguous single-period questions belong in the regex cache.
 // Comparisons, qualified weekdays, and messages ABOUT events require semantic
 // planning: a message's sent time is not the date of the event it discusses.
 var exactDayRe = regexp.MustCompile(`(\d{4})(?:년\s*|-)(\d{1,2})(?:월\s*|-)(\d{1,2})(?:일)?`)
-var complexTimeRe = regexp.MustCompile(`비교|대비|차이|부터|까지|[월화수목금토일]요일|\d{1,2}[/-]\d{1,2}|\d{1,2}일|이번\s*달|다음\s*달|지난\s*주`)
+var complexTimeRe = regexp.MustCompile(`비교|대비|차이|부터|까지|\d{1,2}[/-]\d{1,2}|\d{1,2}일`)
 var recordOccurredRe = regexp.MustCompile(`받|보낸|보냈|수신|발신|통화했|전화했`)
 var recordSourceRe = regexp.MustCompile(`메일|이메일|문자|메시지|메세지|통화|전화|슬랙|노션|문서|노트|기록|대화`)
+
+// periodMentionRegexes는 requiresSemanticWindow의 "몇 개 기간이 언급됐는가" 집계와
+// hasPeriodMention의 "기간이 하나라도 있는가" 판정이 공유하는 단일 목록이다. 두
+// 함수가 각자 다른 목록을 들고 있으면 나중에 표현을 하나 추가할 때 한쪽만 고치고
+// 잊어버리는 드리프트가 생긴다(plan.go 상단 planSourceTypes와 같은 이유). 겹치는
+// 표현(주말 vs 주)은 더 구체적인 쪽이 먼저 나오도록 순서를 맞췄다 —
+// requiresSemanticWindow가 순서대로 치환해 나가면서 세는 로직이라 이 순서에
+// 의존한다.
+var periodMentionRegexes = []*regexp.Regexp{
+	yearMonthRe, lastMonthRe,
+	weekendRe, lastWeekendRe,
+	nextWeekRe, thisWeekRe, lastWeekRe,
+	thisMonthRe, nextMonthRe,
+	dayBeforeYesterdayRe, dayAfterRe, tomorrowRe, todayRe, yesterdayRe,
+	thisYearRe, lastYearRe,
+}
+
+// daysAgoRe/weeksAgoRe/monthsAgoRe는 "N일 전"/"N주 전"/"N달 전"처럼 과거의 한
+// 시점을 가리키는 표현이다. "지난 N일"류(아래 lastNDaysRe/lastNWeeksRe)와 달리
+// 오늘까지 이어지는 범위가 아니라 그 하루/그 주/그 달 자체가 창이 된다.
+var daysAgoRe = regexp.MustCompile(`(\d+)\s*일\s*전`)
+var weeksAgoRe = regexp.MustCompile(`(\d+)\s*주\s*전`)
+var monthsAgoRe = regexp.MustCompile(`(\d+)\s*달\s*전`)
+
+// lastNDaysRe/lastNWeeksRe는 "지난 N일"/"최근 N일"/"지난 N주"/"최근 N주"처럼
+// 오늘까지 포함해 최근 N일(또는 N주)을 훑는 범위 표현이다. 숫자가 없는
+// "최근"·"요즘"·"예전에"는 이 정규식에 매치되지 않는다(그래서 창을 만들지
+// 않는다) — LLM 프롬프트의 같은 정책(planSystemPrompt 규칙 2)과 대칭이다.
+var lastNDaysRe = regexp.MustCompile(`(?:지난|최근)\s*(\d+)\s*일`)
+var lastNWeeksRe = regexp.MustCompile(`(?:지난|최근)\s*(\d+)\s*주`)
+
+// weekdayInWeekRe는 "이번주 금요일"/"지난주 월요일"/"다음주 수요일"처럼 특정
+// 주(이번/지난·저번/다음) 안의 요일 하나를 가리키는 표현이다. bareWeekdayRe는
+// "주" 한정어가 붙었는지와 무관하게 요일 언급 자체를 센다 — matchWeekdayInWeek가
+// "이번주 월요일과 화요일"처럼 두 번째 요일이 한정어 없이 딸려 온 경우까지
+// 잡아내려면 한정어 붙은 패턴만으로는 부족하기 때문이다.
+var weekdayInWeekRe = regexp.MustCompile(`(이번|지난|저번|다음)\s*주\s*([월화수목금토일])요일`)
+var bareWeekdayRe = regexp.MustCompile(`[월화수목금토일]요일`)
+
+// koreanWeekdayOffset은 월요일을 0으로 둔 한글 요일 → 월요일로부터의 일수다.
+var koreanWeekdayOffset = map[string]int{"월": 0, "화": 1, "수": 2, "목": 3, "금": 4, "토": 5, "일": 6}
 
 func requiresSemanticWindow(question string) bool {
 	if complexTimeRe.MatchString(question) {
@@ -144,7 +204,7 @@ func requiresSemanticWindow(question string) bool {
 	// (이번 주/이번 주말, 내일/내일모레).
 	rest := strings.ReplaceAll(question, "내일모레", "모레")
 	count := 0
-	for _, re := range []*regexp.Regexp{yearMonthRe, lastMonthRe, weekendRe, nextWeekRe, thisWeekRe, dayAfterRe, tomorrowRe, todayRe, yesterdayRe} {
+	for _, re := range periodMentionRegexes {
 		matches := re.FindAllStringIndex(rest, -1)
 		count += len(matches)
 		rest = re.ReplaceAllString(rest, " ")
@@ -153,7 +213,7 @@ func requiresSemanticWindow(question string) bool {
 }
 
 func hasPeriodMention(s string) bool {
-	for _, re := range []*regexp.Regexp{yearMonthRe, lastMonthRe, weekendRe, nextWeekRe, thisWeekRe, dayAfterRe, tomorrowRe, todayRe, yesterdayRe} {
+	for _, re := range periodMentionRegexes {
 		if re.MatchString(s) {
 			return true
 		}
@@ -245,9 +305,12 @@ func (p *LLMPlanner) nowFunc() time.Time {
 }
 
 // DeterministicWindow runs the same regex pre-pass deterministicPlan uses to
-// resolve one of the nine Korean date/period phrasings of spec §4.1 to a
-// half-open [from, to) window, evaluated relative to the given base time
-// rather than time.Now(). now should already be normalised to
+// resolve one of the Korean date/period phrasings this file recognises (the
+// original nine of spec §4.1, plus the past/relative expressions added
+// later: 지난주/저번주, 이번달, 다음달, 지난 주말/저번 주말, 그제/그저께,
+// N일·N주·N달 전, 지난·최근 N일/N주, 올해/작년, and 이번주/지난주/다음주
+// X요일) to a half-open [from, to) window, evaluated relative to the given
+// base time rather than time.Now(). now should already be normalised to
 // timeutil.KST() by the caller, exactly as Plan does before calling
 // deterministicPlan — the range helpers (monthRange/weekRange/dayRange) all
 // re-normalise internally, but the regexes' own reading of "this month" /
@@ -299,6 +362,23 @@ func DeterministicWindow(question string, now time.Time) (from, to time.Time, la
 		}
 	}
 
+	// 아래 세 검사는 exactDayRe처럼 매칭된 부분을 떼어내고 남은 문장(rest)이
+	// 깨끗한지 자체적으로 확인한다 — complexTimeRe의 `\d{1,2}일` 항목이 숫자를
+	// 포함한 이 표현들("3일 전", "최근 3일" 등)을 먼저 걸러내 버리기 때문에,
+	// 뒤에 나오는 공용 requiresSemanticWindow(question) 게이트보다 먼저 자기
+	// 숫자를 지우고 판단해야 한다. matched가 false면 세 표현 중 아무것도 없었다는
+	// 뜻이라 다음 검사로 넘어가야 하고, matched가 true이면 그 결과(ok 진위와
+	// 관계없이)가 DeterministicWindow 전체의 답이 된다.
+	if wFrom, wTo, wLabel, wOK, matched := matchWeekdayInWeek(question, now); matched {
+		return wFrom, wTo, wLabel, wOK
+	}
+	if aFrom, aTo, aLabel, aOK, matched := matchRelativeAgo(question, now); matched {
+		return aFrom, aTo, aLabel, aOK
+	}
+	if rFrom, rTo, rLabel, rOK, matched := matchRecentRange(question, now); matched {
+		return rFrom, rTo, rLabel, rOK
+	}
+
 	if requiresSemanticWindow(question) {
 		return time.Time{}, time.Time{}, "", false
 	}
@@ -322,6 +402,12 @@ func DeterministicWindow(question string, now time.Time) (from, to time.Time, la
 		from, _ = dayRange(weekFrom.AddDate(0, 0, 5))
 		_, to = dayRange(weekFrom.AddDate(0, 0, 6))
 		label = "이번 주말"
+	case lastWeekendRe.MatchString(question):
+		// 지난 주말 = 지난주 월요일 기준 +5/+6일 (weekendRe와 대칭).
+		lastMonday := weekStartFor("지난", now)
+		from, _ = dayRange(lastMonday.AddDate(0, 0, 5))
+		_, to = dayRange(lastMonday.AddDate(0, 0, 6))
+		label = "지난 주말"
 	case nextWeekRe.MatchString(question):
 		_, thisWeekEnd := weekRange(now)
 		from, to = weekRange(thisWeekEnd)
@@ -329,6 +415,19 @@ func DeterministicWindow(question string, now time.Time) (from, to time.Time, la
 	case thisWeekRe.MatchString(question):
 		from, to = weekRange(now)
 		label = "이번 주"
+	case lastWeekRe.MatchString(question):
+		from, to = weekRange(weekStartFor("지난", now))
+		label = "지난 주"
+	case thisMonthRe.MatchString(question):
+		from, to = monthRange(now.Year(), int(now.Month()))
+		label = "이번달"
+	case nextMonthRe.MatchString(question):
+		nm := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).AddDate(0, 1, 0)
+		from, to = monthRange(nm.Year(), int(nm.Month()))
+		label = "다음달"
+	case dayBeforeYesterdayRe.MatchString(question):
+		from, to = dayRange(now.AddDate(0, 0, -2))
+		label = "그제"
 	case dayAfterRe.MatchString(question):
 		from, to = dayRange(now.AddDate(0, 0, 2))
 		label = "모레"
@@ -341,14 +440,148 @@ func DeterministicWindow(question string, now time.Time) (from, to time.Time, la
 	case yesterdayRe.MatchString(question):
 		from, to = dayRange(now.AddDate(0, 0, -1))
 		label = "어제"
+	case thisYearRe.MatchString(question) && !bareMonthRe.MatchString(question):
+		from, to = yearRange(now.Year())
+		label = "올해"
+	case lastYearRe.MatchString(question) && !bareMonthRe.MatchString(question):
+		from, to = yearRange(now.Year() - 1)
+		label = "작년"
 	default:
 		return time.Time{}, time.Time{}, "", false
 	}
 	return from, to, label, true
 }
 
-// deterministicPlan resolves the nine phrasings of spec §4.1 without an LLM
-// call. ok is false when nothing matched.
+// matchWeekdayInWeek는 "이번주 금요일"/"지난주 월요일"/"다음주 수요일"처럼 특정
+// 주 안의 요일 하나를 그 날 하루로 좁힌다. matched가 false면 이 표현이 전혀
+// 없었다는 뜻이고, 호출자는 다음 검사로 넘어가야 한다. 같은 문장에 요일이 두 번
+// 나오면(예: "이번주 월요일과 화요일" — 두 번째 "화요일"에는 "주" 한정어가 없어
+// weekdayInWeekRe 자체는 한 번만 잡는다) 어느 쪽을 말하는지 알 수 없으므로
+// bareWeekdayRe로 남은 요일 언급을 다시 확인해 matched=true, ok=false로 LLM
+// 경로로 넘긴다.
+func matchWeekdayInWeek(question string, now time.Time) (from, to time.Time, label string, ok, matched bool) {
+	all := weekdayInWeekRe.FindAllStringSubmatch(question, -1)
+	if len(all) == 0 {
+		return time.Time{}, time.Time{}, "", false, false
+	}
+	if len(all) != 1 {
+		return time.Time{}, time.Time{}, "", false, true
+	}
+	m := all[0]
+	rest := weekdayInWeekRe.ReplaceAllString(question, "")
+	if bareWeekdayRe.MatchString(rest) {
+		return time.Time{}, time.Time{}, "", false, true
+	}
+	if requiresSemanticWindow(rest) || hasPeriodMention(rest) {
+		return time.Time{}, time.Time{}, "", false, true
+	}
+	monday := weekStartFor(m[1], now)
+	day := monday.AddDate(0, 0, koreanWeekdayOffset[m[2]])
+	from, to = dayRange(day)
+	qualifier := m[1]
+	if qualifier == "저번" {
+		qualifier = "지난"
+	}
+	return from, to, qualifier + "주 " + m[2] + "요일", true, true
+}
+
+// weekStartFor는 이번(기본값)/지난(저번)/다음 주의 월요일 00:00(KST)을
+// 돌려준다. "다음 주" 케이스가 이미 쓰는 계산(다음 주 시작 = 이번 주 끝나는
+// 시점을 다시 weekRange에 넣기)을 지난주 쪽에도 대칭으로 적용한다: 지난주 시작
+// = 이번주 월요일보다 하루 전(=지난주 일요일)을 weekRange에 넣은 결과.
+func weekStartFor(qualifier string, now time.Time) time.Time {
+	thisMonday, thisWeekEnd := weekRange(now)
+	switch qualifier {
+	case "지난", "저번":
+		lastMonday, _ := weekRange(thisMonday.AddDate(0, 0, -1))
+		return lastMonday
+	case "다음":
+		nextMonday, _ := weekRange(thisWeekEnd)
+		return nextMonday
+	default: // "이번"
+		return thisMonday
+	}
+}
+
+// matchRelativeAgo는 "N일 전"/"N주 전"/"N달 전"을 해석한다. 이 표현들은 과거의
+// 한 시점 하나를 가리킨다 — "N일 전"은 그 날 하루, "N주 전"은 그 주 전체,
+// "N달 전"은 그 달 전체가 창이 된다(matchRecentRange의 "지난 N일"류처럼 오늘까지
+// 이어지는 범위가 아니다). matched가 false면 세 표현 중 아무것도 없었다는
+// 뜻이고, matched가 true인데 ok가 false면 숫자를 떼어낸 나머지 문장에 다른
+// 기간·복잡 표현이 남아 있어 신뢰할 수 없다는 뜻이다.
+func matchRelativeAgo(question string, now time.Time) (from, to time.Time, label string, ok, matched bool) {
+	units := []struct {
+		re   *regexp.Regexp
+		unit string
+	}{
+		{daysAgoRe, "일"},
+		{weeksAgoRe, "주"},
+		{monthsAgoRe, "달"},
+	}
+	for _, u := range units {
+		m := u.re.FindStringSubmatch(question)
+		if m == nil {
+			continue
+		}
+		n, err := strconv.Atoi(m[1])
+		if err != nil || n <= 0 {
+			return time.Time{}, time.Time{}, "", false, true
+		}
+		rest := u.re.ReplaceAllString(question, "")
+		if requiresSemanticWindow(rest) || hasPeriodMention(rest) {
+			return time.Time{}, time.Time{}, "", false, true
+		}
+		switch u.unit {
+		case "일":
+			from, to = dayRange(now.AddDate(0, 0, -n))
+		case "주":
+			from, to = weekRange(now.AddDate(0, 0, -7*n))
+		case "달":
+			base := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).AddDate(0, -n, 0)
+			from, to = monthRange(base.Year(), int(base.Month()))
+		}
+		return from, to, fmt.Sprintf("%d%s 전", n, u.unit), true, true
+	}
+	return time.Time{}, time.Time{}, "", false, false
+}
+
+// matchRecentRange는 "지난 N일"/"최근 N일"/"지난 N주"/"최근 N주"를 해석한다.
+// matchRelativeAgo와 반대로, 이 표현들은 오늘을 포함해 최근 N일(또는 N*7일)
+// 전체를 훑는 범위다. 숫자가 없는 "최근"·"요즘"·"예전에"는 정규식 자체가
+// 숫자를 요구하므로 매치되지 않는다 — planSystemPrompt 규칙 2(빈 창 유지)와
+// 결정론 경로에서 대칭을 이루는 지점이다.
+func matchRecentRange(question string, now time.Time) (from, to time.Time, label string, ok, matched bool) {
+	units := []struct {
+		re      *regexp.Regexp
+		unit    string
+		daysPer int
+	}{
+		{lastNDaysRe, "일", 1},
+		{lastNWeeksRe, "주", 7},
+	}
+	for _, u := range units {
+		m := u.re.FindStringSubmatch(question)
+		if m == nil {
+			continue
+		}
+		n, err := strconv.Atoi(m[1])
+		if err != nil || n <= 0 {
+			return time.Time{}, time.Time{}, "", false, true
+		}
+		rest := u.re.ReplaceAllString(question, "")
+		if requiresSemanticWindow(rest) || hasPeriodMention(rest) {
+			return time.Time{}, time.Time{}, "", false, true
+		}
+		from, _ = dayRange(now.AddDate(0, 0, -(n*u.daysPer - 1)))
+		_, to = dayRange(now)
+		return from, to, fmt.Sprintf("최근 %d%s", n, u.unit), true, true
+	}
+	return time.Time{}, time.Time{}, "", false, false
+}
+
+// deterministicPlan resolves DeterministicWindow's phrase list (the original
+// nine of spec §4.1 plus the past/relative expressions documented on that
+// function) without an LLM call. ok is false when nothing matched.
 func (p *LLMPlanner) deterministicPlan(question string, now time.Time) (QueryPlan, bool) {
 	from, to, label, ok := DeterministicWindow(question, now)
 	if !ok {

@@ -5,11 +5,11 @@
 //  2. Within each section (or for the whole text when HeadingAware=false):
 //     a. Split on paragraph boundaries (\n\n).
 //     b. If a paragraph exceeds MaxSize, split further on sentence boundaries
-//        (period, exclamation mark, or question mark followed by whitespace).
+//     (period, exclamation mark, or question mark followed by whitespace).
 //     c. Merge consecutive small paragraphs until they approach TargetSize.
 //     d. Append an Overlap-byte suffix from chunk N to the start of chunk N+1
-//        so that multi-chunk phrases are findable in at least one chunk.
-//        Overlap is applied only within a section; never across section boundaries.
+//     so that multi-chunk phrases are findable in at least one chunk.
+//     Overlap is applied only within a section; never across section boundaries.
 //
 // The implementation is intentionally simple: it operates on bytes (UTF-8
 // compatible because all split points are ASCII), which means byte counts are
@@ -20,6 +20,8 @@ package chunker
 import (
 	"strings"
 	"unicode/utf8"
+
+	"github.com/baekenough/second-brain/internal/textclean"
 )
 
 // Options controls chunk size and overlap.
@@ -54,6 +56,15 @@ type Options struct {
 	//
 	// Default: false (v0.1.9 behaviour unchanged).
 	HeadingAware bool
+
+	// SourceType is the originating document's model.SourceType, carried as a
+	// plain string so this package does not need to import internal/model.
+	// SelectOptions populates this field; Split uses it to dispatch
+	// per-source text cleanup (internal/textclean) before splitting — e.g.
+	// stripping quoted replies/signatures from Gmail bodies. Empty means no
+	// cleanup is applied (safe default for all pre-existing callers that
+	// build Options by hand, such as tests).
+	SourceType string
 }
 
 func (o *Options) withDefaults() Options {
@@ -90,6 +101,11 @@ type Section struct {
 // heading prefix when HeadingAware is true and the text contains headings).
 func Split(text string, opts Options) []string {
 	o := opts.withDefaults()
+
+	// 청킹 직전에 소스별 전처리를 적용한다(#Gmail 인용/서명 제거 등). 기존
+	// 문서를 재청킹(re-index)만 해도 정리 결과가 반영되도록, 원문
+	// (documents.content)이 아니라 이 시점에서만 텍스트를 정리한다.
+	text = textclean.CleanForChunking(o.SourceType, text)
 
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -446,8 +462,8 @@ func splitParagraphs(text string) []string {
 // aggressively than equivalent ASCII content.
 func splitSentences(text string, maxSize int) []string {
 	var (
-		chunks   []string
-		buf      strings.Builder
+		chunks    []string
+		buf       strings.Builder
 		runeCount int // runes written to buf
 	)
 

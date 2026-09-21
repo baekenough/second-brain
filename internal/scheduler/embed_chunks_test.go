@@ -4,9 +4,10 @@ import (
 	"context"
 	"testing"
 
-	"github.com/google/uuid"
+	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
+	"github.com/google/uuid"
 )
 
 // mockChunkStore is a test double for *store.ChunkStore used in scheduler tests.
@@ -81,22 +82,29 @@ func TestEmbedChunks_EmptyChunks_NoOp(t *testing.T) {
 	s := New(&mockStore{}, embed)
 
 	// embedChunks with empty slice must not panic.
-	docID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	doc := model.Document{
+		ID:         uuid.MustParse("00000000-0000-0000-0000-000000000001"),
+		SourceType: model.SourceGmail,
+	}
 	// Calling directly to exercise the guard.
-	s.embedChunks(context.Background(), docID, []store.Chunk{})
+	s.embedChunks(context.Background(), doc, []store.Chunk{})
 	// No panic = pass.
 }
 
 // TestEmbedChunks_Signature verifies the function signature compiles with the
-// expected types: uuid.UUID, []store.Chunk.
+// expected types: model.Document, []store.Chunk.
+//
+// 문서 전체를 받는 이유: 청크 임베딩 입력 앞에 붙일 문맥 헤더
+// (BuildChunkContextHeader)를 만들려면 제목·발생시각·메타데이터가 필요하다.
+// 문서 ID 만으로는 헤더를 만들 수 없다.
 func TestEmbedChunks_Signature(t *testing.T) {
 	t.Parallel()
 
 	// This is a compile-time test: if embedChunks signature changes to use an
 	// incompatible type, this will fail to compile.
 	s := &Scheduler{}
-	docID := uuid.New()
+	doc := model.Document{ID: uuid.New()}
 	var chunks []store.Chunk
 	// We cannot call this without a real DB, but the type assertion compiles.
-	_ = func() { s.embedChunks(context.Background(), docID, chunks) }
+	_ = func() { s.embedChunks(context.Background(), doc, chunks) }
 }

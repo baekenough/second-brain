@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/baekenough/second-brain/internal/model"
 )
 
 // Config holds all application configuration loaded from environment variables.
@@ -36,10 +38,29 @@ type Config struct {
 	// EmbeddingAPIKey is a dedicated OpenAI API key (EMBEDDING_API_KEY env var).
 	// Use a separate key from any chat/LLM key so embedding costs are tracked
 	// independently and the key can be rotated without affecting chat traffic.
-	EmbeddingAPIKey  string
-	EmbeddingModel   string
-	EmbeddingDim     int    // EMBEDDING_DIM — vector dimension; must match the model output. Default 1536.
-	CliProxyAuthFile string // CLIPROXY_AUTH_FILE — CliProxyAPI OAuth JSON path (chat proxies only; NOT used for embeddings when EMBEDDING_API_KEY is set)
+	EmbeddingAPIKey string
+	EmbeddingModel  string
+	EmbeddingDim    int // EMBEDDING_DIM — vector dimension; must match the model output. Default 1536.
+	// EmbeddingDimensions 는 임베딩 요청에 실어 보내는 OpenAI `dimensions`
+	// 파라미터다(EMBEDDING_DIMENSIONS 환경변수, 기본 1536).
+	//
+	// EmbeddingDim 과 구분할 것: EmbeddingDim 은 "DB pgvector 컬럼이 몇 차원
+	// 인가"이고, 이 값은 "API 에게 몇 차원으로 줄여 달라고 요청하는가"다. 둘을
+	// 나눠 둔 덕분에 text-embedding-3-large 처럼 원래 3072 차원인 모델을
+	// 1536 차원으로 받아서, 컬럼 차원 변경(=전체 인덱스 재생성)과 모델 교체를
+	// 분리할 수 있다. 0 이면 요청에 dimensions 필드를 싣지 않는다(모델 기본값).
+	//
+	// Matryoshka 표현 학습을 지원하는 text-embedding-3 계열에서만 유효하다.
+	// 그 외 모델에는 전송하지 않는다(internal/search/embed.go 참고).
+	EmbeddingDimensions int
+	// EmbeddingReembedEnabled 는 "현재 설정과 다른 버전으로 만들어진 벡터를
+	// 다시 임베딩할지" 스위치다(EMBEDDING_REEMBED_ENABLED, 기본 false).
+	//
+	// 기본을 꺼 두는 이유: 켜는 순간 전체 코퍼스(문서 4.6만 건, 청크 8.2만 건)
+	// 를 다시 임베딩하므로 비용이 든다. 모델이나 임베딩 입력 구성을 바꾼 뒤
+	// 의도적으로 켜고, 재임베딩이 끝나면 다시 끄는 운영 플래그다.
+	EmbeddingReembedEnabled bool
+	CliProxyAuthFile        string // CLIPROXY_AUTH_FILE — CliProxyAPI OAuth JSON path (chat proxies only; NOT used for embeddings when EMBEDDING_API_KEY is set)
 
 	// EmbeddingProvider selects the embedding backend (EMBEDDING_PROVIDER env var).
 	// Valid values: "openai" (default), "local" (Ollama-compatible).
@@ -130,6 +151,23 @@ type Config struct {
 	// RerankTopN bounds how many candidates are sent to the reranker per
 	// request (search.NewHTTPReranker's topN argument). Default 10.
 	RerankTopN int // RERANKER_TOP_N, default 10
+
+	// SearchTuning 은 검색 실험용 노브다. 전부 기본값이면 현행 동작이며,
+	// 그것이 아무 SEARCH_* 노브도 설정하지 않은 배포의 상태다.
+	//
+	//	SEARCH_RERANK_OVERFETCH      리랭크 시 후보 풀 하한 (기본 0 = 현행)
+	//	SEARCH_MERGE_MODE            asymmetric(기본) | symmetric
+	//	SEARCH_RERANK_BLEND          replace(기본) | rrf
+	//	SEARCH_RERANK_BLEND_WEIGHT   rrf 합산에서 리랭커 항 가중치 (기본 1.0)
+	//	SEARCH_RERANK_INPUT          head(기본) | best_chunk
+	//	SEARCH_RECENCY_HALFLIFE_DAYS 최신성 감쇠 반감기(일), 기본 0 = 끔
+	//	SEARCH_RECENCY_ALPHA         감쇠 최대 강도 (기본 0.3)
+	//
+	// 파싱은 model.EnvSearchTuning 한 곳에만 있다. search.NewService 도 같은
+	// 함수를 부르므로, 이 필드와 실제 검색 동작이 갈라질 수 없다 — 설정
+	// 구조체와 실행 경로가 각자 환경변수를 읽던 방식이 기본값 드리프트를
+	// 만들어 온 전례가 있다.
+	SearchTuning model.SearchTuning
 
 	// OpenSearch (optional — BM25 full-text lane with Korean morphological
 	// (nori) tokenization, DISABLED when OPENSEARCH_URL is empty; this is
@@ -748,6 +786,32 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// EmbeddingDimensions: 임베딩 요청의 `dimensions` 파라미터. 기본값은
+	// EmbeddingDim 과 같게 둔다 — 모델을 바꾸지 않은 기존 배포에서는
+	// text-embedding-3-small 의 native 차원(1536)과 같은 값이 실려 나가므로
+	// 벡터가 달라지지 않는다. 0 을 주면 필드 자체를 싣지 않는다.
+	embeddingDimensions := embeddingDim
+	if v := os.Getenv("EMBEDDING_DIMENSIONS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			slog.Warn("config: EMBEDDING_DIMENSIONS is invalid; falling back to EMBEDDING_DIM",
+				"value", v,
+				"fallback", embeddingDim,
+				"error", err,
+			)
+		} else {
+			embeddingDimensions = n
+		}
+	}
+	if embeddingDimensions != 0 && embeddingDimensions != embeddingDim {
+		// 요청 차원과 컬럼 차원이 다르면 INSERT 자체가 pgvector 에서 실패한다.
+		// 막지는 않되(설정 실수로 프로세스를 죽이지 않는다) 크게 경고한다.
+		slog.Warn("config: EMBEDDING_DIMENSIONS differs from EMBEDDING_DIM; stored vectors will not fit the pgvector column",
+			"embedding_dimensions", embeddingDimensions,
+			"embedding_dim", embeddingDim,
+		)
+	}
+
 	if os.Getenv("PII_NAME_REDACTION_ENABLED") == "true" && (llmAPIURL == "" || (llmAPIKey == "" && llmAuthFile == "")) {
 		return nil, fmt.Errorf("PII_NAME_REDACTION_ENABLED requires a configured approved LLM API")
 	}
@@ -755,10 +819,14 @@ func Load() (*Config, error) {
 		Port:        getenv("PORT", "8080"),
 		DatabaseURL: getenv("DATABASE_URL", "postgres://brain:brain@localhost:5432/second_brain?sslmode=disable"),
 
-		EmbeddingAPIURL:  embeddingAPIURL,
-		EmbeddingAPIKey:  embeddingAPIKey,
-		EmbeddingModel:   getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
-		EmbeddingDim:     embeddingDim,
+		EmbeddingAPIURL:     embeddingAPIURL,
+		EmbeddingAPIKey:     embeddingAPIKey,
+		EmbeddingModel:      getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
+		EmbeddingDim:        embeddingDim,
+		EmbeddingDimensions: embeddingDimensions,
+
+		EmbeddingReembedEnabled: os.Getenv("EMBEDDING_REEMBED_ENABLED") == "true",
+
 		CliProxyAuthFile: os.Getenv("CLIPROXY_AUTH_FILE"),
 
 		EmbeddingProvider: getenv("EMBEDDING_PROVIDER", "openai"),
@@ -801,6 +869,7 @@ func Load() (*Config, error) {
 		RerankModel:   getenv("RERANKER_MODEL", "jina-reranker-v2-base-multilingual"),
 		RerankDefault: rerankDefault,
 		RerankTopN:    rerankTopN(),
+		SearchTuning:  model.EnvSearchTuning(),
 
 		OpensearchURL:            os.Getenv("OPENSEARCH_URL"),
 		OpensearchIndex:          getenv("OPENSEARCH_INDEX", "sb-chunks"),

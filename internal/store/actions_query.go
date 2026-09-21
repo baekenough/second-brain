@@ -100,6 +100,15 @@ func clampActionLimit(limit int) int {
 	}
 }
 
+// awaitingMyReplyKind is the retired action kind (2026-09-21 decision, see
+// migrations/038_retire_awaiting_my_reply.sql and
+// internal/worker/structural_signals.go's package doc comment): 메일·SMS
+// "미회신"은 할일이 아니라 잡음이므로 새로 만들지 않고, 목록 조회에서도 기본
+// 제외한다. It is still a member of model's closed ActionKind vocabulary (old
+// rows keep the value, and a caller may still ask for it explicitly) — only
+// the DEFAULT (no kind filter) view hides it.
+const awaitingMyReplyKind = "awaiting_my_reply"
+
 // ListOpenActions returns the open actions matching f.
 //
 // "Open" is COALESCE(action_status.state, 'open'): the join to action_status is
@@ -107,6 +116,15 @@ func clampActionLimit(limit int) int {
 // extraction worker writes the two in separate statements), and an INNER JOIN
 // would make such an action permanently invisible. The same reasoning applies
 // to the entities join — counterpart_entity_id is nullable.
+//
+// When f.Kinds is empty, awaitingMyReplyKind is excluded regardless of the
+// migration having already flipped its rows to action_status.state='ignored'
+// — this is a second, independent line of defence, not a duplicate of that
+// state filter: it also covers any row a future caller resurrects with state
+// left at 'open' (e.g. a stray EnsureOpenStatus call this migration cannot
+// see in advance). An explicit f.Kinds request for it is still honoured — a
+// caller that names it on purpose (auditing, admin tooling) is not
+// second-guessed.
 func (s *ActionQueryStore) ListOpenActions(ctx context.Context, f ActionFilter) ([]ActionListItem, error) {
 	orderBy, ok := actionSortClauses[f.Sort]
 	if !ok {
@@ -135,6 +153,7 @@ func (s *ActionQueryStore) ListOpenActions(ctx context.Context, f ActionFilter) 
 		WHERE COALESCE(st.state, 'open') = 'open'
 		  AND ($1::boolean OR a.observed_at > now() - interval '` + actionArchiveWindow + `')
 		  AND ($2::text[] IS NULL OR a.kind = ANY($2::text[]))
+		  AND ($2::text[] IS NOT NULL OR a.kind <> '` + awaitingMyReplyKind + `')
 		  AND ($3::text = '' OR COALESCE(e.normalized_name, '') ILIKE '%' || $3 || '%')
 		  AND ($4::timestamptz IS NULL OR (a.due_at IS NOT NULL AND a.due_at <= $4))
 		  AND a.confidence >= $5::numeric

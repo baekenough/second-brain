@@ -53,6 +53,19 @@ var errRegression = errors.New("regression detected")
 // main() maps this to os.Exit(2).
 var errReindexRecommended = errors.New("reindex recommended")
 
+// --window 가 받는 값. 문자열이 config_hash 에도 들어가므로 상수로 고정한다.
+const (
+	// windowModeNone 은 시간창 없이 전체 코퍼스에서 관련도만으로 검색하는
+	// 기존 동작이다. 이 모드에서는 실행 프로필에 window 관련 키를 아예 넣지
+	// 않는다 — 넣는 순간 지금까지 쌓인 baseline 이 전부 해시 불일치로
+	// 비교 불가가 되기 때문이다.
+	windowModeNone = "none"
+	// windowModePlan 은 골든 후보 화면과 같은 결정론적 기간 파서를 적용한다.
+	// 실행 프로필에 window_mode 와 기준 KST 날짜가 추가되므로 none 과는
+	// 자동으로 다른 baseline 계열이 된다.
+	windowModePlan = "plan"
+)
+
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
@@ -111,6 +124,18 @@ type metricsSnapshot struct {
 
 	// Requested is not proof that an optional remote reranker succeeded.
 	Reranked bool `json:"rerank_requested"`
+
+	// 리랭커 호출 실측치. RerankAttempts 는 설정·정렬 조건을 모두 통과해
+	// 실제로 원격 리랭커를 부른 질의 수, RerankFailures 는 그중 실패해
+	// 원래 순서로 되돌아간 수다. 요청(Reranked)이 true 인데 Attempts 가 0
+	// 이면 리랭커가 아예 설정되지 않았다는 뜻이고, Failures 가 Attempts 와
+	// 같으면 이 점수는 리랭크되지 않은 점수다.
+	//
+	// run_config 의 "rerank_outcome" 키는 config_hash 안정성을 위해 예전
+	// 토큰("not_instrumented")을 그대로 둔다. 살아 있는 측정값은 여기다.
+	RerankAttempts  int64 `json:"rerank_attempts"`
+	RerankFailures  int64 `json:"rerank_failures"`
+	RerankSucceeded int64 `json:"rerank_succeeded"`
 }
 
 func run() error {
@@ -127,12 +152,75 @@ func run() error {
 	noPersist := flag.Bool("no-persist", false, "read-only database connection; no migrations, metrics, reindex state, telemetry or alerts")
 	split := flag.String("split", "all", "feedback split: all, train, or holdout (use train for development comparisons)")
 	pairLimit := flag.Int("limit", 0, "deterministic query subset size; zero evaluates all eligible labels")
+	windowMode := flag.String("window", windowModeNone,
+		"질의 시간창 해석 방식. none(기본) 은 시간창 없이 전체 코퍼스에서 검색하는 기존 동작이고, "+
+			"plan 은 골든 후보 화면과 같은 결정론적 기간 파서로 질의 문구의 기간 표현을 "+
+			"occurred_at 범위로 바꿔 검색한다(LLM 호출 없음). plan 은 별도 baseline 계열이 된다")
+	asOf := flag.String("as-of", "",
+		"--window=plan 이 기간 표현을 해석할 기준 시각(RFC3339). 비우면 실행 시각을 쓴다")
+	dumpPath := flag.String("dump", "",
+		"질의별 진단 정보를 JSON Lines 로 쓸 경로(0600). 질의 문구·문서 제목·본문은 기록하지 않는다")
+	// --- 검색 튜닝 노브 (전부 기본값이 현행 동작) ---
+	// 기본이 아닌 값은 실행 프로필(config_hash)에 들어가 별도 baseline 계열이
+	// 된다 — --window 와 같은 방식이다. 기본값으로 돌린 실행은 지금까지 쌓인
+	// baseline 과 그대로 비교된다.
+	rerankOverfetch := flag.Int("rerank-overfetch", 0,
+		"리랭크 시 후보 풀 크기의 하한. 0(기본)이면 현행 min(limit*2, 200). "+
+			"예: 50 이면 limit=10 에서도 후보 50건이 리랭커에 간다")
+	mergeMode := flag.String("merge", model.MergeAsymmetric,
+		"청크·OpenSearch 레인 융합 방식. asymmetric(기본)은 secondary 단독 히트를 "+
+			"primary 가 남긴 슬롯에만 넣고, symmetric 은 RRF 점수로 동등하게 경쟁시킨다")
+	rerankBlend := flag.String("rerank-blend", model.RerankBlendReplace,
+		"리랭크 결과 반영 방식. replace(기본)는 최종 순서를 리랭커 순위로 대체하고, "+
+			"rrf 는 융합 순위와 리랭커 순위를 1/(60+rank) 로 합산한다")
+	rerankBlendWeight := flag.Float64("rerank-blend-weight", model.DefaultRerankBlendWeight,
+		"--rerank-blend=rrf 에서 리랭커 항에 곱하는 가중치. 1.0(기본)이면 융합 순위와 동등하게 본다")
+	rerankInput := flag.String("rerank-input", model.RerankInputHead,
+		"리랭커에 보내는 텍스트. head(기본)는 제목+본문 앞부분, best_chunk 는 "+
+			"[소스·날짜·제목] 머리글 한 줄 + 질의와 가장 잘 맞는 청크 본문")
+	recencyHalflife := flag.Float64("recency-halflife-days", 0,
+		"최신성 감쇠 반감기(일). 0(기본)이면 감쇠하지 않는다. 시간창이 없는 질의에만 적용된다")
+	recencyAlpha := flag.Float64("recency-alpha", model.DefaultRecencyAlpha,
+		"최신성 감쇠의 최대 강도. 승수는 (1-alpha)+alpha*exp(-ln2*age/halflife) 다")
 	flag.Parse()
 	if *pairLimit < 0 || (*split != "all" && *split != "train" && *split != "holdout") {
 		return errors.New("invalid eval --split or --limit")
 	}
 	if *useGolden && *split != "all" {
 		return errors.New("--split is supported only for feedback labels")
+	}
+	if *windowMode != windowModeNone && *windowMode != windowModePlan {
+		return fmt.Errorf("eval: invalid --window %q (want %q or %q)", *windowMode, windowModeNone, windowModePlan)
+	}
+	// --as-of 를 조용히 무시하면 "기준 시각을 지정했다"고 믿는 실행과 실제
+	// 실행이 갈라진다. 효력이 없는 조합은 받지 않는다.
+	if *asOf != "" && *windowMode != windowModePlan {
+		return fmt.Errorf("eval: --as-of requires --window=%s", windowModePlan)
+	}
+	// 노브는 조용히 무시하지 않는다. 오타 하나로 "실험을 켰다고 믿는 실행" 과
+	// "실제로는 기본값으로 돈 실행" 이 갈라지면, 그 결과로 내린 판단이 전부
+	// 근거 없는 것이 된다 — --as-of 를 거부하는 위 분기와 같은 이유다.
+	tuning := model.SearchTuning{
+		RerankOverfetch:     *rerankOverfetch,
+		MergeMode:           *mergeMode,
+		RerankBlend:         *rerankBlend,
+		RerankBlendWeight:   *rerankBlendWeight,
+		RerankInput:         *rerankInput,
+		RecencyHalfLifeDays: *recencyHalflife,
+		RecencyAlpha:        *recencyAlpha,
+	}
+	if err := validateTuningFlags(tuning); err != nil {
+		return err
+	}
+	tuning = tuning.Normalized()
+
+	asOfTime := time.Now()
+	if *asOf != "" {
+		parsed, perr := time.Parse(time.RFC3339, *asOf)
+		if perr != nil {
+			return fmt.Errorf("eval: invalid --as-of (want RFC3339): %w", perr)
+		}
+		asOfTime = parsed
 	}
 
 	// wg tracks any background goroutines (e.g. webhook alert) so that deferred
@@ -264,6 +352,13 @@ func run() error {
 	profile["summary_vector_threshold"] = model.SummaryVecCoverageThreshold()
 	entityFlag := strings.ToLower(strings.TrimSpace(os.Getenv("ENTITY_EXTRACTION_ENABLED")))
 	profile["entity_vector_enabled"] = entityFlag == "true" || entityFlag == "1" || entityFlag == "yes"
+	// 시간창 설정은 config_hash 에도 들어간다 — applyWindowProfile 참고.
+	windows := windowResolver(nil)
+	if *windowMode == windowModePlan {
+		windows = planWindowResolver(asOfTime)
+	}
+	applyWindowProfile(profile, *windowMode, asOfTime)
+	applyTuningProfile(profile, tuning)
 	revision := currentCodeRevision()
 	configHash := digest(profile)
 
@@ -310,7 +405,12 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("load matching baseline: %w", err)
 	}
-	evaluated := evaluatePairs(ctx, searchSvc, pairs, *rerank)
+	evaluated := evaluatePairs(ctx, searchSvc, pairs, evalRunOptions{
+		rerank:   *rerank,
+		window:   windows,
+		diagnose: *dumpPath != "",
+		tuning:   tuning,
+	})
 	metrics := evaluated.Metrics
 	fpPenalty10 := evaluated.FPPenalty10
 	latencies := evaluated.Latencies
@@ -345,7 +445,37 @@ func run() error {
 		}
 	}
 
+	// --- 질의별 진단 덤프 (--dump) ---
+	// 검색이 실패한 실행에서도 남긴다. 무엇이 어디까지 올라왔는지가 가장
+	// 궁금해지는 순간이 바로 점수가 0 으로 나온 실행이다.
+	if *dumpPath != "" {
+		labelIDs := map[string]bool{}
+		for _, p := range pairs {
+			for _, id := range p.RelevantDocIDs {
+				labelIDs[id] = true
+			}
+		}
+		ids := make([]string, 0, len(labelIDs))
+		for id := range labelIDs {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		facts, ferr := evalStore.LabelFacts(ctx, ids)
+		if ferr != nil {
+			return fmt.Errorf("eval: dump label facts: %w", ferr)
+		}
+		enrichDiagnostics(evaluated.Diagnostics, facts)
+		if werr := writeDiagnostics(*dumpPath, evaluated.Diagnostics); werr != nil {
+			return werr
+		}
+		slog.Info("eval: diagnostics written", "path", *dumpPath, "queries", len(evaluated.Diagnostics))
+	}
+
 	// --- Build output ---
+	// 리랭커 "요청" 과 "실제 호출" 은 다른 사실이다. 원격 리랭커가 실패하면
+	// 서비스는 경고만 남기고 원래 순서로 돌아가므로, 요청 플래그만 보고
+	// 리랭크된 점수라고 읽으면 안 된다 — 아래 수치가 그 실측이다.
+	rerankAttempts, rerankFailures := searchSvc.RerankStats()
 	current := metricsSnapshot{
 		Attempted: evaluated.Attempted, Failed: evaluated.Failed, PositiveQueries: evaluated.PositiveQueries, NegativeQueries: evaluated.NegativeQueries,
 		NDCG5:               metrics.NDCG5,
@@ -357,6 +487,9 @@ func run() error {
 		SearchLatencyP95Ms:  p95Ms,
 		SearchLatencyMeanMs: meanMs,
 		Reranked:            *rerank,
+		RerankAttempts:      rerankAttempts,
+		RerankFailures:      rerankFailures,
+		RerankSucceeded:     rerankAttempts - rerankFailures,
 	}
 
 	out := evalOutput{Current: current, ConfigHash: configHash, LabelHash: labelHash, CodeRevision: revision, RunConfig: profile, ExcludedLabels: excluded}

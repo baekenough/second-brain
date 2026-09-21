@@ -27,8 +27,11 @@ func TestSemanticPlannerDoesNotDiscardSpecificity(t *testing.T) {
 		question, from, to string
 		source             model.SourceType
 	}{
-
-		{"이번 주 금요일 일정", "2026-08-21", "2026-08-22", model.SourceCalendar},
+		// "이번 주 금요일 일정" was here as a semantic-path case before
+		// DeterministicWindow learned weekday-in-week phrases (이번주/지난주/
+		// 다음주 X요일); it is now covered deterministically, see
+		// TestDeterministicWindow_RelativeAndPastPhrases in
+		// relative_window_test.go.
 
 		{"내일 일정에 대해 어제 받은 메일", "2026-08-18", "2026-08-19", model.SourceGmail},
 		{"내일 일정에 관한 문자", "", "", model.SourceSMS},
@@ -58,7 +61,11 @@ func TestSemanticPlannerDoesNotDiscardSpecificity(t *testing.T) {
 }
 
 func TestAmbiguousPlannerFailureDoesNotInventNarrowWindow(t *testing.T) {
-	for _, q := range []string{"이번 주 금요일 일정", "지난달과 이번달 비교", "내일 일정에 관한 메일"} {
+	// "이번주 월요일과 화요일 일정" keeps a genuinely ambiguous weekday case
+	// here: matchWeekdayInWeek in plan.go deliberately refuses to pick when a
+	// question names two weekdays, so this still falls through to the LLM
+	// path (and must not invent a window when that path has no completer).
+	for _, q := range []string{"이번주 월요일과 화요일 일정", "지난달과 이번달 비교", "내일 일정에 관한 메일"} {
 		got := newPlanner(t, nil, planNowUTC).Plan(context.Background(), q)
 		if got.OccurredFrom != nil || got.OccurredTo != nil || len(got.SourceTypes) > 0 {
 			t.Fatalf("unsafe narrowing for %q", q)

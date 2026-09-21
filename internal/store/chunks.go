@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"time"
 
@@ -284,6 +285,10 @@ func (s *ChunkStore) ListByDocument(ctx context.Context, documentID uuid.UUID) (
 type ChunkEmbedding struct {
 	ChunkID   int64
 	Embedding []float32
+	// Version 은 이 벡터를 만든 설정 식별자다(internal/search.EmbeddingVersion).
+	// 빈 문자열이면 chunks.embedding_version 을 건드리지 않는다 — 버전 배선이
+	// 없는 호출자의 동작을 그대로 두기 위해서다. 마이그레이션 037 참고.
+	Version string
 }
 
 // updateEmbeddingsBatchSize is the maximum number of UPDATE statements per
@@ -348,10 +353,16 @@ func (s *ChunkStore) updateEmbeddingsBatch(ctx context.Context, embeddings []Chu
 		if len(ce.Embedding) == 0 {
 			continue
 		}
+		// 벡터와 버전은 반드시 같은 UPDATE 에서 쓴다. 버전을 남기지 않으면
+		// 재임베딩 선별 쿼리가 같은 청크를 영원히 다시 집어 간다.
 		if _, err := tx.Exec(ctx,
-			`UPDATE chunks SET embedding = $1 WHERE id = $2`,
+			`UPDATE chunks
+			 SET embedding = $1,
+			     embedding_version = CASE WHEN $3 = '' THEN embedding_version ELSE $3 END
+			 WHERE id = $2`,
 			pgvector.NewVector(ce.Embedding),
 			ce.ChunkID,
+			ce.Version,
 		); err != nil {
 			return fmt.Errorf("chunk update embedding id=%d: %w", ce.ChunkID, err)
 		}
@@ -364,10 +375,20 @@ func (s *ChunkStore) updateEmbeddingsBatch(ctx context.Context, embeddings []Chu
 }
 
 // UnembeddedChunk is a minimal chunk record used for embedding backfill.
-// Only the fields necessary for embedding (ID and Content) are included.
+//
+// 청크 본문(Content) 외에 소속 문서의 메타(SourceType/Title/OccurredAt/
+// Metadata)도 함께 싣는다. 청크 임베딩 입력 앞에 붙일 문맥 헤더
+// (scheduler.BuildChunkContextHeader)를 만들려면 "누가·언제·무슨 제목" 이
+// 필요한데, 그 정보는 청크 행이 아니라 문서 행에 있기 때문이다. 어차피 활성
+// 문서인지 보려고 documents 와 조인하고 있으므로 추가 쿼리 비용은 없다.
 type UnembeddedChunk struct {
-	ID      int64
-	Content string
+	ID         int64
+	Content    string
+	DocumentID uuid.UUID
+	SourceType model.SourceType
+	Title      string
+	OccurredAt *time.Time
+	Metadata   map[string]any
 }
 
 // ListUnembeddedChunks returns up to limit chunks whose embedding column is
@@ -387,17 +408,39 @@ type UnembeddedChunk struct {
 //
 // This is the per-chunk analogue of DocumentStore.ListUnembedded (#141).
 func (s *ChunkStore) ListUnembeddedChunks(ctx context.Context, limit int) ([]UnembeddedChunk, error) {
-	const q = `
-		SELECT c.id, c.content
+	return s.ListChunksNeedingEmbedding(ctx, limit, "")
+}
+
+// listChunksNeedingEmbeddingQuery 는 ListChunksNeedingEmbedding 이 실제로
+// 실행하는 SQL 이다. 테스트가 사본이 아니라 이 상수를 직접 검사하도록 패키지
+// 레벨로 꺼내 두었다 — 쿼리 안의 사본을 검사하는 테스트는 본문이 바뀌어도
+// 계속 통과해서 검증 구실을 못 한다.
+const listChunksNeedingEmbeddingQuery = `
+		SELECT c.id, c.content, d.id, d.source_type, d.title, d.occurred_at, d.metadata
 		FROM chunks c
 		JOIN documents d ON d.id = c.document_id
-		WHERE c.embedding IS NULL
-		  AND d.status = 'active'
+		WHERE d.status = 'active'
+		  AND (c.embedding IS NULL
+		       OR ($2 <> '' AND c.embedding_version IS DISTINCT FROM $2))
 		ORDER BY c.id ASC
 		LIMIT $1
 		FOR UPDATE OF c SKIP LOCKED`
 
-	rows, err := s.pg.pool.Query(ctx, q, limit)
+// ListChunksNeedingEmbedding 은 "임베딩을 (다시) 만들어야 하는" 청크를 최대
+// limit 건 돌려준다. 대상은 두 부류다:
+//
+//  1. embedding IS NULL — 아직 임베딩되지 않은 청크.
+//  2. embedding_version 이 currentVersion 과 다른 청크 — 다른 모델/차원/입력
+//     구성으로 만들어진 옛 벡터. NULL(마이그레이션 037 이전 레거시, 즉 문맥
+//     헤더 없이 청크 본문만 임베딩한 벡터)도 여기 포함된다.
+//
+// currentVersion 이 빈 문자열이면 2번 조건을 적용하지 않는다 — 버전 배선이
+// 없거나 재임베딩이 꺼진 배포에서 기존 동작을 그대로 두기 위한 기본값이다.
+//
+// 잠금·정렬 규약은 ListUnembeddedChunks 문서 주석과 동일하다
+// (id ASC + FOR UPDATE OF c SKIP LOCKED).
+func (s *ChunkStore) ListChunksNeedingEmbedding(ctx context.Context, limit int, currentVersion string) ([]UnembeddedChunk, error) {
+	rows, err := s.pg.pool.Query(ctx, listChunksNeedingEmbeddingQuery, limit, currentVersion)
 	if err != nil {
 		return nil, fmt.Errorf("chunks list unembedded: %w", err)
 	}
@@ -405,9 +448,24 @@ func (s *ChunkStore) ListUnembeddedChunks(ctx context.Context, limit int) ([]Une
 
 	var chunks []UnembeddedChunk
 	for rows.Next() {
-		var c UnembeddedChunk
-		if err := rows.Scan(&c.ID, &c.Content); err != nil {
+		var (
+			c       UnembeddedChunk
+			rawMeta []byte
+		)
+		if err := rows.Scan(&c.ID, &c.Content, &c.DocumentID, &c.SourceType,
+			&c.Title, &c.OccurredAt, &rawMeta); err != nil {
 			return nil, fmt.Errorf("chunks list unembedded scan: %w", err)
+		}
+		if len(rawMeta) > 0 {
+			// 메타데이터가 깨져 있어도 백필 자체는 계속한다 — 헤더 일부가
+			// 빠질 뿐이고, 임베딩을 통째로 건너뛰는 것보다 낫다.
+			if err := json.Unmarshal(rawMeta, &c.Metadata); err != nil {
+				slog.Warn("chunks: metadata unmarshal failed; header context will be partial",
+					"chunk_id", c.ID,
+					"document_id", c.DocumentID,
+					"error", err,
+				)
+			}
 		}
 		chunks = append(chunks, c)
 	}
@@ -415,6 +473,25 @@ func (s *ChunkStore) ListUnembeddedChunks(ctx context.Context, limit int) ([]Une
 		return nil, fmt.Errorf("chunks list unembedded iter: %w", err)
 	}
 	return chunks, nil
+}
+
+// CountChunksNeedingEmbedding 은 재임베딩 대상 청크 수를 센다. 진행 상황
+// 로그용이며 검색 경로에서는 호출하지 않는다.
+func (s *ChunkStore) CountChunksNeedingEmbedding(ctx context.Context, currentVersion string) (int, error) {
+	var n int
+	err := s.pg.pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM chunks c
+		JOIN documents d ON d.id = c.document_id
+		WHERE d.status = 'active'
+		  AND (c.embedding IS NULL
+		       OR ($1 <> '' AND c.embedding_version IS DISTINCT FROM $1))`,
+		currentVersion,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count chunks needing embedding: %w", err)
+	}
+	return n, nil
 }
 
 // SearchVector performs approximate nearest-neighbour (ANN) vector search over

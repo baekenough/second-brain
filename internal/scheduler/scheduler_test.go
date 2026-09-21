@@ -85,6 +85,10 @@ func (m *mockStore) ListUnembedded(_ context.Context, _ int) ([]*model.Document,
 	return nil, nil
 }
 
+func (m *mockStore) ListDocumentsNeedingEmbedding(_ context.Context, _ int, _ string) ([]*model.Document, error) {
+	return nil, nil
+}
+
 func (m *mockStore) UpdateEmbedding(_ context.Context, _ *model.Document) error {
 	return nil
 }
@@ -159,18 +163,18 @@ func (m *mockStoreErrorIDs) ActiveSourceIDSet(_ context.Context, _ model.SourceT
 // slowCollector blocks for the given duration then returns zero documents.
 // Enabled() always returns true so the scheduler will run it.
 type slowCollector struct {
-	delay    time.Duration
-	callsMu  sync.Mutex
-	calls    int
+	delay   time.Duration
+	callsMu sync.Mutex
+	calls   int
 }
 
 func newSlowCollector(delay time.Duration) *slowCollector {
 	return &slowCollector{delay: delay}
 }
 
-func (c *slowCollector) Name() string                 { return "slow" }
-func (c *slowCollector) Source() model.SourceType     { return "test-slow" }
-func (c *slowCollector) Enabled() bool                { return true }
+func (c *slowCollector) Name() string             { return "slow" }
+func (c *slowCollector) Source() model.SourceType { return "test-slow" }
+func (c *slowCollector) Enabled() bool            { return true }
 func (c *slowCollector) Collect(_ context.Context, _ time.Time) ([]model.Document, error) {
 	c.callsMu.Lock()
 	c.calls++
@@ -191,9 +195,9 @@ type panicCollector struct {
 	calls   int
 }
 
-func (c *panicCollector) Name() string                 { return "panic-col" }
-func (c *panicCollector) Source() model.SourceType     { return "test-panic" }
-func (c *panicCollector) Enabled() bool                { return true }
+func (c *panicCollector) Name() string             { return "panic-col" }
+func (c *panicCollector) Source() model.SourceType { return "test-panic" }
+func (c *panicCollector) Enabled() bool            { return true }
 func (c *panicCollector) Collect(_ context.Context, _ time.Time) ([]model.Document, error) {
 	c.callsMu.Lock()
 	n := c.calls

@@ -235,3 +235,15 @@ func weekRange(t time.Time) (time.Time, time.Time) {
 	y, m, d := from.Date()
 	return from, time.Date(y, m, d+7, 0, 0, 0, 0, from.Location())
 }
+
+// yearRange는 [해당 연도 1월 1일 00:00:00 KST, 다음 연도 1월 1일 00:00:00 KST)를
+// 돌려준다. "올해"/"작년"(intent/plan.go의 thisYearRe/lastYearRe) 해석에 쓰인다.
+// monthRange와 마찬가지로 half-open이며 KST에 고정된다 — 위 세 헬퍼의 doc
+// comment가 설명하는 컨테이너 타임존 문제(Etc/UTC)가 연 단위 경계에도 똑같이
+// 적용된다.
+func yearRange(year int) (time.Time, time.Time) {
+	loc := timeutil.KST()
+	from := time.Date(year, time.January, 1, 0, 0, 0, 0, loc)
+	to := time.Date(year+1, time.January, 1, 0, 0, 0, 0, loc)
+	return from, to
+}

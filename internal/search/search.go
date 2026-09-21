@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
+	"sort"
+	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
@@ -95,12 +97,152 @@ type Service struct {
 	activeWeights        ActiveWeightsReader
 	activeWeightsEnabled bool
 	activeWeightsLog     *activeWeightsFailureLog
+
+	// tuning 은 이 서비스의 기본 노브 값이다. NewService 가 환경변수에서
+	// 읽으며(model.EnvSearchTuning), 아무것도 설정하지 않은 배포에서는
+	// 제로값 — 즉 현행 동작 — 이다. 요청이 SearchQuery.Tuning 을 채우면
+	// 그쪽이 이긴다(resolveTuning 참고).
+	tuning model.SearchTuning
+
+	// 리랭커 호출 계수기. "리랭크를 요청했다"와 "리랭커가 실제로 응답했다"는
+	// 서로 다른 사실이고, 실패는 경고 로그로만 남은 뒤 원래 순서로 조용히
+	// 되돌아간다. 평가 리포트가 rerank_outcome 을 추측이 아니라 실측으로
+	// 적을 수 있도록 여기서만 센다 — RerankStats 참고.
+	rerankAttempts atomic.Int64
+	rerankFailures atomic.Int64
+}
+
+// 후보를 올려보낸 레인의 이름. 진단 출력에만 쓰이며, 값이 그대로 JSON 에
+// 실리므로 영어 식별자로 고정한다.
+const (
+	LaneDocumentStore = "document_store" // internal/store 의 5-lane 가중 RRF 결과
+	LaneChunkVector   = "chunk_vector"
+	LaneOpenSearch    = "opensearch"
+	LaneChunkFTS      = "chunk_fts" // 1차 경로가 비었을 때만 도는 폴백
+)
+
+// SearchTrace 는 Search 한 번에 대한 진단 기록이다. "왜 이 문서가 상위에
+// 없었나"를 답하는 데 필요한 최소 증거만 담는다.
+//
+// 제목·본문·질의 텍스트는 의도적으로 담지 않는다. 이 구조체는 평가 도구가
+// 파일로 떨구는 값이고, 그 파일에 개인정보가 섞이는 순간 진단 산출물 전체가
+// 취급 곤란해진다. 식별자·순위·레인 이름까지만 남긴다.
+type SearchTrace struct {
+	// PoolIDs 는 페이지 크기(q.Limit)로 잘라내기 직전의 후보 풀 순서다.
+	// 여기에 있는데 최종 결과에 없다면 "검색은 찾았지만 10위 밖" 이고,
+	// 여기에도 없다면 "아예 회수되지 않음" 이다 — 전혀 다른 결함이다.
+	PoolIDs []uuid.UUID
+	// PreRerankIDs 는 리랭커에 넘기기 직전의 순서. 리랭크를 시도하지 않았으면 nil.
+	PreRerankIDs []uuid.UUID
+	// FusedIDs 는 융합·최신성 감쇠까지 끝나고 리랭크 합산이 개입하기 직전의
+	// 순서다. PreRerankIDs 와 달리 리랭크를 하지 않은 실행에서도 채워진다 —
+	// "리랭커가 순위를 올렸나 내렸나" 는 이 순서와의 차이로만 답할 수 있고,
+	// 리랭크를 끈 실행과 켠 실행을 같은 기준으로 비교하려면 양쪽 모두에
+	// 같은 기준선이 있어야 한다.
+	FusedIDs []uuid.UUID
+	// LaneHits 는 문서별로 그 문서를 후보로 올린 레인 이름 목록이다.
+	LaneHits map[uuid.UUID][]string
+	// RerankRequested 는 질의가 리랭크를 요청했는지, RerankAttempted 는
+	// 리랭커가 실제로 호출됐는지(설정·정렬 조건을 모두 통과했는지),
+	// RerankFailed 는 그 호출이 실패해 원래 순서로 되돌아갔는지를 뜻한다.
+	RerankRequested bool
+	RerankAttempted bool
+	RerankFailed    bool
+}
+
+// recordLane 은 한 레인이 내놓은 후보를 기록한다. 수신자가 nil 이면 아무 일도
+// 하지 않으므로 운영 경로(Search)는 추적 비용을 지지 않는다.
+func (t *SearchTrace) recordLane(name string, results []*model.SearchResult) {
+	if t == nil {
+		return
+	}
+	if t.LaneHits == nil {
+		t.LaneHits = make(map[uuid.UUID][]string, len(results))
+	}
+	for _, r := range results {
+		if lanes := t.LaneHits[r.ID]; !slices.Contains(lanes, name) {
+			t.LaneHits[r.ID] = append(lanes, name)
+		}
+	}
+}
+
+// recordPreRerank 은 리랭커에 넘기기 직전의 후보 순서를 남기고, 리랭커를
+// 실제로 호출했다는 사실도 함께 표시한다.
+func (t *SearchTrace) recordPreRerank(results []*model.SearchResult) {
+	if t == nil {
+		return
+	}
+	t.RerankAttempted = true
+	t.PreRerankIDs = resultIDs(results)
+}
+
+// recordFused 는 리랭크 합산이 개입하기 직전의 융합 순서를 남긴다.
+func (t *SearchTrace) recordFused(results []*model.SearchResult) {
+	if t == nil {
+		return
+	}
+	t.FusedIDs = resultIDs(results)
+}
+
+// recordPool 은 페이지 크기로 잘라내기 직전의 후보 풀 순서를 남긴다.
+func (t *SearchTrace) recordPool(results []*model.SearchResult) {
+	if t == nil {
+		return
+	}
+	t.PoolIDs = resultIDs(results)
+}
+
+// markRerankFailed 는 리랭커 호출이 실패해 원래 순서로 되돌아갔음을 남긴다.
+func (t *SearchTrace) markRerankFailed() {
+	if t == nil {
+		return
+	}
+	t.RerankFailed = true
+}
+
+func resultIDs(results []*model.SearchResult) []uuid.UUID {
+	ids := make([]uuid.UUID, len(results))
+	for i, r := range results {
+		ids[i] = r.ID
+	}
+	return ids
+}
+
+// RerankStats 는 이 서비스가 살아 있는 동안 실제로 리랭커를 호출한 횟수와
+// 그중 실패한 횟수를 돌려준다. 요청 설정(UseRerank)만으로는 원격 리랭커가
+// 동작했는지 알 수 없다는 평가 프로토콜의 지적에 대한 실측값이다.
+func (s *Service) RerankStats() (attempts, failures int64) {
+	return s.rerankAttempts.Load(), s.rerankFailures.Load()
 }
 
 // NewService returns a search Service.
 // Use WithChunkStore to enable chunk-based FTS search (issue #9).
 func NewService(store DocumentSearcher, embed EmbeddingEngine) *Service {
-	return &Service{store: store, embed: embed}
+	// 노브 기본값은 생성 시점에 환경변수에서 한 번 읽는다. 아무것도 설정하지
+	// 않은 배포는 제로값을 받으므로 이 줄이 생기기 전과 동작이 같다. 여기서
+	// 읽는 덕분에 cmd/server·cmd/mcp·cmd/collector 의 조립 코드를 바꾸지
+	// 않고도 운영에서 노브를 켤 수 있다 — model.LowRetentionPenalty 가 쓰는
+	// 것과 같은 방식이다.
+	return &Service{store: store, embed: embed, tuning: model.EnvSearchTuning()}
+}
+
+// WithTuning 은 이 서비스의 기본 노브를 덮어쓴다. 환경변수보다 우선하며,
+// 개별 요청의 SearchQuery.Tuning 은 다시 이것보다 우선한다. 평가 도구
+// (cmd/eval)가 플래그로 실험 설정을 주입하는 경로다.
+func (s *Service) WithTuning(t model.SearchTuning) *Service {
+	s.tuning = t
+	return s
+}
+
+// chunkLister 는 RerankInputBestChunk 가 쓸 청크 조회기를 찾는다.
+// 운영 배선의 *store.ChunkStore 는 ListByDocument 를 가지고 있어 별도 배선
+// 없이 발견되고, DocumentSearcher 만 구현한 테스트 더블에서는 nil 이 되어
+// head 입력으로 조용히 되돌아간다.
+func (s *Service) chunkLister() ChunkLister {
+	if cl, ok := s.chunkStore.(ChunkLister); ok {
+		return cl
+	}
+	return nil
 }
 
 // WithChunkStore attaches a ChunkSearcher so that the service can perform
@@ -539,6 +681,19 @@ func overfetchLimit(limit int) int {
 // When the primary path returns no results AND a chunk store is configured,
 // chunk-based FTS is attempted as a final fallback strategy.
 func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.SearchResult, error) {
+	return s.search(ctx, q, nil)
+}
+
+// SearchTraced 는 Search 와 완전히 같은 검색을 수행하면서 진단 기록을 함께
+// 돌려준다. 결과 슬라이스는 Search 가 돌려주는 것과 동일하다 — 추적은 읽기만
+// 할 뿐 순위·후보에 손대지 않는다. 평가 도구(cmd/eval --dump)용 경로다.
+func (s *Service) SearchTraced(ctx context.Context, q model.SearchQuery) ([]*model.SearchResult, *SearchTrace, error) {
+	trace := &SearchTrace{RerankRequested: q.UseRerank, LaneHits: map[uuid.UUID][]string{}}
+	results, err := s.search(ctx, q, trace)
+	return results, trace, err
+}
+
+func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *SearchTrace) ([]*model.SearchResult, error) {
 	if q.Limit <= 0 {
 		q.Limit = 20
 	}
@@ -559,6 +714,10 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	if q.Weights == (model.SearchWeights{}) {
 		q.Weights = s.defaultWeights(ctx)
 	}
+
+	// 검색 실험용 노브. 제로값이면 전부 현행 동작이므로, 아래 경로들은
+	// 노브를 켜지 않은 배포에서 이 줄이 생기기 전과 같은 결과를 낸다.
+	tune := s.resolveTuning(q)
 
 	// Hypothetical text belongs only in the dense embedding input. Keep the
 	// user's original words for lexical retrieval and cross-encoder reranking.
@@ -607,6 +766,13 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	if fusionPossible || rerankEnabled {
 		laneLimit = overfetchLimit(q.Limit)
 	}
+	// 리랭크 전용 후보 풀 하한(SEARCH_RERANK_OVERFETCH). 리랭크를 하지 않는
+	// 요청의 풀 크기는 건드리지 않는다 — 이 노브가 겨냥하는 것은 "리랭커가
+	// 고칠 대상을 못 봤다" 는 문제 하나뿐이고, 융합만 하는 경로의 풀까지
+	// 키우면 두 변화가 한 실행에 섞여 원인을 가릴 수 없게 된다.
+	if rerankEnabled {
+		laneLimit = rerankPoolLimit(laneLimit, tune.RerankOverfetch)
+	}
 
 	storeQuery := q
 	storeQuery.Limit = laneLimit
@@ -621,6 +787,7 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	// point. The retention="low" score penalty is applied once, after every
 	// lane has been fused — see applyLowRetentionPenalty below.
 	results = applyRetentionExclusion(q, results)
+	trace.recordLane(LaneDocumentStore, results)
 
 	// Production chunk SQL applies window/source/retention predicates before
 	// LIMIT. Legacy adapters still need a fail-closed membership verifier.
@@ -651,12 +818,13 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 				chunkVecResults = s.verifyWindow(ctx, q, chunkVecResults)
 			}
 			chunkVecResults = applyRetentionExclusion(q, chunkVecResults)
+			trace.recordLane(LaneChunkVector, chunkVecResults)
 			if len(chunkVecResults) > 0 {
 				// laneLimit, not q.Limit: see the overfetch comment above
 				// s.store.Search — mergeRRF's own internal truncation must not
 				// evict a keep-tagged document before applyLowRetentionPenalty
 				// gets a chance to demote whatever displaced it.
-				results = mergeRRF(results, chunkVecResults, laneLimit)
+				results = mergeRRFMode(results, chunkVecResults, laneLimit, tune.MergeMode)
 				chunkFused = true
 			}
 		}
@@ -682,9 +850,10 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 			osResults = s.hydrateExternalCandidates(ctx, q, osResults)
 			osResults = applySourceTypeFilters(q, osResults)
 			osResults = applyRetentionExclusion(q, osResults)
+			trace.recordLane(LaneOpenSearch, osResults)
 			if len(osResults) > 0 {
 				// laneLimit — same reason as the chunk vector merge above.
-				results = mergeRRF(results, osResults, laneLimit)
+				results = mergeRRFMode(results, osResults, laneLimit, tune.MergeMode)
 				chunkFused = true
 			}
 		}
@@ -705,6 +874,7 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 		}
 		results = applySourceTypeFilters(q, chunkResults)
 		results = applyRetentionExclusion(q, results)
+		trace.recordLane(LaneChunkFTS, results)
 		chunkFused = true
 	}
 
@@ -717,6 +887,15 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 	// q.Limit runs AFTER this and the recency branch below, once both
 	// orderings this penalty can affect have already been decided.
 	results = applyLowRetentionPenalty(q, results)
+
+	// 최신성 감쇠(SEARCH_RECENCY_HALFLIFE_DAYS). 기본은 꺼져 있고, 시간창이
+	// 없는 질의에만 적용된다 — applyRecencyDecay 의 주석 참고.
+	//
+	// 여기에 두는 이유: 보존 페널티와 같은 "융합이 끝난 뒤 점수를 한 번만
+	// 조정하는" 층이고, 리랭크 합산(blendRerankRRF)이 쓰는 융합 순위가
+	// 이 조정까지 반영된 순서여야 하기 때문이다. 리랭크 뒤에 적용하면
+	// 리랭커 순위를 다시 흔들게 되어 두 신호가 서로를 덮어쓴다.
+	results = applyRecencyDecay(q, results, tune, time.Now())
 
 	// Sort="recent" over a set this service assembled.
 	//
@@ -756,14 +935,32 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 
 	// Cross-encoder reranking: opt-in per-request via UseRerank.
 	// Failure is non-fatal — original order is preserved on error.
+	//
+	// 융합 순서는 리랭크 여부와 무관하게 남긴다. 리랭크를 끈 실행과 켠
+	// 실행을 같은 기준선으로 비교해야 "리랭커가 올렸나 내렸나" 를 셀 수 있다.
+	trace.recordFused(results)
 	if rerankEnabled && len(results) > 1 {
-		reranked, rerr := s.applyRerank(ctx, q.Query, results)
+		fused := results
+		trace.recordPreRerank(results)
+		s.rerankAttempts.Add(1)
+		reranked, rerr := s.applyRerank(ctx, q.Query, results, tune)
 		if rerr != nil {
+			s.rerankFailures.Add(1)
+			trace.markRerankFailed()
 			slog.Warn("search: rerank failed, using original order", "error", rerr)
+		} else if tune.RerankBlend == model.RerankBlendRRF {
+			// 대체가 아니라 합산. 리랭크 실패 경로는 위 분기가 이미
+			// 처리했으므로 여기서는 현행과 동일하게 원 순서로 돌아가는
+			// 안전망이 그대로 유지된다.
+			results = blendRerankRRF(fused, reranked, tune.RerankBlendWeight)
 		} else {
 			results = reranked
 		}
 	}
+
+	// 페이지 크기로 자르기 직전의 후보 풀. 여기서 기록해야 "회수는 됐으나
+	// 상위 N 밖" 과 "회수 자체가 안 됨" 이 구분된다.
+	trace.recordPool(results)
 
 	// Apply the page limit only after reranking the candidate pool.
 	if len(results) > q.Limit {
@@ -795,21 +992,13 @@ func (s *Service) Search(ctx context.Context, q model.SearchQuery) ([]*model.Sea
 // applyRerank calls the cross-encoder reranker with truncated title+content
 // text for each result and returns results reordered by descending score.
 // Documents are truncated to 1000 runes to stay within typical API limits.
-func (s *Service) applyRerank(ctx context.Context, query string, results []*model.SearchResult) ([]*model.SearchResult, error) {
+func (s *Service) applyRerank(ctx context.Context, query string, results []*model.SearchResult,
+	tune model.SearchTuning) ([]*model.SearchResult, error) {
 	if len(results) == 0 {
 		return nil, nil
 	}
-	const maxDocRunes = 1000
 
-	docs := make([]string, len(results))
-	for i, r := range results {
-		text := r.Title + "\n" + r.Content
-		if utf8.RuneCountInString(text) > maxDocRunes {
-			runes := []rune(text)
-			text = string(runes[:maxDocRunes])
-		}
-		docs[i] = text
-	}
+	docs := s.buildRerankDocs(ctx, query, results, tune)
 
 	ranked, err := s.reranker.Rerank(ctx, query, docs)
 	if err != nil {
@@ -926,6 +1115,23 @@ func (s *Service) searchChunksVector(ctx context.Context, queryVec []float32, li
 // Results are deduplicated by document ID and the merged list is truncated
 // to limit entries, ordered by descending RRF score.
 func mergeRRF(primary, secondary []*model.SearchResult, limit int) []*model.SearchResult {
+	return mergeRRFMode(primary, secondary, limit, model.MergeAsymmetric)
+}
+
+// mergeRRFMode 는 mergeRRF 에 융합 방식 노브를 더한 형태다.
+//
+//   - model.MergeAsymmetric(기본): 위 mergeRRF 문서가 설명하는 현행 동작.
+//     secondary 단독 히트는 primary 가 남긴 슬롯에만 들어간다.
+//   - model.MergeSymmetric: secondary 단독 히트도 후보에 모두 넣고 RRF
+//     점수로 경쟁시킨다. limit 으로 자르는 것은 여전히 마지막이므로, 이
+//     모드가 여는 것은 "오버페치 풀 진입" 이다.
+//
+// 대칭 모드가 필요한 이유(실측): 사용자 판정 정답 1건이 chunk_vector 레인에
+// 분명히 잡혔는데도 최종 후보에 없었다. primary 가 풀을 이미 채운 상태라
+// 비대칭 규칙이 진입 자체를 막았기 때문이다. 다만 이 규칙은 "한영석" 고유명사
+// 질의에서 정답 절반이 무관한 문서로 교체되는 것을 막기 위해 도입된 것이라
+// (TestMergeRRF_FullPrimary_SecondaryDoesNotDisplace) 기본값은 바꾸지 않는다.
+func mergeRRFMode(primary, secondary []*model.SearchResult, limit int, mode string) []*model.SearchResult {
 	const k = 60.0
 
 	type entry struct {
@@ -943,6 +1149,11 @@ func mergeRRF(primary, secondary []*model.SearchResult, limit int) []*model.Sear
 	// Slots still open for brand-new (secondary-only) documents. Negative or
 	// zero means primary already filled the page.
 	remaining := limit - len(primary)
+	if mode == model.MergeSymmetric {
+		// 대칭 모드: 진입 제한을 두지 않는다. 모두 맵에 넣은 뒤 RRF 점수로
+		// 정렬하고 limit 으로 자르므로, 경쟁은 슬롯 수가 아니라 점수로 갈린다.
+		remaining = len(secondary)
+	}
 
 	for rank, r := range secondary {
 		rrf := 1.0 / (k + float64(rank+1))
@@ -963,7 +1174,15 @@ func mergeRRF(primary, secondary []*model.SearchResult, limit int) []*model.Sear
 		e.result.Score = e.score
 		out = append(out, e.result)
 	}
-	sortByScore(out)
+	// 맵 순회 순서는 무작위라 동률(예: primary 1위와 secondary 1위 모두 1/61)의
+	// 선후가 실행마다 달라진다. 평가 재현성을 위해 점수 내림차순 → ID 오름차순으로
+	// 결정론적으로 정렬한다.
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Score != out[j].Score {
+			return out[i].Score > out[j].Score
+		}
+		return out[i].ID.String() < out[j].ID.String()
+	})
 	if len(out) > limit {
 		out = out[:limit]
 	}
