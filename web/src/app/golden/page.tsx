@@ -377,7 +377,8 @@ export default function GoldenPage() {
       </div>
 
       <p className="text-sm text-foreground-muted">
-        생성 버튼을 누르면 질문 이력과 저장 문서를 바탕으로 새 질의를 만듭니다. 기존 판정은 유지됩니다.
+        생성 버튼을 누르면 질문 이력과 저장 문서를 바탕으로 새 질의를 만듭니다. 기존 판정은
+        유지됩니다.
       </p>
 
       {generationMessage && (
