@@ -228,10 +228,15 @@ func TestGoldenNextHandler_NoOpenQuery(t *testing.T) {
 // already judged for this query is filtered out and the remaining
 // candidates are re-ranked from 1, and that IncludeRetention=true reaches
 // BOTH search calls (disposable-tagged documents must still be judgeable on
-// either stream). The query text ("지난주에 누구랑 통화했지") matches no
-// intent.DeterministicWindow phrase, so this also pins the "no explicit
-// period" shape: an unconstrained relevance stream plus a 90-day-fallback
-// recent stream, and a null query.window in the response.
+// either stream).
+//
+// The query text ("지난주에 누구랑 통화했지") used to pin the "no explicit
+// period" shape here (unconstrained relevance stream, 90-day-fallback recent
+// stream, null query.window), because intent.DeterministicWindow did not
+// recognise "지난주" yet. It now does (internal/intent/plan.go's lastWeekRe),
+// so BOTH search streams must instead receive that resolved window — see
+// TestGoldenNextHandler_NoWindow_WhenQueryHasNoPeriodPhrase below for the
+// "no explicit period" shape this test used to (incidentally) also cover.
 //
 // storedAskedAt is set on the stub's GoldenQuery but deliberately far from
 // reviewNow: the recent-stream fallback window and response asked_at must be
@@ -246,9 +251,22 @@ func TestGoldenNextHandler_ExcludesAlreadyJudged(t *testing.T) {
 	occurredAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	storedAskedAt := time.Date(2026, 8, 20, 3, 0, 0, 0, time.UTC)
 	reviewNow := time.Date(2026, 9, 20, 3, 0, 0, 0, time.UTC)
+	queryText := "지난주에 누구랑 통화했지"
+
+	// Resolved at REVIEW TIME, not at storedAskedAt — same rule
+	// TestGoldenNextHandler_PeriodPhraseResolvesWindowFromReviewTime pins.
+	// reviewNow is 2026-09-20 (Sun) 12:00 KST, so its ISO week starts Monday
+	// 2026-09-14; "지난주" is therefore the week before that.
+	wantFrom, wantTo, label, ok := intent.DeterministicWindow(queryText, reviewNow.In(timeutil.KST()))
+	if !ok {
+		t.Fatalf("test setup: DeterministicWindow did not match %q", queryText)
+	}
+	if label != "지난 주" {
+		t.Fatalf("test setup: label = %q, want %q", label, "지난 주")
+	}
 
 	stub := &stubGoldenSet{
-		nextQuery: &store.GoldenQuery{ID: queryID, Text: "지난주에 누구랑 통화했지", Source: "seed", Status: "open", AskedAt: storedAskedAt},
+		nextQuery: &store.GoldenQuery{ID: queryID, Text: queryText, Source: "seed", Status: "open", AskedAt: storedAskedAt},
 		judgedDocIDs: map[uuid.UUID]struct{}{
 			judgedDocID: {},
 		},
@@ -298,15 +316,22 @@ func TestGoldenNextHandler_ExcludesAlreadyJudged(t *testing.T) {
 	if recCall.Limit != 2 { // round(5*0.4)
 		t.Errorf("recent stream Limit = %d, want 2 (round(5*0.4))", recCall.Limit)
 	}
-	if relCall.OccurredFrom != nil || relCall.OccurredTo != nil {
-		t.Errorf("relevance stream window = [%v, %v), want none (no period phrase in the query text)", relCall.OccurredFrom, relCall.OccurredTo)
+	// "지난주" now resolves (internal/intent/plan.go's lastWeekRe), so BOTH
+	// streams receive that SAME resolved window — not the unconstrained
+	// relevance stream / 90-day recent fallback this test used to pin (see
+	// TestGoldenNextHandler_NoWindow_WhenQueryHasNoPeriodPhrase for that
+	// shape now).
+	if relCall.OccurredFrom == nil || !relCall.OccurredFrom.Equal(wantFrom) {
+		t.Errorf("relevance stream OccurredFrom = %v, want %v (resolved 지난주 window)", relCall.OccurredFrom, wantFrom)
 	}
-	wantRecentFrom := reviewNow.Add(-goldenRecentFallbackWindow)
-	if recCall.OccurredFrom == nil || !recCall.OccurredFrom.Equal(wantRecentFrom) {
-		t.Errorf("recent stream OccurredFrom = %v, want %v (reviewNow - 90d fallback)", recCall.OccurredFrom, wantRecentFrom)
+	if relCall.OccurredTo == nil || !relCall.OccurredTo.Equal(wantTo) {
+		t.Errorf("relevance stream OccurredTo = %v, want %v", relCall.OccurredTo, wantTo)
 	}
-	if recCall.OccurredTo == nil || !recCall.OccurredTo.Equal(reviewNow) {
-		t.Errorf("recent stream OccurredTo = %v, want reviewNow %v (NOT the stored asked_at %v)", recCall.OccurredTo, reviewNow, storedAskedAt)
+	if recCall.OccurredFrom == nil || !recCall.OccurredFrom.Equal(wantFrom) {
+		t.Errorf("recent stream OccurredFrom = %v, want %v (same resolved window as the relevance stream, NOT the 90-day fallback)", recCall.OccurredFrom, wantFrom)
+	}
+	if recCall.OccurredTo == nil || !recCall.OccurredTo.Equal(wantTo) {
+		t.Errorf("recent stream OccurredTo = %v, want %v", recCall.OccurredTo, wantTo)
 	}
 	if stub.nextJudgeGot != "user" {
 		t.Errorf("NextQuery judge = %q, want default 'user' when ?judge= is omitted", stub.nextJudgeGot)
@@ -325,8 +350,14 @@ func TestGoldenNextHandler_ExcludesAlreadyJudged(t *testing.T) {
 	if resp.Query.AskedAt != reviewNow.Format(time.RFC3339) {
 		t.Errorf("query.asked_at = %q, want reviewNow %q (NOT the stored asked_at %q)", resp.Query.AskedAt, reviewNow.Format(time.RFC3339), storedAskedAt.Format(time.RFC3339))
 	}
-	if resp.Query.Window != nil {
-		t.Errorf("query.window = %+v, want nil (no period phrase in the query text)", resp.Query.Window)
+	if resp.Query.Window == nil {
+		t.Fatalf("query.window = %v, want a resolved 지난주 window", resp.Query.Window)
+	}
+	if resp.Query.Window.From != wantFrom.Format(time.RFC3339) {
+		t.Errorf("query.window.from = %q, want %q", resp.Query.Window.From, wantFrom.Format(time.RFC3339))
+	}
+	if resp.Query.Window.To != wantTo.Format(time.RFC3339) {
+		t.Errorf("query.window.to = %q, want %q", resp.Query.Window.To, wantTo.Format(time.RFC3339))
 	}
 	if len(resp.Candidates) != 1 {
 		t.Fatalf("candidates = %v, want exactly 1 (already-judged doc excluded, recent-stream duplicate deduped)", resp.Candidates)
@@ -352,6 +383,64 @@ func TestGoldenNextHandler_ExcludesAlreadyJudged(t *testing.T) {
 	}
 	if c.OccurredAt == nil || !c.OccurredAt.Equal(occurredAt) {
 		t.Errorf("occurred_at = %v, want %v", c.OccurredAt, occurredAt)
+	}
+}
+
+// TestGoldenNextHandler_NoWindow_WhenQueryHasNoPeriodPhrase pins the shape
+// TestGoldenNextHandler_ExcludesAlreadyJudged used to (incidentally) also
+// cover before "지난주" became a recognised intent.DeterministicWindow phrase:
+// a query with genuinely no period expression gets an unconstrained relevance
+// stream, a recent stream falling back to the standard 90-day-before-reviewNow
+// window, and a null query.window in the response.
+func TestGoldenNextHandler_NoWindow_WhenQueryHasNoPeriodPhrase(t *testing.T) {
+	t.Parallel()
+
+	queryText := "누구랑 통화했지"
+	reviewNow := time.Date(2026, 9, 20, 3, 0, 0, 0, time.UTC)
+	if _, _, _, ok := intent.DeterministicWindow(queryText, reviewNow.In(timeutil.KST())); ok {
+		t.Fatalf("test setup: %q matched a DeterministicWindow phrase, want no match", queryText)
+	}
+
+	queryID := uuid.New()
+	stub := &stubGoldenSet{
+		nextQuery: &store.GoldenQuery{ID: queryID, Text: queryText, Source: "seed", Status: "open"},
+		progress:  store.GoldenProgress{OpenQueries: 1},
+	}
+	searcher := &recordingGoldenSearcher{results: []*model.SearchResult{
+		{Document: model.Document{ID: uuid.New(), Title: "a call", SourceType: model.SourceCall}},
+	}}
+	srv := newGoldenTestServer(stub, searcher)
+	srv.now = func() time.Time { return reviewNow }
+
+	rec := doGoldenRequest(srv, http.MethodGet, "/api/v1/golden/next", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+
+	if len(searcher.calls) != 2 {
+		t.Fatalf("Search called %d times, want 2 (relevance stream + recent stream)", len(searcher.calls))
+	}
+	relCall, recCall := searcher.calls[0], searcher.calls[1]
+	if relCall.OccurredFrom != nil || relCall.OccurredTo != nil {
+		t.Errorf("relevance stream window = [%v, %v), want none (no period phrase in the query text)", relCall.OccurredFrom, relCall.OccurredTo)
+	}
+	wantRecentFrom := reviewNow.Add(-goldenRecentFallbackWindow)
+	if recCall.OccurredFrom == nil || !recCall.OccurredFrom.Equal(wantRecentFrom) {
+		t.Errorf("recent stream OccurredFrom = %v, want %v (reviewNow - 90d fallback)", recCall.OccurredFrom, wantRecentFrom)
+	}
+	if recCall.OccurredTo == nil || !recCall.OccurredTo.Equal(reviewNow) {
+		t.Errorf("recent stream OccurredTo = %v, want reviewNow %v", recCall.OccurredTo, reviewNow)
+	}
+
+	var resp goldenNextResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.Query == nil {
+		t.Fatalf("query = %v, want non-nil", resp.Query)
+	}
+	if resp.Query.Window != nil {
+		t.Errorf("query.window = %+v, want nil (no period phrase in the query text)", resp.Query.Window)
 	}
 }
 
