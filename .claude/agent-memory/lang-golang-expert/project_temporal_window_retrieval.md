@@ -1,6 +1,6 @@
 ---
 name: temporal-window-retrieval
-description: Why occurred_at is a per-lane WHERE predicate (not a sort hint), and the chunk-lane include-filter leak found next to it
+description: Why occurred_at is a per-lane WHERE predicate (not a sort hint), the chunk-lane include-filter leak next to it, and the eval-harness window mismatch that made golden NDCG look like 0
 metadata:
   type: project
 ---
@@ -59,5 +59,37 @@ them SMS, via `mergeRRF`'s fill path. This also explains the "20 results from 14
 documents" observation — it is not duplicate rows. The same-shaped hole for the
 date window WAS closed here (chunk lanes are skipped when a window is set, so an
 empty window answers empty instead of silently widening).
+
+**The same distinction bit the EVALUATOR, not just retrieval (2026-09-21).**
+`cmd/eval --golden` scored ndcg10 ≈ 0 on labels the user had just judged
+relevant at rank 1–2 on the golden screen. Neither number was wrong: the golden
+candidate screen (`internal/api/golden.go`) resolves the question's period
+phrase through `intent.DeterministicWindow` anchored at REVIEW TIME and searches
+inside that window, while `cmd/eval` searched the whole corpus. Different
+candidate pools, so the scores were never comparable. **Before calling a
+retrieval metric a regression, check that the harness retrieves from the same
+pool the labels were produced in.** Added `--window=plan|none` (default `none`,
+anchored by `--as-of`) to reproduce the screen's window; the two-stream
+relevance/recency merge and `IncludeRetention` are deliberately NOT reproduced
+(screen ergonomics, and a wider corpus than `/ask` uses).
+
+Two conventions established there, both worth keeping:
+
+- **config_hash extension**: a new run-config key is added ONLY for the
+  non-default value (`applyWindowProfile` in cmd/eval/provenance.go). Adding it
+  unconditionally would change every existing hash and orphan every stored
+  baseline for a behaviour change that did not happen. The as-of anchor enters
+  the hash as a KST *calendar date*, not an instant — every branch of the
+  deterministic parser lands on KST day boundaries, so day granularity is exact
+  while second granularity would make every run its own unhashable island.
+- **Frozen hash tokens vs live claims**: `run_config.rerank_outcome` still reads
+  `"not_instrumented"` even though `Service.RerankStats()` now measures it. That
+  string is a hash INPUT, not an assertion; the real counts live in
+  `current.rerank_attempts/failures/succeeded`. If a future change "corrects"
+  the token, every baseline splits.
+
+Diagnostics (`--dump`) deliberately carry no question text, title or body —
+queries are named by `golden_queries.id` or a `sha256:` prefix, timestamps are
+truncated to a date, file mode 0600. See [[feedback_personal_data_endpoint_verification]].
 
 Related: [[project_search_rrf_relevance]], [[project_second_brain]]
