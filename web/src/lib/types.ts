@@ -473,7 +473,7 @@ export type RetentionTag = "keep" | "low" | "disposable" | null;
  * because an unrecognised value must still round-trip through the UI
  * unchanged — see app/golden/goldenJudge.ts's goldenSourceLabel, which falls
  * back to the raw string for anything outside this set. */
-export const GOLDEN_QUERY_SOURCES = ["ask_history", "seed", "manual"] as const;
+export const GOLDEN_QUERY_SOURCES = ["ask_history", "seed", "manual", "document"] as const;
 export type GoldenQuerySource = (typeof GOLDEN_QUERY_SOURCES)[number];
 
 /** A query's search-window expression resolved against `asked_at` — the

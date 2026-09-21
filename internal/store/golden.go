@@ -23,12 +23,6 @@ func goldenNormalize(query string) string {
 	return strings.ToLower(strings.Trim(query, " "))
 }
 
-// goldenAskHistoryPool is the number of most-recent distinct ask_sessions
-// questions considered as ask_history candidates before filtering (too
-// short, near-duplicate) narrows them down to at most
-// goldenAskHistoryCap.
-const goldenAskHistoryPool = 200
-
 // goldenAskHistoryCap is the maximum number of ask_history-sourced queries
 // GenerateQueries will insert in a single call.
 const goldenAskHistoryCap = 50
@@ -72,7 +66,7 @@ var goldenSeedQueries = []string{
 type GoldenQuery struct {
 	ID     uuid.UUID
 	Text   string
-	Source string // "ask_history" | "seed" | "manual" | "hermes"
+	Source string // "ask_history" | "seed" | "manual" | "hermes" | "document"
 	Status string // "open" | "done" | "skipped"
 	// AskedAt is the instant golden_queries row was created
 	// (migrations/032_golden_asked_at.sql), for every source including
@@ -146,12 +140,17 @@ func NewGoldenStore(pg *Postgres) *GoldenStore {
 // same rule the feedback train/holdout split already uses) is checked in Go
 // before each insert, so "질문" and "질문 " are not both admitted.
 func (s *GoldenStore) GenerateQueries(ctx context.Context) (created int, totalOpen int, err error) {
-	seen, err := s.normalizedExistingTexts(ctx)
+	tx, err := s.beginGeneration(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback(context.Background())
+	seen, err := s.normalizedExistingTexts(ctx, tx)
 	if err != nil {
 		return 0, 0, fmt.Errorf("golden: load existing queries: %w", err)
 	}
 
-	askHistory, err := s.candidateAskHistoryQueries(ctx, seen)
+	askHistory, err := s.candidateAskHistoryQueries(ctx, tx, seen)
 	if err != nil {
 		return 0, 0, fmt.Errorf("golden: load ask_history candidates: %w", err)
 	}
@@ -159,28 +158,31 @@ func (s *GoldenStore) GenerateQueries(ctx context.Context) (created int, totalOp
 	// seen is mutated by each insertQueries call (maps are reference types),
 	// so the seed pass below sees every ask_history query just inserted and
 	// will not admit a near-duplicate of one.
-	created, err = s.insertQueries(ctx, askHistory, "ask_history", seen)
+	created, err = s.insertQueries(ctx, tx, askHistory, "ask_history", seen)
 	if err != nil {
 		return 0, 0, fmt.Errorf("golden: insert ask_history queries: %w", err)
 	}
 
-	seedCreated, err := s.insertQueries(ctx, goldenSeedQueries, "seed", seen)
+	seedCreated, err := s.insertQueries(ctx, tx, goldenSeedQueries, "seed", seen)
 	if err != nil {
 		return 0, 0, fmt.Errorf("golden: insert seed queries: %w", err)
 	}
 	created += seedCreated
 
-	totalOpen, err = s.countByStatus(ctx, "open")
+	totalOpen, err = s.countByStatus(ctx, tx, "open")
 	if err != nil {
 		return 0, 0, fmt.Errorf("golden: count open queries: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, 0, fmt.Errorf("golden: commit generation: %w", err)
 	}
 	return created, totalOpen, nil
 }
 
 // normalizedExistingTexts returns the normalized (dataset.Normalize) form of
 // every golden_queries.text currently stored.
-func (s *GoldenStore) normalizedExistingTexts(ctx context.Context) (map[string]struct{}, error) {
-	rows, err := s.pg.pool.Query(ctx, `SELECT text FROM golden_queries`)
+func (s *GoldenStore) normalizedExistingTexts(ctx context.Context, tx pgx.Tx) (map[string]struct{}, error) {
+	rows, err := tx.Query(ctx, `SELECT text FROM golden_queries`)
 	if err != nil {
 		return nil, err
 	}
@@ -200,7 +202,8 @@ func (s *GoldenStore) normalizedExistingTexts(ctx context.Context) (map[string]s
 // candidateAskHistoryQueries reads the most recent distinct ask_sessions
 // question texts, filters out ones too short to carry retrievable intent,
 // and deduplicates by normalized form against `seen` (and against each
-// other), returning at most goldenAskHistoryCap results ordered by recency
+// other), streaming past previously used questions without a fixed pool cap,
+// returning at most goldenAskHistoryCap results ordered by recency
 // (MAX(created_at) DESC — the most recently repeated questions first). The
 // original ask_sessions.created_at moment(s) a question was asked are used
 // only for this recency ordering; insertQueries always lets golden_queries'
@@ -214,14 +217,13 @@ func (s *GoldenStore) normalizedExistingTexts(ctx context.Context) (map[string]s
 // afterwards, and insertQueries would skip every one of them as a
 // false-positive duplicate — the caller (GenerateQueries) mutates `seen`
 // itself, incrementally, as each candidate is actually inserted.
-func (s *GoldenStore) candidateAskHistoryQueries(ctx context.Context, seen map[string]struct{}) ([]string, error) {
-	rows, err := s.pg.pool.Query(ctx, `
+func (s *GoldenStore) candidateAskHistoryQueries(ctx context.Context, tx pgx.Tx, seen map[string]struct{}) ([]string, error) {
+	rows, err := tx.Query(ctx, `
 		SELECT question, MAX(created_at) AS latest
 		FROM ask_sessions
 		GROUP BY question
-		ORDER BY latest DESC
-		LIMIT $1
-	`, goldenAskHistoryPool)
+		ORDER BY latest DESC, question ASC
+	`)
 	if err != nil {
 		return nil, err
 	}
@@ -267,7 +269,7 @@ func (s *GoldenStore) candidateAskHistoryQueries(ctx context.Context, seen map[s
 // updated for every text considered (inserted or not) so a second call in
 // the same GenerateQueries invocation cannot admit a near-duplicate. Returns
 // the number of rows actually created.
-func (s *GoldenStore) insertQueries(ctx context.Context, candidates []string, source string, seen map[string]struct{}) (int, error) {
+func (s *GoldenStore) insertQueries(ctx context.Context, tx pgx.Tx, candidates []string, source string, seen map[string]struct{}) (int, error) {
 	created := 0
 	for _, text := range candidates {
 		norm := goldenNormalize(text)
@@ -280,7 +282,7 @@ func (s *GoldenStore) insertQueries(ctx context.Context, candidates []string, so
 		seen[norm] = struct{}{}
 
 		var id uuid.UUID
-		err := s.pg.pool.QueryRow(ctx, `
+		err := tx.QueryRow(ctx, `
 			INSERT INTO golden_queries (text, source)
 			VALUES ($1, $2)
 			ON CONFLICT (text) DO NOTHING
@@ -301,9 +303,9 @@ func (s *GoldenStore) insertQueries(ctx context.Context, candidates []string, so
 	return created, nil
 }
 
-func (s *GoldenStore) countByStatus(ctx context.Context, status string) (int, error) {
+func (s *GoldenStore) countByStatus(ctx context.Context, tx pgx.Tx, status string) (int, error) {
 	var n int
-	err := s.pg.pool.QueryRow(ctx, `SELECT COUNT(*) FROM golden_queries WHERE status = $1`, status).Scan(&n)
+	err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM golden_queries WHERE status = $1`, status).Scan(&n)
 	return n, err
 }
 

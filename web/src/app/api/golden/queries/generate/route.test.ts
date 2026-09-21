@@ -12,6 +12,7 @@ it("forwards one explicit POST and preserves zero-created results", async () => 
   const [url, options] = fetchMock.mock.calls[0]!;
   expect(url).toMatch(/\/api\/v1\/golden\/queries\/generate$/);
   expect(options.method).toBe("POST");
+  expect(options.signal).toBeInstanceOf(AbortSignal);
 });
 
 it("propagates a generation failure without issuing another request", async () => {
