@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -160,9 +161,58 @@ func truncateForEmbed(text string) string {
 type EmbedClient struct {
 	apiURL string
 	model  string
-	dim    int    // advisory dimension; 0 means unknown
-	client *http.Client
-	tokens auth.TokenSource // nil when no auth configured
+	dim    int // advisory dimension; 0 means unknown
+	// requestDimensions 는 요청 본문에 실어 보낼 OpenAI `dimensions` 값이다.
+	// 0 이면 필드를 싣지 않는다(모델 기본 차원). WithRequestDimensions 로 설정.
+	requestDimensions int
+	client            *http.Client
+	tokens            auth.TokenSource // nil when no auth configured
+}
+
+// WithRequestDimensions 는 임베딩 요청에 실어 보낼 `dimensions` 값을 설정하고
+// 같은 클라이언트를 돌려준다(체이닝용).
+//
+// 왜 생성자 파라미터가 아니라 별도 메서드인가: NewEmbedClient 의 호출 지점이
+// 프로덕션 1곳 + 테스트 다수라, 파라미터를 하나 더 늘리면 임베딩과 무관한
+// 테스트까지 전부 손봐야 한다. 기본 동작(필드 미전송)을 유지하는 선택적 설정
+// 이므로 옵션 메서드가 더 알맞다.
+//
+// n 이 0 이하이거나 모델이 dimensions 를 지원하지 않으면 무시한다.
+func (c *EmbedClient) WithRequestDimensions(n int) *EmbedClient {
+	if n <= 0 {
+		return c
+	}
+	if !supportsDimensionsParam(c.model) {
+		slog.Warn("embed: model does not support the dimensions parameter; ignoring",
+			"model", c.model,
+			"requested_dimensions", n,
+		)
+		return c
+	}
+	c.requestDimensions = n
+	return c
+}
+
+// supportsDimensionsParam 은 모델이 OpenAI `dimensions` 파라미터를 받는지
+// 판정한다. Matryoshka 표현 학습으로 차원 축소를 지원하는 text-embedding-3
+// 계열만 해당하며, 그 외 모델(ada-002, Ollama 호환 게이트웨이 등)에 보내면
+// 400 으로 임베딩 경로 전체가 멈춘다.
+func supportsDimensionsParam(model string) bool {
+	return strings.HasPrefix(model, "text-embedding-3")
+}
+
+// newEmbedPayload 는 /v1/embeddings 요청 본문을 만든다. input 은 단건(string)
+// 이거나 배치([]string)다. requestDimensions 가 0 이면 dimensions 키 자체가
+// 빠지므로, 설정하지 않은 배포의 요청 본문은 기존과 바이트 단위로 같다.
+func (c *EmbedClient) newEmbedPayload(input any) map[string]any {
+	payload := map[string]any{
+		"input": input,
+		"model": c.model,
+	}
+	if c.requestDimensions > 0 {
+		payload["dimensions"] = c.requestDimensions
+	}
+	return payload
 }
 
 // NewEmbedClient returns an EmbedClient. When apiURL is empty the client is
@@ -233,11 +283,7 @@ func (c *EmbedClient) Embed(ctx context.Context, text string) (vec []float32, er
 
 	text = truncateForEmbed(text)
 
-	payload := map[string]interface{}{
-		"input": text,
-		"model": c.model,
-	}
-	body, err := json.Marshal(payload)
+	body, err := json.Marshal(c.newEmbedPayload(text))
 	if err != nil {
 		return nil, fmt.Errorf("embed marshal: %w", err)
 	}
@@ -342,9 +388,9 @@ func (c *EmbedClient) Embed(ctx context.Context, text string) (vec []float32, er
 // text stays within maxEmbedTokens, so the batch budget only needs to bound
 // the aggregate.
 //
-//   safeTokenLimit  = 250,000 tokens   (leave 50k headroom below the 300k cap)
-//   charsPerToken   = 2                (conservative: 1 token ≈ 2 chars)
-//   maxBatchChars   = 500,000 chars    (= safeTokenLimit × charsPerToken)
+//	safeTokenLimit  = 250,000 tokens   (leave 50k headroom below the 300k cap)
+//	charsPerToken   = 2                (conservative: 1 token ≈ 2 chars)
+//	maxBatchChars   = 500,000 chars    (= safeTokenLimit × charsPerToken)
 const (
 	safeTokenLimit = 250_000
 	charsPerToken  = 2
@@ -449,11 +495,7 @@ func (c *EmbedClient) embedBatchOnce(ctx context.Context, texts []string) (_ [][
 		}
 	}()
 
-	payload := map[string]interface{}{
-		"input": texts,
-		"model": c.model,
-	}
-	body, err := json.Marshal(payload)
+	body, err := json.Marshal(c.newEmbedPayload(texts))
 	if err != nil {
 		return nil, fmt.Errorf("embed batch marshal: %w", err)
 	}

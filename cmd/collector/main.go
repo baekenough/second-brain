@@ -572,9 +572,19 @@ func run() error {
 		WithChunkStore(chunkStore).
 		WithInstance(cfg.CollectorInstance).
 		WithCutover(cfg.CollectorCutover).
-		WithDeletionRatioOverride(cfg.DeletionRatioOverride)
+		WithDeletionRatioOverride(cfg.DeletionRatioOverride).
+		// 임베딩 버전(모델·차원·입력 구성)을 벡터에 함께 기록한다. 마이그
+		// 레이션 037 / internal/search.EmbeddingVersion 참고.
+		WithEmbeddingVersion(cfg.EmbeddingModel, cfg.EmbeddingDimensions).
+		WithStaleReembedding(cfg.EmbeddingReembedEnabled)
 	if entityExtractionEnabled {
 		sched = sched.WithEntityExtraction(entityStore, llmClient)
+	}
+	if cfg.EmbeddingReembedEnabled {
+		slog.Warn("stale re-embedding enabled — documents/chunks embedded with a different version will be re-embedded every cycle (EMBEDDING_REEMBED_ENABLED=true)",
+			"embedding_model", cfg.EmbeddingModel,
+			"embedding_dimensions", cfg.EmbeddingDimensions,
+		)
 	}
 	if cfg.DeletionRatioOverride {
 		slog.Warn("deletion ratio override active — 50% guard bypassed (DELETION_RATIO_OVERRIDE=true)")

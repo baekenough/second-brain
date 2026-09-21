@@ -26,13 +26,17 @@ func NewEmbeddingEngine(cfg *config.Config) (EmbeddingEngine, error) {
 
 	switch cfg.EmbeddingProvider {
 	case "", "openai":
+		// WithRequestDimensions: EMBEDDING_DIMENSIONS 를 요청의 `dimensions`
+		// 필드로 전달한다. text-embedding-3-large 를 1536 차원으로 받아
+		// pgvector 컬럼 차원을 유지한 채 모델만 교체하기 위한 경로다.
+		// 지원하지 않는 모델이면 WithRequestDimensions 가 무시한다.
 		engine = NewEmbedClient(
 			cfg.EmbeddingAPIURL,
 			cfg.EmbeddingAPIKey,
 			cfg.CliProxyAuthFile,
 			cfg.EmbeddingModel,
 			cfg.EmbeddingDim,
-		)
+		).WithRequestDimensions(cfg.EmbeddingDimensions)
 
 	case "local":
 		if cfg.LocalEmbeddingEndpoint == "" {

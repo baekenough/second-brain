@@ -24,117 +24,117 @@ func TestSelectOptions(t *testing.T) {
 	const chatContent = "hey, can you send me the report? thanks"
 
 	tests := []struct {
-		name            string
-		sourceType      model.SourceType
-		content         string
+		name             string
+		sourceType       model.SourceType
+		content          string
 		wantHeadingAware bool
-		wantTargetSize  int
-		wantMaxSize     int
-		wantOverlap     int
+		wantTargetSize   int
+		wantMaxSize      int
+		wantOverlap      int
 	}{
 		// --- Long-form / structured sources (regression guard) ---
 		{
-			name:            "filesystem_structured_keeps_defaults",
-			sourceType:      model.SourceFilesystem,
-			content:         structuredContent,
+			name:             "filesystem_structured_keeps_defaults",
+			sourceType:       model.SourceFilesystem,
+			content:          structuredContent,
 			wantHeadingAware: true,
-			wantTargetSize:  longFormTargetSize, // 2000 — must match scheduler default
-			wantMaxSize:     longFormMaxSize,    // 4000
-			wantOverlap:     longFormOverlap,   // 100
+			wantTargetSize:   longFormTargetSize, // 2000 — must match scheduler default
+			wantMaxSize:      longFormMaxSize,    // 4000
+			wantOverlap:      longFormOverlap,    // 100
 		},
 		{
-			name:            "notion_structured_keeps_defaults",
-			sourceType:      model.SourceNotion,
-			content:         structuredContent,
+			name:             "notion_structured_keeps_defaults",
+			sourceType:       model.SourceNotion,
+			content:          structuredContent,
 			wantHeadingAware: true,
-			wantTargetSize:  longFormTargetSize,
-			wantMaxSize:     longFormMaxSize,
-			wantOverlap:     longFormOverlap,
+			wantTargetSize:   longFormTargetSize,
+			wantMaxSize:      longFormMaxSize,
+			wantOverlap:      longFormOverlap,
 		},
 		{
-			name:            "github_structured_keeps_defaults",
-			sourceType:      model.SourceGitHub,
-			content:         structuredContent,
+			name:             "github_structured_keeps_defaults",
+			sourceType:       model.SourceGitHub,
+			content:          structuredContent,
 			wantHeadingAware: true,
-			wantTargetSize:  longFormTargetSize,
-			wantMaxSize:     longFormMaxSize,
-			wantOverlap:     longFormOverlap,
+			wantTargetSize:   longFormTargetSize,
+			wantMaxSize:      longFormMaxSize,
+			wantOverlap:      longFormOverlap,
 		},
 		{
-			name:            "gdrive_structured_keeps_defaults",
-			sourceType:      model.SourceGDrive,
-			content:         structuredContent,
+			name:             "gdrive_structured_keeps_defaults",
+			sourceType:       model.SourceGDrive,
+			content:          structuredContent,
 			wantHeadingAware: true,
-			wantTargetSize:  longFormTargetSize,
-			wantMaxSize:     longFormMaxSize,
-			wantOverlap:     longFormOverlap,
+			wantTargetSize:   longFormTargetSize,
+			wantMaxSize:      longFormMaxSize,
+			wantOverlap:      longFormOverlap,
 		},
 		// --- Long-form source with flat content (content-shape override) ---
 		{
-			name:            "filesystem_flat_content_disables_heading_aware",
-			sourceType:      model.SourceFilesystem,
-			content:         flatContent,
+			name:             "filesystem_flat_content_disables_heading_aware",
+			sourceType:       model.SourceFilesystem,
+			content:          flatContent,
 			wantHeadingAware: false, // BI heuristic: no structure detected
-			wantTargetSize:  longFormTargetSize,
-			wantMaxSize:     longFormMaxSize,
-			wantOverlap:     longFormOverlap,
+			wantTargetSize:   longFormTargetSize,
+			wantMaxSize:      longFormMaxSize,
+			wantOverlap:      longFormOverlap,
 		},
 		// --- Short chat sources ---
 		{
-			name:            "slack_uses_small_chunks",
-			sourceType:      model.SourceSlack,
-			content:         chatContent,
+			name:             "slack_uses_small_chunks",
+			sourceType:       model.SourceSlack,
+			content:          chatContent,
 			wantHeadingAware: false,
-			wantTargetSize:  chatTargetSize, // 900
-			wantMaxSize:     chatMaxSize,    // 1500
-			wantOverlap:     chatOverlap,   // 80
+			wantTargetSize:   chatTargetSize, // 900
+			wantMaxSize:      chatMaxSize,    // 1500
+			wantOverlap:      chatOverlap,    // 80
 		},
 		{
-			name:            "discord_uses_small_chunks",
-			sourceType:      model.SourceDiscord,
-			content:         chatContent,
+			name:             "discord_uses_small_chunks",
+			sourceType:       model.SourceDiscord,
+			content:          chatContent,
 			wantHeadingAware: false,
-			wantTargetSize:  chatTargetSize,
-			wantMaxSize:     chatMaxSize,
-			wantOverlap:     chatOverlap,
+			wantTargetSize:   chatTargetSize,
+			wantMaxSize:      chatMaxSize,
+			wantOverlap:      chatOverlap,
 		},
 		{
-			name:            "telegram_uses_small_chunks",
-			sourceType:      model.SourceTelegram,
-			content:         chatContent,
+			name:             "telegram_uses_small_chunks",
+			sourceType:       model.SourceTelegram,
+			content:          chatContent,
 			wantHeadingAware: false,
-			wantTargetSize:  chatTargetSize,
-			wantMaxSize:     chatMaxSize,
-			wantOverlap:     chatOverlap,
+			wantTargetSize:   chatTargetSize,
+			wantMaxSize:      chatMaxSize,
+			wantOverlap:      chatOverlap,
 		},
 		// --- Memory / agent sources ---
 		{
-			name:            "secretary_uses_mid_chunks",
-			sourceType:      model.SourceSecretary,
-			content:         "Session summary for 2024-01-15. Tasks completed: review PR #42.",
+			name:             "secretary_uses_mid_chunks",
+			sourceType:       model.SourceSecretary,
+			content:          "Session summary for 2024-01-15. Tasks completed: review PR #42.",
 			wantHeadingAware: false,
-			wantTargetSize:  memTargetSize, // 1200
-			wantMaxSize:     memMaxSize,    // 2500
-			wantOverlap:     memOverlap,   // 100
+			wantTargetSize:   memTargetSize, // 1200
+			wantMaxSize:      memMaxSize,    // 2500
+			wantOverlap:      memOverlap,    // 100
 		},
 		{
-			name:            "llm_memory_uses_mid_chunks",
-			sourceType:      model.SourceLLMMemory,
-			content:         "The user prefers concise answers and works in Go.",
+			name:             "llm_memory_uses_mid_chunks",
+			sourceType:       model.SourceLLMMemory,
+			content:          "The user prefers concise answers and works in Go.",
 			wantHeadingAware: false,
-			wantTargetSize:  memTargetSize,
-			wantMaxSize:     memMaxSize,
-			wantOverlap:     memOverlap,
+			wantTargetSize:   memTargetSize,
+			wantMaxSize:      memMaxSize,
+			wantOverlap:      memOverlap,
 		},
 		// --- Unknown source type falls back to long-form defaults ---
 		{
-			name:            "unknown_source_falls_back_to_defaults",
-			sourceType:      model.SourceType("unknown-future-source"),
-			content:         structuredContent,
+			name:             "unknown_source_falls_back_to_defaults",
+			sourceType:       model.SourceType("unknown-future-source"),
+			content:          structuredContent,
 			wantHeadingAware: true,
-			wantTargetSize:  longFormTargetSize,
-			wantMaxSize:     longFormMaxSize,
-			wantOverlap:     longFormOverlap,
+			wantTargetSize:   longFormTargetSize,
+			wantMaxSize:      longFormMaxSize,
+			wantOverlap:      longFormOverlap,
 		},
 	}
 
@@ -180,11 +180,15 @@ func TestSelectOptionsFilesystemRegressionSplit(t *testing.T) {
 	opts := SelectOptions(doc)
 
 	// Verify the options match the old hardcoded values exactly.
+	// SourceType is a new field (textclean dispatch, see internal/textclean) —
+	// SelectOptions always sets it to the document's own source type, so the
+	// expected value here must match doc.SourceType, not the zero value.
 	want := Options{
 		TargetSize:   2000,
 		MaxSize:      4000,
 		Overlap:      100,
 		HeadingAware: true,
+		SourceType:   string(model.SourceFilesystem),
 	}
 	if opts != want {
 		t.Errorf("regression: SelectOptions returned %+v, want %+v", opts, want)

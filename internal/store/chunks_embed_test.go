@@ -160,16 +160,9 @@ func TestListByDocumentQueryFragments(t *testing.T) {
 func TestListUnembeddedChunksQueryFragments(t *testing.T) {
 	t.Parallel()
 
-	// Inline copy of the query constant from ListUnembeddedChunks for fragment checking.
-	const q = `
-		SELECT c.id, c.content
-		FROM chunks c
-		JOIN documents d ON d.id = c.document_id
-		WHERE c.embedding IS NULL
-		  AND d.status = 'active'
-		ORDER BY c.id ASC
-		LIMIT $1
-		FOR UPDATE OF c SKIP LOCKED`
+	// 실제 실행되는 쿼리 상수를 직접 검사한다. 예전에는 이 자리에 쿼리 사본이
+	// 있었는데, 사본은 본문이 바뀌어도 그대로 통과해서 검증 구실을 못 했다.
+	const q = listChunksNeedingEmbeddingQuery
 
 	type fragment struct {
 		name string
@@ -180,6 +173,8 @@ func TestListUnembeddedChunksQueryFragments(t *testing.T) {
 		{"SKIP LOCKED avoids blocking on locked rows", "SKIP LOCKED"},
 		{"FOR UPDATE exclusive lock claim", "FOR UPDATE OF c"},
 		{"NULL embedding filter", "c.embedding IS NULL"},
+		{"stale version filter", "c.embedding_version IS DISTINCT FROM $2"},
+		{"document context for the embedding header", "d.source_type, d.title, d.occurred_at, d.metadata"},
 		{"active documents only", "d.status = 'active'"},
 		{"limit placeholder", "LIMIT $1"},
 	}

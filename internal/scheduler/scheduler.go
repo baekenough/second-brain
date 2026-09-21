@@ -11,8 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/robfig/cron/v3"
 	"github.com/baekenough/second-brain/internal/chunker"
 	"github.com/baekenough/second-brain/internal/collector"
 	"github.com/baekenough/second-brain/internal/llm"
@@ -20,6 +18,8 @@ import (
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
 	"github.com/baekenough/second-brain/internal/worker"
+	"github.com/google/uuid"
+	"github.com/robfig/cron/v3"
 )
 
 // DocumentUpserter is the subset of the document store used by the scheduler.
@@ -37,6 +37,12 @@ type DocumentUpserter interface {
 	CountActiveDocuments(ctx context.Context, sourceType model.SourceType) (int, error)
 	// ListUnembedded returns up to limit active documents with a NULL embedding.
 	ListUnembedded(ctx context.Context, limit int) ([]*model.Document, error)
+	// ListDocumentsNeedingEmbedding 은 임베딩이 없거나 currentVersion 과 다른
+	// 버전으로 만들어진 활성 문서를 돌려준다. currentVersion 이 빈 문자열이면
+	// ListUnembedded 와 같다. 선택 메서드가 아니라 필수 메서드로 둔 이유는
+	// CountActiveDocuments(#148) 와 같다 — 타입 어서션으로 두면 어떤 구현체가
+	// 조용히 재임베딩을 건너뛰어도 컴파일 단계에서 드러나지 않는다.
+	ListDocumentsNeedingEmbedding(ctx context.Context, limit int, currentVersion string) ([]*model.Document, error)
 	// UpdateEmbedding persists the embedding vector for a single document.
 	UpdateEmbedding(ctx context.Context, doc *model.Document) error
 	// ActiveSourceIDSet returns the set of source_ids currently active in the
@@ -108,15 +114,15 @@ type EntityExtractor interface {
 
 // Scheduler wraps robfig/cron and manages periodic collection runs.
 type Scheduler struct {
-	cron        *cron.Cron
-	collectors  []collector.Collector
-	store       DocumentUpserter
-	embed       search.EmbeddingEngine
-	chunkStore  *store.ChunkStore  // nil when chunk storage is disabled
-	entities    EntityExtractor    // nil when entity extraction is disabled
-	llmClient   llm.Completer      // nil when entity extraction is disabled
-	instanceID  string             // per-instance watermark key (e.g., "laptop", "host1", "host2")
-	cutover     time.Time          // zero = floor disabled; propagated to CutoverAwareCollectors
+	cron       *cron.Cron
+	collectors []collector.Collector
+	store      DocumentUpserter
+	embed      search.EmbeddingEngine
+	chunkStore *store.ChunkStore // nil when chunk storage is disabled
+	entities   EntityExtractor   // nil when entity extraction is disabled
+	llmClient  llm.Completer     // nil when entity extraction is disabled
+	instanceID string            // per-instance watermark key (e.g., "laptop", "host1", "host2")
+	cutover    time.Time         // zero = floor disabled; propagated to CutoverAwareCollectors
 	// deletionRatioOverride, when true, bypasses the 50% deletion-ratio guard for
 	// a single MarkDeleted pass. This is an escape hatch for legitimate large-scale
 	// deletions (e.g. a user genuinely deletes >50% of a source's files) that would
@@ -128,6 +134,16 @@ type Scheduler struct {
 	// Set DELETION_RATIO_OVERRIDE=true in the environment; the scheduler reads it at
 	// construction time via WithDeletionRatioOverride.
 	deletionRatioOverride bool
+
+	// documentEmbedVersion / chunkEmbedVersion 은 이번 프로세스가 만드는
+	// 벡터에 찍을 버전 식별자다(internal/search.EmbeddingVersion). 빈 문자열
+	// 이면 버전을 기록하지 않는다 — 배선 전 동작과 동일.
+	documentEmbedVersion string
+	chunkEmbedVersion    string
+
+	// reembedStale 이 true 면 백필이 "버전이 다른" 행까지 집어 간다
+	// (EMBEDDING_REEMBED_ENABLED). false 면 embedding IS NULL 인 행만 본다.
+	reembedStale bool
 
 	// running is a global guard used by runAll / TriggerAll to prevent a
 	// "run all collectors" operation from overlapping with another one.
@@ -215,6 +231,42 @@ func (s *Scheduler) WithEntityExtraction(entities EntityExtractor, client llm.Co
 func (s *Scheduler) WithCutover(t time.Time) *Scheduler {
 	s.cutover = t
 	return s
+}
+
+// WithEmbeddingVersion 은 이 스케줄러가 만드는 벡터에 찍을 버전 식별자를
+// 설정한다. model/dimensions 는 설정값(EMBEDDING_MODEL / EMBEDDING_DIMENSIONS)
+// 을 그대로 넘기면 된다.
+//
+// 설정하지 않으면(빈 model) 버전을 기록하지 않으므로 재임베딩 선별도 동작하지
+// 않는다 — 배선 누락이 조용한 전량 재임베딩으로 번지지 않도록 한 안전
+// 기본값이다.
+func (s *Scheduler) WithEmbeddingVersion(modelName string, dimensions int) *Scheduler {
+	s.documentEmbedVersion = search.EmbeddingVersion(modelName, dimensions, search.RecipeDocumentV1)
+	s.chunkEmbedVersion = search.EmbeddingVersion(modelName, dimensions, search.RecipeChunkContextV1)
+	return s
+}
+
+// WithStaleReembedding 은 "현재 버전과 다른 벡터를 다시 만들지" 여부를 정한다
+// (EMBEDDING_REEMBED_ENABLED). 기본은 false.
+//
+// 켜면 백필이 매 수집 사이클마다 구버전 문서·청크를 배치 단위로 다시 임베딩
+// 한다. 전체 코퍼스를 한 번 훑는 동안은 새 벡터와 옛 벡터가 같은 인덱스에
+// 섞여 있으므로(= 거리 비교가 부분적으로만 의미 있는 상태) 그 사실을 사이클
+// 마다 경고 로그로 남긴다. 검색을 막지는 않는다 — 막으면 재임베딩이 끝날
+// 때까지 서비스가 통째로 멈춘다.
+func (s *Scheduler) WithStaleReembedding(enabled bool) *Scheduler {
+	s.reembedStale = enabled
+	return s
+}
+
+// embeddingSelectorVersion 은 백필 선별 쿼리에 넘길 버전 문자열이다.
+// 재임베딩이 꺼져 있으면 빈 문자열을 돌려주어 "embedding IS NULL 인 행만"
+// 이라는 기존 동작을 그대로 유지한다.
+func (s *Scheduler) embeddingSelectorVersion(version string) string {
+	if !s.reembedStale {
+		return ""
+	}
+	return version
 }
 
 // WithDeletionRatioOverride enables the escape hatch for the deletion-ratio
@@ -490,7 +542,7 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 	}
 
 	var (
-		count    int
+		count     int
 		totalSeen int
 	)
 
@@ -715,6 +767,22 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 // the resulting request rate without triggering 429 errors.
 const backfillBatchSize = 200
 
+// 재임베딩 모드(EMBEDDING_REEMBED_ENABLED=true)에서 한 사이클에 처리하는 건수.
+//
+// 평상시 백필은 "429 로 몇 건 밀린 것"을 따라잡는 용도라 작은 배치로 충분하다.
+// 반면 재임베딩은 코퍼스 전체(문서 4.6만 / 청크 8.2만)를 한 번 훑어야 한다 —
+// 청크 100건/사이클, 수집 주기 10분이면 827 사이클 = 5.7일이 걸려 사실상 못
+// 쓴다. 그래서 재임베딩일 때만 배치를 키운다(청크 8.2만 ÷ 1000 ≈ 83 사이클 =
+// 약 14시간).
+//
+// 상한의 근거: EmbedBatch 가 50만 자 단위로 하위 배치를 나눠 보내므로
+// (internal/search/embed.go maxBatchChars) 요청 크기는 자동으로 분할된다.
+// 여기서 제한하는 것은 한 사이클이 붙잡는 DB 행 수와 API 호출량이다.
+const (
+	reembedBatchSize      = 500
+	chunkReembedBatchSize = 1000
+)
+
 // backfillEmbeddings queries for active documents with a NULL embedding and
 // embeds them in batches of backfillBatchSize. It is called at the end of
 // every collection cycle so that documents that were skipped earlier (e.g.
@@ -729,13 +797,26 @@ func (s *Scheduler) backfillEmbeddings(ctx context.Context) {
 		return
 	}
 
-	docs, err := s.store.ListUnembedded(ctx, backfillBatchSize)
+	selector := s.embeddingSelectorVersion(s.documentEmbedVersion)
+	batch := backfillBatchSize
+	if selector != "" {
+		batch = reembedBatchSize
+	}
+	docs, err := s.store.ListDocumentsNeedingEmbedding(ctx, batch, selector)
 	if err != nil {
 		slog.Warn("scheduler: backfill list unembedded failed", "error", err)
 		return
 	}
 	if len(docs) == 0 {
 		return
+	}
+	if selector != "" {
+		// 모델/레시피 전환 중: 이 배치를 처리하는 동안에도 인덱스에는 옛 버전
+		// 벡터가 남아 있다. 검색을 막지는 않되 상태는 드러낸다.
+		slog.Warn("scheduler: re-embedding documents with a stale embedding version",
+			"target_version", selector,
+			"batch", len(docs),
+		)
 	}
 
 	texts := make([]string, len(docs))
@@ -757,6 +838,7 @@ func (s *Scheduler) backfillEmbeddings(ctx context.Context) {
 			continue
 		}
 		doc.Embedding = vecs[i]
+		doc.EmbeddingVersion = s.documentEmbedVersion
 		if err := s.store.UpdateEmbedding(ctx, doc); err != nil {
 			slog.Warn("scheduler: backfill update embedding failed",
 				"doc_id", doc.ID, "error", err)
@@ -793,18 +875,39 @@ func (s *Scheduler) backfillChunkEmbeddings(ctx context.Context) {
 		return
 	}
 
-	chunks, err := s.chunkStore.ListUnembeddedChunks(ctx, chunkBackfillBatchSize)
+	selector := s.embeddingSelectorVersion(s.chunkEmbedVersion)
+	batch := chunkBackfillBatchSize
+	if selector != "" {
+		batch = chunkReembedBatchSize
+	}
+	chunks, err := s.chunkStore.ListChunksNeedingEmbedding(ctx, batch, selector)
 	if err != nil {
 		slog.Warn("scheduler: chunk backfill list unembedded failed", "error", err)
 		return
+	}
+	if len(chunks) > 0 && selector != "" {
+		// 모델/레시피 전환 중 — backfillEmbeddings 쪽 주석 참고.
+		slog.Warn("scheduler: re-embedding chunks with a stale embedding version",
+			"target_version", selector,
+			"batch", len(chunks),
+		)
 	}
 	if len(chunks) == 0 {
 		return
 	}
 
+	// 임베딩 입력에는 문맥 헤더를 붙인다(저장된 청크 본문은 건드리지 않는다).
+	// 백필 경로는 문서 행을 함께 읽어 오므로(store.UnembeddedChunk) 인라인
+	// 경로와 같은 헤더를 재구성할 수 있다.
 	texts := make([]string, len(chunks))
 	for i, c := range chunks {
-		texts[i] = c.Content
+		texts[i] = withChunkContextHeader(model.Document{
+			ID:         c.DocumentID,
+			SourceType: c.SourceType,
+			Title:      c.Title,
+			OccurredAt: c.OccurredAt,
+			Metadata:   c.Metadata,
+		}, c.Content)
 	}
 
 	vecs, err := s.embed.EmbedBatch(ctx, texts)
@@ -823,6 +926,7 @@ func (s *Scheduler) backfillChunkEmbeddings(ctx context.Context) {
 		embeddings = append(embeddings, store.ChunkEmbedding{
 			ChunkID:   c.ID,
 			Embedding: vecs[i],
+			Version:   s.chunkEmbedVersion,
 		})
 	}
 
@@ -876,8 +980,11 @@ func (s *Scheduler) embedDocuments(ctx context.Context, docs []model.Document) {
 			continue
 		}
 		for i := range batch {
-			if i < len(vecs) {
+			if i < len(vecs) && len(vecs[i]) > 0 {
 				docs[start+i].Embedding = vecs[i]
+				// 벡터와 버전을 같은 자리에서 찍는다. Upsert 는 벡터가 있을
+				// 때만 embedding_version 을 덮어쓴다(internal/store/document.go).
+				docs[start+i].EmbeddingVersion = s.documentEmbedVersion
 			}
 		}
 
@@ -927,7 +1034,7 @@ func (s *Scheduler) persistChunks(ctx context.Context, doc *model.Document) {
 	// This is a best-effort operation: failure is non-fatal and only affects
 	// vector search quality. FTS-based chunk search remains available.
 	if s.embed.Enabled() {
-		s.embedChunks(ctx, doc.ID, chunks)
+		s.embedChunks(ctx, *doc, chunks)
 	}
 }
 
@@ -940,14 +1047,18 @@ func (s *Scheduler) persistChunks(ctx context.Context, doc *model.Document) {
 //
 // Failures are non-fatal: a warning is logged and the document remains
 // searchable via FTS.
-func (s *Scheduler) embedChunks(ctx context.Context, docID uuid.UUID, chunks []store.Chunk) {
+func (s *Scheduler) embedChunks(ctx context.Context, doc model.Document, chunks []store.Chunk) {
 	if len(chunks) == 0 {
 		return
 	}
 
+	docID := doc.ID
+
+	// 임베딩 입력 = 문맥 헤더 + 청크 본문. 저장된 chunk.Content 는 그대로다
+	// (FTS 인덱스와 검색 결과 표시가 헤더 텍스트로 오염되면 안 된다).
 	texts := make([]string, len(chunks))
 	for i, c := range chunks {
-		texts[i] = c.Content
+		texts[i] = withChunkContextHeader(doc, c.Content)
 	}
 
 	vecs, err := s.embed.EmbedBatch(ctx, texts)
@@ -990,6 +1101,7 @@ func (s *Scheduler) embedChunks(ctx context.Context, docID uuid.UUID, chunks []s
 		embeddings = append(embeddings, store.ChunkEmbedding{
 			ChunkID:   id,
 			Embedding: vecs[i],
+			Version:   s.chunkEmbedVersion,
 		})
 	}
 

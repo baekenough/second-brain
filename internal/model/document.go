@@ -125,9 +125,15 @@ type Document struct {
 	Title      string         `json:"title"`
 	Content    string         `json:"content"`
 	Metadata   map[string]any `json:"metadata"`
-	Embedding  []float32      `json:"-"`                    // omit from REST: large vector
-	Status     string         `json:"status"`               // "active", "deleted", "moved"
-	DeletedAt  *time.Time     `json:"deleted_at,omitempty"` // nil for active documents
+	Embedding  []float32      `json:"-"` // omit from REST: large vector
+	// EmbeddingVersion 은 Embedding 이 어떤 설정(모델·차원·입력 구성)으로
+	// 만들어졌는지 나타내는 식별자다. 형식과 생성은
+	// internal/search.EmbeddingVersion 참고. 빈 문자열이면 저장 시 기존 값을
+	// 덮어쓰지 않는다 — 임베딩을 새로 만들지 않은 upsert 가 버전만 지우는
+	// 일을 막기 위해서다. DB 의 NULL 은 레거시(마이그레이션 037 이전) 벡터.
+	EmbeddingVersion string     `json:"-"`
+	Status           string     `json:"status"`               // "active", "deleted", "moved"
+	DeletedAt        *time.Time `json:"deleted_at,omitempty"` // nil for active documents
 	// OccurredAt is the timestamp of the original event: email sent date,
 	// calendar event start time, SMS/call time, etc.  It is distinct from
 	// CollectedAt (when second-brain ingested the document).  Nil when the
@@ -344,6 +350,15 @@ type SearchQuery struct {
 	// value the caller set explicitly — that is a stronger, deliberate request
 	// and is never silently overridden.
 	IncludeRetention bool
+
+	// Tuning 은 검색 실험용 노브 묶음이다. 제로값(= 아무것도 설정하지 않음)
+	// 이면 서비스 기본값(SEARCH_* 환경변수, 기본은 전부 현행 동작)을 쓴다 —
+	// Weights 필드와 정확히 같은 "제로값은 기본값을 뜻한다" 규약이다.
+	//
+	// 이 필드는 후보 풀 크기·융합 방식·리랭크 합산·리랭커 입력·최신성 감쇠를
+	// 바꾸므로 검색 결과의 정체성 일부다. 평가 실행(cmd/eval)은 기본이 아닌
+	// 값을 config_hash 에 넣어 별도 baseline 계열이 되게 한다.
+	Tuning SearchTuning
 }
 
 // SortRecent is the ONLY value of SearchQuery.Sort that ranks by time. Every
