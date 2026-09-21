@@ -244,8 +244,8 @@ func TestClient_APIErrorIn200(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for API-level error in 200, got nil")
 	}
-	if !strings.Contains(err.Error(), "rate_limit_exceeded") {
-		t.Fatalf("error should contain API error message, got: %v", err)
+	if !strings.Contains(err.Error(), "HTTP 200") || strings.Contains(err.Error(), "rate_limit_exceeded") {
+		t.Fatalf("error should retain status without upstream message, got: %v", err)
 	}
 }
 

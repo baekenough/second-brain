@@ -97,6 +97,7 @@ services:
     volumes:
       - /home/baekenough/.second-brain/secretary/gmail:/data/gmail:ro
       - /home/baekenough/.second-brain/secretary/calendar:/data/calendar:ro
+      - /home/baekenough/.second-brain/calendar-write:/data/calendar-write:ro
       - /home/baekenough/.second-brain/stage/sms:/data/sms:ro
       - /home/baekenough/.second-brain/stage/call:/data/call:ro
     restart: unless-stopped

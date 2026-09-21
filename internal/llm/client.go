@@ -451,27 +451,26 @@ func (c *Client) StreamWithMessages(ctx context.Context, system string, messages
 	url := c.baseURL + "/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("llm: build request: %w", err)
+		return safeFailure("build request", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 	if c.tokens != nil {
 		tok, err := c.tokens.Token()
 		if err != nil {
-			return fmt.Errorf("llm: token source: %w", err)
+			return safeFailure("token source", err)
 		}
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("llm: HTTP request: %w", err)
+		return safeFailure("HTTP request", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return &clientError{statusCode: resp.StatusCode, body: string(body)}
+		return &clientError{statusCode: resp.StatusCode}
 	}
 
 	// finishReason keeps the last non-empty finish_reason seen on the stream:
@@ -534,7 +533,7 @@ func (c *Client) StreamWithMessages(ctx context.Context, system string, messages
 			return fmt.Errorf("llm: stream canceled: %w", ctxErr)
 		}
 		if err := scanner.Err(); err != nil {
-			return fmt.Errorf("llm: read stream: %w", err)
+			return safeFailure("read stream", err)
 		}
 	}
 
@@ -561,14 +560,24 @@ func (c *Client) StreamWithMessages(ctx context.Context, system string, messages
 	return nil
 }
 
+// safeFailure keeps upstream URLs, response fragments, and credential-provider
+// details out of logs and tracing. Preserve standard cancellation semantics.
+func safeFailure(stage string, err error) error {
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded} {
+		if errors.Is(err, cause) {
+			return fmt.Errorf("llm: %s: %w", stage, cause)
+		}
+	}
+	return fmt.Errorf("llm: %s failed", stage)
+}
+
 // clientError wraps an HTTP 4xx response so the caller can detect it without retrying.
 type clientError struct {
 	statusCode int
-	body       string
 }
 
 func (e *clientError) Error() string {
-	return fmt.Sprintf("llm: HTTP %d: %s", e.statusCode, e.body)
+	return fmt.Sprintf("llm: provider error (HTTP %d)", e.statusCode)
 }
 
 func isClientError(err error) bool {
@@ -595,45 +604,44 @@ func (c *Client) doRequest(ctx context.Context, reqBody chatRequest) (string, *t
 	url := c.baseURL + "/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
-		return "", nil, fmt.Errorf("llm: build request: %w", err)
+		return "", nil, safeFailure("build request", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if c.tokens != nil {
 		tok, err := c.tokens.Token()
 		if err != nil {
-			return "", nil, fmt.Errorf("llm: token source: %w", err)
+			return "", nil, safeFailure("token source", err)
 		}
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", nil, fmt.Errorf("llm: HTTP request: %w", err)
+		return "", nil, safeFailure("HTTP request", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", nil, fmt.Errorf("llm: read response body: %w", err)
+		return "", nil, safeFailure("read response body", err)
 	}
 
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-		return "", nil, &clientError{statusCode: resp.StatusCode, body: string(body)}
+		return "", nil, &clientError{statusCode: resp.StatusCode}
 	}
 	if resp.StatusCode >= 500 {
-		return "", nil, fmt.Errorf("llm: server error %d: %s", resp.StatusCode, string(body))
+		return "", nil, fmt.Errorf("llm: server error %d", resp.StatusCode)
 	}
 
 	var chatResp chatResponse
 	if err := json.Unmarshal(body, &chatResp); err != nil {
-		return "", nil, fmt.Errorf("llm: unmarshal response: %w", err)
+		return "", nil, safeFailure("unmarshal response", err)
 	}
 
 	// Surface API-level errors embedded in a 200 response (some proxies do this).
 	if chatResp.Error != nil {
 		return "", nil, &clientError{
 			statusCode: http.StatusOK,
-			body:       chatResp.Error.Message,
 		}
 	}
 
