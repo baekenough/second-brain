@@ -11,13 +11,22 @@ import (
 // EvalPair is a single (query, relevant_document) evaluation pair
 // derived from positive feedback or explicit ratings.
 type EvalPair struct {
-	ID               int64          `json:"id"`
-	Query            string         `json:"query"`
-	RelevantDocIDs   []string       `json:"relevant_doc_ids"`
-	IrrelevantDocIDs []string       `json:"irrelevant_doc_ids,omitempty"` // thumbs=-1 docs for this query
-	Source           string         `json:"source"`                       // "feedback", "manual"
-	CreatedAt        time.Time      `json:"created_at"`
-	Metadata         map[string]any `json:"metadata,omitempty"`
+	ID               int64     `json:"id"`
+	Query            string    `json:"query"`
+	RelevantDocIDs   []string  `json:"relevant_doc_ids"`
+	IrrelevantDocIDs []string  `json:"irrelevant_doc_ids,omitempty"` // thumbs=-1 docs for this query
+	Source           string    `json:"source"`                       // "feedback", "manual"
+	CreatedAt        time.Time `json:"created_at"`
+
+	// GoldenQueryID / GoldenQuerySource 는 골든셋에서 뽑은 쌍에만 채워진다
+	// (GoldenStore.ExportEvalPairs). 각각 golden_queries.id 와 그 행의
+	// source("seed" | "ask_history" | "manual" | "hermes" | "document")로,
+	// 질의 문구를 드러내지 않고도 진단 출력에서 질의를 지목하고 출처별로
+	// 나눠 볼 수 있게 한다. 피드백 기반 쌍에서는 빈 문자열이다.
+	GoldenQueryID     string `json:"golden_query_id,omitempty"`
+	GoldenQuerySource string `json:"golden_query_source,omitempty"`
+
+	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
 // EvalStore derives evaluation pairs from feedback data.

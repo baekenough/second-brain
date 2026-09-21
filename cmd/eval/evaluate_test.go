@@ -21,14 +21,14 @@ func (s controlledSearch) Search(_ context.Context, q model.SearchQuery) ([]*mod
 func TestEvaluationCountsFailuresAndNegativeOnlyQuestions(t *testing.T) {
 	id := "00000000-0000-0000-0000-000000000001"
 	pairs := []store.EvalPair{{Query: "hit", RelevantDocIDs: []string{id}}, {Query: "fail", RelevantDocIDs: []string{id}}, {Query: "negative", IrrelevantDocIDs: []string{id}}}
-	got := evaluatePairs(context.Background(), controlledSearch{}, pairs, true)
+	got := evaluatePairs(context.Background(), controlledSearch{}, pairs, evalRunOptions{rerank: true})
 	if got.Attempted != 3 || got.Failed != 1 || got.PositiveQueries != 2 || got.NegativeQueries != 1 || got.Metrics.NDCG10 != 0.5 || got.FPPenalty10 != 0.1 {
 		t.Fatalf("unexpected evaluation: %+v", got)
 	}
 	if got.completionError() == nil {
 		t.Fatal("partial failure must fail the run")
 	}
-	failed := evaluatePairs(context.Background(), controlledSearch{failAll: true}, pairs, true)
+	failed := evaluatePairs(context.Background(), controlledSearch{failAll: true}, pairs, evalRunOptions{rerank: true})
 	if failed.completionError() == nil {
 		t.Fatal("all failed run reported success")
 	}
