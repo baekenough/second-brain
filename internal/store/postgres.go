@@ -18,6 +18,9 @@ import (
 // Postgres wraps a pgx connection pool with store operations.
 type Postgres struct {
 	pool *pgxpool.Pool
+	// ptahVectors is set by UsePtahVectors (VECTOR_SOURCE=ptah). Nil means
+	// search reads the application's own vector columns.
+	ptahVectors *ptahVectorResolver
 }
 
 // NewPostgres opens a pgx pool, registers pgvector types, and enables the

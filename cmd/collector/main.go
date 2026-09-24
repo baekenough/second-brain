@@ -154,6 +154,9 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("embedding engine: %w", err)
 	}
+	// Every vector the collector produces is written, never searched, so
+	// under VECTOR_SOURCE=ptah all of its paths take the disabled engine.
+	embedClient = search.NewIngestEmbeddingEngine(cfg, embedClient)
 	if embedClient.Enabled() {
 		slog.Info("embedding engine configured", "provider", cfg.EmbeddingProvider)
 	} else {

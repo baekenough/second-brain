@@ -517,6 +517,15 @@ func (s *ChunkStore) SearchVectorFiltered(ctx context.Context, filter model.Sear
 	// cosine distance operator <=> returns 0 (identical) to 2 (opposite).
 	// Score = 1 - distance maps it to [−1, 1] with 1 being perfect match.
 	args, filters := chunkEligibilitySQL([]interface{}{pgvector.NewVector(queryVec), limit}, filter)
+	if s.pg.ptahVectors != nil {
+		target := s.pg.ptahVectors.targets(ctx).chunk
+		if target == nil {
+			// No chunk generation search can read yet: the lane is empty
+			// rather than an error, as it is before the first embedding.
+			return nil, nil
+		}
+		return s.scanChunkSearch(ctx, ptahChunkVectorSQL(*target, filters), args)
+	}
 	q := `
 		SELECT
 			c.id,
@@ -539,6 +548,13 @@ func (s *ChunkStore) SearchVectorFiltered(ctx context.Context, filter model.Sear
 		ORDER BY c.embedding <=> $1::vector
 		LIMIT $2`
 
+	return s.scanChunkSearch(ctx, q, args)
+}
+
+// scanChunkSearch runs a chunk vector search statement and reads its rows.
+// Both the application's column and a Ptah generation select the same
+// columns in the same order.
+func (s *ChunkStore) scanChunkSearch(ctx context.Context, q string, args []interface{}) ([]ChunkSearchResult, error) {
 	rows, err := s.pg.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("chunks search vector: %w", err)

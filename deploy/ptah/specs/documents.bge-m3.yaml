@@ -1,0 +1,50 @@
+# Document vectors for hybrid search (the `vec` lane).
+#
+# The text is the doc-v1 recipe: title + "\n\n" + content, exactly what
+# internal/scheduler sends today. Ptah writes the vectors into its own table,
+# document_vectors, so the documents table gains no columns.
+version: 1
+name: documents-bge-m3
+description: documents.title + content (doc-v1) embedded with bge-m3
+source:
+  schema: public
+  table: documents
+  key_fields: [id]
+  input_fields: [title, content]
+  version_strategy: outbox_sequence
+  mutable: true
+preprocessing:
+  separator: "\n\n"
+  null_policy: refuse
+  empty_policy: skip
+  unicode_normalization: none
+  collapse_whitespace: false
+  # Ollama answers with a 2048-token context unless OLLAMA_CONTEXT_LENGTH says
+  # otherwise, and Korean text measured about 4.8 bytes per bge-m3 token.
+  # 8000 bytes stays under that. Raise both together for a longer context.
+  max_input_bytes: 8000
+  truncate: bytes
+model:
+  provider: openai-compatible
+  endpoint_class: local
+  endpoint: http://ollama:11434/v1
+  identifier: bge-m3
+  # The Ollama model ID the generation is built with (`ollama list`). A tag
+  # can move to other weights; change this with it, and the new weights are a
+  # new generation rather than a silent change to this one.
+  revision: "790764642607"
+  reported_dimension: 1024
+  normalization: l2
+target:
+  schema: public
+  table: document_vectors
+  column: embedding_bge_m3
+  layout: own_table
+  representation: vector
+  metric: cosine
+  index_method: hnsw
+consistency:
+  mode: outbox
+policy:
+  require_exact_approval: true
+  require_consistency_mode: true

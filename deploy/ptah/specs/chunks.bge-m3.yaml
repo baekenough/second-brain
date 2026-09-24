@@ -1,0 +1,47 @@
+# Chunk vectors for chunk search and /ask.
+#
+# The chunk-ctx-v1 recipe is a context header built in Go from the parent
+# document, then "\n\n", then the chunk text. cmd/sparsectx --recipe=v1-full
+# already stores exactly that string in chunk_sparse_context.sparse_text
+# (internal/chunkctx.BuildSparseText and scheduler.withChunkContextHeader
+# produce the same bytes), so that table is the source and no header logic is
+# repeated here.
+version: 1
+name: chunks-bge-m3
+description: chunk_sparse_context.sparse_text (v1-full = chunk-ctx-v1) embedded with bge-m3
+source:
+  schema: public
+  table: chunk_sparse_context
+  filter: "context_version = 'v1-full'"
+  key_fields: [chunk_id, context_version]
+  input_fields: [sparse_text]
+  version_strategy: outbox_sequence
+  mutable: true
+preprocessing:
+  null_policy: refuse
+  empty_policy: skip
+  unicode_normalization: none
+  collapse_whitespace: false
+  max_input_bytes: 8000
+  truncate: bytes
+model:
+  provider: openai-compatible
+  endpoint_class: local
+  endpoint: http://ollama:11434/v1
+  identifier: bge-m3
+  revision: "790764642607"
+  reported_dimension: 1024
+  normalization: l2
+target:
+  schema: public
+  table: chunk_context_vectors
+  column: embedding_bge_m3
+  layout: own_table
+  representation: vector
+  metric: cosine
+  index_method: hnsw
+consistency:
+  mode: outbox
+policy:
+  require_exact_approval: true
+  require_consistency_mode: true
