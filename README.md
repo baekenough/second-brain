@@ -360,6 +360,9 @@ Android second-brain-push 앱이 SMS·통화 기록을 JSON 배치로 전송합�
 | `ALERT_WEBHOOK_URL` | — | 수집 신선도 알림 Slack 웹훅 URL |
 | `RERANK_API_URL` | — | BGE cross-encoder rerank 엔드포인트 |
 | `ENTITY_EXTRACTION_ENABLED` | `false` | 엔티티 추출 + 검색 레인 활성화 |
+| `SEARCH_REQUEST_TIMEOUT_SECONDS` | `60` | 검색 요청 하나(임베딩·DB·리랭크)의 제한 시간(초). REST `/api/v1/search`·GraphQL `search`·MCP `search` 에 적용, 초과 시 REST 는 504. DB 전역 `statement_timeout` 이 아니라 요청 context 타임아웃이다(ctx 가 끝나면 pgx 가 서버 측 문장도 취소). `/api/v1/ask` 는 `ASK_TIMEOUT_SECONDS` 가 따로 묶는다. 0·음수·잘못된 값은 기본값 |
+
+검색 입력 검증(#282): 검색 질의(`q`, `query`)와 소스 필터·정렬 값은 DB 에 가기 전에 검사한다. 잘못된 UTF-8·NUL(`\x00`) 포함·질의 1024바이트 초과는 400 이고, `POST /api/v1/search` 본문은 16KB(초과 시 413), `/api/v1/ask` 본문은 32KB, `/api/v1/graphql` 본문·쿼리스트링은 각각 64KB(초과 시 413/414)로 제한한다. GraphQL 은 요청당 `search` 필드 5개(별칭·fragment 전개 포함), `curated:true` 검색 1개까지만 실행하고(초과 시 400), 순환 fragment 는 400 으로 거부하며, 요청 전체에 `SEARCH_REQUEST_TIMEOUT_SECONDS` 를 한 번 건다. MCP HTTP 본문은 31MB(add_note 10MB 의 비 ASCII 이스케이프 최악 3배 + 1MB)로 제한한다. `/api/v1/ask` 질문은 같은 검증을 거치되 길이 상한만 4KB 다. 오류 응답과 로그에는 질의 원문을 남기지 않는다.
 
 ### Collector
 
