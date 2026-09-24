@@ -225,7 +225,7 @@ report.
 
 ## Retrieval tuning knobs
 
-The search service exposes five experimental knobs. Every knob defaults to the
+The search service exposes several experimental knobs. Every knob defaults to the
 current production behaviour, so an unset knob changes nothing. Each can be set
 per process through the environment and overridden per evaluation run through
 the matching `cmd/eval` flag.
@@ -239,10 +239,48 @@ the matching `cmd/eval` flag.
 | `SEARCH_RERANK_INPUT` | `--rerank-input=head\|best_chunk` | `head` | `best_chunk` sends `[source · date · title]` plus the chunk closest to the query instead of the document head. |
 | `SEARCH_RECENCY_HALFLIFE_DAYS` | `--recency-halflife-days=D` | `0` (off) | Multiplies fused scores by `(1-α)+α*2^(-age/D)` on queries that carry no event-time window. |
 | `SEARCH_RECENCY_ALPHA` | `--recency-alpha=A` | `0.3` | Maximum strength `α` of the recency decay. |
+| `SEARCH_CHUNK_SPARSE` | `--chunk-sparse=fallback\|fuse\|fuse_ctx` | `fallback` | 청크 FTS/bigm 레인을 RRF 융합에 상시 참여시킨다(#270). 자세한 내용은 `docs/chunk-sparse-context.md`. |
+| `SEARCH_SPARSE_QUERY` | `--sparse-query=raw\|chunk\|chunk_doc` | `raw` | 희소 레인이 질문 원문 대신 `internal/sparseq` 추출 키워드를 쓴다(#276). 아래 절 참고. |
 
 Only non-default knob values are written into the config-hash profile, so a run
 with every knob at its default keeps matching existing baselines, while any
 enabled knob establishes a separate baseline exactly like `--window=plan`.
+
+### 희소 레인 질의 키워드 (`--sparse-query`, #276)
+
+문서·청크의 tsvector 는 `simple` 설정이라 한국어 어절이 조사까지 붙은 채
+하나의 렉심으로 남는다("회의를"). 그래서 "이번 주 회의 일정 알려줘" 같은
+문장형 질의는 기존 `plainto_tsquery`(모든 단어 AND)와 `LIKE '%질문 전체%'`
+로는 희소 레인에서 0건이 된다. 이 노브를 켜면 `internal/sparseq` 가 질문에서
+시간 표현·요청 동사·의문사·서술어 어미·끝 조사를 걷어 낸 키워드(최대 8개)를
+뽑고, 희소 레인은 접두 OR tsquery(`'회의':* | '일정':*`, 파라미터 하나로
+바인딩)와 키워드별 `LIKE` OR 로 매칭한다. LLM 호출이나 외부 의존성은 없고
+같은 질문에는 항상 같은 키워드가 나온다.
+
+| 값 | 키워드를 쓰는 레인 |
+|---|---|
+| `raw`(기본) | 없음. 생성 SQL 은 #276 이전과 바이트 단위로 같다(`internal/store/testdata/sparse_query_raw.golden` 가 고정). |
+| `chunk` | 청크 FTS/bigm 레인(폴백·`fuse`·`fuse_ctx` 의 두 CTE). |
+| `chunk_doc` | `chunk` + 문서 하이브리드의 fts·bigm 레인 + 임베딩 없는 fulltext 경로. |
+
+- 어느 값이든 임베딩·리랭커·엔티티 레인·OpenSearch 는 질문 원문을 받는다.
+  엔티티 레인의 매칭 방향 문제는 이 노브의 범위가 아니다.
+- 살아남은 키워드가 없으면("뭐 있었지?") 그 질의는 `raw` 와 같은 SQL 을 탄다.
+- 기본 `--chunk-sparse=fallback` 에서는 청크 FTS 레인이 1차 경로 0건일
+  때만 돌기 때문에 `chunk` 범위의 효과를 재려면 `--chunk-sparse=fuse` 또는
+  `fuse_ctx` 와 함께 돌린다.
+- `raw` 가 아니면 실행 프로필에 `sparse_query` 와 `sparse_terms_version`
+  (`sparseq.Version`, 현재 `v1`)이 함께 들어가 별도 baseline 계열이 된다.
+  불용어·조사·시간 표현 목록을 바꾸면 `sparseq.Version` 을 올려야 한다 —
+  어휘가 다른 실행이 같은 계열로 섞이지 않게 하기 위해서다.
+- 추출 키워드는 질문에서 파생된 개인 데이터라 로그·trace·덤프에 싣지 않고
+  개수만 남긴다.
+
+```sh
+go run ./cmd/eval --golden --no-persist --window=plan --chunk-sparse=fuse --dump=/tmp/c1.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --chunk-sparse=fuse --sparse-query=chunk --dump=/tmp/t1.jsonl
+go run ./cmd/evalcompare --baseline=/tmp/c1.jsonl --candidate=/tmp/t1.jsonl
+```
 
 ## Read-only comparisons
 

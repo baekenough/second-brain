@@ -17,3 +17,4 @@
 - [feedback_tests_must_inject_prod_environment.md](feedback_tests_must_inject_prod_environment.md) — inject UTC (prod container TZ), not the dev machine's KST; use internal/timeutil.KST() for all calendar boundaries
 - [feedback_prove_worker_liveness_before_regression_verdict.md](feedback_prove_worker_liveness_before_regression_verdict.md) — date rows via id-sequence + pg_stat_user_tables before blaming a deploy; a false regression cost a 447-row prod DELETE
 - [feedback_no_blocking_remote_calls_in_write_path.md](feedback_no_blocking_remote_calls_in_write_path.md) — ingest handlers must never embed inline; same retransmit-loop outage happened twice
+- [project_sparse_query_terms.md](project_sparse_query_terms.md) — #276 sparseq knob: raw SQL golden snapshot, terms-params-last, unreferenced $1 fails PG, EXPLAIN-on-empty-table trap

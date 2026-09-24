@@ -124,6 +124,10 @@ func assembleRetrieval(ctx context.Context, searcher documentSearcher, params in
 	case params.Kind == intent.KindExactToken:
 		// Best-effort nudge toward the bigram-similarity lane; does not fix
 		// the underlying tokenization gap (spec §4.3).
+		// #276: 그 토큰화 공백은 이제 SEARCH_SPARSE_QUERY=chunk|chunk_doc
+		// 노브(internal/sparseq)로 다룰 수 있다 — 기본은 raw 라 이 경로의
+		// 동작은 그대로다. 정확 토큰(이메일·전화번호)은 노브를 켜도 LIKE
+		// 키워드 한 덩어리로 남는다.
 		base.Weights.BigmWeight = 1.5
 	case params.Kind == intent.KindTemporal && params.Confidence >= confidenceThreshold:
 		// Kept for the date-less temporal question ("최근에 뭐 있었지"), which
