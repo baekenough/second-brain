@@ -270,7 +270,7 @@ enabled knob establishes a separate baseline exactly like `--window=plan`.
   때만 돌기 때문에 `chunk` 범위의 효과를 재려면 `--chunk-sparse=fuse` 또는
   `fuse_ctx` 와 함께 돌린다.
 - `raw` 가 아니면 실행 프로필에 `sparse_query` 와 `sparse_terms_version`
-  (`sparseq.Version`, 현재 `v1`)이 함께 들어가 별도 baseline 계열이 된다.
+  (`sparseq.Version`, 현재 `v2`)이 함께 들어가 별도 baseline 계열이 된다.
   불용어·조사·시간 표현 목록을 바꾸면 `sparseq.Version` 을 올려야 한다 —
   어휘가 다른 실행이 같은 계열로 섞이지 않게 하기 위해서다.
 - 추출 키워드는 질문에서 파생된 개인 데이터라 로그·trace·덤프에 싣지 않고

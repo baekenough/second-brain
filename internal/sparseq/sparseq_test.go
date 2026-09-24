@@ -1,8 +1,11 @@
 package sparseq
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -271,4 +274,80 @@ func FuzzTSQuery(f *testing.F) {
 			t.Fatalf("TSQuery(Fields(%q)) = %q violates grammar", in, raw)
 		}
 	})
+}
+
+// TestExtract_ReviewFollowups 는 PR-B 리뷰 후속(v2) 사례를 고정한다.
+func TestExtract_ReviewFollowups(t *testing.T) {
+	t.Parallel()
+	// "중에" 는 불용어다. 다른 단어가 모두 불용어이면 빈 결과(원문 폴백)가 된다.
+	if got := Extract("중에 뭐 있었지"); !got.Empty() {
+		t.Errorf(`Extract("중에 뭐 있었지") = %+v, want empty (원문 폴백)`, got)
+	}
+	got := Extract("어제 회의 중에 나온 이야기")
+	want := []string{"회의", "나온", "이야기"}
+	if !reflect.DeepEqual(got.Like, want) || !reflect.DeepEqual(got.TS, want) {
+		t.Errorf(`Extract("어제 회의 중에 나온 이야기") = %+v, want TS·Like %q`, got, want)
+	}
+	for _, w := range []string{"이건", "그건", "저건"} {
+		if got := Extract(w + " 뭐야"); !got.Empty() {
+			t.Errorf("Extract(%q) = %+v, want empty", w+" 뭐야", got)
+		}
+	}
+	if got := Extract("그건 예산 문제"); !reflect.DeepEqual(got.Like, []string{"예산", "문제"}) {
+		t.Errorf(`Extract("그건 예산 문제").Like = %q, want [예산 문제]`, got.Like)
+	}
+}
+
+// TestExtract_KnownLimit_AdnominalHan 은 현재 동작을 기록할 뿐 바람직한
+// 동작을 주장하지 않는다.
+//
+// 알려진 한계: 관형형 어미 "한" 규칙(3 rune 이상 토큰)은 "통화한" → "통화"
+// 를 위해 넣었지만, "한" 으로 끝나는 세 글자 이름도 똑같이 자른다
+// ("박성한" → "박성"). 접두·부분 문자열 매치라 "박성한" 문서는 여전히
+// 찾지만 "박성호"·"박성민" 같은 다른 이름까지 끌어온다. 규칙을 유지할지는
+// 골든셋 측정으로 정하기로 했다 — 규칙을 바꾸면 이 테스트를 새 동작으로
+// 고치고 Version 을 올린다.
+func TestExtract_KnownLimit_AdnominalHan(t *testing.T) {
+	t.Parallel()
+	got := Extract("박성한")
+	if !reflect.DeepEqual(got.Like, []string{"박성"}) || !reflect.DeepEqual(got.TS, []string{"박성"}) {
+		t.Errorf(`Extract("박성한") = %+v, want 현재 동작 [박성]`, got)
+	}
+}
+
+// lexiconDigests 는 판별 어휘 지문이다. 어휘(불용어·조사·어미·시간 표현)를
+// 바꾸면 lexiconDigest() 가 달라져 TestVersionPinsLexicon 이 실패한다 —
+// 그때 Version 을 올리고 새 판의 지문을 여기에 추가한다. 이전 판의 값은
+// 이력으로 남겨 둔다(v1 은 이 테스트가 생기기 전 판이라 지문이 없다).
+var lexiconDigests = map[string]string{
+	"v2": "30edc7673e0bd81d",
+}
+
+func lexiconDigest() string {
+	words := make([]string, 0, len(stopwords))
+	for w := range stopwords {
+		words = append(words, w)
+	}
+	sort.Strings(words)
+	parts := []string{
+		strings.Join(words, ","),
+		strings.Join(particles, ","),
+		strings.Join(predicateSuffixes, ","),
+		timeExprRe.String(),
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\n")))
+	return hex.EncodeToString(sum[:8])
+}
+
+// TestVersionPinsLexicon 은 "어휘를 바꾸면 Version 을 올린다" 는 규칙을
+// 강제한다. 판을 올리지 않은 어휘 변경은 평가 baseline 계열을 조용히 섞는다.
+func TestVersionPinsLexicon(t *testing.T) {
+	t.Parallel()
+	want, ok := lexiconDigests[Version]
+	if !ok {
+		t.Fatalf("Version %q 의 어휘 지문이 lexiconDigests 에 없다: 현재 지문 %s", Version, lexiconDigest())
+	}
+	if got := lexiconDigest(); got != want {
+		t.Fatalf("어휘가 바뀌었는데 Version(%q)은 그대로다: 지문 %s, 고정값 %s — Version 을 올리고 새 지문을 추가할 것", Version, got, want)
+	}
 }

@@ -29,6 +29,11 @@ Non-obvious things that will matter again:
   the planner joins via a documents index and pushes the LIKEs into a Filter.
   Index usability was proven by EXPLAINing the generated predicate alone
   (`chunkSparseExprs`) with `enable_seqscan=off` → BitmapOr over bigm GIN.
+- **Lexicon edits must bump `sparseq.Version`** — enforced by
+  `TestVersionPinsLexicon` (sha256 fingerprint per version in
+  `lexiconDigests`). v2 (2026-09-24) added stopwords 중에/이건/그건/저건.
+  The '-한' adnominal rule (박성한→박성) is a known limit, kept pending golden
+  measurement; `TestExtract_KnownLimit_AdnominalHan` documents it.
 - Repo baseline: ~45 files were already not gofmt-clean at HEAD; "gofmt -l
   empty" can only be claimed for changed/new files.
 
