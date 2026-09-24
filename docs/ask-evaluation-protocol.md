@@ -589,28 +589,30 @@ if `windowAround`'s reserve-before-sizing invariant ever regresses.
 (`internal/askeval/runner_test.go`) covers all six `call_transcript_mid_late`
 fixtures, `ctm-06` included.
 
-### `ctm-06`'s fake-vector ranking margin
+### `ctm-01`–`ctm-06`'s fake-vector ranking margins
 
-`ctm-06`'s content was originally authored the same way as `ctm-01`–`ctm-05`
-(one long, mostly-identical filler sentence repeated across both the head
-and tail halves) and its gold chunk's `hashedEmbedder` cosine score beat the
-runner-up chunk by only ~0.007 (0.3818 vs 0.3748) — fragile enough that an
-unrelated `hashEmbed`/`semanticAliasFold` change, or even a single extra
+All six `call_transcript_mid_late` fixtures were originally authored the
+same way (one long, mostly-identical filler sentence repeated across both
+the head and tail halves), which made each gold chunk's `hashedEmbedder`
+cosine score beat the runner-up chunk by only a thin margin — for example,
+`ctm-06`'s margin was only ~0.007 (0.3818 vs 0.3748) — fragile enough that
+an unrelated `hashEmbed`/`semanticAliasFold` change, or even a single extra
 hash collision in the 48-dimension fake embedding space, could silently
 flip which chunk the fake vector lane ranks first without any test failing
-to say so. It has since been re-authored: the head is longer and uses
-topic-neutral filler with no vocabulary overlap with the gold fact, and the
-tail is short and dense with the gold fact's own vocabulary (repeating the
-`semantic_aliases`-folded "승인 기한" phrase once more before the final
-sentence), pushing the margin to ~0.28. `TestRun_CTMFakeVectorMargin`
-(`internal/askeval/runner_test.go`) asserts a per-fixture floor for every
-`call_transcript_mid_late` fixture's own margin (`ctm-06`'s floor is 0.02;
-`ctm-01`–`ctm-05` keep their original, more fragile margins and floors set
-with headroom under their currently-measured values — re-authoring them is
-a separate, not-yet-scheduled follow-up), so a future regression that
-erodes or flips any of these margins fails loudly with the fixture ID and
-both scores in the message, instead of silently relying on the fixture
-still happening to rank correctly.
+to say so. All six have since been re-authored (#272): the head is longer
+and uses topic-neutral filler with no vocabulary overlap with the gold
+fact, and the tail is short and dense with the gold fact's own vocabulary
+(e.g. `ctm-06` repeats the `semantic_aliases`-folded "승인 기한" phrase
+once more before the final sentence), widening every fixture's margin
+substantially. Currently measured margins: `ctm-01` 0.3402, `ctm-02`
+0.3293, `ctm-03` 0.3951, `ctm-04` 0.3332, `ctm-05` 0.3669, `ctm-06` 0.2839.
+`TestRun_CTMFakeVectorMargin` (`internal/askeval/runner_test.go`) asserts a
+per-fixture floor for every `call_transcript_mid_late` fixture's own margin
+— all six now share the same `0.02` floor, with wide headroom under their
+currently-measured values — so a future regression that erodes or flips
+any of these margins fails loudly with the fixture ID and both scores in
+the message, instead of silently relying on the fixture still happening to
+rank correctly.
 
 ### Control check (pre-#267 vs. HEAD)
 

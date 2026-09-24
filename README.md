@@ -523,6 +523,9 @@ go vet ./...
 gofmt -w .
 ```
 
+> `go build ./cmd/eval` 는 레포 루트에 추적 중인 `eval/`(평가 픽스처) 디렉터리와 이름이 충돌해 로컬에서 실패합니다.
+> `make build-eval` (또는 `make build-all`)을 사용하면 `bin/`(gitignore 대상) 아래로 빌드되어 충돌을 피할 수 있습니다.
+
 ### 마이그레이션
 
 마이그레이션 파일은 `migrations/` 디렉터리(001~019)에 위치하며, 서버 기동 시 advisory lock 하에 순서대로 자동 적용됩니다.

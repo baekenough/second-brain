@@ -27,6 +27,23 @@ type ChunkLister interface {
 	ListByDocument(ctx context.Context, documentID uuid.UUID) ([]store.Chunk, error)
 }
 
+// ChunkBatchLister 는 여러 문서의 청크를 한 번에 돌려주는 선택 인터페이스다.
+// *store.ChunkStore 가 만족한다. 청크가 없는 문서는 맵에 키가 없어도 되고,
+// 문서별 슬라이스는 ListByDocument 와 같은 chunk_index 오름차순이어야 한다.
+//
+// ChunkLister 에 메서드를 더하지 않고 따로 둔 이유: 기존 더블(askeval 가짜
+// 코퍼스 등)을 건드리지 않기 위해서다. 이걸 만족하지 않으면 buildRerankDocs 는
+// 예전처럼 문서마다 ListByDocument 를 부른다 — 결과 텍스트는 두 경로가 같다.
+type ChunkBatchLister interface {
+	ListByDocuments(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID][]store.Chunk, error)
+}
+
+// 운영 배선이 조용히 N회 경로로 떨어지지 않게 컴파일 시점에 고정한다.
+var (
+	_ ChunkLister      = (*store.ChunkStore)(nil)
+	_ ChunkBatchLister = (*store.ChunkStore)(nil)
+)
+
 // resolveTuning 은 이 요청에 적용할 노브를 정한다. 요청이 아무것도 지정하지
 // 않았으면 서비스 기본값(= 환경변수)을 쓴다. Weights 필드와 같은 규약이다.
 func (s *Service) resolveTuning(q model.SearchQuery) model.SearchTuning {
@@ -219,7 +236,10 @@ const maxRerankDocRunes = 1000
 // 통화 5건이 리랭크 후 5·9·10위와 탈락 2건이 된 실행에서, 리랭커가 받은
 // 텍스트에는 질의어가 아예 없었다.
 //
-// DB 왕복은 문서당 최대 1회이며, 실패하면 그 문서만 head 로 되돌아간다.
+// DB 왕복: 청크 스토어가 ChunkBatchLister 를 만족하면 요청당 최대 1회(#263),
+// 아니면 문서당 최대 1회다. 단건 경로에서 조회가 실패하면 그 문서만, 배치
+// 경로에서 실패하면 그 한 번의 조회에 걸린 문서 전부가 head 로 되돌아간다 —
+// 어느 쪽이든 "청크를 못 읽은 문서는 head" 라는 같은 규칙이다.
 func (s *Service) buildRerankDocs(ctx context.Context, query string,
 	results []*model.SearchResult, tune model.SearchTuning) []string {
 	docs := make([]string, len(results))
@@ -231,8 +251,14 @@ func (s *Service) buildRerankDocs(ctx context.Context, query string,
 	}
 
 	lister := s.chunkLister()
+	batch, batched := prefetchChunks(ctx, s.chunkBatchLister(), results)
 	for i, r := range results {
-		body := bestChunkText(ctx, lister, query, r)
+		var body string
+		if batched {
+			body = bestChunkFromBatch(query, r, batch)
+		} else {
+			body = bestChunkText(ctx, lister, query, r)
+		}
 		if body == "" {
 			body = r.Content // head 폴백: 청크를 못 읽었거나 없는 문서
 		}
@@ -259,6 +285,63 @@ func bestChunkText(ctx context.Context, lister ChunkLister, query string, r *mod
 			"error", err, "document_id", r.ID)
 		return ""
 	}
+	return pickBestChunk(query, chunks)
+}
+
+// prefetchChunks 는 청크 레인이 아닌 결과들의 청크를 한 번에 읽는다.
+//
+// 두 번째 반환값은 "배치 경로를 탔는가" 다. false 이면 호출자는 기존 단건
+// 경로(bestChunkText)로 간다 — 배치 조회기가 없을 때만 그렇다. 배치 조회가
+// 실패했을 때는 true 와 nil 맵을 돌려, 단건으로 N회 재시도하지 않고 대상 문서
+// 전부가 head 로 되돌아가게 한다(단건 경로의 실패 의미와 같다: 못 읽은 문서는
+// head). 이미 실패한 DB 에 같은 요청 안에서 N번 더 두드릴 이유가 없다.
+//
+// 조회할 문서가 하나도 없으면(전부 청크 레인 결과) DB 를 건드리지 않는다.
+func prefetchChunks(ctx context.Context, bl ChunkBatchLister,
+	results []*model.SearchResult) (map[uuid.UUID][]store.Chunk, bool) {
+	if bl == nil {
+		return nil, false
+	}
+	ids := make([]uuid.UUID, 0, len(results))
+	seen := make(map[uuid.UUID]struct{}, len(results))
+	for _, r := range results {
+		if isChunkResult(r) {
+			continue
+		}
+		if _, dup := seen[r.ID]; dup {
+			continue
+		}
+		seen[r.ID] = struct{}{}
+		ids = append(ids, r.ID)
+	}
+	if len(ids) == 0 {
+		return nil, true
+	}
+	byDoc, err := bl.ListByDocuments(ctx, ids)
+	if err != nil {
+		// 비치명적: 이번 요청의 대상 문서 전부가 head 입력으로 되돌아간다.
+		// 문서 수만 남기고 내용은 절대 로그에 싣지 않는다.
+		slog.Warn("search: batched best-chunk lookup failed, falling back to head input",
+			"error", err, "documents", len(ids))
+		return nil, true
+	}
+	return byDoc, true
+}
+
+// bestChunkFromBatch 는 prefetchChunks 가 읽어 둔 청크로 bestChunkText 와 같은
+// 답을 낸다. 청크 레인 결과는 그대로, 맵에 없는 문서(청크 없음·조회 실패)는
+// 빈 문자열이다.
+func bestChunkFromBatch(query string, r *model.SearchResult, byDoc map[uuid.UUID][]store.Chunk) string {
+	if isChunkResult(r) {
+		return r.Content
+	}
+	return pickBestChunk(query, byDoc[r.ID])
+}
+
+// pickBestChunk 는 chunk_index 오름차순으로 정렬된 청크 중 질의와 가장 잘
+// 맞는 본문을 고른다. 청크가 없으면 빈 문자열이다. 단건·배치 두 경로가 이
+// 함수 하나를 공유하므로 선택 규칙은 여기서만 정의된다.
+func pickBestChunk(query string, chunks []store.Chunk) string {
 	if len(chunks) == 0 {
 		return ""
 	}
@@ -267,7 +350,7 @@ func bestChunkText(ctx context.Context, lister ChunkLister, query string, r *mod
 	// 돌려주지 않는다) 질의와의 문자 바이그램 겹침으로 고른다. 한국어에서는
 	// 형태소 경계를 몰라도 바이그램 겹침이 꽤 잘 듣고, 이 리포의 FTS 레인이
 	// 쓰는 pg_bigm 과 같은 단위다. 동점이면 chunk_index 가 작은 쪽 —
-	// ListByDocument 가 인덱스 오름차순을 보장하므로 결정론적이다.
+	// ListByDocument/ListByDocuments 가 인덱스 오름차순을 보장하므로 결정론적이다.
 	qgrams := bigrams(query)
 	if len(qgrams) == 0 {
 		return chunks[0].Content

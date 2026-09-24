@@ -247,6 +247,15 @@ func (s *Service) chunkLister() ChunkLister {
 	return nil
 }
 
+// chunkBatchLister 는 RerankInputBestChunk 의 배치 조회기를 찾는다(#263).
+// 만족하지 않는 더블에서는 nil 이 되어 문서별 ListByDocument 경로로 간다.
+func (s *Service) chunkBatchLister() ChunkBatchLister {
+	if bl, ok := s.chunkStore.(ChunkBatchLister); ok {
+		return bl
+	}
+	return nil
+}
+
 // WithChunkStore attaches a ChunkSearcher so that the service can perform
 // chunk-based FTS and vector search.
 //
