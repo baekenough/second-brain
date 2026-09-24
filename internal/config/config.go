@@ -616,6 +616,29 @@ type Config struct {
 	// "unlimited" setting on purpose.
 	HTTPWriteTimeout time.Duration
 
+	// SearchRequestTimeout 은 검색 요청 하나의 검색 서비스 호출(임베딩·DB 레인·
+	// 리랭크)에 거는 context 타임아웃이다(#282). SEARCH_REQUEST_TIMEOUT_SECONDS
+	// 환경변수, 기본 60초. REST GET/POST /api/v1/search, GraphQL search, MCP
+	// search 도구가 쓴다. /api/v1/ask 는 이미 ASK_TIMEOUT_SECONDS 가 검색까지
+	// 포함해 요청 전체를 묶고 있어 이 값을 쓰지 않는다.
+	//
+	// DB 전역이나 커넥션 풀 전체에 statement_timeout 을 걸지 않고 요청 경로에만
+	// 거는 이유: 마이그레이션·백필·collector 가 같은 DB 와 풀을 쓰고, 그쪽의
+	// 정당하게 긴 문장까지 끊으면 안 된다.
+	//
+	// 기본 60초의 근거: 이 값은 정상 지연(p50 약 0.5초, 리랭크 포함 수 초)에
+	// 맞춘 SLO 가 아니라 폭주 질의를 끊는 상한이다. 재기동 직후 첫 검색은 HNSW
+	// 페이지가 캐시에 없어 30초를 넘긴 실측이 있고(#195), HTTPWriteTimeout 기본
+	// 90초는 바로 그 콜드 스타트를 살리려고 잡은 값이다. 여기서 30초 이하로 잡으면
+	// 배포할 때마다 첫 검색이 504 가 된다. 60초는 /ask 가 같은 검색을 이미 묶고
+	// 있는 ASK_TIMEOUT_SECONDS 기본값과 같고, HTTPWriteTimeout(90초)보다 짧아서
+	// 연결이 잘리기 전에 504 JSON 을 쓸 여유가 남는다. 워밍업(#195)이 들어가면
+	// 운영에서 10초대로 낮추는 것을 권한다.
+	//
+	// 0·음수·잘못된 값은 기본값으로 대체한다 — 0 은 "즉시 만료"라 모든 검색이
+	// 실패하게 되고, 무제한 설정은 의도적으로 두지 않는다.
+	SearchRequestTimeout time.Duration
+
 	// FeedbackEvidenceEnabled gates POST /api/v1/feedback/evidence (Part D).
 	// FEEDBACK_EVIDENCE_ENABLED env var, default false.
 	//
@@ -962,6 +985,9 @@ func Load() (*Config, error) {
 		BriefingTimeout:    BriefingTimeout(),
 		HTTPWriteTimeout:   httpWriteTimeout(),
 
+		// #282 검색 요청 타임아웃 — 기본값 근거는 필드 doc comment 참고.
+		SearchRequestTimeout: SearchRequestTimeout(),
+
 		// Part D feedback collection — default false (see doc comment above).
 		FeedbackEvidenceEnabled: envFlag("FEEDBACK_EVIDENCE_ENABLED"),
 
@@ -998,6 +1024,17 @@ const defaultHTTPWriteTimeout = 90 * time.Second
 // See Config.HTTPWriteTimeout for why this stays finite.
 func httpWriteTimeout() time.Duration {
 	return timeoutSeconds("HTTP_WRITE_TIMEOUT_SECONDS", defaultHTTPWriteTimeout)
+}
+
+// DefaultSearchRequestTimeout 은 SEARCH_REQUEST_TIMEOUT_SECONDS 의 기본값이다.
+// 60초로 잡은 근거는 Config.SearchRequestTimeout 의 doc comment 에 있다.
+const DefaultSearchRequestTimeout = 60 * time.Second
+
+// SearchRequestTimeout 은 SEARCH_REQUEST_TIMEOUT_SECONDS 를 환경에서 읽는다.
+// *Config 없이도 부를 수 있게 공개한 이유는 BriefingTimeout 과 같다 — Load 도
+// 이 함수를 불러서 cfg.SearchRequestTimeout 과 값이 어긋날 수 없다.
+func SearchRequestTimeout() time.Duration {
+	return timeoutSeconds("SEARCH_REQUEST_TIMEOUT_SECONDS", DefaultSearchRequestTimeout)
 }
 
 // timeoutSeconds parses an integer-seconds env var into a duration, logging

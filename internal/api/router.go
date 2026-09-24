@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/baekenough/second-brain/internal/briefing"
+	"github.com/baekenough/second-brain/internal/config"
 	"github.com/baekenough/second-brain/internal/intent"
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
@@ -127,6 +128,12 @@ type Server struct {
 	askTimeout       time.Duration
 	askTopK          int
 	askInsightM      int
+
+	// searchTimeout 은 REST GET/POST /api/v1/search 와 GraphQL search 가 검색
+	// 서비스 호출 하나에 거는 context 타임아웃이다(#282). askTimeout 처럼
+	// NewServer 에서 기본값(config.DefaultSearchRequestTimeout)으로 채워 두므로
+	// 0 이 될 수 없다. WithSearchTimeout 으로 바꾼다.
+	searchTimeout time.Duration
 
 	// askRerankDefault mirrors cfg.RerankDefault (SEARCH_RERANK_DEFAULT):
 	// whether /api/v1/ask requests opt into cross-encoder reranking
@@ -249,7 +256,19 @@ func NewServer(
 		askTimeout:   defaultAskTimeout,
 		askTopK:      defaultAskTopK,
 		askInsightM:  defaultAskInsightM,
+
+		searchTimeout: config.DefaultSearchRequestTimeout,
 	}
+}
+
+// WithSearchTimeout 은 검색 요청 타임아웃(SEARCH_REQUEST_TIMEOUT_SECONDS)을
+// 설정한다. 0 이하 값은 무시하고 기본값을 유지한다 — 0 은 "즉시 만료"라
+// 설정 실수 하나로 모든 검색이 504 가 되기 때문이다.
+func (s *Server) WithSearchTimeout(timeout time.Duration) *Server {
+	if timeout > 0 {
+		s.searchTimeout = timeout
+	}
+	return s
 }
 
 // WithAskConfig sets the ask-pipeline tuning knobs: the overall

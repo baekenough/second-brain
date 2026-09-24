@@ -201,6 +201,7 @@ func run() error {
 		WithNotes(docStore, chunkStore, embedClient).
 		WithAskConfig(time.Duration(cfg.AskTimeoutSeconds)*time.Second, cfg.AskContextTopK, cfg.AskContextInsightM).
 		WithAskRerankDefault(cfg.RerankDefault).
+		WithSearchTimeout(cfg.SearchRequestTimeout).
 		WithAskSessions(askSessionStore).
 		WithGolden(store.NewGoldenStore(pg))
 

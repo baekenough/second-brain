@@ -293,8 +293,10 @@ func (s *Server) goldenGenerateHandler(w http.ResponseWriter, r *http.Request) {
 // and, on error, logs it tagged with label (e.g. "relevance", "recent
 // fallback") so ops can tell which of the handler's up-to-four search calls
 // failed without needing to correlate by timestamp alone.
+//
+// 검색 호출마다 searchTimeout 을 건다(#282) — 다른 검색 진입점과 같은 상한이다.
 func (s *Server) goldenSearchStream(ctx context.Context, label string, q model.SearchQuery) ([]*model.SearchResult, error) {
-	results, err := s.search.Search(ctx, q)
+	results, err := s.searchWithTimeout(ctx, q)
 	if err != nil {
 		slog.Error("golden: "+label+" search failed", "error", err)
 		return nil, err
