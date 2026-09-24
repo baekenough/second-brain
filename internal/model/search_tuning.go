@@ -66,6 +66,18 @@ const (
 	// internal/chunkctx 가 이미 이 패키지를 임포트하므로(model.Document),
 	// 반대 방향 임포트는 순환이 된다.
 	ChunkSparseCtxV1Full = "v1-full"
+
+	// SparseQueryRaw 는 현행 동작이다(#276). 희소 레인(FTS·bigm)은 질문
+	// 원문을 plainto_tsquery(AND)와 LIKE '%질문 전체%' 로 그대로 쓴다.
+	SparseQueryRaw = "raw"
+	// SparseQueryChunk 는 청크 희소 레인(청크 FTS 폴백·fuse·fuse_ctx)에만
+	// internal/sparseq 가 뽑은 키워드를 쓴다 — 접두 OR tsquery 와 키워드별
+	// LIKE. 문서 레인과 엔티티 레인은 그대로다.
+	SparseQueryChunk = "chunk"
+	// SparseQueryChunkDoc 은 SparseQueryChunk 에 더해 문서 하이브리드의
+	// fts·bigm 레인과 임베딩 없는 fulltext 경로에도 키워드를 쓴다. 엔티티
+	// 레인은 어떤 값에서도 바뀌지 않는다(방향 문제는 별도 이슈).
+	SparseQueryChunkDoc = "chunk_doc"
 )
 
 // 노브 기본값. 제로값이 곧 "현행 동작" 이 되도록 잡았다 — 새 필드가 생겼다는
@@ -128,6 +140,12 @@ type SearchTuning struct {
 	// 쓰인다. ChunkSparseCtxV1TP 또는 ChunkSparseCtxV1Full. 그 외 값(또는
 	// fuse_ctx 가 아닌데 채워진 값)은 Normalized 가 안전하게 비운다.
 	ChunkSparseCtxVersion string
+
+	// SparseQuery 는 SparseQueryRaw(기본)·SparseQueryChunk·
+	// SparseQueryChunkDoc 중 하나(#276). 어느 값이든 리랭커·임베딩·엔티티
+	// 레인은 질문 원문을 그대로 받는다 — 바뀌는 것은 희소 레인의 매칭
+	// 조건뿐이다.
+	SparseQuery string
 }
 
 // IsZero 는 노브가 하나도 설정되지 않았는지 — 즉 "현행 동작" 인지 — 알린다.
@@ -176,6 +194,9 @@ func (t SearchTuning) Normalized() SearchTuning {
 	if t.ChunkSparse != ChunkSparseFuseCtx {
 		t.ChunkSparseCtxVersion = ""
 	}
+	if t.SparseQuery != SparseQueryChunk && t.SparseQuery != SparseQueryChunkDoc {
+		t.SparseQuery = SparseQueryRaw
+	}
 	return t
 }
 
@@ -199,6 +220,7 @@ func EnvSearchTuning() SearchTuning {
 		RecencyAlpha:          envTuningFloat("SEARCH_RECENCY_ALPHA"),
 		ChunkSparse:           envTuningChoice("SEARCH_CHUNK_SPARSE", ChunkSparseFallback, ChunkSparseFuse, ChunkSparseFuseCtx),
 		ChunkSparseCtxVersion: envChunkSparseCtxVersion(),
+		SparseQuery:           envTuningChoice("SEARCH_SPARSE_QUERY", SparseQueryRaw, SparseQueryChunk, SparseQueryChunkDoc),
 	}.Normalized()
 }
 

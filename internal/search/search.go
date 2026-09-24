@@ -730,8 +730,19 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 	// 노브를 켜지 않은 배포에서 이 줄이 생기기 전과 같은 결과를 낸다.
 	tune := s.resolveTuning(q)
 
-	// Hypothetical text belongs only in the dense embedding input. Keep the
-	// user's original words for lexical retrieval and cross-encoder reranking.
+	// 희소 레인 질의 형태(SEARCH_SPARSE_QUERY, #276). SparseTerms 는 이
+	// 서비스만 채운다: 호출자가 넣은 값은 먼저 버리고, 노브가 켠 범위의
+	// 레인에 넘기는 사본(chunkSparseQ, chunk_doc 이면 storeQuery)에만
+	// 키워드를 싣는다. q.Query 자체는 바꾸지 않으므로 임베딩·리랭커·엔티티
+	// 레인·OpenSearch 는 어느 값에서든 질문 원문을 받는다.
+	q.SparseTerms = model.SparseTerms{}
+	sparseTerms := sparseTermsFor(ctx, q.Query, tune)
+	chunkSparseQ := q
+	chunkSparseQ.SparseTerms = sparseTerms
+
+	// HyDE 가상 문서는 밀집 임베딩 입력에만 쓴다. 리랭커는 항상 사용자
+	// 원문을 받고, 어휘 검색도 원문을 받는다 — 단 SEARCH_SPARSE_QUERY 가
+	// 켜진 범위의 희소 레인만 원문 대신 추출 키워드(위 sparseTerms)를 쓴다.
 	embeddingQuery := q.Query
 	if q.UseHyDE && s.embed.Enabled() {
 		embeddingQuery = Expand(ctx, s.llmClient, q.Query)
@@ -787,6 +798,9 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 
 	storeQuery := q
 	storeQuery.Limit = laneLimit
+	if tune.SparseQuery == model.SparseQueryChunkDoc {
+		storeQuery.SparseTerms = sparseTerms
+	}
 	results, err := s.store.Search(ctx, storeQuery)
 	if err != nil {
 		return nil, fmt.Errorf("search store: %w", err)
@@ -878,12 +892,12 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 	// to exist before migration 040's derived sparse context is worth
 	// building at all.
 	if tune.ChunkSparse == model.ChunkSparseFuse && s.chunkStore != nil && chunkLanesEnabled {
-		if fused, ok := s.fuseChunkSparse(ctx, q, results, laneLimit, tune, trace); ok {
+		if fused, ok := s.fuseChunkSparse(ctx, chunkSparseQ, results, laneLimit, tune, trace); ok {
 			results = fused
 			chunkFused = true
 		}
 	} else if tune.ChunkSparse == model.ChunkSparseFuseCtx && s.chunkStore != nil && chunkLanesEnabled {
-		if fused, ok := s.fuseChunkSparseCtx(ctx, q, results, laneLimit, tune, trace); ok {
+		if fused, ok := s.fuseChunkSparseCtx(ctx, chunkSparseQ, results, laneLimit, tune, trace); ok {
 			results = fused
 			chunkFused = true
 		}
@@ -893,7 +907,7 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 		// are verified like the vector lane's; unverifiable hits are dropped,
 		// so an empty answer stays empty rather than silently widening the
 		// window.
-		chunkResults, cerr := s.searchChunksFTS(ctx, q.Query, laneLimit, q)
+		chunkResults, cerr := s.searchChunksFTS(ctx, q.Query, laneLimit, chunkSparseQ)
 		if cerr != nil {
 			// Non-fatal: log and return the empty primary result set.
 			slog.Warn("search: chunk FTS fallback failed",

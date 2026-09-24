@@ -18,6 +18,19 @@ Both default OFF (`fallback`). Turning either on changes retrieval, so it
 also changes `cmd/eval`'s `config_hash` — see `--chunk-sparse` and
 `--chunk-sparse-ctx-version` in `cmd/eval/main.go`.
 
+### 질의 키워드와의 조합 (`SEARCH_SPARSE_QUERY`, #276)
+
+이 문서의 두 모드는 "어떤 텍스트에 매칭하는가"(청크 본문 vs 파생 문맥)를
+바꾸고, `SEARCH_SPARSE_QUERY=chunk|chunk_doc` 는 "무엇으로 매칭하는가"(질문
+원문 vs 추출 키워드)를 바꾼다. 두 노브는 독립이며 함께 켤 수 있다.
+`fuse_ctx` 에서 키워드를 켜면 fresh CTE(`sparse_tsv`·`sparse_text`)와 raw
+CTE(`content_tsv`·`content`) 모두 같은 키워드 플레이스홀더를 쓰고, 문서
+적격성 필터(출처·시간창·보존)는 두 CTE 안에 그대로 남는다. 키워드 LIKE 는
+키워드마다 따로 OR 로 펼쳐 `idx_chunk_sparse_context_bigm`·
+`idx_chunks_content_bigm` GIN 인덱스를 쓸 수 있게 했다(`LIKE ANY(배열)` 는
+pg_bigm GIN 이 인덱스로 처리하지 못한다). 측정 설계와 프로필 키는
+`docs/evaluation-protocol.md` 의 해당 절을 따른다.
+
 No LLM involved anywhere in this feature. Every header is built from
 document metadata already in Postgres (`internal/chunkctx.BuildSparseText`);
 nothing is generated, summarized, or sent to an external API.

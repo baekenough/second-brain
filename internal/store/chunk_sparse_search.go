@@ -42,7 +42,6 @@ import (
 // to 2*limit rows here (rather than a single hard cap) is intentional, not
 // a leak.
 func (s *ChunkStore) SearchSparseContextFiltered(ctx context.Context, filter model.SearchQuery, limit int, version string) ([]ChunkSearchResult, error) {
-	query := filter.Query
 	if limit <= 0 {
 		limit = 20
 	}
@@ -50,61 +49,7 @@ func (s *ChunkStore) SearchSparseContextFiltered(ctx context.Context, filter mod
 		return nil, fmt.Errorf("chunk sparse context search: empty context_version")
 	}
 
-	args, filters := chunkEligibilitySQL([]interface{}{query, limit, version}, filter)
-	q := `
-		WITH fresh AS (
-			SELECT
-				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
-				GREATEST(
-					ts_rank(sc.sparse_tsv, plainto_tsquery('simple', $1)),
-					CASE WHEN sc.sparse_text LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
-				) AS rank,
-				d.title          AS document_title,
-				d.source_type    AS document_source,
-				d.status         AS document_status,
-				d.occurred_at    AS document_occurred_at,
-				d.collected_at   AS document_collected_at,
-				d.metadata       AS document_metadata
-			FROM chunk_sparse_context sc
-			JOIN chunks c ON c.id = sc.chunk_id
-			JOIN documents d ON d.id = c.document_id
-			WHERE sc.context_version = $3
-			  AND sc.fingerprint = ` + chunkSparseFingerprintSQL + `
-			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
-			  AND d.status = 'active' ` + filters + `
-			ORDER BY rank DESC
-			LIMIT $2
-		),
-		raw AS (
-			SELECT
-				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
-				GREATEST(
-					ts_rank(c.content_tsv, plainto_tsquery('simple', $1)),
-					CASE WHEN c.content LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
-				) AS rank,
-				d.title          AS document_title,
-				d.source_type    AS document_source,
-				d.status         AS document_status,
-				d.occurred_at    AS document_occurred_at,
-				d.collected_at   AS document_collected_at,
-				d.metadata       AS document_metadata
-			FROM chunks c
-			JOIN documents d ON d.id = c.document_id
-			WHERE NOT EXISTS (
-				SELECT 1 FROM chunk_sparse_context sc2
-				WHERE sc2.chunk_id = c.id
-				  AND sc2.context_version = $3
-				  AND sc2.fingerprint = ` + chunkSparseFingerprintSQL + `
-			)
-			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
-			AND d.status = 'active' ` + filters + `
-			ORDER BY rank DESC
-			LIMIT $2
-		)
-		SELECT * FROM fresh
-		UNION ALL
-		SELECT * FROM raw
-		ORDER BY rank DESC`
+	q, args := buildSparseContextQuery(filter, limit, version)
 
 	rows, err := s.pg.pool.Query(ctx, q, args...)
 	if err != nil {
@@ -140,4 +85,72 @@ func (s *ChunkStore) SearchSparseContextFiltered(ctx context.Context, filter mod
 		return nil, fmt.Errorf("chunk sparse context search iter: %w", err)
 	}
 	return results, nil
+}
+
+// buildSparseContextQuery 는 SearchSparseContextFiltered 의 SQL 과 인자를
+// 만든다. DB 없이 SQL 을 검사할 수 있게 떼어 냈다.
+func buildSparseContextQuery(filter model.SearchQuery, limit int, version string) (string, []interface{}) {
+	query := filter.Query
+	args, filters := chunkEligibilitySQL([]interface{}{query, limit, version}, filter)
+	// #276: 키워드가 있으면 fresh·raw 두 CTE 모두 같은 키워드 플레이스홀더를
+	// 쓴다. 없으면 아래 SQL 은 #276 이전과 바이트 단위로 같다.
+	args, sp := bindChunkSparse(args, filter.SparseTerms)
+	fe := chunkSparseExprs(sp, "sc.sparse_tsv", "sc.sparse_text")
+	re := chunkSparseExprs(sp, "c.content_tsv", "c.content")
+	q := `
+		WITH fresh AS (
+			SELECT
+				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
+				GREATEST(
+					` + fe.rankTS + `,
+					` + fe.rankBigm + `
+				) AS rank,
+				d.title          AS document_title,
+				d.source_type    AS document_source,
+				d.status         AS document_status,
+				d.occurred_at    AS document_occurred_at,
+				d.collected_at   AS document_collected_at,
+				d.metadata       AS document_metadata
+			FROM chunk_sparse_context sc
+			JOIN chunks c ON c.id = sc.chunk_id
+			JOIN documents d ON d.id = c.document_id
+			WHERE sc.context_version = $3
+			  AND sc.fingerprint = ` + chunkSparseFingerprintSQL + `
+			  AND (` + fe.matchTS + ` OR ` + fe.matchLike + `)
+			  AND d.status = 'active' ` + filters + `
+			ORDER BY rank DESC
+			LIMIT $2
+		),
+		raw AS (
+			SELECT
+				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
+				GREATEST(
+					` + re.rankTS + `,
+					` + re.rankBigm + `
+				) AS rank,
+				d.title          AS document_title,
+				d.source_type    AS document_source,
+				d.status         AS document_status,
+				d.occurred_at    AS document_occurred_at,
+				d.collected_at   AS document_collected_at,
+				d.metadata       AS document_metadata
+			FROM chunks c
+			JOIN documents d ON d.id = c.document_id
+			WHERE NOT EXISTS (
+				SELECT 1 FROM chunk_sparse_context sc2
+				WHERE sc2.chunk_id = c.id
+				  AND sc2.context_version = $3
+				  AND sc2.fingerprint = ` + chunkSparseFingerprintSQL + `
+			)
+			AND (` + re.matchTS + ` OR ` + re.matchLike + `)
+			AND d.status = 'active' ` + filters + `
+			ORDER BY rank DESC
+			LIMIT $2
+		)
+		SELECT * FROM fresh
+		UNION ALL
+		SELECT * FROM raw
+		ORDER BY rank DESC`
+
+	return q, args
 }

@@ -763,30 +763,50 @@ func buildFulltextSearchQuery(query model.SearchQuery) (string, []interface{}) {
 	var occurredFilter string
 	args, occurredFilter, _ = appendOccurredRangeFilters(args, query.OccurredFrom, query.OccurredTo)
 
-	// The LIKE pattern uses SQL string concatenation ('%%' || $1 || '%%') so that
-	// pg_bigm's gin_bigm_ops index is used automatically without embedding literal
-	// percent signs in the Go format string (which would require '%%%%').
+	// 질의 형태(#276). raw(키워드 없음)의 두 조각은 #276 이전 SQL 과 글자
+	// 하나까지 같다. 키워드가 있으면 접두 OR tsquery 와 키워드별 LIKE 로
+	// 바꾼다 — 인자는 다른 모든 인자 뒤에 붙으므로 기존 번호는 움직이지 않는다.
+	scoreExpr := `GREATEST(
+		           ts_rank(tsv, plainto_tsquery('simple', $1)),
+		           ts_rank(tsv, plainto_tsquery('english', $1))
+		       )`
+	matchExpr := `(tsv @@ plainto_tsquery('simple', $1)
+		   OR tsv @@ plainto_tsquery('english', $1)
+		   OR content LIKE '%' || $1 || '%'
+		   OR title   LIKE '%' || $1 || '%'
+		   OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))`
+	if query.SparseTerms.Active() {
+		var sp sparseSQL
+		args, sp = appendSparseTerms(args, query.SparseTerms)
+		// 세 번째 항: LIKE 로만 맞은 문서도 맞은 키워드 비율과 질문 전체
+		// 일치로 순서가 서게 한다(청크 레인과 같은 0.01 척도 — 진짜 FTS
+		// 히트보다는 항상 아래). raw 에서 LIKE 만 맞은 문서는 전부 0점이라
+		// 서로 순서가 없었다. 이 항이 $1 을 참조하는 것도 필요하다: 참조되지
+		// 않는 파라미터는 PostgreSQL 이 타입을 정하지 못해 질의가 실패한다.
+		scoreExpr = fmt.Sprintf("GREATEST(\n\t\t           %s,\n\t\t           %s,\n\t\t           %s\n\t\t       )",
+			sp.tsRank("tsv", "simple"), sp.tsRank("tsv", "english"), sp.docSparseRank())
+		matchExpr = fmt.Sprintf("(%s\n\t\t   OR %s\n\t\t   OR %s)",
+			sp.tsMatch("tsv", "simple"), sp.tsMatch("tsv", "english"), sp.likeAny(true, "content", "title"))
+	}
+
+	// The LIKE pattern uses SQL string concatenation ('%' || $1 || '%') so that
+	// pg_bigm's gin_bigm_ops index is used automatically. 매칭·점수 식은 위의
+	// scoreExpr/matchExpr 로 옮겨 %s 인자로 넣으므로 그 안의 '%' 는 포맷
+	// 문자열로 해석되지 않는다.
 	q := fmt.Sprintf(`
 		SELECT id, source_type, source_id, title, content, metadata, embedding,
 		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
 		       title_summary, bullet_summary, summary_embedding,
-		       GREATEST(
-		           ts_rank(tsv, plainto_tsquery('simple', $1)),
-		           ts_rank(tsv, plainto_tsquery('english', $1))
-		       ) AS score
+		       %s AS score
 		FROM documents
-		WHERE (tsv @@ plainto_tsquery('simple', $1)
-		   OR tsv @@ plainto_tsquery('english', $1)
-		   OR content LIKE '%%' || $1 || '%%'
-		   OR title   LIKE '%%' || $1 || '%%'
-		   OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+		WHERE %s
 		%s
 		%s
 		%s
 		%s
 		%s
 		ORDER BY %s
-		LIMIT $2`, statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, sortOrder(query, time.Now(), ""))
+		LIMIT $2`, scoreExpr, matchExpr, statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, sortOrder(query, time.Now(), ""))
 
 	return q, args
 }
@@ -1091,7 +1111,8 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 	// Each CTE shares the same statusFilter/sourceFilter/excludeFilter snippets;
 	// args are appended once and referenced by the same positional parameters.
 	// bigm uses pg_bigm's gin_bigm_ops index via LIKE '%%' || $1 || '%%'.
-	// SQL '%%%%' in fmt.Sprintf produces a literal '%%' which pg_bigm needs.
+	// (#276 이후 이 조건은 아래 bigmMatch 변수에 있고 %s 인자로 들어가므로
+	// 포맷 문자열을 거치지 않는다 — 출력이 이전과 같도록 '%%' 를 그대로 둔다.)
 	// bigm lane ranks by GREATEST(bigm_similarity(content,$1), bigm_similarity(title,$1))
 	// so Korean partial-match is ordered by real relevance, not document length (#138).
 	// summvec uses the same query embedding ($2) as vec for consistency.
@@ -1120,16 +1141,40 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 		entityCTE = buildEntityCTE(entityFilterParam, entityStatusFilter, entitySourceFilter, entityExcludeFilter, entityRetentionFilter, entityOccurredFilter)
 	}
 
+	// 질의 형태(#276). 아래 네 조각의 기본값은 #276 이전 SQL 과 글자 하나까지
+	// 같다. 키워드가 있으면 fts·bigm 레인만 바꾸고 vec·summvec·entity 레인은
+	// 건드리지 않는다. 키워드 인자는 엔티티 파라미터까지 전부 붙인 뒤 맨
+	// 끝에 붙인다 — 그래야 엔티티 CTE 가 바이트 단위로 그대로 남는다.
+	ftsRank := `GREATEST(
+			           ts_rank(tsv, plainto_tsquery('simple', $1)),
+			           ts_rank(tsv, plainto_tsquery('english', $1))
+			       )`
+	ftsMatch := `(tsv @@ plainto_tsquery('simple', $1)
+			   OR tsv @@ plainto_tsquery('english', $1))`
+	bigmOrderPrefix := ""
+	bigmMatch := `(content LIKE '%%' || $1 || '%%'
+			    OR title   LIKE '%%' || $1 || '%%'
+			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))`
+	if query.SparseTerms.Active() {
+		var sp sparseSQL
+		args, sp = appendSparseTerms(args, query.SparseTerms)
+		ftsRank = fmt.Sprintf("GREATEST(\n\t\t\t           %s,\n\t\t\t           %s\n\t\t\t       )",
+			sp.tsRank("tsv", "simple"), sp.tsRank("tsv", "english"))
+		ftsMatch = fmt.Sprintf("(%s\n\t\t\t   OR %s)", sp.tsMatch("tsv", "simple"), sp.tsMatch("tsv", "english"))
+		// bigm 레인 순서: 맞은 키워드 수 → 질문 전체 일치 보너스(기존의 정밀
+		// 일치가 동점일 때 이기게) → 기존 bigm_similarity → id.
+		bigmOrderPrefix = fmt.Sprintf("\n\t\t\t           %s DESC,\n\t\t\t           %s DESC,",
+			sp.likeCount(true, "content", "title"),
+			"CASE WHEN content LIKE '%' || $1 || '%' OR title LIKE '%' || $1 || '%' THEN 1 ELSE 0 END")
+		bigmMatch = sp.likeAny(true, "content", "title")
+	}
+
 	q := fmt.Sprintf(`
 		WITH fts AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY GREATEST(
-			           ts_rank(tsv, plainto_tsquery('simple', $1)),
-			           ts_rank(tsv, plainto_tsquery('english', $1))
-			       ) DESC) AS rank
+			       row_number() OVER (ORDER BY %s DESC) AS rank
 			FROM documents
-			WHERE (tsv @@ plainto_tsquery('simple', $1)
-			   OR tsv @@ plainto_tsquery('english', $1))
+			WHERE %s
 			%s
 			%s
 			%s
@@ -1151,16 +1196,14 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 		),
 		bigm AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY
+			       row_number() OVER (ORDER BY%s
 			           GREATEST(
 			               bigm_similarity(content, $1),
 			               bigm_similarity(title,   $1),
 			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
 			           ) DESC, id ASC) AS rank
 			FROM documents
-			WHERE (content LIKE '%%%%' || $1 || '%%%%'
-			    OR title   LIKE '%%%%' || $1 || '%%%%'
-			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+			WHERE %s
 			%s
 			%s
 			%s
@@ -1199,8 +1242,10 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 		JOIN documents d ON d.id = rrf.id
 		ORDER BY %s
 		LIMIT $3`,
+		ftsRank, ftsMatch, // fts: 질의 형태(#276)
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, // fts
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, // vec
+		bigmOrderPrefix, bigmMatch, // bigm: 질의 형태(#276)
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, // bigm
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, // summvec
 		entityCTE, // entity lane carries the same filters in d.-qualified form

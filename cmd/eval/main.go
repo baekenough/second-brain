@@ -189,6 +189,11 @@ func run() error {
 			"fuse_ctx 는 migrations/040 의 파생 sparse context 를 우선 매칭한다(--chunk-sparse-ctx-version 필요)")
 	chunkSparseCtxVersion := flag.String("chunk-sparse-ctx-version", "",
 		"--chunk-sparse=fuse_ctx 에서만 쓰인다. v1-tp(제목+참여자) 또는 v1-full(임베딩과 동일한 헤더)")
+	sparseQuery := flag.String("sparse-query", model.SparseQueryRaw,
+		"희소 레인(FTS·bigm)의 질의 형태(#276). raw(기본)는 질문 원문을 그대로 쓰고, "+
+			"chunk 는 청크 희소 레인에만, chunk_doc 은 문서 fts·bigm 레인까지 internal/sparseq 가 "+
+			"뽑은 키워드(접두 OR tsquery + 키워드별 LIKE)를 쓴다. 리랭커·임베딩·엔티티 레인은 "+
+			"어느 값이든 원문을 받는다. 청크 범위는 --chunk-sparse=fuse|fuse_ctx 와 함께 써야 거의 매번 돈다")
 	flag.Parse()
 	if *pairLimit < 0 || (*split != "all" && *split != "train" && *split != "holdout") {
 		return errors.New("invalid eval --split or --limit")
@@ -217,6 +222,7 @@ func run() error {
 		RecencyAlpha:          *recencyAlpha,
 		ChunkSparse:           *chunkSparse,
 		ChunkSparseCtxVersion: *chunkSparseCtxVersion,
+		SparseQuery:           *sparseQuery,
 	}
 	if err := validateTuningFlags(tuning); err != nil {
 		return err
