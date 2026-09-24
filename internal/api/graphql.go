@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -9,13 +10,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/baekenough/second-brain/internal/curation"
+	"github.com/baekenough/second-brain/internal/model"
+	"github.com/baekenough/second-brain/internal/search"
+	"github.com/baekenough/second-brain/internal/store"
 	"github.com/google/uuid"
 	"github.com/graphql-go/graphql"
 	"github.com/graphql-go/graphql/language/ast"
 	gqlhandler "github.com/graphql-go/handler"
-	"github.com/baekenough/second-brain/internal/curation"
-	"github.com/baekenough/second-brain/internal/model"
-	"github.com/baekenough/second-brain/internal/store"
 )
 
 // schemaMu guards buildSchema so that package-level graphql type objects
@@ -115,12 +117,12 @@ var searchQueryResultType = graphql.NewObject(graphql.ObjectConfig{
 	Name:        "SearchQueryResult",
 	Description: "Response envelope for a search query.",
 	Fields: graphql.Fields{
-		"results":  {Type: graphql.NewList(searchResultType), Description: "Ranked search results."},
-		"curated":  {Type: graphql.NewList(curatedResultType), Description: "LLM-curated results (only when curated=true)."},
-		"count":    {Type: graphql.Int},
-		"query":    {Type: graphql.String},
+		"results":    {Type: graphql.NewList(searchResultType), Description: "Ranked search results."},
+		"curated":    {Type: graphql.NewList(curatedResultType), Description: "LLM-curated results (only when curated=true)."},
+		"count":      {Type: graphql.Int},
+		"query":      {Type: graphql.String},
 		"is_curated": {Type: graphql.Boolean, Description: "True when LLM curation was applied."},
-		"took_ms":  {Type: graphql.Int},
+		"took_ms":    {Type: graphql.Int},
 	},
 })
 
@@ -139,15 +141,15 @@ var feedbackInputType = graphql.NewInputObject(graphql.InputObjectConfig{
 	Name:        "FeedbackInput",
 	Description: "Input payload for recording user feedback.",
 	Fields: graphql.InputObjectConfigFieldMap{
-		"query":       {Type: graphql.String},
-		"documentId":  {Type: graphql.String},
-		"chunkId":     {Type: graphql.Int},
-		"source":      {Type: graphql.NewNonNull(graphql.String)},
-		"sessionId":   {Type: graphql.String},
-		"userId":      {Type: graphql.String},
-		"thumbs":      {Type: graphql.NewNonNull(graphql.Int)},
-		"comment":     {Type: graphql.String},
-		"metadata":    {Type: jsonScalar},
+		"query":      {Type: graphql.String},
+		"documentId": {Type: graphql.String},
+		"chunkId":    {Type: graphql.Int},
+		"source":     {Type: graphql.NewNonNull(graphql.String)},
+		"sessionId":  {Type: graphql.String},
+		"userId":     {Type: graphql.String},
+		"thumbs":     {Type: graphql.NewNonNull(graphql.Int)},
+		"comment":    {Type: graphql.String},
+		"metadata":   {Type: jsonScalar},
 	},
 })
 
@@ -282,12 +284,26 @@ func (s *Server) buildSchema() (graphql.Schema, error) {
 					UseHyDE:            useHyDE,
 					UseRerank:          useRerank,
 				}
+				// REST 검색과 같은 공통 검증(#282). InputError 문구는 필드 이름과
+				// 고정 사유만 담으므로 그대로 GraphQL errors 로 돌려줘도 질의 원문이
+				// 새지 않는다.
+				if err := search.ValidateQueryInput(q, search.MaxQueryBytes); err != nil {
+					return nil, errors.New(searchInputMessage(err))
+				}
 
 				start := time.Now()
-				results, err := s.search.Search(p.Context, q)
+				results, err := s.searchWithTimeout(p.Context, q)
 				if err != nil {
-					slog.Error("graphql: search failed", "error", err)
-					return nil, fmt.Errorf("internal server error")
+					switch {
+					case errors.Is(err, errSearchTimeout):
+						slog.Warn("graphql: search timed out", "timeout", s.searchTimeout.String(), "error", err)
+						return nil, errSearchTimeout
+					case errors.Is(err, search.ErrInvalidInput):
+						return nil, errors.New(searchInputMessage(err))
+					default:
+						slog.Error("graphql: search failed", "error", err)
+						return nil, fmt.Errorf("internal server error")
+					}
 				}
 
 				tookMs := int(time.Since(start).Milliseconds())
@@ -578,5 +594,7 @@ func (s *Server) graphqlHandler() http.Handler {
 		Playground: false,
 	})
 
-	return h
+	// 검색 진입점이므로 쿼리스트링·본문 크기, 요청당 검색 수, 요청 전체
+	// 시간을 실행 전에 묶는다(#282). 상세는 guardGraphQL 참고.
+	return s.guardGraphQL(h)
 }
