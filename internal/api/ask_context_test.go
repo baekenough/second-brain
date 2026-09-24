@@ -89,7 +89,7 @@ func TestAskPromptSeparatesRelativeTimeAnchors(t *testing.T) {
 
 func TestAskPassageKeepsMatchInsideSmallBudget(t *testing.T) {
 	content := strings.Repeat("앞", 900) + " ZX900 예약번호 " + strings.Repeat("뒤", 900)
-	got := askPassage(content, "ZX900 예약번호", 500)
+	got, _ := askPassage(content, "ZX900 예약번호", 500)
 	if len(got) > 500 || !strings.Contains(got, "ZX900") {
 		t.Fatalf("invalid excerpt: %s", got)
 	}

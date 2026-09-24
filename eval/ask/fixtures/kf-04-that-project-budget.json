@@ -1,0 +1,34 @@
+{
+  "id": "kf-04-that-project-budget",
+  "category": "korean_followup",
+  "as_of": "2026-06-10T09:00:00+09:00",
+  "corpus": [
+    {
+      "alias": "call-nova",
+      "source_type": "call",
+      "title": "노바 프로젝트 예산 통화",
+      "content": "노바 프로젝트 예산은 최종적으로 1억 2천만원으로 승인되었다.",
+      "occurred_at": "2026-06-07T13:00:00+09:00"
+    }
+  ],
+  "history": [
+    {
+      "question": "요즘 진행 중인 신규 프로젝트 이름이 뭐야?",
+      "answer": "신규 프로젝트 이름은 노바 프로젝트입니다."
+    }
+  ],
+  "question": "그 프로젝트 예산은 얼마였지?",
+  "standalone_question": "노바 프로젝트 예산이 얼마야?",
+  "gold": {
+    "answerable": true,
+    "claims": [
+      "1억 2천만원"
+    ],
+    "support_doc_ids": [
+      "call-nova"
+    ],
+    "support_spans": [
+      "노바 프로젝트 예산은 최종적으로 1억 2천만원으로 승인되었다"
+    ]
+  }
+}

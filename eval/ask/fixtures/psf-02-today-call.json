@@ -1,0 +1,41 @@
+{
+  "id": "psf-02-today-call",
+  "category": "period_source_filter",
+  "as_of": "2026-06-10T09:00:00+09:00",
+  "corpus": [
+    {
+      "alias": "call-today",
+      "source_type": "call",
+      "title": "오늘 배송 지연 통화",
+      "content": "오늘 통화에서 배송이 3일 지연된다고 안내받았다.",
+      "occurred_at": "2026-06-10T08:30:00+09:00"
+    },
+    {
+      "alias": "call-yesterday",
+      "source_type": "call",
+      "title": "어제 배송 통화",
+      "content": "어제 통화에서 배송이 1일 지연된다고 안내받았다.",
+      "occurred_at": "2026-06-09T08:30:00+09:00"
+    },
+    {
+      "alias": "mail-today",
+      "source_type": "gmail",
+      "title": "오늘 받은 배송 메일",
+      "content": "오늘 배송 관련 메일입니다.",
+      "occurred_at": "2026-06-10T09:30:00+09:00"
+    }
+  ],
+  "question": "오늘 통화한 내용에서 배송이 며칠 지연된다고 했어?",
+  "gold": {
+    "answerable": true,
+    "claims": [
+      "3일"
+    ],
+    "support_doc_ids": [
+      "call-today"
+    ],
+    "support_spans": [
+      "오늘 통화에서 배송이 3일 지연된다고 안내받았다"
+    ]
+  }
+}

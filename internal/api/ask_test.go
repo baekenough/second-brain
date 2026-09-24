@@ -96,6 +96,16 @@ type fakeAskLLM struct {
 	cancelAfter  int
 	cancelFn     context.CancelFunc
 
+	// failAfter, when > 0, makes StreamWithMessages deliver chunks normally
+	// up through the failAfter-th one and then return streamErr — a
+	// mid-stream PROVIDER failure with partial text already produced,
+	// distinct from cancelFn's "client disconnected" simulation (issue #268
+	// TestAskHandler_StreamingError_WithPartialAnswer_ReportsUnverified
+	// needs partial text AND a non-context.Canceled error, which neither
+	// streamErr alone (fails before any chunk) nor cancelFn alone (produces
+	// context.Canceled, not an arbitrary error) can simulate).
+	failAfter int
+
 	streamCalls   int
 	completeCalls int
 
@@ -128,7 +138,7 @@ func (f *fakeAskLLM) StreamWithMessages(ctx context.Context, systemPrompt string
 	f.streamCalls++
 	f.gotSystemPrompt = systemPrompt
 	f.gotMessages = messages
-	if f.streamErr != nil {
+	if f.streamErr != nil && f.failAfter == 0 {
 		return f.streamErr
 	}
 	for i, c := range f.chunks {
@@ -140,6 +150,9 @@ func (f *fakeAskLLM) StreamWithMessages(ctx context.Context, systemPrompt string
 		onDelta(c)
 		if f.cancelFn != nil && i+1 == f.cancelAfter {
 			f.cancelFn()
+		}
+		if f.failAfter > 0 && i+1 == f.failAfter {
+			return f.streamErr
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -587,6 +600,24 @@ func TestAskHandler_SSEFieldNames(t *testing.T) {
 	}
 	if _, ok := raw["finish_reason"]; !ok {
 		t.Errorf("done payload missing key %q", "finish_reason")
+	}
+	// verification (issue #268) is additive to the #258 done payload — see
+	// askDonePayload's doc comment for exactly when it is present.
+	verificationRaw, ok := raw["verification"]
+	if !ok {
+		t.Fatalf("done payload missing key %q; raw=%s", "verification", frames[3].data)
+	}
+	var verification map[string]json.RawMessage
+	if err := json.Unmarshal(verificationRaw, &verification); err != nil {
+		t.Fatalf("verification not valid JSON: %v", err)
+	}
+	for _, want := range []string{
+		"citation_status", "cited_ids", "unknown_ids", "malformed_links",
+		"inferred_cited_ids", "prompt_evidence_ids", "claim_support",
+	} {
+		if _, ok := verification[want]; !ok {
+			t.Errorf("verification JSON is missing key %q; got keys=%v", want, mapKeys(verification))
+		}
 	}
 }
 

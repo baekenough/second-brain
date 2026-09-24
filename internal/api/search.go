@@ -39,6 +39,29 @@ type searchRequest struct {
 	IncludeRetention bool `json:"include_retention,omitempty"`
 }
 
+// stripEvidenceForREST returns a shallow copy of results with Evidence set
+// to nil on each copy. model.SearchResult.Evidence carries chunk-lane
+// provenance (chunk ID/index/lane/score, #267) added for /ask's excerpt
+// selection (internal/api/ask_context.go) only — it was never meant to be a
+// public field, but its "evidence,omitempty" JSON tag means it silently
+// started appearing in REST /api/v1/search responses once chunk-lane fusion
+// began populating it. A shallow copy is used (rather than clearing
+// Evidence on the original *model.SearchResult) so this never mutates the
+// slice the search service returned, which the caller may still hold a
+// reference to (e.g. a curated-results branch derives from the same slice).
+func stripEvidenceForREST(results []*model.SearchResult) []*model.SearchResult {
+	out := make([]*model.SearchResult, len(results))
+	for i, r := range results {
+		if r == nil {
+			continue
+		}
+		cp := *r
+		cp.Evidence = nil
+		out[i] = &cp
+	}
+	return out
+}
+
 // searchHandler handles POST /api/v1/search.
 func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 	var req searchRequest
@@ -90,7 +113,7 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"results": results,
+		"results": stripEvidenceForREST(results),
 		"count":   len(results),
 		"total":   len(results),
 		"query":   req.Query,
@@ -160,7 +183,7 @@ func (s *Server) searchGetHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"results": results,
+		"results": stripEvidenceForREST(results),
 		"count":   len(results),
 		"total":   len(results),
 		"query":   query,

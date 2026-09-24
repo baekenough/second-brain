@@ -1,0 +1,27 @@
+{
+  "id": "st-03-meeting-time",
+  "category": "single_turn",
+  "as_of": "2026-06-10T09:00:00+09:00",
+  "corpus": [
+    {
+      "alias": "cal-2",
+      "source_type": "calendar",
+      "title": "디자인 리뷰 일정",
+      "content": "디자인 리뷰는 오후 3시 30분에 시작됩니다.",
+      "occurred_at": "2026-06-12T09:00:00+09:00"
+    }
+  ],
+  "question": "디자인 리뷰 몇 시에 시작해?",
+  "gold": {
+    "answerable": true,
+    "claims": [
+      "오후 3시 30분"
+    ],
+    "support_doc_ids": [
+      "cal-2"
+    ],
+    "support_spans": [
+      "디자인 리뷰는 오후 3시 30분에 시작됩니다"
+    ]
+  }
+}

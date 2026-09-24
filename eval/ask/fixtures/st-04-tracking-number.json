@@ -1,0 +1,27 @@
+{
+  "id": "st-04-tracking-number",
+  "category": "single_turn",
+  "as_of": "2026-06-10T09:00:00+09:00",
+  "corpus": [
+    {
+      "alias": "mail-1",
+      "source_type": "gmail",
+      "title": "택배 배송 안내",
+      "content": "고객님의 상품이 발송되었습니다. 송장번호는 998877665544입니다.",
+      "occurred_at": "2026-06-09T10:00:00+09:00"
+    }
+  ],
+  "question": "택배 송장번호가 뭐야?",
+  "gold": {
+    "answerable": true,
+    "claims": [
+      "998877665544"
+    ],
+    "support_doc_ids": [
+      "mail-1"
+    ],
+    "support_spans": [
+      "송장번호는 998877665544입니다"
+    ]
+  }
+}

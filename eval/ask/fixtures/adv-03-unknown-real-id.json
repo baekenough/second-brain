@@ -1,0 +1,27 @@
+{
+  "id": "adv-03-unknown-real-id",
+  "category": "adversarial_citation",
+  "as_of": "2026-06-10T09:00:00+09:00",
+  "corpus": [
+    {
+      "alias": "call-1",
+      "source_type": "call",
+      "title": "홍길동과 예산 통화",
+      "content": "홍길동과 예산 관련 통화를 했다. 예산은 5천만원이다.",
+      "occurred_at": "2026-06-10T08:00:00+09:00"
+    },
+    {
+      "alias": "other-doc",
+      "source_type": "gmail",
+      "title": "완전히 다른 주제의 메일",
+      "content": "사내 카페테리아 메뉴 변경 안내입니다.",
+      "occurred_at": "2026-06-01T08:00:00+09:00"
+    }
+  ],
+  "question": "오늘 홍길동과 통화한 내용이 뭐야?",
+  "scripted_answer": "예산은 5천만원입니다 [근거](/documents/{{doc:other-doc}})",
+  "gold": {
+    "answerable": false,
+    "expected_citation_status": "invalid"
+  }
+}

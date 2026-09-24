@@ -1,0 +1,34 @@
+{
+  "id": "cs-03-deadline",
+  "category": "conflicting_sources",
+  "as_of": "2026-06-10T09:00:00+09:00",
+  "corpus": [
+    {
+      "alias": "call-old-deadline",
+      "source_type": "call",
+      "title": "초기 일정 통화",
+      "content": "초기 계획상 마감일은 6월 20일로 논의되었다.",
+      "occurred_at": "2026-06-02T09:00:00+09:00"
+    },
+    {
+      "alias": "call-new-deadline",
+      "source_type": "call",
+      "title": "일정 재조정 통화",
+      "content": "일정 재조정 결과 마감일은 6월 30일로 연기되었다.",
+      "occurred_at": "2026-06-08T09:00:00+09:00"
+    }
+  ],
+  "question": "마감일이 최종적으로 언제로 조정됐어?",
+  "gold": {
+    "answerable": true,
+    "claims": [
+      "6월 30일"
+    ],
+    "support_doc_ids": [
+      "call-new-deadline"
+    ],
+    "support_spans": [
+      "마감일은 6월 30일로 연기되었다"
+    ]
+  }
+}

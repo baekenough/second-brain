@@ -3,7 +3,8 @@
 The evaluator measures **search ranking**, not `/ask` temporal planning, context
 assembly, citation faithfulness, abstention, or answer accuracy. It does not
 reinterpret historical relative-date questions as a validated current-time test.
-Those behaviors require separate tests and human judgments.
+Those behaviors are covered by a separate offline `/ask` E2E evaluator — see
+[`docs/ask-evaluation-protocol.md`](ask-evaluation-protocol.md).
 
 HTTP, MCP, and eval use `search.AssembleService`: document/chunk retrieval,
 optional OpenSearch, entity surfacing, active weights, reranker, and the LLM client

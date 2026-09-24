@@ -14,6 +14,7 @@ import (
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/timeutil"
+	"github.com/google/uuid"
 )
 
 // AskRequest is the JSON body accepted by POST /api/v1/ask. ConversationID
@@ -134,9 +135,56 @@ type askTokenPayload struct {
 }
 
 // askDonePayload is the "done" SSE event body (spec §5.1).
-// FinishReason is one of "stop" | "error" | "no_evidence".
+// FinishReason is one of "stop" | "error" | "no_evidence" — this enum is
+// frozen (issue #258); Verification is purely additive.
 type askDonePayload struct {
 	FinishReason string `json:"finish_reason"`
+	// Verification is the deterministic citation-validation result (issue
+	// #268), present whenever synthesize actually produced an answer worth
+	// checking. It is absent (omitempty) for finish_reason "no_evidence"
+	// (synthesis never ran) and for "error" with an empty answer (nothing
+	// was produced to validate) — see synthesize's doc comment for the
+	// exact rule. web/src/lib/sseEvents.ts only reads finish_reason from
+	// this event and ignores unknown keys (deep-plan #268 finding F9), so
+	// adding this field is wire-safe for the already-shipped frontend.
+	Verification *askVerificationPayload `json:"verification,omitempty"`
+}
+
+// askVerificationPayload is askDonePayload's wire projection of
+// askCitationReport (ask_citation.go) — every ID slice is stringified
+// (uuid.UUID -> string) and never nil, so an empty result serializes as
+// "[]" rather than "null".
+type askVerificationPayload struct {
+	CitationStatus    string   `json:"citation_status"`
+	CitedIDs          []string `json:"cited_ids"`
+	UnknownIDs        []string `json:"unknown_ids"`
+	MalformedLinks    int      `json:"malformed_links"`
+	InferredCitedIDs  []string `json:"inferred_cited_ids"`
+	PromptEvidenceIDs []string `json:"prompt_evidence_ids"`
+	ClaimSupport      string   `json:"claim_support"`
+}
+
+// newAskVerificationPayload projects an askCitationReport onto the wire
+// shape. Never called with a nil report by askHandler — see synthesize's
+// doc comment for exactly when a report exists.
+func newAskVerificationPayload(r askCitationReport) *askVerificationPayload {
+	return &askVerificationPayload{
+		CitationStatus:    string(r.Status),
+		CitedIDs:          uuidsToStrings(r.CitedIDs),
+		UnknownIDs:        uuidsToStrings(r.UnknownIDs),
+		MalformedLinks:    r.MalformedLinks,
+		InferredCitedIDs:  uuidsToStrings(r.InferredCitedIDs),
+		PromptEvidenceIDs: uuidsToStrings(r.PromptEvidenceIDs),
+		ClaimSupport:      string(r.ClaimSupport),
+	}
+}
+
+func uuidsToStrings(ids []uuid.UUID) []string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, id.String())
+	}
+	return out
 }
 
 // askErrorPayload is the "error" SSE event body (spec §5.1).
@@ -356,13 +404,21 @@ func (s *Server) askHandler(w http.ResponseWriter, r *http.Request) {
 	// (spec §6.3). insight-only results never satisfy this check.
 	if len(result.Observed) == 0 {
 		_ = writeSSEEvent(w, flusher, "done", askDonePayload{FinishReason: "no_evidence"})
-		s.saveAskTurn(ctx, conversationID, turnIndex, req.Question, "", "no_evidence", sources)
+		s.saveAskTurn(ctx, conversationID, turnIndex, req.Question, "", "no_evidence", sources, nil)
 		return
 	}
 
 	// Stage 3: synthesis + streaming. question passed here is the user's
 	// ORIGINAL wording (not searchQuestion) — see the rewrite comment above.
-	finishReason, answer := s.synthesize(ctx, w, flusher, req.Question, result, history)
+	// searchQuestion is passed separately as the excerpt-selection query
+	// (#267): it drives ONLY askPassage's lexical fallback window for
+	// documents with no chunk evidence, so a follow-up like "그건 언제로
+	// 정했지?" — which carries no vocabulary of its own — still selects the
+	// same passage retrieval already searched for, instead of falling back
+	// to the document's beginning. report is the deterministic
+	// citation-validation result (issue #268); see synthesize's doc comment
+	// for exactly when it is nil.
+	finishReason, answer, report := s.synthesize(ctx, w, flusher, req.Question, searchQuestion, result, history)
 	if finishReason == "" {
 		// Sentinel for "client disconnected mid-stream" (context.Canceled):
 		// the connection is already gone, so attempting a final "done"
@@ -379,16 +435,20 @@ func (s *Server) askHandler(w http.ResponseWriter, r *http.Request) {
 		// the answer never legitimately completed. An empty partial answer
 		// (cancelled before the first token) is not worth a turn_index.
 		if answer != "" {
-			s.saveAskTurn(ctx, conversationID, turnIndex, req.Question, answer, "error", sources)
+			s.saveAskTurn(ctx, conversationID, turnIndex, req.Question, answer, "error", sources, report)
 		}
 		return
 	}
-	_ = writeSSEEvent(w, flusher, "done", askDonePayload{FinishReason: finishReason})
+	done := askDonePayload{FinishReason: finishReason}
+	if report != nil {
+		done.Verification = newAskVerificationPayload(*report)
+	}
+	_ = writeSSEEvent(w, flusher, "done", done)
 	// Saved AFTER the client-visible "done" write so a slow/failing DB
 	// write never delays or breaks the response the client already has —
 	// saveAskTurn itself also swallows its own errors (see its doc
 	// comment), this ordering is the second half of that guarantee.
-	s.saveAskTurn(ctx, conversationID, turnIndex, req.Question, answer, finishReason, sources)
+	s.saveAskTurn(ctx, conversationID, turnIndex, req.Question, answer, finishReason, sources, report)
 }
 
 // planner returns the configured query planner, defaulting to a planner with
@@ -434,13 +494,26 @@ func mapAskSources(results []*model.SearchResult) []AskSourceItem {
 // was produced before that happened, which may be empty (disconnected
 // before the first token) or partial (disconnected mid-stream) — it is
 // never the empty string for finishReason "stop".
-func (s *Server) synthesize(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, question string, result RetrievalResult, history []askHistoryTurn) (finishReason, answer string) {
+//
+// report is issue #268's deterministic citation-validation result, computed
+// against the SAME askPromptManifest buildBudgetedAskMessages returned for
+// this call — both the streaming and the CompleteWithMessages fallback path
+// below run it at the same point, right after the full answer text is
+// known. report is nil exactly when there is nothing meaningful to validate:
+// the LLM was never configured, the connection was disconnected before any
+// text was produced, or a non-streaming call failed outright (no partial
+// text exists for that path). When synthesis produced text but did not
+// finish cleanly (streaming error or disconnect AFTER at least one token),
+// report is non-nil with Status askCitationUnverified rather than actually
+// validating a truncated answer (deep-plan #268 §2.2: "partial answer then
+// error -> unverified").
+func (s *Server) synthesize(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, question, excerptQuery string, result RetrievalResult, history []askHistoryTurn) (finishReason, answer string, report *askCitationReport) {
 	if !s.llmClient.Enabled() {
 		_ = writeSSEEvent(w, flusher, "error", askErrorPayload{Message: "LLM is not configured"})
-		return "error", ""
+		return "error", "", nil
 	}
 
-	messages := buildAskMessages(question, result, history)
+	messages, manifest := buildBudgetedAskMessages(question, excerptQuery, result, history)
 	systemPrompt := buildAskSystemPrompt(s.nowFunc())
 
 	if sc, ok := s.llmClient.(llm.StreamCompleter); ok {
@@ -449,16 +522,18 @@ func (s *Server) synthesize(ctx context.Context, w http.ResponseWriter, flusher 
 			answerBuilder.WriteString(delta)
 			_ = writeSSEEvent(w, flusher, "token", askTokenPayload{Text: delta})
 		})
+		text := answerBuilder.String()
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				slog.Info("ask: client disconnected during synthesis", "error", err)
-				return "", answerBuilder.String()
+				return "", text, unverifiedReportOrNil(text, manifest)
 			}
 			slog.Error("ask: streaming synthesis failed", "error", err)
 			_ = writeSSEEvent(w, flusher, "error", askErrorPayload{Message: "synthesis failed"})
-			return "error", answerBuilder.String()
+			return "error", text, unverifiedReportOrNil(text, manifest)
 		}
-		return "stop", answerBuilder.String()
+		validated := validateAskCitations(text, manifest)
+		return "stop", text, &validated
 	}
 
 	// Fallback for a Completer that does not implement StreamCompleter
@@ -468,14 +543,28 @@ func (s *Server) synthesize(ctx context.Context, w http.ResponseWriter, flusher 
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			slog.Info("ask: client disconnected during synthesis", "error", err)
-			return "", ""
+			return "", "", nil
 		}
 		slog.Error("ask: synthesis failed", "error", err)
 		_ = writeSSEEvent(w, flusher, "error", askErrorPayload{Message: "synthesis failed"})
-		return "error", ""
+		return "error", "", nil
 	}
 	_ = writeSSEEvent(w, flusher, "token", askTokenPayload{Text: full})
-	return "stop", full
+	validated := validateAskCitations(full, manifest)
+	return "stop", full, &validated
+}
+
+// unverifiedReportOrNil is synthesize's helper for its two "did not finish
+// cleanly" branches: nil when there is no text at all (nothing was
+// produced, so there is nothing to mark unverified — matches askHandler's
+// own "an empty partial answer is not worth a turn_index" rule), otherwise
+// an askCitationUnverified report.
+func unverifiedReportOrNil(text string, manifest askPromptManifest) *askCitationReport {
+	if text == "" {
+		return nil
+	}
+	r := unverifiedAskCitationReport(manifest)
+	return &r
 }
 
 // buildAskMessages assembles the multi-turn prompt for Stage 3.
@@ -500,5 +589,10 @@ func (s *Server) synthesize(ctx context.Context, w http.ResponseWriter, flusher 
 // says — the second half of the date-context fix (see buildAskSystemPrompt
 // for the first half, "what day is today").
 func buildAskMessages(question string, result RetrievalResult, history []askHistoryTurn) []llm.Message {
-	return buildBudgetedAskMessages(question, result, history)
+	// excerptQuery == question: this wrapper has no separate
+	// standalone-rewrite input to offer (see buildBudgetedAskMessages'
+	// excerptQuery doc comment) — the only production caller, synthesize,
+	// calls buildBudgetedAskMessages directly with searchQuestion instead.
+	messages, _ := buildBudgetedAskMessages(question, question, result, history)
+	return messages
 }

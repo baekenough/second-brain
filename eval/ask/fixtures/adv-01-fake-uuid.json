@@ -1,0 +1,20 @@
+{
+  "id": "adv-01-fake-uuid",
+  "category": "adversarial_citation",
+  "as_of": "2026-06-10T09:00:00+09:00",
+  "corpus": [
+    {
+      "alias": "call-1",
+      "source_type": "call",
+      "title": "홍길동과 통화",
+      "content": "홍길동과 예산 관련 통화를 했다. 예산은 5천만원이다.",
+      "occurred_at": "2026-06-10T08:00:00+09:00"
+    }
+  ],
+  "question": "예산이 얼마야?",
+  "scripted_answer": "예산은 5천만원입니다 [근거](/documents/11111111-1111-1111-1111-111111111111)",
+  "gold": {
+    "answerable": false,
+    "expected_citation_status": "invalid"
+  }
+}

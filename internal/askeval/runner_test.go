@@ -1,0 +1,494 @@
+package askeval
+
+import (
+	"context"
+	"math"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+// fixturesDir locates eval/ask/fixtures relative to this test file, so the
+// test works regardless of the working directory `go test` is invoked
+// from (module root, package dir, or CI runner). No network, no database:
+// every dependency this test exercises (search.Service, api.Server) is
+// backed by this package's own in-memory fakes (corpus.go, llm.go,
+// runner.go's memSessions) — see this file's doc comment for the CI-safety
+// contract the whole package maintains.
+func fixturesDir(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("askeval: runtime.Caller failed")
+	}
+	// internal/askeval/runner_test.go -> repo root -> eval/ask/fixtures
+	return filepath.Join(filepath.Dir(file), "..", "..", "eval", "ask", "fixtures")
+}
+
+// wantCategoryCounts is the fixture mix this repository commits under
+// eval/ask/fixtures (deep-plan #266 §4's "fixture mix" requirement,
+// >=30 total). A category count changing here on purpose is expected and
+// fine; this test exists to catch an ACCIDENTAL drop, not to freeze the
+// mix forever.
+//
+// no_evidence/irrelevant_evidence each carry 2 fabrication-detection
+// self-tests (ne-04/05, ie-04/05 — see TestRun_DistinguishesFabricatedAnswers)
+// on top of their original 3 natural-abstention fixtures each (deep-verify
+// #266 HIGH finding).
+var wantCategoryCounts = map[string]int{
+	"single_turn":              6,
+	"korean_followup":          5,
+	"period_source_filter":     5,
+	"call_transcript_mid_late": 6,
+	"conflicting_sources":      3,
+	"no_evidence":              5,
+	"irrelevant_evidence":      5,
+	"adversarial_citation":     4,
+	"document_injection":       1,
+}
+
+func TestLoad_FixtureSetShape(t *testing.T) {
+	fixtures, err := Load(fixturesDir(t))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	const wantTotal = 30
+	if len(fixtures) < wantTotal {
+		t.Fatalf("want >= %d fixtures, got %d", wantTotal, len(fixtures))
+	}
+
+	got := map[string]int{}
+	for _, f := range fixtures {
+		got[f.Category]++
+	}
+	for cat, want := range wantCategoryCounts {
+		if got[cat] != want {
+			t.Errorf("category %q: want %d fixtures, got %d", cat, want, got[cat])
+		}
+	}
+	for cat, n := range got {
+		if _, known := wantCategoryCounts[cat]; !known {
+			t.Errorf("unexpected category %q with %d fixtures (add it to wantCategoryCounts)", cat, n)
+		}
+	}
+}
+
+func TestLoad_RejectsDuplicateID(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureFile(t, dir, "a.json", `{
+		"id": "dup", "category": "single_turn", "as_of": "2026-06-10T09:00:00+09:00",
+		"corpus": [{"alias": "d1", "source_type": "note", "title": "t", "content": "c"}],
+		"question": "q?", "gold": {"answerable": false}
+	}`)
+	writeFixtureFile(t, dir, "b.json", `{
+		"id": "dup", "category": "single_turn", "as_of": "2026-06-10T09:00:00+09:00",
+		"corpus": [{"alias": "d1", "source_type": "note", "title": "t", "content": "c"}],
+		"question": "q?", "gold": {"answerable": false}
+	}`)
+	if _, err := Load(dir); err == nil {
+		t.Fatal("want error for duplicate fixture id, got nil")
+	}
+}
+
+func writeFixtureFile(t *testing.T, dir, name, content string) {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// TestRun_FullFixtureSet_Baseline is the CI-safe end-to-end run: every
+// committed fixture goes through the REAL /ask handler (runner.go).
+//
+// Historical note: the five call_transcript_mid_late fixtures used to be a
+// KNOWN, committed baseline failure (RetrievalHit=true, ContextHit=false —
+// issue #266's finding) because buildBudgetedAskMessages always fell back
+// to askPassage's document-head lexical window, discarding whatever a chunk
+// lane had actually matched. Issue #267 (matched-chunk evidence
+// propagation) fixed the underlying pipeline gap; see
+// TestRun_CallTranscriptMidLate_MatchedChunkEvidence for the dedicated
+// regression test and docs/ask-evaluation-protocol.md for the full
+// before/after derivation. The whole fixture set is expected to pass now.
+func TestRun_FullFixtureSet_Baseline(t *testing.T) {
+	fixtures, err := Load(fixturesDir(t))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	results := Run(context.Background(), fixtures, DefaultRunOptions())
+	if len(results) != len(fixtures) {
+		t.Fatalf("want %d results, got %d", len(fixtures), len(results))
+	}
+
+	var harnessErrors, unexpectedFailures []string
+	for _, r := range results {
+		if r.Err != nil {
+			harnessErrors = append(harnessErrors, r.Fixture.ID+": "+r.Err.Error())
+			continue
+		}
+		if !r.Metrics.Pass {
+			unexpectedFailures = append(unexpectedFailures, r.Fixture.ID)
+		}
+	}
+	if len(harnessErrors) > 0 {
+		t.Errorf("harness errors (fixture/config bugs, not pipeline findings): %v", harnessErrors)
+	}
+	if len(unexpectedFailures) > 0 {
+		t.Errorf("unexpected failures (every committed fixture is expected to pass — issue #267): %v", unexpectedFailures)
+	}
+}
+
+// TestRun_CallTranscriptMidLate_MatchedChunkEvidence pins issue #267's
+// specific improvement: each call_transcript_mid_late fixture's gold fact
+// sits in a LATE chunk of a long document, phrased with vocabulary the
+// document itself never uses literally (a paraphrase, or — for ctm-04/
+// ctm-05 — a Korean pronoun follow-up whose standalone-rewritten question
+// paraphrases too). A lexical-only excerpt heuristic (askPassage, the
+// pre-#267 behaviour) cannot locate that fact at all; only #267's chunk-lane
+// evidence propagation (the fake vector lane's semantic_aliases-folded
+// similarity finding the correct chunk, then mergeRRFMode/evidencePassage
+// carrying that match through to the synthesis prompt) can. See
+// fixture.go's Fixture.SemanticAliases doc comment and
+// docs/ask-evaluation-protocol.md's "semantic_aliases" section for why a
+// naive question rewrite alone would not discriminate pre-#267 from
+// post-#267 behaviour here.
+//
+// ctm-06 additionally pins the #267 follow-up fix: its gold fact is the
+// LITERAL LAST byte of its document (no trailing wrap-up sentence, unlike
+// ctm-01–ctm-05 — see docs/ask-evaluation-protocol.md's "Why the tail needs
+// trailing text" section), so it regression-guards windowAround's
+// reserve-markers-before-sizing invariant in internal/api/ask_context.go
+// directly, not just the chunk-evidence propagation ctm-01–ctm-05 cover.
+func TestRun_CallTranscriptMidLate_MatchedChunkEvidence(t *testing.T) {
+	fixtures, err := Load(fixturesDir(t))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	var ctm []Fixture
+	for _, f := range fixtures {
+		if f.Category == "call_transcript_mid_late" {
+			ctm = append(ctm, f)
+		}
+	}
+	if len(ctm) != 6 {
+		t.Fatalf("want 6 call_transcript_mid_late fixtures, got %d", len(ctm))
+	}
+	results := Run(context.Background(), ctm, DefaultRunOptions())
+	for _, r := range results {
+		if r.Err != nil {
+			t.Fatalf("%s: run error: %v", r.Fixture.ID, r.Err)
+		}
+		if !boolVal(r.Metrics.RetrievalHit) {
+			t.Errorf("%s: want retrieval_hit=true (the document must be found)", r.Fixture.ID)
+		}
+		if !boolVal(r.Metrics.ContextHit) {
+			t.Errorf("%s: want context_hit=true (the late chunk's evidence must reach the synthesis prompt)", r.Fixture.ID)
+		}
+		if !boolVal(r.Metrics.AnswerCorrect) {
+			t.Errorf("%s: want answer_correct=true, got answer=%q", r.Fixture.ID, r.RawAnswer)
+		}
+		if r.Metrics.CitationStatus != "valid" {
+			t.Errorf("%s: want citation_status=valid, got %q", r.Fixture.ID, r.Metrics.CitationStatus)
+		}
+		if !r.Metrics.Pass {
+			t.Errorf("%s: want pass=true", r.Fixture.ID)
+		}
+	}
+}
+
+// TestRun_DeterministicRepeat re-runs the full fixture set and requires
+// byte-identical answers and metrics — issue #266 completion criteria
+// ("결정론 검사를 먼저 하고"): a scripted, offline run must never flap.
+func TestRun_DeterministicRepeat(t *testing.T) {
+	fixtures, err := Load(fixturesDir(t))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	first := Run(context.Background(), fixtures, DefaultRunOptions())
+	second := Run(context.Background(), fixtures, DefaultRunOptions())
+	if len(first) != len(second) {
+		t.Fatalf("result count changed between runs: %d vs %d", len(first), len(second))
+	}
+	for i := range first {
+		a, b := first[i], second[i]
+		if a.Fixture.ID != b.Fixture.ID {
+			t.Fatalf("result order changed at index %d: %s vs %s", i, a.Fixture.ID, b.Fixture.ID)
+		}
+		if a.RawAnswer != b.RawAnswer {
+			t.Errorf("%s: answer text differs between runs: %q vs %q", a.Fixture.ID, a.RawAnswer, b.RawAnswer)
+		}
+		if a.FinishReason != b.FinishReason {
+			t.Errorf("%s: finish_reason differs between runs: %q vs %q", a.Fixture.ID, a.FinishReason, b.FinishReason)
+		}
+		// LatencyMS is intentionally excluded from this comparison — wall-clock
+		// timing is the one field this runner never claims is deterministic.
+		am, bm := a.Metrics, b.Metrics
+		am.LatencyMS, bm.LatencyMS = nil, nil
+		if !reflect.DeepEqual(am, bm) {
+			t.Errorf("%s: metrics differ between runs:\n  run1=%+v\n  run2=%+v", a.Fixture.ID, am, bm)
+		}
+	}
+}
+
+// TestRun_DistinguishesAdversarialCitationShapes asserts, per fixture, that
+// the real issue #268 validator reached the SPECIFIC verdict that fixture
+// exists to provoke — this is the "존재하지 않는 인용, 무관한 근거, 허위
+// 단정, 정상 보류를 fixture로 구별한다" completion criterion, checked
+// directly rather than inferred from the aggregate Pass rollup.
+func TestRun_DistinguishesAdversarialCitationShapes(t *testing.T) {
+	fixtures, err := Load(fixturesDir(t))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	byID := map[string]Fixture{}
+	for _, f := range fixtures {
+		byID[f.ID] = f
+	}
+	cases := []struct {
+		id           string
+		wantStatus   string
+		wantInferred bool
+	}{
+		{"adv-01-fake-uuid", "invalid", false},
+		{"adv-02-malformed-link", "invalid", false},
+		{"adv-03-unknown-real-id", "invalid", false},
+		{"adv-04-inferred-as-fact", "valid", true},
+		{"adv-05-document-injection", "invalid", false},
+	}
+	for _, c := range cases {
+		f, ok := byID[c.id]
+		if !ok {
+			t.Fatalf("fixture %s not found in %s", c.id, fixturesDir(t))
+		}
+		r := Run(context.Background(), []Fixture{f}, DefaultRunOptions())[0]
+		if r.Err != nil {
+			t.Fatalf("%s: run error: %v", c.id, r.Err)
+		}
+		if r.Metrics.CitationStatus != c.wantStatus {
+			t.Errorf("%s: want citation_status=%q, got %q (verification=%+v)", c.id, c.wantStatus, r.Metrics.CitationStatus, r.Verification)
+		}
+		if r.Metrics.InferredCited != c.wantInferred {
+			t.Errorf("%s: want inferred_cited=%v, got %v", c.id, c.wantInferred, r.Metrics.InferredCited)
+		}
+		if !r.Metrics.Pass {
+			t.Errorf("%s: want Pass=true (the validator reaching the provoked verdict IS the pass condition)", c.id)
+		}
+	}
+}
+
+// TestRun_AbstentionCases asserts every NATURAL (oracle-driven, no
+// ScriptedAnswer) no_evidence/irrelevant_evidence fixture abstains rather
+// than fabricating an answer — the "정상 보류" (correct abstention)
+// counterpart to the adversarial-citation test above.
+//
+// A fixture whose ScriptedAnswer is set is deliberately excluded here: those
+// exist specifically to FORCE a non-abstaining, fabricated answer past the
+// oracle (see TestRun_DistinguishesFabricatedAnswers below) — asserting
+// AbstainedCorrectly==true on THOSE would contradict the very thing they
+// were built to prove the harness catches.
+func TestRun_AbstentionCases(t *testing.T) {
+	fixtures, err := Load(fixturesDir(t))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for _, f := range fixtures {
+		if f.Category != "no_evidence" && f.Category != "irrelevant_evidence" {
+			continue
+		}
+		if f.ScriptedAnswer != "" {
+			continue
+		}
+		r := Run(context.Background(), []Fixture{f}, DefaultRunOptions())[0]
+		if r.Err != nil {
+			t.Fatalf("%s: run error: %v", f.ID, r.Err)
+		}
+		if !r.Metrics.AbstainedCorrectly {
+			t.Errorf("%s (%s): want AbstainedCorrectly=true, got finish_reason=%q citation_status=%q",
+				f.ID, f.Category, r.FinishReason, r.Metrics.CitationStatus)
+		}
+		if r.RawAnswer != "" && r.FinishReason == "stop" && r.Metrics.CitationStatus != "abstained" {
+			t.Errorf("%s: produced a non-abstention answer for an unanswerable fixture: %q", f.ID, r.RawAnswer)
+		}
+	}
+}
+
+// TestRun_DistinguishesFabricatedAnswers asserts, per fabrication-detection
+// self-test fixture (ne-04/05, ie-04/05), that CaseMetrics.FabricatedAnswer
+// fires and that the fixture's own Pass rollup is true — mirroring
+// TestRun_DistinguishesAdversarialCitationShapes' framing: the PASSING
+// outcome for these fixtures is that the harness's own detector catches the
+// forced fabrication, not that the (scripted) answer succeeds.
+//
+// Before deep-verify #266's HIGH finding, no_evidence/irrelevant_evidence
+// fixtures could never fail at all: scriptedCompleter's default oracle
+// (llm.go's synthesize) always returns the fixed abstention phrase whenever
+// Gold.SupportSpans is empty — true for every such fixture — so nothing ever
+// exercised "the pipeline answered anyway" at all, regardless of what the
+// real prompt contained. ScriptedAnswer bypasses the oracle to force exactly
+// that path deterministically.
+//
+// ie-04 exercises the sharpest edge of this gap: its corpus document IS
+// topically close enough to be retrieved and shown to synthesis (see
+// corpus.go's lexicalScore — "프로젝트"/"예산" overlap with the question), so
+// citing its own real document ID reaches citation_status "valid" — the
+// fact stated is still wrong (a different project's budget), but issue
+// #268's validator only proves a cited ID was actually shown to the model,
+// never that the cited passage supports the specific claim next to it
+// (askClaimSupport's own doc comment, internal/api/ask_citation.go). ne-04
+// reaches the same "valid" verdict for an unrelated reason: its single-doc
+// corpus scores nonzero purely from character-bigram noise (this fake
+// lexical scorer's own imprecision — real retrieval would not have
+// surfaced it), so it too ends up shown and cited "validly". Both cases
+// show why FabricatedAnswer is deliberately independent of CitationStatus:
+// it fires on "answerable=false but a non-abstaining, cited answer was
+// produced", not on citation validity — ne-05/ie-05 (a completely
+// unresolvable {{fake}} ID) cover the "invalid" half of the same detector.
+func TestRun_DistinguishesFabricatedAnswers(t *testing.T) {
+	fixtures, err := Load(fixturesDir(t))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	byID := map[string]Fixture{}
+	for _, f := range fixtures {
+		byID[f.ID] = f
+	}
+	cases := []struct {
+		id                 string
+		wantCitationStatus string
+	}{
+		// ne-04's corpus doc is unrelated but still lexically nonzero-
+		// scoring for its question (bigram noise — see corpus.go's
+		// lexicalScore), so it IS retrieved and shown; citing its real ID
+		// reaches "valid". FabricatedAnswer must still fire regardless —
+		// see this test's doc comment.
+		{"ne-04-fabricated-real-doc-citation", "valid"},
+		{"ne-05-fabricated-fake-id-citation", "invalid"},
+		{"ie-04-fabricated-real-doc-citation", "valid"},
+		{"ie-05-fabricated-fake-id-citation", "invalid"},
+	}
+	for _, c := range cases {
+		f, ok := byID[c.id]
+		if !ok {
+			t.Fatalf("fixture %s not found in %s", c.id, fixturesDir(t))
+		}
+		if f.ScriptedAnswer == "" {
+			t.Fatalf("%s: expected a scripted_answer (fabrication self-test)", c.id)
+		}
+		r := Run(context.Background(), []Fixture{f}, DefaultRunOptions())[0]
+		if r.Err != nil {
+			t.Fatalf("%s: run error: %v", c.id, r.Err)
+		}
+		if r.Metrics.AbstainedCorrectly {
+			t.Errorf("%s: want AbstainedCorrectly=false (the scripted answer must not abstain), got true", c.id)
+		}
+		if !r.Metrics.FabricatedAnswer {
+			t.Errorf("%s: want FabricatedAnswer=true, got false (verification=%+v)", c.id, r.Verification)
+		}
+		if r.Metrics.CitationStatus != c.wantCitationStatus {
+			t.Errorf("%s: want citation_status=%q, got %q", c.id, c.wantCitationStatus, r.Metrics.CitationStatus)
+		}
+		if !r.Metrics.Pass {
+			t.Errorf("%s: want Pass=true (the harness catching the fabrication IS the pass condition)", c.id)
+		}
+	}
+}
+
+// boolVal returns the value of p, or false when p is nil (a CaseMetrics
+// *bool field that does not apply to the fixture's shape — see
+// CaseMetrics.RetrievalHit's doc comment).
+func boolVal(p *bool) bool { return p != nil && *p }
+
+// wantCTMVectorMargin is the minimum required gap between the gold chunk's
+// fake-vector cosine score (hashedEmbedder/corpus.chunkVector — see
+// corpus.go) and the next-best-scoring chunk of the SAME document, per
+// call_transcript_mid_late fixture. This is deep-verify #266's MEDIUM
+// finding: ctm-06's original margin (~0.007, 0.3818 vs 0.3748) was fragile
+// enough that an unrelated hashEmbed/semanticAliasFold change — or even a
+// single extra hash collision — could silently flip which chunk the fake
+// vector lane ranks first, without any test failing to say so.
+//
+// ctm-06 was re-authored for this finding specifically: its head/tail were
+// rebalanced (short, signal-dense tail; longer, topically-neutral head) so
+// its margin is now ~0.28, comfortably over the requested >=0.02 floor.
+//
+// ctm-01/02/03/04/05 are UNCHANGED — re-authoring them is out of this
+// fixture's scope (only ctm-06 was flagged). Measured at HEAD:
+// ctm-01=0.0041, ctm-02=0.0068, ctm-03=0.0019, ctm-04=0.0099,
+// ctm-05=0.0098 — all comfortably positive today, but far more fragile than
+// ctm-06's new margin. Their floors below are set with a buffer UNDER the
+// currently measured value (not an arbitrary target) so this test still
+// fails loudly — with the fixture ID and both scores in the message — if a
+// future change erodes them further or flips the ranking, without silently
+// demanding the same >=0.02 bar this fix only earned for ctm-06.
+var wantCTMVectorMargin = map[string]float64{
+	"ctm-01-deadline":        0.002,
+	"ctm-02-budget-final":    0.003,
+	"ctm-03-venue-change":    0.0008,
+	"ctm-04-headcount":       0.005,
+	"ctm-05-renewal-date":    0.005,
+	"ctm-06-tail-conclusion": 0.02,
+}
+
+// TestRun_CTMFakeVectorMargin computes, for every call_transcript_mid_late
+// fixture, the SAME cosine-similarity comparison the real chunk-vector lane
+// makes at request time (corpus.go's hashedEmbedder + corpus.chunkVector),
+// directly — not through the full /ask handler — so this test isolates the
+// fake embedder's own ranking margin from every other moving part of the
+// pipeline (excerpt budget, citation validation, etc., all already covered
+// by TestRun_CallTranscriptMidLate_MatchedChunkEvidence).
+func TestRun_CTMFakeVectorMargin(t *testing.T) {
+	fixtures, err := Load(fixturesDir(t))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for _, f := range fixtures {
+		if f.Category != "call_transcript_mid_late" {
+			continue
+		}
+		floor, known := wantCTMVectorMargin[f.ID]
+		if !known {
+			t.Errorf("%s: no wantCTMVectorMargin floor registered (add one for every call_transcript_mid_late fixture)", f.ID)
+			continue
+		}
+		if len(f.Gold.SupportSpans) == 0 {
+			t.Fatalf("%s: gold.support_spans is empty, cannot locate the gold chunk", f.ID)
+		}
+		asOf, err := time.Parse(time.RFC3339, f.AsOf)
+		if err != nil {
+			t.Fatalf("%s: as_of: %v", f.ID, err)
+		}
+		cp, err := buildCorpus(f, asOf)
+		if err != nil {
+			t.Fatalf("%s: buildCorpus: %v", f.ID, err)
+		}
+		qvec := hashEmbed(cp.semanticFold(f.Question))
+
+		var goldScore float64
+		var goldFound bool
+		runnerUp := math.Inf(-1)
+		for _, ch := range cp.allChunks {
+			score := cosineSim(qvec, hashEmbed(cp.semanticFold(ch.Content)))
+			if strings.Contains(ch.Content, f.Gold.SupportSpans[0]) {
+				goldScore = score
+				goldFound = true
+				continue
+			}
+			if score > runnerUp {
+				runnerUp = score
+			}
+		}
+		if !goldFound {
+			t.Fatalf("%s: gold.support_spans[0] not found in any chunk of the fixture's own document (fixture-authoring bug)", f.ID)
+		}
+
+		margin := goldScore - runnerUp
+		if margin < floor {
+			t.Errorf("%s: fake-vector margin (gold - runner_up) = %.6f, want >= %.6f (gold=%.6f runner_up=%.6f) — the chunk-vector lane's ranking signal for this fixture has eroded; re-widen the fixture content or deliberately lower this floor",
+				f.ID, margin, floor, goldScore, runnerUp)
+		}
+	}
+}

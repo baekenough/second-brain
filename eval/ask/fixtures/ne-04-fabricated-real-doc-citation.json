@@ -1,0 +1,19 @@
+{
+  "id": "ne-04-fabricated-real-doc-citation",
+  "category": "no_evidence",
+  "as_of": "2026-06-10T09:00:00+09:00",
+  "corpus": [
+    {
+      "alias": "unrelated-4",
+      "source_type": "gmail",
+      "title": "회식 공지",
+      "content": "이번 주 금요일 저녁 회식이 있습니다.",
+      "occurred_at": "2026-06-08T09:00:00+09:00"
+    }
+  ],
+  "question": "화성 이주 프로젝트 예산이 얼마야?",
+  "scripted_answer": "화성 이주 프로젝트 예산은 5천만원입니다 [근거](/documents/{{doc:unrelated-4}})",
+  "gold": {
+    "answerable": false
+  }
+}

@@ -61,14 +61,18 @@ type askConversationSummary struct {
 // GET /api/v1/ask/conversations/{id} response body: a full turn, including
 // its sources (unlike askConversationSummary, which omits them — the list
 // view does not need per-conversation evidence, only the detail view does).
+// Verification mirrors the "done" SSE event's same-named field (ask.go) —
+// omitempty for the same reasons: a no_evidence turn or a pre-migration-039
+// row has none (see store.AskSession.Verification's doc comment).
 type askConversationTurn struct {
-	ID           string          `json:"id"`
-	TurnIndex    int             `json:"turn_index"`
-	Question     string          `json:"question"`
-	Answer       string          `json:"answer"`
-	FinishReason string          `json:"finish_reason"`
-	Sources      []AskSourceItem `json:"sources"`
-	CreatedAt    time.Time       `json:"created_at"`
+	ID           string                  `json:"id"`
+	TurnIndex    int                     `json:"turn_index"`
+	Question     string                  `json:"question"`
+	Answer       string                  `json:"answer"`
+	FinishReason string                  `json:"finish_reason"`
+	Sources      []AskSourceItem         `json:"sources"`
+	Verification *askVerificationPayload `json:"verification,omitempty"`
+	CreatedAt    time.Time               `json:"created_at"`
 }
 
 func toAskConversationSummary(session store.AskSession) askConversationSummary {
@@ -90,7 +94,30 @@ func toAskConversationTurn(session store.AskSession) askConversationTurn {
 		Answer:       session.Answer,
 		FinishReason: session.FinishReason,
 		Sources:      toAskSourceItems(session.Sources),
+		Verification: toAskVerificationPayload(session.Verification),
 		CreatedAt:    session.CreatedAt,
+	}
+}
+
+// toAskVerificationPayload converts store.AskCitationVerification
+// (persistence shape) to askVerificationPayload (wire shape) — the two are
+// structurally identical (both already store string-form IDs, unlike
+// AskSource/AskSourceItem's *time.Time field), but kept as distinct types
+// per package for the same layering reason as toAskSourceItems. Returns nil
+// for a nil input so the "verification" key stays omitted rather than
+// becoming a JSON null.
+func toAskVerificationPayload(v *store.AskCitationVerification) *askVerificationPayload {
+	if v == nil {
+		return nil
+	}
+	return &askVerificationPayload{
+		CitationStatus:    v.CitationStatus,
+		CitedIDs:          v.CitedIDs,
+		UnknownIDs:        v.UnknownIDs,
+		MalformedLinks:    v.MalformedLinks,
+		InferredCitedIDs:  v.InferredCitedIDs,
+		PromptEvidenceIDs: v.PromptEvidenceIDs,
+		ClaimSupport:      v.ClaimSupport,
 	}
 }
 
