@@ -280,6 +280,52 @@ func (s *ChunkStore) ListByDocument(ctx context.Context, documentID uuid.UUID) (
 	return chunks, nil
 }
 
+// ListByDocuments 는 여러 문서의 청크를 한 번의 왕복으로 읽는다. 반환 컬럼과
+// 문서 내 정렬(chunk_index 오름차순)은 ListByDocument 와 같다 — 리랭크 입력
+// 선택(search.bestChunkText)이 동점일 때 인덱스가 작은 청크를 고르는 규칙이
+// 이 순서에 기대므로, 두 경로의 순서가 달라지면 같은 질의의 순위가 바뀐다.
+//
+// 청크가 하나도 없는 문서는 맵에 키 자체가 없다(빈 슬라이스로 채우지 않는다).
+// ids 가 비어 있으면 DB 를 건드리지 않고 빈 맵을 돌려준다. 중복 ID 는 ANY 가
+// 알아서 한 번만 매칭하므로 호출자가 미리 걸러 둘 필요는 없다.
+func (s *ChunkStore) ListByDocuments(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID][]Chunk, error) {
+	out := make(map[uuid.UUID][]Chunk, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+
+	const q = `
+		SELECT id, document_id, chunk_index, content, byte_size, created_at
+		FROM chunks
+		WHERE document_id = ANY($1::uuid[])
+		ORDER BY document_id, chunk_index ASC`
+
+	rows, err := s.pg.pool.Query(ctx, q, ids)
+	if err != nil {
+		return nil, fmt.Errorf("chunks list by documents (%d ids): %w", len(ids), err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var c Chunk
+		if err := rows.Scan(
+			&c.ID,
+			&c.DocumentID,
+			&c.ChunkIndex,
+			&c.Content,
+			&c.ByteSize,
+			&c.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("chunks list by documents scan: %w", err)
+		}
+		out[c.DocumentID] = append(out[c.DocumentID], c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("chunks list by documents iter: %w", err)
+	}
+	return out, nil
+}
+
 // ChunkEmbedding pairs a chunk ID with its embedding vector.
 // Used by UpdateChunkEmbeddings for batch persistence.
 type ChunkEmbedding struct {
