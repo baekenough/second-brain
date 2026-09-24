@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/baekenough/second-brain/internal/config"
+	"github.com/baekenough/second-brain/internal/evaldump"
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/search"
@@ -465,7 +466,20 @@ func run() error {
 			return fmt.Errorf("eval: dump label facts: %w", ferr)
 		}
 		enrichDiagnostics(evaluated.Diagnostics, facts)
-		if werr := writeDiagnostics(*dumpPath, evaluated.Diagnostics); werr != nil {
+		attachQueryMetrics(evaluated.Diagnostics, evaluated.Latencies)
+		header := evaldump.Header{
+			DumpVersion:  evaldump.SchemaVersion,
+			LabelHash:    labelHash,
+			ConfigHash:   configHash,
+			CodeRevision: revision,
+			Attempted:    evaluated.Attempted,
+			Failed:       evaluated.Failed,
+			LabelSource:  map[bool]string{true: "golden-user", false: "feedback"}[*useGolden],
+			Split:        *split,
+			WindowMode:   *windowMode,
+			CreatedAt:    time.Now().UTC().Format(time.RFC3339),
+		}
+		if werr := writeDiagnostics(*dumpPath, header, evaluated.Diagnostics); werr != nil {
 			return werr
 		}
 		slog.Info("eval: diagnostics written", "path", *dumpPath, "queries", len(evaluated.Diagnostics))

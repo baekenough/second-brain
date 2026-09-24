@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/baekenough/second-brain/internal/evaldump"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
@@ -96,8 +98,13 @@ func TestDumpFileCarriesNoQueryOrDocumentText(t *testing.T) {
 		labelDocID.String(): {Found: true, Status: "active", SourceType: "call", Retention: "keep", OccurredAt: &occurred},
 	})
 
+	attachQueryMetrics(evaluated.Diagnostics, evaluated.Latencies)
 	path := filepath.Join(t.TempDir(), "dump.jsonl")
-	if err := writeDiagnostics(path, evaluated.Diagnostics); err != nil {
+	header := evaldump.Header{
+		DumpVersion: evaldump.SchemaVersion, LabelHash: "lh", ConfigHash: "ch", CodeRevision: "rev",
+		Attempted: 1, Failed: 0, LabelSource: "golden-user", Split: "all", WindowMode: "none",
+	}
+	if err := writeDiagnostics(path, header, evaluated.Diagnostics); err != nil {
 		t.Fatalf("writeDiagnostics: %v", err)
 	}
 	raw, err := os.ReadFile(path)
@@ -118,18 +125,42 @@ func TestDumpFileCarriesNoQueryOrDocumentText(t *testing.T) {
 		t.Fatalf("dump mode = %v, want %v", info.Mode().Perm(), dumpFileMode)
 	}
 
-	// 파일은 JSON Lines 다 — 한 줄에 한 질의.
+	// 파일은 JSON Lines 다 — 1 번째 줄은 헤더, 그다음 한 줄에 한 질의.
 	scanner := bufio.NewScanner(strings.NewReader(string(raw)))
-	lines := 0
-	var diag queryDiagnostics
+	var lines [][]byte
 	for scanner.Scan() {
-		lines++
-		if err := json.Unmarshal(scanner.Bytes(), &diag); err != nil {
-			t.Fatalf("line %d is not JSON: %v", lines, err)
-		}
+		line := append([]byte(nil), scanner.Bytes()...)
+		lines = append(lines, line)
 	}
-	if lines != 1 {
-		t.Fatalf("dump has %d lines, want 1", lines)
+	if len(lines) != 2 {
+		t.Fatalf("dump has %d lines, want 2 (header + 1 query row)", len(lines))
+	}
+	var gotHeader evaldump.Header
+	if err := json.Unmarshal(lines[0], &gotHeader); err != nil {
+		t.Fatalf("line 1 is not a valid header: %v", err)
+	}
+	if gotHeader.Kind != "header" || gotHeader.DumpVersion != evaldump.SchemaVersion {
+		t.Fatalf("header shape wrong: %+v", gotHeader)
+	}
+	if gotHeader.LabelHash != "lh" || gotHeader.ConfigHash != "ch" || gotHeader.CodeRevision != "rev" {
+		t.Fatalf("header provenance lost: %+v", gotHeader)
+	}
+
+	var diag queryDiagnostics
+	if err := json.Unmarshal(lines[1], &diag); err != nil {
+		t.Fatalf("line 2 is not a valid query row: %v", err)
+	}
+	if diag.Kind != "query" {
+		t.Fatalf("row kind = %q, want %q", diag.Kind, "query")
+	}
+	if diag.LatencyMs == nil {
+		t.Fatal("latency_ms was not attached")
+	}
+	if diag.NDCG10 == nil || diag.Recall10 == nil {
+		t.Fatalf("ndcg10/recall10 must be set for a query with positive labels: %+v", diag)
+	}
+	if diag.FP10 == nil || *diag.FP10 != diag.NegativeInTop10 {
+		t.Fatalf("fp10 = %v, want mirror of negative_ids_in_top10 = %d", diag.FP10, diag.NegativeInTop10)
 	}
 
 	if diag.QueryID != "aaaaaaaa-0000-0000-0000-000000000001" || diag.QuerySource != "seed" {
@@ -213,5 +244,93 @@ func TestFeedbackPairGetsStablePseudonymousQueryID(t *testing.T) {
 	}
 	if got := diagnosticQuerySource(pair); got != "feedback" {
 		t.Fatalf("query_source = %q, want feedback", got)
+	}
+}
+
+// 정답 라벨이 없는 질의는 ndcg10/recall10 이 0 이 아니라 null 로 남아야 한다 —
+// "잴 대상 없음"과 "쟀더니 0 점"은 다른 사실이다. fp10 은 라벨과 무관하게
+// 항상 채워진다.
+func TestAttachQueryMetricsLeavesNDCGNullWithoutPositives(t *testing.T) {
+	diags := []queryDiagnostics{
+		{Top10IDs: []string{"a", "b"}, RelevantDocIDs: nil, NegativeInTop10: 2},
+	}
+	attachQueryMetrics(diags, []float64{7.5})
+	if diags[0].Kind != "query" {
+		t.Fatalf("kind = %q, want query", diags[0].Kind)
+	}
+	if diags[0].LatencyMs == nil || *diags[0].LatencyMs != 7.5 {
+		t.Fatalf("latency_ms = %v, want 7.5", diags[0].LatencyMs)
+	}
+	if diags[0].NDCG10 != nil || diags[0].Recall10 != nil {
+		t.Fatalf("ndcg10/recall10 must stay nil without positives, got ndcg10=%v recall10=%v",
+			diags[0].NDCG10, diags[0].Recall10)
+	}
+	if diags[0].FP10 == nil || *diags[0].FP10 != 2 {
+		t.Fatalf("fp10 = %v, want 2", diags[0].FP10)
+	}
+}
+
+// NDCG10 은 search.NDCGK 를 직접 호출해 만든다 — Aggregate 가 macro-average 를
+// 낼 때 쓰는 것과 같은 함수다. 이 테스트는 그 값이 손으로 계산한 값과
+// 일치하는지, 그리고 Recall10 이 |rel ∩ top10| / |rel| 인지 확인한다.
+func TestAttachQueryMetricsComputesNDCGAndRecall(t *testing.T) {
+	diags := []queryDiagnostics{
+		// top10 = [x, rel1, y, rel2]; rel = {rel1, rel2, rel3(미회수)}.
+		{Top10IDs: []string{"x", "rel1", "y", "rel2"}, RelevantDocIDs: []string{"rel1", "rel2", "rel3"}},
+	}
+	attachQueryMetrics(diags, []float64{1})
+
+	wantDCG := 1/math.Log2(3) + 1/math.Log2(5) // rel1 at rank 2, rel2 at rank 4
+	wantIDCG := 1/math.Log2(2) + 1/math.Log2(3) + 1/math.Log2(4)
+	wantNDCG := wantDCG / wantIDCG
+	if diags[0].NDCG10 == nil || math.Abs(*diags[0].NDCG10-wantNDCG) > 1e-9 {
+		t.Fatalf("ndcg10 = %v, want %v", diags[0].NDCG10, wantNDCG)
+	}
+	wantRecall := 2.0 / 3.0
+	if diags[0].Recall10 == nil || math.Abs(*diags[0].Recall10-wantRecall) > 1e-9 {
+		t.Fatalf("recall10 = %v, want %v", diags[0].Recall10, wantRecall)
+	}
+}
+
+// writeDiagnostics 가 쓴 v2 덤프는 internal/evaldump.Read 로 그대로 읽혀야
+// 한다 — 완료 기준 6번(round trip).
+func TestDumpV2RoundTripsThroughEvaldumpReader(t *testing.T) {
+	evaluated := evaluatePairs(context.Background(), newTracingStub(false),
+		[]store.EvalPair{diagnosticTestPair()}, evalRunOptions{rerank: true, diagnose: true})
+	attachQueryMetrics(evaluated.Diagnostics, evaluated.Latencies)
+
+	path := filepath.Join(t.TempDir(), "roundtrip.jsonl")
+	header := evaldump.Header{
+		DumpVersion: evaldump.SchemaVersion, LabelHash: "lh-rt", ConfigHash: "ch-rt", CodeRevision: "rev-rt",
+		Attempted: 1, Failed: 0, LabelSource: "golden-user", Split: "all", WindowMode: "plan",
+		CreatedAt: "2026-09-24T00:00:00Z",
+	}
+	if err := writeDiagnostics(path, header, evaluated.Diagnostics); err != nil {
+		t.Fatalf("writeDiagnostics: %v", err)
+	}
+
+	dump, err := evaldump.Read(path)
+	if err != nil {
+		t.Fatalf("evaldump.Read: %v", err)
+	}
+	if dump.Version != evaldump.SchemaVersion {
+		t.Fatalf("Version = %d, want %d", dump.Version, evaldump.SchemaVersion)
+	}
+	if dump.Header == nil || dump.Header.LabelHash != "lh-rt" || dump.Header.ConfigHash != "ch-rt" ||
+		dump.Header.CodeRevision != "rev-rt" || dump.Header.WindowMode != "plan" {
+		t.Fatalf("header did not round trip: %+v", dump.Header)
+	}
+	if len(dump.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(dump.Rows))
+	}
+	row := dump.Rows[0]
+	if row.QueryID != "aaaaaaaa-0000-0000-0000-000000000001" || row.Kind != "query" {
+		t.Fatalf("row identity did not round trip: %+v", row)
+	}
+	if row.LatencyMs == nil || row.NDCG10 == nil || row.Recall10 == nil || row.FP10 == nil {
+		t.Fatalf("v2 metrics did not round trip: %+v", row)
+	}
+	if len(row.RelevantDocs) != 2 {
+		t.Fatalf("relevant_docs did not round trip: %+v", row.RelevantDocs)
 	}
 }

@@ -1,0 +1,2 @@
+{"query_id":"q1","query_source":"seed","relevant_docs":[{"doc_id":"d1","final_rank":1,"source_type":"call"}],"search_failed":false,"negative_ids_in_top10":0}
+{"query_id":"q2","query_source":"seed","relevant_docs":[{"doc_id":"d2","final_rank":1,"source_type":"call"}],"search_failed":false,"negative_ids_in_top10":0}
