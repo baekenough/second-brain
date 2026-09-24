@@ -175,6 +175,181 @@ func TestAskPromptManifest_LayerOf(t *testing.T) {
 	}
 }
 
+// --- validateAskCitations: #268 follow-up edge cases found by deep-verify ---
+//
+// Each fixture below reproduces a specific bug against the PRE-fix
+// implementation (greedy "[A-Za-z0-9-]+" token capture, no remainder check
+// on an empty "/documents/" link, and the 4-phrase-only refusal list) — see
+// this file's git history for the failing behavior these guard against.
+
+// TestValidateAskCitations_TrailingProseAfterBareID covers the exact
+// reproduction from deep-verify: a bare "/documents/<uuid>" reference with
+// no delimiter before trailing Korean prose used to sweep the "-" that
+// separates them into the captured token, fail uuid.Parse, and turn a
+// legitimately cited answer into askCitationInvalid.
+func TestValidateAskCitations_TrailingProseAfterBareID(t *testing.T) {
+	t.Parallel()
+	observedID := uuid.New()
+	manifest := askPromptManifest{Evidence: []askPromptEvidence{{ID: observedID, Layer: askEvidenceObserved}}}
+
+	answer := "관련 내용은 /documents/" + observedID.String() + "-요약 문서 참고하시기 바랍니다."
+	report := validateAskCitations(answer, manifest)
+
+	if report.Status != askCitationValid {
+		t.Fatalf("Status = %q, want %q (cited=%v unknown=%v malformed=%d)",
+			report.Status, askCitationValid, report.CitedIDs, report.UnknownIDs, report.MalformedLinks)
+	}
+	if !uuidSlicesEqual(report.CitedIDs, []uuid.UUID{observedID}) {
+		t.Errorf("CitedIDs = %v, want [%s]", report.CitedIDs, observedID)
+	}
+	if report.MalformedLinks != 0 {
+		t.Errorf("MalformedLinks = %d, want 0", report.MalformedLinks)
+	}
+}
+
+// TestValidateAskCitations_UppercaseUUID pins the case-insensitive hex
+// requirement explicitly.
+func TestValidateAskCitations_UppercaseUUID(t *testing.T) {
+	t.Parallel()
+	observedID := uuid.New()
+	manifest := askPromptManifest{Evidence: []askPromptEvidence{{ID: observedID, Layer: askEvidenceObserved}}}
+
+	answer := "참고 [근거](/documents/" + strings.ToUpper(observedID.String()) + ")"
+	report := validateAskCitations(answer, manifest)
+
+	if report.Status != askCitationValid {
+		t.Fatalf("Status = %q, want %q (malformed=%d)", report.Status, askCitationValid, report.MalformedLinks)
+	}
+	if !uuidSlicesEqual(report.CitedIDs, []uuid.UUID{observedID}) {
+		t.Errorf("CitedIDs = %v, want [%s]", report.CitedIDs, observedID)
+	}
+}
+
+// TestValidateAskCitations_FullURLWithHost covers a citation whose URL
+// carries a full host (e.g. the model echoed an absolute link) rather than
+// a bare "/documents/<uuid>" path.
+func TestValidateAskCitations_FullURLWithHost(t *testing.T) {
+	t.Parallel()
+	observedID := uuid.New()
+	manifest := askPromptManifest{Evidence: []askPromptEvidence{{ID: observedID, Layer: askEvidenceObserved}}}
+
+	answer := "참고 [근거](https://sb.example.com/documents/" + observedID.String() + ")"
+	report := validateAskCitations(answer, manifest)
+
+	if report.Status != askCitationValid {
+		t.Fatalf("Status = %q, want %q (malformed=%d)", report.Status, askCitationValid, report.MalformedLinks)
+	}
+	if !uuidSlicesEqual(report.CitedIDs, []uuid.UUID{observedID}) {
+		t.Errorf("CitedIDs = %v, want [%s]", report.CitedIDs, observedID)
+	}
+}
+
+// TestValidateAskCitations_EmptyDocumentsLink covers the second deep-verify
+// reproduction: "[근거](/documents/)" (no ID at all) was invisible to both
+// the old reDocumentsLink (requires at least one token character) and the
+// old reCitationShapedLink loop (which only checked the URL's prefix, and
+// "/documents/" itself satisfies "HasPrefix(/documents/)") — so it fell
+// through to zero citations, zero malformed links, and was misclassified
+// askCitationMissing instead of askCitationInvalid.
+func TestValidateAskCitations_EmptyDocumentsLink(t *testing.T) {
+	t.Parallel()
+	manifest := askPromptManifest{}
+
+	answer := "참고했습니다 [근거](/documents/)"
+	report := validateAskCitations(answer, manifest)
+
+	if report.Status != askCitationInvalid {
+		t.Fatalf("Status = %q, want %q (cited=%v unknown=%v malformed=%d)",
+			report.Status, askCitationInvalid, report.CitedIDs, report.UnknownIDs, report.MalformedLinks)
+	}
+	if report.MalformedLinks != 1 {
+		t.Errorf("MalformedLinks = %d, want 1 (no double count with reCitationShapedLink loop)", report.MalformedLinks)
+	}
+}
+
+// TestValidateAskCitations_TruncatedUUIDStillMalformed keeps the pre-fix
+// "any /documents/<non-uuid> token is malformed" detection alive for a
+// truncated UUID, in a BARE (non-bracketed) reference — the shape the old
+// reDocumentsLink loop, not reCitationShapedLink, was solely responsible
+// for.
+func TestValidateAskCitations_TruncatedUUIDStillMalformed(t *testing.T) {
+	t.Parallel()
+	manifest := askPromptManifest{}
+
+	answer := "참고: /documents/1234abcd-5678 확인하세요."
+	report := validateAskCitations(answer, manifest)
+
+	if report.Status != askCitationInvalid {
+		t.Fatalf("Status = %q, want %q (malformed=%d)", report.Status, askCitationInvalid, report.MalformedLinks)
+	}
+	if report.MalformedLinks != 1 {
+		t.Errorf("MalformedLinks = %d, want 1", report.MalformedLinks)
+	}
+}
+
+// --- isAskAbstentionAnswer: paraphrased zero-citation refusals (#268 follow-up) ---
+
+func TestIsAskAbstentionAnswer_ParaphrasedRefusals(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{
+			name: "확인되지 않습니다 refers to provided info",
+			in:   "제공된 정보로는 확인되지 않습니다.",
+			want: true,
+		},
+		{
+			name: "판단하기 어렵습니다 refers to provided info",
+			in:   "제공된 정보만으로는 판단하기 어렵습니다.",
+			want: true,
+		},
+		{
+			name: "언급되어 있지 않습니다 refers to the document",
+			in:   "질문하신 내용은 문서에 언급되어 있지 않습니다.",
+			want: true,
+		},
+		{
+			name: "ordinary factual negative sentence with no reference to provided info stays non-abstention",
+			in:   "회의는 취소되지 않았습니다.",
+			want: false,
+		},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isAskAbstentionAnswer(tc.in); got != tc.want {
+				t.Errorf("isAskAbstentionAnswer(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestValidateAskCitations_ParaphrasedRefusalIsAbstainedNotMissing exercises
+// the paraphrased refusal end-to-end through validateAskCitations, pinning
+// the exact regression: a zero-citation answer using one of these phrases
+// used to be reported askCitationMissing.
+func TestValidateAskCitations_ParaphrasedRefusalIsAbstainedNotMissing(t *testing.T) {
+	t.Parallel()
+	manifest := askPromptManifest{}
+
+	report := validateAskCitations("제공된 정보로는 확인되지 않습니다.", manifest)
+	if report.Status != askCitationAbstained {
+		t.Errorf("Status = %q, want %q", report.Status, askCitationAbstained)
+	}
+
+	// Negative control: zero citations, no refusal wording at all, must
+	// still be missing.
+	report = validateAskCitations("회의는 취소되지 않았습니다.", manifest)
+	if report.Status != askCitationMissing {
+		t.Errorf("Status = %q, want %q (negative control)", report.Status, askCitationMissing)
+	}
+}
+
 // --- stripAskDocumentLinks ---
 
 func TestStripAskDocumentLinks(t *testing.T) {

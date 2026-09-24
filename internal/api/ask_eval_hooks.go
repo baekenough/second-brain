@@ -32,6 +32,10 @@ import (
 // the WithNow-returning shape is the correct behavior here, not an error —
 // see intent.LLMClassifier.WithNow / intent.LLMPlanner.WithNow for the
 // exported setters this asserts against.
+//
+// 주의: WithClock은 고루틴 안전하지 않다 — s.now와 두 필드를 잠금 없이 그대로
+// 대입한다. 서버가 이미 요청을 처리하기 시작한 뒤 호출하면 데이터 레이스가
+// 된다. eval/test 전용 빌더이므로, 서버 시작 전(요청 처리 이전)에만 호출할 것.
 func (s *Server) WithClock(now func() time.Time) *Server {
 	s.now = now
 	if c, ok := s.intentClassifier.(*intent.LLMClassifier); ok {

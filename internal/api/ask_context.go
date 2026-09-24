@@ -296,6 +296,20 @@ func evidencePassage(content string, evidence []model.MatchedEvidence, budget in
 	// Not locatable in content: use the chunk's own text directly rather
 	// than guessing an offset (deep-plan #267 finding F3 / risk table).
 	if best := bestEvidenceByScore(evidence); best != nil && best.Text != "" {
+		if budget <= len(unlocatedEvidenceMarker) {
+			// budget cannot fit both the marker and any evidence text —
+			// reserving the marker's bytes first (budget-len(marker)) would
+			// go negative, and clipAskText's negative-budget behavior
+			// ("") plus the marker appended afterward would then exceed
+			// budget outright (the same overflow class windowAround's own
+			// marker-reservation guards against, #267 follow-up: "sized the
+			// window against the raw budget first ... relied on
+			// clipAskText's end-trim safety net to absorb any marker
+			// overflow afterward"). Drop the marker rather than let its
+			// fixed cost push the result over budget — the evidence text
+			// itself must never be sacrificed to annotate it.
+			return clipAskText(best.Text, budget), askEvidenceModeMatchedChunk
+		}
 		return clipAskText(best.Text, budget-len(unlocatedEvidenceMarker)) + unlocatedEvidenceMarker, askEvidenceModeMatchedChunk
 	}
 	return "", ""

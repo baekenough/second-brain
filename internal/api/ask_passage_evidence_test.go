@@ -366,3 +366,45 @@ func TestWindowAround_MultiByteBoundariesNeverSplitARune(t *testing.T) {
 		})
 	}
 }
+
+// --- evidencePassage: unlocated-evidence fallback must never exceed budget
+// (deep-verify follow-up, same overflow class as windowAround above) ---
+//
+// evidencePassage's unlocated-evidence branch used to reserve
+// unlocatedEvidenceMarker's bytes out of budget BEFORE clipping
+// (clipAskText(best.Text, budget-len(marker))), exactly the pattern the
+// windowAround tests above guard against. When budget was smaller than the
+// marker's own length (56 bytes), budget-len(marker) went negative,
+// clipAskText returned "" for the negative budget, and the marker was then
+// appended on top anyway — producing a result LONGER than budget instead of
+// shorter, and silently dropping all of the evidence text.
+
+// TestEvidencePassage_UnlocatedFallbackNeverExceedsBudget sweeps budgets
+// 0..80 — straddling unlocatedEvidenceMarker's byte length on both sides —
+// directly against evidencePassage's unlocated-evidence branch (content
+// that does NOT contain the evidence text verbatim, forcing
+// locateEvidenceSpans to find nothing and fall through to
+// bestEvidenceByScore).
+func TestEvidencePassage_UnlocatedFallbackNeverExceedsBudget(t *testing.T) {
+	t.Parallel()
+
+	content := "저장된 원문은 이렇게 시작합니다..."
+	evidence := []model.MatchedEvidence{
+		{ChunkID: 1, ChunkIndex: 0, Lane: model.MatchTypeChunkFTS, Score: 0.5,
+			Text: "정제된 청크 본문 전체는 원문과 바이트 단위로 일치하지 않는 별도 텍스트입니다"},
+	}
+
+	for budget := 0; budget <= 80; budget++ {
+		budget := budget
+		t.Run(fmt.Sprintf("budget=%d", budget), func(t *testing.T) {
+			t.Parallel()
+			got, _ := evidencePassage(content, evidence, budget)
+			if len(got) > budget {
+				t.Fatalf("budget=%d: evidencePassage exceeded budget: len=%d passage=%q", budget, len(got), got)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("budget=%d: result is not valid UTF-8: %q", budget, got)
+			}
+		})
+	}
+}
