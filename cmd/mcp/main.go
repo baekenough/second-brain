@@ -91,6 +91,10 @@ func run() error {
 	} else {
 		slog.Info("embedding engine not configured — full-text search only")
 	}
+	ingestEmbed := search.NewIngestEmbeddingEngine(cfg, embedClient)
+	if cfg.VectorSource == config.VectorSourcePtah {
+		pg.UsePtahVectors(embedClient.Dimension())
+	}
 
 	// --- Reranker (optional — same assembly as cmd/server). Enabled() gates
 	// on RerankURL being non-empty, so this is a no-op when unconfigured.
@@ -125,7 +129,7 @@ func run() error {
 	registerSearchTool(s, searchSvc, cfg.RerankDefault)
 	registerGetDocumentTool(s, docStore)
 	registerStatsTool(s, docStore)
-	registerAddNoteTool(s, docStore, chunkStore, embedClient, cfg.APIKey)
+	registerAddNoteTool(s, docStore, chunkStore, ingestEmbed, cfg.APIKey)
 
 	addr := bindAddr + ":" + mcpPort
 	slog.Info("MCP server starting", "addr", addr, "transport", "streamable-http",

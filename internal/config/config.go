@@ -75,6 +75,16 @@ type Config struct {
 	LocalEmbeddingModel    string
 	LocalEmbeddingEndpoint string
 
+	// VectorSource selects who owns the vectors search reads (VECTOR_SOURCE).
+	//
+	//   - "app" (default): the application embeds on ingest and search reads
+	//     documents.embedding, documents.summary_embedding and chunks.embedding.
+	//   - "ptah": search reads the generations Ptah cut over to
+	//     (deploy/ptah), and the write paths stop embedding, because
+	//     `ptah inference catchup` keeps those generations current from the
+	//     outbox on documents and chunk_sparse_context.
+	VectorSource string
+
 	// LLM (optional — Discord RAG answer generation; falls back to EmbeddingAPIURL when unset)
 	// LLMAPIURL: LLM_API_URL env var; defaults to EmbeddingAPIURL with /embeddings → /chat/completions suffix fix.
 	// LLMAPIKey: LLM_API_KEY env var; defaults to EmbeddingAPIKey.
@@ -815,6 +825,10 @@ func Load() (*Config, error) {
 	if os.Getenv("PII_NAME_REDACTION_ENABLED") == "true" && (llmAPIURL == "" || (llmAPIKey == "" && llmAuthFile == "")) {
 		return nil, fmt.Errorf("PII_NAME_REDACTION_ENABLED requires a configured approved LLM API")
 	}
+	vectorSource := getenv("VECTOR_SOURCE", VectorSourceApp)
+	if vectorSource != VectorSourceApp && vectorSource != VectorSourcePtah {
+		return nil, fmt.Errorf("VECTOR_SOURCE %q is not one of %q, %q", vectorSource, VectorSourceApp, VectorSourcePtah)
+	}
 	return &Config{
 		Port:        getenv("PORT", "8080"),
 		DatabaseURL: getenv("DATABASE_URL", "postgres://brain:brain@localhost:5432/second_brain?sslmode=disable"),
@@ -833,6 +847,8 @@ func Load() (*Config, error) {
 
 		LocalEmbeddingModel:    getenv("LOCAL_EMBEDDING_MODEL", "bge-m3"),
 		LocalEmbeddingEndpoint: os.Getenv("LOCAL_EMBEDDING_ENDPOINT"),
+
+		VectorSource: vectorSource,
 
 		LLMAPIURL:         llmAPIURL,
 		LLMAPIKey:         llmAPIKey,
@@ -1396,6 +1412,12 @@ func askContextInsightM() int {
 	}
 	return n
 }
+
+// VECTOR_SOURCE values. See Config.VectorSource.
+const (
+	VectorSourceApp  = "app"
+	VectorSourcePtah = "ptah"
+)
 
 // LoadCollector reads configuration for the collector daemon.
 // It excludes server-only fields (PORT, API_KEY).

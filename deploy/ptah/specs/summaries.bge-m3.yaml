@@ -1,0 +1,46 @@
+# Summary vectors for hybrid search (the `summvec` lane).
+#
+# The text is what internal/worker/summarizer.go embeds:
+# title_summary + "\n\n" + bullet_summary. Only summarized documents are in
+# scope, and both columns are input fields, so a new summary produces an
+# outbox event.
+version: 1
+name: summaries-bge-m3
+description: documents.title_summary + bullet_summary embedded with bge-m3
+source:
+  schema: public
+  table: documents
+  filter: "title_summary IS NOT NULL AND bullet_summary IS NOT NULL"
+  key_fields: [id]
+  input_fields: [title_summary, bullet_summary]
+  version_strategy: outbox_sequence
+  mutable: true
+preprocessing:
+  separator: "\n\n"
+  null_policy: refuse
+  empty_policy: skip
+  unicode_normalization: none
+  collapse_whitespace: false
+  max_input_bytes: 8000
+  truncate: bytes
+model:
+  provider: openai-compatible
+  endpoint_class: local
+  endpoint: http://ollama:11434/v1
+  identifier: bge-m3
+  revision: "790764642607"
+  reported_dimension: 1024
+  normalization: l2
+target:
+  schema: public
+  table: document_summary_vectors
+  column: embedding_bge_m3
+  layout: own_table
+  representation: vector
+  metric: cosine
+  index_method: hnsw
+consistency:
+  mode: outbox
+policy:
+  require_exact_approval: true
+  require_consistency_mode: true

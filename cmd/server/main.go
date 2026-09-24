@@ -108,6 +108,10 @@ func run() error {
 	} else {
 		slog.Info("embedding engine not configured — full-text search only")
 	}
+	ingestEmbed := search.NewIngestEmbeddingEngine(cfg, embedClient)
+	if cfg.VectorSource == config.VectorSourcePtah {
+		pg.UsePtahVectors(embedClient.Dimension())
+	}
 
 	// --- Reranker (optional) ---
 	reranker := search.NewHTTPReranker(cfg.RerankURL, cfg.RerankAPIKey, cfg.RerankModel, cfg.RerankTopN)
@@ -193,12 +197,12 @@ func run() error {
 			docStore,
 			reindexStateStore,
 		)).
-		WithIngestFile(docStore, chunkStore, embedClient, cfg.IngestMaxFileBytes).
+		WithIngestFile(docStore, chunkStore, ingestEmbed, cfg.IngestMaxFileBytes).
 		WithPIINumberHashing(cfg.PIINumberHashingEnabled).
 		WithPIINameRedaction(cfg.PIINameRedactionEnabled).
-		WithIngestMessages(docStore, chunkStore, embedClient, cfg.IngestMaxBatchMessages, cfg.CollectorCutover).
+		WithIngestMessages(docStore, chunkStore, ingestEmbed, cfg.IngestMaxBatchMessages, cfg.CollectorCutover).
 		WithIngestRecording(docStore, cfg.IngestRecordingDir, cfg.IngestMaxFileBytes, cfg.CollectorCutover).
-		WithNotes(docStore, chunkStore, embedClient).
+		WithNotes(docStore, chunkStore, ingestEmbed).
 		WithAskConfig(time.Duration(cfg.AskTimeoutSeconds)*time.Second, cfg.AskContextTopK, cfg.AskContextInsightM).
 		WithAskRerankDefault(cfg.RerankDefault).
 		WithAskSessions(askSessionStore).

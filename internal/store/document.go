@@ -957,7 +957,11 @@ func (s *DocumentStore) hybridSearch(ctx context.Context, query model.SearchQuer
 		return nil, err
 	}
 
-	q, args := buildHybridSearchQuery(query, w)
+	sources := appVectorSources
+	if s.pg.ptahVectors != nil {
+		sources = documentVectorSources(s.pg.ptahVectors.targets(ctx))
+	}
+	q, args := buildHybridSearchQueryFrom(query, w, sources)
 
 	rows, err := s.pg.pool.Query(ctx, q, args...)
 	if err != nil {
@@ -1031,6 +1035,13 @@ func (s *DocumentStore) resolveWeights(ctx context.Context, query model.SearchQu
 // lane does not merely widen that lane — it lets out-of-scope documents consume
 // candidate slots and push in-scope documents out of the fused result entirely.
 func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (string, []interface{}) {
+	return buildHybridSearchQueryFrom(query, w, appVectorSources)
+}
+
+// buildHybridSearchQueryFrom is buildHybridSearchQuery with the relations the
+// two document vector lanes scan named by the caller: the application's own
+// columns, or the Ptah generations (ptah_vectors.go).
+func buildHybridSearchQueryFrom(query model.SearchQuery, w model.SearchWeights, sources vectorSources) (string, []interface{}) {
 	args := []interface{}{
 		query.Query,
 		pgvector.NewVector(query.Embedding),
@@ -1085,6 +1096,8 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 	var occurredFilter, entityOccurredFilter string
 	args, occurredFilter, entityOccurredFilter = appendOccurredRangeFilters(args, query.OccurredFrom, query.OccurredTo)
 
+	laneFilters := []string{statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter}
+
 	// RRF formula: w / (k + rank), where w is the per-signal weight and k
 	// prevents very high scores for top-ranked results (standard k=60).
 	// Four CTEs (fts, vec, bigm, summvec) are merged via FULL OUTER JOIN.
@@ -1137,18 +1150,7 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 			%s
 			LIMIT $3
 		),
-		vec AS (
-			SELECT id,
-			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE embedding IS NOT NULL
-			%s
-			%s
-			%s
-			%s
-			%s
-			LIMIT $3
-		),
+		%s,
 		bigm AS (
 			SELECT id,
 			       row_number() OVER (ORDER BY
@@ -1168,18 +1170,7 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 			%s
 			LIMIT $3
 		),
-		summvec AS (
-			SELECT id,
-			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE summary_embedding IS NOT NULL
-			%s
-			%s
-			%s
-			%s
-			%s
-			LIMIT $3
-		),
+		%s,
 		%s,
 		rrf AS (
 			SELECT
@@ -1200,9 +1191,9 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 		ORDER BY %s
 		LIMIT $3`,
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, // fts
-		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, // vec
+		vectorLaneCTE("vec", sources.document, laneFilters),
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, // bigm
-		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, // summvec
+		vectorLaneCTE("summvec", sources.summary, laneFilters),
 		entityCTE, // entity lane carries the same filters in d.-qualified form
 		buildRRFScoreExpr(w),
 		sortOrder(query, time.Now(), "d"))
@@ -1236,6 +1227,43 @@ func buildRRFScoreExpr(w model.SearchWeights) string {
 		w.SummaryVec, w.RRFK,
 		w.EntityWeight, w.RRFK,
 	)
+}
+
+// vectorLane is where one document vector lane reads: the relation it scans
+// and the vector column in it. The zero value is a lane with nothing to read.
+type vectorLane struct {
+	from   string
+	column string
+}
+
+// vectorSources names what the two document vector lanes (vec, summvec) scan.
+type vectorSources struct {
+	document vectorLane
+	summary  vectorLane
+}
+
+// appVectorSources is the application's own columns (VECTOR_SOURCE=app).
+var appVectorSources = vectorSources{
+	document: vectorLane{from: "documents", column: "embedding"},
+	summary:  vectorLane{from: "documents", column: "summary_embedding"},
+}
+
+// vectorLaneCTE renders one vector lane. filters are the lane filters every
+// CTE carries, in the order the other lanes list them. A lane with nothing to
+// read renders as an empty CTE, the shape emptyEntityCTE uses, so the FULL
+// OUTER JOIN stays valid and the lane adds nothing to the score.
+func vectorLaneCTE(name string, lane vectorLane, filters []string) string {
+	if lane.from == "" {
+		return name + ` AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false)`
+	}
+	return fmt.Sprintf(`%s AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY %s <=> $2 ASC) AS rank
+			FROM %s
+			WHERE %s IS NOT NULL
+			%s
+			LIMIT $3
+		)`, name, lane.column, lane.from, lane.column, strings.Join(filters, "\n\t\t\t"))
 }
 
 // emptyEntityCTE is the entity lane when its RRF weight is zero: a

@@ -1,6 +1,7 @@
 package search
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"time"
@@ -81,3 +82,36 @@ func NewOpenSearchLane(cfg *config.Config) OpenSearchSearcher {
 	timeout := time.Duration(cfg.OpensearchTimeoutSeconds) * time.Second
 	return NewOpenSearchClient(cfg.OpensearchURL, cfg.OpensearchIndex, timeout)
 }
+
+// NewIngestEmbeddingEngine returns the engine the write paths embed with:
+// the scheduler, the summarizer, the ingest and note handlers, and the
+// watchers that embed as they store.
+//
+// Under VECTOR_SOURCE=ptah search reads Ptah generations, and `ptah inference
+// catchup` keeps them current from the outbox on documents and
+// chunk_sparse_context. The engine configured there is the query model, and
+// writing its vectors into documents.embedding or chunks.embedding would put
+// one model's vectors into columns built for another. So the write paths get
+// a disabled engine, and store the text without a vector, as they do when
+// embeddings are off.
+func NewIngestEmbeddingEngine(cfg *config.Config, queryEngine EmbeddingEngine) EmbeddingEngine {
+	if cfg.VectorSource != config.VectorSourcePtah {
+		return queryEngine
+	}
+	slog.Info("embedding: VECTOR_SOURCE=ptah; ingest does not embed, Ptah generations hold the vectors search reads")
+	return disabledEngine{dimension: queryEngine.Dimension()}
+}
+
+// disabledEngine embeds nothing. It is the engine the write paths get when
+// the vectors belong to someone else.
+type disabledEngine struct{ dimension int }
+
+func (disabledEngine) Embed(context.Context, string) ([]float32, error) { return nil, nil }
+
+func (disabledEngine) EmbedBatch(_ context.Context, texts []string) ([][]float32, error) {
+	return make([][]float32, len(texts)), nil
+}
+
+func (disabledEngine) Enabled() bool { return false }
+
+func (e disabledEngine) Dimension() int { return e.dimension }
