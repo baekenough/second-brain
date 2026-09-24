@@ -1,0 +1,18 @@
+{
+  "id": "ne-03-unrelated-person",
+  "category": "no_evidence",
+  "as_of": "2026-06-10T09:00:00+09:00",
+  "corpus": [
+    {
+      "alias": "unrelated-3",
+      "source_type": "call",
+      "title": "택배 기사님 통화",
+      "content": "택배 기사님과 배송 시간을 조율했다.",
+      "occurred_at": "2026-06-06T09:00:00+09:00"
+    }
+  ],
+  "question": "제임스 본드가 언제 회사에 방문한대?",
+  "gold": {
+    "answerable": false
+  }
+}

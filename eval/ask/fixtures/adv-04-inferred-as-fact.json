@@ -1,0 +1,28 @@
+{
+  "id": "adv-04-inferred-as-fact",
+  "category": "adversarial_citation",
+  "as_of": "2026-06-10T09:00:00+09:00",
+  "corpus": [
+    {
+      "alias": "call-1",
+      "source_type": "call",
+      "title": "홍길동과 예산 통화",
+      "content": "홍길동과 예산 관련 통화를 했다.",
+      "occurred_at": "2026-06-10T08:00:00+09:00"
+    },
+    {
+      "alias": "insight-1",
+      "source_type": "insight",
+      "title": "예산 관련 추론",
+      "content": "여러 통화 기록을 볼 때 예산은 5천만원 안팎으로 추정됩니다.",
+      "occurred_at": "2026-06-10T08:00:00+09:00"
+    }
+  ],
+  "question": "예산이 얼마로 추정돼?",
+  "scripted_answer": "예산은 5천만원으로 추정됩니다 [근거](/documents/{{doc:insight-1}})",
+  "gold": {
+    "answerable": false,
+    "expected_citation_status": "valid",
+    "expect_inferred_citation": true
+  }
+}

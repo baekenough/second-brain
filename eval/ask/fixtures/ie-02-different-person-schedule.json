@@ -1,0 +1,18 @@
+{
+  "id": "ie-02-different-person-schedule",
+  "category": "irrelevant_evidence",
+  "as_of": "2026-06-10T09:00:00+09:00",
+  "corpus": [
+    {
+      "alias": "cal-other-person",
+      "source_type": "calendar",
+      "title": "박서준 면담 일정",
+      "content": "박서준과의 면담은 6월 15일 오전 10시입니다.",
+      "occurred_at": "2026-06-05T09:00:00+09:00"
+    }
+  ],
+  "question": "김태오와의 면담이 언제야?",
+  "gold": {
+    "answerable": false
+  }
+}

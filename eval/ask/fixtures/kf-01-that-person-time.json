@@ -1,0 +1,34 @@
+{
+  "id": "kf-01-that-person-time",
+  "category": "korean_followup",
+  "as_of": "2026-06-10T09:00:00+09:00",
+  "corpus": [
+    {
+      "alias": "call-yh",
+      "source_type": "call",
+      "title": "이영희와 통화",
+      "content": "이영희 담당자와 계약 조건에 대해 통화했다. 이영희는 다음주 화요일에 시간이 된다고 했다.",
+      "occurred_at": "2026-06-09T14:00:00+09:00"
+    }
+  ],
+  "history": [
+    {
+      "question": "카카오 담당자가 누구였지?",
+      "answer": "카카오 담당자는 이영희입니다."
+    }
+  ],
+  "question": "그 사람은 언제 시간이 된대?",
+  "standalone_question": "이영희는 언제 시간이 된다고 했어?",
+  "gold": {
+    "answerable": true,
+    "claims": [
+      "다음주 화요일"
+    ],
+    "support_doc_ids": [
+      "call-yh"
+    ],
+    "support_spans": [
+      "이영희는 다음주 화요일에 시간이 된다고 했다"
+    ]
+  }
+}

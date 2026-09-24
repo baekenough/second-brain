@@ -1,6 +1,16 @@
 # Compiled binaries
 /bin/
 /eval
+# /eval above ignores the `go build ./cmd/eval` binary output at repo root.
+# A parent-directory exclusion blocks re-inclusion of anything below it
+# unless the directory itself is re-included first (git-scm.com/docs/gitignore
+# "It is not possible to re-include a file if a parent directory of that
+# file is excluded"), so every level down to the synthetic /ask evaluation
+# fixtures (issue #266) must be listed explicitly.
+!/eval/
+!/eval/ask/
+!/eval/ask/fixtures/
+!/eval/ask/fixtures/*.json
 /server
 /collector
 /mcp

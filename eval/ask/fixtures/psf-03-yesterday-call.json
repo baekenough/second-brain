@@ -1,0 +1,34 @@
+{
+  "id": "psf-03-yesterday-call",
+  "category": "period_source_filter",
+  "as_of": "2026-06-10T09:00:00+09:00",
+  "corpus": [
+    {
+      "alias": "call-yesterday-2",
+      "source_type": "call",
+      "title": "어제 통화한 내용",
+      "content": "어제 담당자와 통화했고 다음 미팅은 7월 3일로 잡혔다.",
+      "occurred_at": "2026-06-09T15:00:00+09:00"
+    },
+    {
+      "alias": "call-today-2",
+      "source_type": "call",
+      "title": "오늘 통화한 내용",
+      "content": "오늘 담당자와 통화했고 다음 미팅은 7월 10일로 잡혔다.",
+      "occurred_at": "2026-06-10T07:00:00+09:00"
+    }
+  ],
+  "question": "어제 통화한 내용에서 다음 미팅이 언제로 잡혔다고 했어?",
+  "gold": {
+    "answerable": true,
+    "claims": [
+      "7월 3일"
+    ],
+    "support_doc_ids": [
+      "call-yesterday-2"
+    ],
+    "support_spans": [
+      "다음 미팅은 7월 3일로 잡혔다"
+    ]
+  }
+}

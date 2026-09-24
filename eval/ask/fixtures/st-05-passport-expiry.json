@@ -1,0 +1,27 @@
+{
+  "id": "st-05-passport-expiry",
+  "category": "single_turn",
+  "as_of": "2026-06-10T09:00:00+09:00",
+  "corpus": [
+    {
+      "alias": "note-1",
+      "source_type": "note",
+      "title": "여권 정보 메모",
+      "content": "여권 만료일은 2028년 3월 14일이다.",
+      "occurred_at": "2026-01-05T09:00:00+09:00"
+    }
+  ],
+  "question": "내 여권 만료일이 언제야?",
+  "gold": {
+    "answerable": true,
+    "claims": [
+      "2028년 3월 14일"
+    ],
+    "support_doc_ids": [
+      "note-1"
+    ],
+    "support_spans": [
+      "여권 만료일은 2028년 3월 14일이다"
+    ]
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "id": "psf-01-lastweek-gmail",
+  "category": "period_source_filter",
+  "as_of": "2026-06-10T09:00:00+09:00",
+  "corpus": [
+    {
+      "alias": "mail-in-window",
+      "source_type": "gmail",
+      "title": "지난주 계약서 초안 발송",
+      "content": "계약서 초안을 첨부합니다. 계약 금액은 3천만원입니다.",
+      "occurred_at": "2026-06-04T10:00:00+09:00"
+    },
+    {
+      "alias": "mail-out-of-window",
+      "source_type": "gmail",
+      "title": "이번달 계약서 관련",
+      "content": "계약서 관련해서 다시 연락드립니다. 계약 금액은 9천만원입니다.",
+      "occurred_at": "2026-06-09T10:00:00+09:00"
+    },
+    {
+      "alias": "call-same-window",
+      "source_type": "call",
+      "title": "지난주 통화",
+      "content": "지난주에 전화로 계약 관련 이야기를 나눴다.",
+      "occurred_at": "2026-06-05T10:00:00+09:00"
+    }
+  ],
+  "question": "지난주에 받은 이메일에서 계약 금액이 얼마라고 했어?",
+  "gold": {
+    "answerable": true,
+    "claims": [
+      "3천만원"
+    ],
+    "support_doc_ids": [
+      "mail-in-window"
+    ],
+    "support_spans": [
+      "계약 금액은 3천만원입니다"
+    ]
+  }
+}

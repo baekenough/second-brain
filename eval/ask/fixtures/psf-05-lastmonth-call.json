@@ -1,0 +1,34 @@
+{
+  "id": "psf-05-lastmonth-call",
+  "category": "period_source_filter",
+  "as_of": "2026-06-10T09:00:00+09:00",
+  "corpus": [
+    {
+      "alias": "call-lastmonth",
+      "source_type": "call",
+      "title": "지난달 협력사 통화",
+      "content": "지난달 협력사와 통화했고 단가는 개당 1200원으로 합의했다.",
+      "occurred_at": "2026-05-15T10:00:00+09:00"
+    },
+    {
+      "alias": "call-thismonth",
+      "source_type": "call",
+      "title": "이번달 협력사 통화",
+      "content": "이번달 협력사와 통화했고 단가는 개당 1500원으로 재협상 중이다.",
+      "occurred_at": "2026-06-03T10:00:00+09:00"
+    }
+  ],
+  "question": "지난달 협력사 통화에서 단가를 얼마로 합의했다고 했어?",
+  "gold": {
+    "answerable": true,
+    "claims": [
+      "1200원"
+    ],
+    "support_doc_ids": [
+      "call-lastmonth"
+    ],
+    "support_spans": [
+      "단가는 개당 1200원으로 합의했다"
+    ]
+  }
+}

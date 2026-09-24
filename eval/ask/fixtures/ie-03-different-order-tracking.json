@@ -1,0 +1,18 @@
+{
+  "id": "ie-03-different-order-tracking",
+  "category": "irrelevant_evidence",
+  "as_of": "2026-06-10T09:00:00+09:00",
+  "corpus": [
+    {
+      "alias": "mail-other-order",
+      "source_type": "gmail",
+      "title": "주문번호 A-1001 배송 안내",
+      "content": "주문번호 A-1001 상품이 발송되었습니다. 송장번호는 111222333444입니다.",
+      "occurred_at": "2026-06-03T09:00:00+09:00"
+    }
+  ],
+  "question": "주문번호 B-2002 송장번호가 뭐야?",
+  "gold": {
+    "answerable": false
+  }
+}

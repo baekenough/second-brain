@@ -1,0 +1,34 @@
+{
+  "id": "st-01-budget",
+  "category": "single_turn",
+  "as_of": "2026-06-10T09:00:00+09:00",
+  "corpus": [
+    {
+      "alias": "call-1",
+      "source_type": "call",
+      "title": "홍길동과 통화",
+      "content": "홍길동과 오늘 오전 프로젝트 예산에 대해 통화했다. 예산은 5천만원으로 확정되었다.",
+      "occurred_at": "2026-06-10T08:00:00+09:00"
+    },
+    {
+      "alias": "distractor-1",
+      "source_type": "gmail",
+      "title": "점심 메뉴 추천",
+      "content": "오늘 점심은 김치찌개 어떠세요.",
+      "occurred_at": "2026-06-09T12:00:00+09:00"
+    }
+  ],
+  "question": "프로젝트 예산이 얼마로 확정됐어?",
+  "gold": {
+    "answerable": true,
+    "claims": [
+      "5천만원"
+    ],
+    "support_doc_ids": [
+      "call-1"
+    ],
+    "support_spans": [
+      "예산은 5천만원으로 확정되었다"
+    ]
+  }
+}
