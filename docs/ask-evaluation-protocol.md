@@ -159,7 +159,7 @@ pre-#267 lexical fallback provably fails — see
 `askPassage`'s window search scores `0` everywhere), while still being
 answerable because the (simulated) vector lane can bridge the paraphrase.
 
-## Fixture mix (40 fixtures, ≥30 required)
+## Fixture mix (42 fixtures, ≥30 required)
 
 | Category | Count | What it exercises |
 |---|---:|---|
@@ -172,6 +172,7 @@ answerable because the (simulated) vector lane can bridge the paraphrase.
 | `irrelevant_evidence` | 5 | 3 abstention fixtures + 2 fabrication self-tests (`ie-04`/`ie-05`) — see below |
 | `adversarial_citation` | 4 | Fabricated UUID, malformed link, a real-but-unshown document ID, and an allowed-but-flagged inferred-layer citation — see "Adversarial citations" below |
 | `document_injection` | 1 | A retrieved document's own content tries to instruct the model to cite a fabricated ID; `validateAskCitations` never trusts document content, only the server-built manifest |
+| `claim_support_injection` | 2 | A real, provided citation attached to either a false claim (`csi-01`) or a document outside `gold.support_doc_ids` (`csi-02`) — issue #273; see "`claim_support_injection`: closing the citation-target gap" below |
 
 ### `no_evidence`/`irrelevant_evidence`: two different things being tested
 
@@ -218,10 +219,71 @@ matters which kind a reader is looking at:
    claim next to it. `fabricated_answer` is deliberately independent of
    `citation_status` for exactly this reason.
 
+### `claim_support_injection`: closing the citation-target gap (issue #273)
+
+Issue #268's `askCitationStatus` validator proves a cited ID was actually
+**shown to the model** (present in the manifest built from the real
+excerpt-budget stage) — it never proves the cited passage supports the
+specific claim next to it. `citation_status: "valid"` therefore lets two
+different injection shapes through, and until issue #273 nothing in this
+harness caught either:
+
+1. A correct-sounding claim attached to the RIGHT support document, but the
+   claim text itself is false (`csi-01-claim-mismatch`).
+2. A correct claim attached to a REAL, retrieved document that is not one
+   of `gold.support_doc_ids` at all (`csi-02-citation-outside-support`).
+
+Both fixtures set `scripted_answer` (bypassing the oracle, like the
+adversarial-citation and fabrication-self-test fixtures) and
+`gold.expected_detector` — `"claim_mismatch"` for shape 1,
+`"citation_outside_support"` for shape 2 — which switches
+`computeMetrics` into a THIRD self-test branch, parallel to
+`expected_citation_status` and the fabrication self-tests' own default-
+branch handling. The PASSING outcome, as with every self-test category in
+this package, is that the REAL, unmodified detector the fixture targets
+actually fires:
+
+- `csi-01`: the real `answer_correct` detector (a literal substring check
+  against `gold.claims`) must come out `false`, because the scripted
+  answer's false claim text does not match.
+- `csi-02`: the new `citation_within_support` detector (below) must come
+  out `false`, because the cited document resolves to a real, manifest-
+  known ID that is not in `gold.support_doc_ids`.
+
+`csi-02`'s second corpus document (`mail-other-project`) is deliberately
+topically close to the question (reusing `ie-04`'s already-proven-
+retrievable wording) so it is genuinely retrieved and survives the excerpt
+budget — the same reasoning `adv-03-unknown-real-id`'s doc comment and the
+"Why omitted-by-budget is not one of the four adversarial-citation shapes"
+section below explain: this fixture corpus is far too small for the
+budget to ever drop a candidate, so any retrieved document reaches the
+manifest as real evidence, never `Omitted`. That is exactly the property
+this fixture needs: `citation_status` must reach `"valid"`, not
+`"invalid"`, for the citation-within-support gap to be the thing that
+catches it.
+
+**Flip check (issue #273 step 2 requirement):** adding
+`citation_within_support` to the answerable branch's `Pass` rule flips
+ZERO of this repository's pre-existing (pre-#273) fixtures —
+`TestRun_FullFixtureSet_Baseline` and the dedicated
+`TestBuildReport_CitationWithinSupportFlipsNoExistingFixture`
+(`internal/askeval/runner_test.go`) both pin this. This is not a
+coincidence: the oracle (`llm.go`'s `synthesize`) only ever cites a
+claim's own `gold.support_doc_ids[i]` entry, so it is structurally
+incapable of producing the "cited outside support" shape — only a
+`scripted_answer` (a self-test, or, outside this package's own fixtures,
+a genuine pipeline regression) can.
+`TestComputeMetrics_CitationWithinSupportGatesPass`
+(`internal/askeval/runner_test.go`) proves the gate can fail a case
+directly (bypassing fixture-file validation, which correctly refuses to
+let an on-disk answerable fixture express this shape outside a declared
+self-test — see `fixture.go`'s `validate`).
+
 ## Metrics (`internal/askeval/metrics.go`)
 
-Every `CaseMetrics` field is a deterministic detector over what the real
-pipeline produced — never a semantic judge (see "Judge mode" below):
+Every `CaseMetrics` field except `shadow` is a deterministic detector over
+what the real pipeline produced — never a semantic judge (see "Shadow judge
+(issue #273)" below for the one field that is):
 
 - **`retrieval_hit`** — every `gold.support_doc_ids` entry's ID appears in
   the `sources` SSE event. Retrieval FOUND the evidence, independent of the
@@ -241,6 +303,15 @@ pipeline produced — never a semantic judge (see "Judge mode" below):
   of the produced answer text. Omitted (nil) for any fixture shape outside
   the plain answerable case (adversarial-citation and unanswerable
   fixtures never populate this field).
+- **`citation_within_support`** (issue #273) — every cited document ID
+  resolves into `gold.support_doc_ids`. This is a DIFFERENT question from
+  `citation_status: "valid"`: that verdict only proves a cited ID was
+  actually shown to the model (any prompt-evidence document); this field
+  additionally checks it is one of THIS question's own support documents.
+  Omitted (nil) unless `gold.support_doc_ids` is non-empty AND the answer
+  cited at least one ID — see "`claim_support_injection`: closing the
+  citation-target gap" above for the two fixtures that exercise it, and
+  for why it flips zero pre-existing fixtures.
 - **`citation_status`** — copied from the `done` SSE event's
   `verification.citation_status` (issue #268's `askCitationStatus`:
   `valid|invalid|missing|abstained|unverified`), or `"no_evidence"` when
@@ -269,15 +340,118 @@ pipeline produced — never a semantic judge (see "Judge mode" below):
   request. This measures the harness's own overhead (fake corpus lookup,
   JSON marshalling), NOT production request latency, which depends on a
   real database and a real LLM round-trip this runner never makes.
+- **`shadow`** (issue #273) — a `ClaimJudge`'s per-case verdict tally, set
+  ONLY by a prior `RunShadowJudge` call (`judge.go`), never by
+  `computeMetrics` itself. This is the one `CaseMetrics` field that is a
+  semantic judge's output rather than a deterministic detector — see
+  "Shadow judge (issue #273)" below. Omitted (nil) when `--judge=off`, a
+  case measured nothing (`Err != nil`), or the fixture has no
+  `gold.claim_support` annotations to judge against at all.
 
 `Pass` is the single rollup `report.go`'s category counts and
 `FailingCaseIDs` are built from — see `metrics.go`'s `computeMetrics` for
 the exact rule per fixture shape: adversarial-citation fixtures pass when
 the validator reaches the provoked verdict; answerable fixtures pass on
-correct-claim-plus-valid-citation; unanswerable fixtures pass on correct
-abstention — UNLESS `scripted_answer` is set (the fabrication self-tests),
+correct-claim-plus-valid-citation-plus-citation-within-support;
+claim-support-injection self-tests pass when the specific detector each
+targets fires (`gold.expected_detector`); unanswerable fixtures pass on
+correct abstention — UNLESS `scripted_answer` is set (the fabrication self-tests),
 in which case Pass tracks `fabricated_answer` instead, because the
 fixture's whole point is that the scripted answer does NOT abstain.
+
+### Abstention precision/recall (`report.go`'s `Report.Abstention`, issue #273)
+
+Every report also carries a report-level (not per-case) abstention
+precision/recall summary — `predicted_abstain` = `finish_reason ==
+"no_evidence" || citation_status == "abstained"`, `actual_unanswerable`
+= `!gold.answerable`, computed ONLY over fixtures whose finish_reason/
+citation_status reflect REAL pipeline behaviour. Any fixture with a
+non-empty `scripted_answer` (every adversarial-citation, fabrication
+self-test, and claim-support-injection fixture) is excluded: its
+finish_reason/citation_status was forced by the fixture author to provoke
+a specific detector, not produced by the real abstention-decision path, so
+counting it here would not measure the pipeline at all. `false_positive`
+(predicted abstain but actually answerable) doubles as issue #266's
+"normal-answer loss" figure — the same value `CaseMetrics.false_abstention`
+already reports per case, aggregated here at the report level.
+`Precision`/`Recall` are `0` (never `NaN`) when their denominator is `0` —
+check `considered`/`predicted_abstain`/`actual_unanswerable` before trusting
+either on a small or zero-`considered` report.
+
+## Shadow judge (issue #273)
+
+A `ClaimJudge` (`internal/askeval/judge.go`) answers a DIFFERENT question
+than issue #268's deterministic citation validator: not "was this ID shown
+to the model", but "does this excerpt actually support this claim". It is
+**never a Pass gate** — issue #266/#273 scope explicitly excludes a runtime
+LLM judge from deciding pass/fail; `TestRunShadowJudge_NeverChangesPass`
+(`internal/askeval/runner_test.go`) pins this directly, running the full
+committed fixture set with `--judge=off` and with the fake judge and
+requiring every fixture's `Pass` to be byte-identical.
+
+```go
+type Verdict string // "supported" | "unsupported" | "error"
+type ClaimJudge interface {
+    Judge(ctx context.Context, claim, excerpt string) (Verdict, error)
+}
+```
+
+**Judge units.** An answer is split into one segment per citation-marker
+occurrence (`judge.go`'s `splitCitationSegments`) — a deliberately
+different choice from a plain sentence splitter, because this package's
+own oracle and every self-test's `scripted_answer` join multiple claims
+with a bare space, never period-terminated sentences; anchoring on the
+citation marker itself gives exactly one unit per (claim, citation) pair
+regardless of punctuation. A citation whose ID does not resolve to any
+document in the fixture's own corpus (a fabricated or `{{fake}}` ID)
+produces no unit — there is no excerpt to judge it against, and issue
+#268's validator already reports that case.
+
+**`fakeJudge`** (`judge_fake.go`) is the ONLY judge `go test` and CI ever
+construct. It answers strictly from the CURRENT fixture's own
+`gold.claim_support` annotations (`[{doc_alias, sentence_contains,
+expected}]`) — a unit with no matching annotation returns `"error"` with an
+explanatory message, never a guessed verdict.
+`TestFakeJudge_NoNetworkCalls` proves this by poisoning
+`http.DefaultTransport` for the duration of the test and running the fake
+judge across the full fixture set regardless.
+
+**`RunShadowJudge`** (`judge.go`) runs strictly AFTER `Run` has already
+produced every `CaseResult`'s final, judge-independent `Metrics` — this is
+the structural guarantee behind "judge 실패/불일치를 정상 통과로 처리하지
+않는다": there is no code path by which a judge's verdict could reach
+`Pass`, by construction. A fixture with zero `gold.claim_support`
+annotations is skipped entirely (`Metrics.Shadow` stays `nil` — "not
+evaluated", never a zero-value tally); an error or a disagreement with a
+human-labelled annotation is tallied as a shadow failure, never as
+`"supported"`. `report.go`'s `Report.Shadow` aggregates every case's tally
+into a report-level summary.
+
+**Backends** (`cmd/askeval --judge-backend`):
+
+- `fake` (default) — `judge_fake.go`, offline and deterministic, described
+  above.
+- `remote` — `judge_remote.go`, a real, remote, OpenAI-compatible chat
+  completion call via `internal/llm.Client` (never local inference, per
+  this repo's no-local-inference policy). `NewRemoteClaimJudge` refuses to
+  construct a client unless ALL of the following hold, checked
+  independently of whatever gated the caller into requesting it:
+  - `ASKEVAL_JUDGE_API_KEY` (or an auth file) is set;
+  - `--fixtures` resolves under this repo's `eval/ask/fixtures` tree —
+    a remote judge run must be structurally incapable of seeing anything
+    but synthetic fixture content, not merely trusted not to;
+  - no `DATABASE_URL` or `*_DATABASE_URL` environment variable is set in
+    the process — a remote judge process has no legitimate reason to also
+    hold a database credential.
+
+  `go test`/CI never construct this backend at all — only `cmd/askeval`
+  does, itself gated behind an explicit `--judge-backend=remote` flag, and
+  no real API call is made anywhere in this repository's own test suite or
+  CI configuration. `TestNewRemoteClaimJudge_RefusesWithoutGuards`
+  (`internal/askeval/judge_test.go`) exercises every guard above without
+  ever reaching a network call, and
+  `TestRun_JudgeShadowRemoteRefusesWithoutAPIKey` (`cmd/askeval/main_test.go`)
+  pins the same refusal at the CLI's own entry point.
 
 ## `call_transcript_mid_late`: resolved by #267 (was a 5/5 known baseline gap)
 
@@ -450,13 +624,23 @@ completion criteria: "수치 근거 없이 개선을 단정하지 않는다").
 Every report's `provenance` block records `git_rev`, `fixture_set_hash`,
 `cases`, `mode` (`"scripted"` — the only mode this runner implements;
 `"configured"` — a real LLM backend — is reserved for future work and
-rejected by the CLI today), and `judge_mode` (`"off"` by default). A
-semantic judge is **never** implemented in this issue's scope
-(`askClaimSupport` stays `askClaimSupportNotEvaluated` at runtime — issue
-#268's own doc comment on that type). If a future issue adds one, it must
-run in `shadow` mode only: judge disagreement can subtract from a result,
-never add one (a judge failure or disagreement must never be read as a
-pass).
+rejected by the CLI today), `judge_mode` (`"off"` by default), and, only
+when `judge_mode == "shadow"`, `judge_backend` (`"fake"` or `"remote"`) plus
+`judge_model`/`judge_prompt_hash` (meaningful for `"remote"` only — the fake
+backend has no model or prompt of its own). `--judge=shadow` runs a real
+`ClaimJudge` (see "Shadow judge (issue #273)" above) — importantly, this
+NEVER changes `askClaimSupport` in the real `/ask` HTTP path, which stays
+`askClaimSupportNotEvaluated` at runtime regardless (issue #268's own doc
+comment on that type, issue #268's own decision to keep the judge out of
+production traffic). A judge only ever subtracts from a report — a judge
+failure or disagreement is tallied as a shadow failure, never a pass, and
+`Pass` itself never depends on `Metrics.Shadow` at all (structurally, not
+just by convention — see `RunShadowJudge`'s doc comment).
+
+Note that adding the `claim_support_injection` fixtures (and any future
+fixture) changes `fixture_set_hash` — a baseline JSON report captured
+before this change cannot be diffed against a candidate captured after it
+(`DiffReports` refuses); capture a new baseline first.
 
 ## Running it
 
@@ -464,6 +648,9 @@ pass).
 # Full offline run, text summary to stdout, JSON report to a file:
 go run ./cmd/askeval --out /tmp/askeval-report.json
 
+# Same, with the shadow judge (deterministic, offline fake backend):
+go run ./cmd/askeval --judge shadow --out /tmp/askeval-report.json
+
 # CI-safe test suite (no network, no database):
-go test ./internal/askeval/... -race -count=1
+go test ./internal/askeval/... ./cmd/askeval/... -race -count=1
 ```
