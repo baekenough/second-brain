@@ -124,7 +124,35 @@ type Fixture struct {
 	// RetrievalHit/ContextHit detectors, which read the REAL prompt the
 	// oracle saw — actually runs.
 	ScriptedAnswer string `json:"scripted_answer,omitempty"`
-	Gold           Gold   `json:"gold"`
+	// SemanticAliases declares synonym groups the FAKE VECTOR EMBEDDER
+	// (corpus.go's hashedEmbedder/hashEmbed, via semanticAliasFold) treats
+	// as interchangeable: every member of a group is folded to that group's
+	// first ("canonical") member before the bigram hash runs, for BOTH the
+	// query text and every chunk's text — so a question that paraphrases a
+	// chunk's actual wording (e.g. asks about "마감일" when the transcript
+	// says "완료 기준일") still hashes into overlapping features, the same
+	// way a real embedding model would place semantically-close paraphrases
+	// near each other in vector space.
+	//
+	// This package's fake embedder otherwise has NO notion of semantics at
+	// all (hashEmbed is a literal character-bigram hash — see its doc
+	// comment): SemanticAliases exists precisely to simulate a real vector
+	// model's paraphrase recall for fixtures that need to exercise the
+	// chunk-vector lane finding a passage the question's own words do not
+	// literally contain (deep-plan #267 finding: the chunk-vector lane is
+	// what actually recovers a paraphrased mid/late-transcript fact once
+	// its evidence is preserved through fusion).
+	//
+	// Deliberately scoped to hashedEmbedder ONLY — corpus.go's lexical
+	// lanes (Search's lexicalScore, chunkLexical) never see a folded text,
+	// so a synonym never leaks into the fake FTS/document lane. If it did,
+	// a fixture built to show "the vector lane recovers what the lexical
+	// lane misses" would recover on BOTH lanes and stop being a
+	// discriminating test — see docs/ask-evaluation-protocol.md's
+	// "semantic_aliases" section for the full rationale and the control
+	// check that verifies this scoping.
+	SemanticAliases [][]string `json:"semantic_aliases,omitempty"`
+	Gold            Gold       `json:"gold"`
 }
 
 // Load reads every *.json file in dir as one Fixture, validates it, and
@@ -225,6 +253,35 @@ func validate(f Fixture) error {
 	for _, alias := range f.Gold.SupportDocs {
 		if !aliases[alias] {
 			return fmt.Errorf("fixture %s: gold support_doc_ids references unknown corpus alias %q", f.ID, alias)
+		}
+	}
+	if err := validateSemanticAliases(f); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateSemanticAliases rejects a semantic_aliases declaration this
+// fixture cannot mean unambiguously: every group needs at least two members
+// to fold anything, and a term appearing in two different groups would fold
+// to two different canonicals depending on iteration order — semanticFold
+// (corpus.go) does not define which one wins, so this is a fixture-authoring
+// error, not a runtime ambiguity to silently resolve.
+func validateSemanticAliases(f Fixture) error {
+	seen := map[string]int{} // member (trimmed) -> group index
+	for gi, group := range f.SemanticAliases {
+		if len(group) < 2 {
+			return fmt.Errorf("fixture %s: semantic_aliases[%d] needs at least 2 members to fold anything, got %d", f.ID, gi, len(group))
+		}
+		for _, member := range group {
+			m := strings.TrimSpace(member)
+			if m == "" {
+				return fmt.Errorf("fixture %s: semantic_aliases[%d] has an empty member", f.ID, gi)
+			}
+			if prev, dup := seen[m]; dup && prev != gi {
+				return fmt.Errorf("fixture %s: semantic_aliases member %q appears in both group %d and group %d", f.ID, m, prev, gi)
+			}
+			seen[m] = gi
 		}
 	}
 	return nil

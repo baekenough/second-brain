@@ -95,13 +95,17 @@ func writeFixtureFile(t *testing.T, dir, name, content string) {
 }
 
 // TestRun_FullFixtureSet_Baseline is the CI-safe end-to-end run: every
-// committed fixture goes through the REAL /ask handler (runner.go), and the
-// result is checked against this package's known, currently-measured
-// baseline — not against "everything should pass". Five
-// call_transcript_mid_late fixtures are EXPECTED to fail today
-// (RetrievalHit=true, ContextHit=false): this is issue #266's actual
-// finding, the baseline issue #267 exists to improve, not a test bug. See
-// docs/ask-evaluation-protocol.md for the full derivation.
+// committed fixture goes through the REAL /ask handler (runner.go).
+//
+// Historical note: the five call_transcript_mid_late fixtures used to be a
+// KNOWN, committed baseline failure (RetrievalHit=true, ContextHit=false —
+// issue #266's finding) because buildBudgetedAskMessages always fell back
+// to askPassage's document-head lexical window, discarding whatever a chunk
+// lane had actually matched. Issue #267 (matched-chunk evidence
+// propagation) fixed the underlying pipeline gap; see
+// TestRun_CallTranscriptMidLate_MatchedChunkEvidence for the dedicated
+// regression test and docs/ask-evaluation-protocol.md for the full
+// before/after derivation. The whole fixture set is expected to pass now.
 func TestRun_FullFixtureSet_Baseline(t *testing.T) {
 	fixtures, err := Load(fixturesDir(t))
 	if err != nil {
@@ -112,32 +116,13 @@ func TestRun_FullFixtureSet_Baseline(t *testing.T) {
 		t.Fatalf("want %d results, got %d", len(fixtures), len(results))
 	}
 
-	knownContextFailures := map[string]bool{
-		"ctm-01-deadline":     true,
-		"ctm-02-budget-final": true,
-		"ctm-03-venue-change": true,
-		"ctm-04-headcount":    true,
-		"ctm-05-renewal-date": true,
-	}
-
-	var harnessErrors, unexpectedFailures, unexpectedPasses []string
+	var harnessErrors, unexpectedFailures []string
 	for _, r := range results {
 		if r.Err != nil {
 			harnessErrors = append(harnessErrors, r.Fixture.ID+": "+r.Err.Error())
 			continue
 		}
-		wantFail := knownContextFailures[r.Fixture.ID]
-		switch {
-		case wantFail && r.Metrics.Pass:
-			unexpectedPasses = append(unexpectedPasses, r.Fixture.ID)
-		case wantFail && !r.Metrics.Pass:
-			if !r.Metrics.RetrievalHit {
-				t.Errorf("%s: known context-failure fixture must still have RetrievalHit=true (the doc IS found; only the excerpt is dropped)", r.Fixture.ID)
-			}
-			if r.Metrics.ContextHit {
-				t.Errorf("%s: known context-failure fixture unexpectedly has ContextHit=true now — #267 may have landed; update knownContextFailures and docs/ask-evaluation-protocol.md", r.Fixture.ID)
-			}
-		case !wantFail && !r.Metrics.Pass:
+		if !r.Metrics.Pass {
 			unexpectedFailures = append(unexpectedFailures, r.Fixture.ID)
 		}
 	}
@@ -145,10 +130,58 @@ func TestRun_FullFixtureSet_Baseline(t *testing.T) {
 		t.Errorf("harness errors (fixture/config bugs, not pipeline findings): %v", harnessErrors)
 	}
 	if len(unexpectedFailures) > 0 {
-		t.Errorf("unexpected failures outside the known context-failure set: %v", unexpectedFailures)
+		t.Errorf("unexpected failures (every committed fixture is expected to pass — issue #267): %v", unexpectedFailures)
 	}
-	if len(unexpectedPasses) > 0 {
-		t.Errorf("fixtures in knownContextFailures now pass — #267 likely landed; remove them from knownContextFailures: %v", unexpectedPasses)
+}
+
+// TestRun_CallTranscriptMidLate_MatchedChunkEvidence pins issue #267's
+// specific improvement: each call_transcript_mid_late fixture's gold fact
+// sits in a LATE chunk of a long document, phrased with vocabulary the
+// document itself never uses literally (a paraphrase, or — for ctm-04/
+// ctm-05 — a Korean pronoun follow-up whose standalone-rewritten question
+// paraphrases too). A lexical-only excerpt heuristic (askPassage, the
+// pre-#267 behaviour) cannot locate that fact at all; only #267's chunk-lane
+// evidence propagation (the fake vector lane's semantic_aliases-folded
+// similarity finding the correct chunk, then mergeRRFMode/evidencePassage
+// carrying that match through to the synthesis prompt) can. See
+// fixture.go's Fixture.SemanticAliases doc comment and
+// docs/ask-evaluation-protocol.md's "semantic_aliases" section for why a
+// naive question rewrite alone would not discriminate pre-#267 from
+// post-#267 behaviour here.
+func TestRun_CallTranscriptMidLate_MatchedChunkEvidence(t *testing.T) {
+	fixtures, err := Load(fixturesDir(t))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	var ctm []Fixture
+	for _, f := range fixtures {
+		if f.Category == "call_transcript_mid_late" {
+			ctm = append(ctm, f)
+		}
+	}
+	if len(ctm) != 5 {
+		t.Fatalf("want 5 call_transcript_mid_late fixtures, got %d", len(ctm))
+	}
+	results := Run(context.Background(), ctm, DefaultRunOptions())
+	for _, r := range results {
+		if r.Err != nil {
+			t.Fatalf("%s: run error: %v", r.Fixture.ID, r.Err)
+		}
+		if !r.Metrics.RetrievalHit {
+			t.Errorf("%s: want retrieval_hit=true (the document must be found)", r.Fixture.ID)
+		}
+		if !r.Metrics.ContextHit {
+			t.Errorf("%s: want context_hit=true (the late chunk's evidence must reach the synthesis prompt)", r.Fixture.ID)
+		}
+		if !r.Metrics.AnswerCorrect {
+			t.Errorf("%s: want answer_correct=true, got answer=%q", r.Fixture.ID, r.RawAnswer)
+		}
+		if r.Metrics.CitationStatus != "valid" {
+			t.Errorf("%s: want citation_status=valid, got %q", r.Fixture.ID, r.Metrics.CitationStatus)
+		}
+		if !r.Metrics.Pass {
+			t.Errorf("%s: want pass=true", r.Fixture.ID)
+		}
 	}
 }
 

@@ -55,16 +55,26 @@ type corpus struct {
 
 	chunksByDoc map[uuid.UUID][]store.Chunk
 	allChunks   []store.Chunk
+
+	// semanticFold is this fixture's Fixture.SemanticAliases, compiled once
+	// (semanticAliasFold) — the SAME fold function corpus.chunkVector applies
+	// to a chunk's text and runOne hands to hashedEmbedder for the query
+	// text, so both sides of one cosine-similarity comparison are folded
+	// identically. nil-Fixture.SemanticAliases compiles to the identity
+	// function (see semanticAliasFold), so every pre-existing fixture's
+	// vector-lane behaviour is byte-for-byte unchanged.
+	semanticFold func(string) string
 }
 
 // buildCorpus converts a Fixture's declared documents (and their derived
 // chunks) into a corpus. now is the fixture's parsed AsOf.
 func buildCorpus(f Fixture, now time.Time) (*corpus, error) {
 	c := &corpus{
-		now:         now,
-		docs:        make([]model.Document, len(f.Corpus)),
-		byID:        make(map[uuid.UUID]*model.Document, len(f.Corpus)),
-		chunksByDoc: make(map[uuid.UUID][]store.Chunk, len(f.Corpus)),
+		now:          now,
+		docs:         make([]model.Document, len(f.Corpus)),
+		byID:         make(map[uuid.UUID]*model.Document, len(f.Corpus)),
+		chunksByDoc:  make(map[uuid.UUID][]store.Chunk, len(f.Corpus)),
+		semanticFold: semanticAliasFold(f.SemanticAliases),
 	}
 	for i, cd := range f.Corpus {
 		id := aliasID(cd.Alias)
@@ -264,7 +274,7 @@ func (c *corpus) chunkVector(vec []float32, q model.SearchQuery, limit int) []st
 		if !inWindow(doc.OccurredAt, q.OccurredFrom, q.OccurredTo) {
 			continue
 		}
-		sim := cosineSim(vec, hashEmbed(ch.Content))
+		sim := cosineSim(vec, hashEmbed(c.semanticFold(ch.Content)))
 		if sim <= 0 {
 			continue
 		}
@@ -301,19 +311,36 @@ func chunkResultFor(ch store.Chunk, doc *model.Document, rank, score float64) st
 // actually run end-to-end against synthetic fixtures, without depending on
 // a real embedding API this offline runner must never call (issue #266
 // scope: CI-safe, no network).
-type hashedEmbedder struct{}
+//
+// fold is applied to every text before hashing — runOne always constructs
+// this with the SAME corpus.semanticFold function corpus.chunkVector uses on
+// chunk text, so a fixture's semantic_aliases groups (Fixture.SemanticAliases'
+// doc comment) fold identically on both sides of a cosine-similarity
+// comparison. A nil fold (e.g. a hashedEmbedder built outside runOne, such as
+// in a unit test) means "no folding" — see semanticAliasFold's nil-groups
+// case, which is what every pre-existing fixture (no semantic_aliases) gets.
+type hashedEmbedder struct {
+	fold func(string) string
+}
 
 func (hashedEmbedder) Enabled() bool  { return true }
 func (hashedEmbedder) Dimension() int { return embedDim }
 
-func (hashedEmbedder) Embed(_ context.Context, text string) ([]float32, error) {
-	return hashEmbed(text), nil
+func (h hashedEmbedder) apply(text string) string {
+	if h.fold == nil {
+		return text
+	}
+	return h.fold(text)
 }
 
-func (hashedEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float32, error) {
+func (h hashedEmbedder) Embed(_ context.Context, text string) ([]float32, error) {
+	return hashEmbed(h.apply(text)), nil
+}
+
+func (h hashedEmbedder) EmbedBatch(_ context.Context, texts []string) ([][]float32, error) {
 	out := make([][]float32, len(texts))
 	for i, t := range texts {
-		out[i] = hashEmbed(t)
+		out[i] = hashEmbed(h.apply(t))
 	}
 	return out, nil
 }
@@ -348,6 +375,48 @@ func cosineSim(a, b []float32) float64 {
 		dot += float64(a[i]) * float64(b[i])
 	}
 	return dot // both vectors are already L2-normalized, so dot == cosine.
+}
+
+// semanticAliasFold compiles a Fixture's SemanticAliases into a text
+// transform: every non-canonical member of a group is replaced by that
+// group's first ("canonical") member, longest member first so a shorter
+// alias sharing a prefix/suffix with a longer one cannot partially consume
+// it before the longer replacement runs. groups==nil (the overwhelming
+// majority of fixtures, which declare no semantic_aliases) returns the
+// identity function — every fixture predating this mechanism embeds exactly
+// as before.
+//
+// This function backs ONLY hashedEmbedder/corpus.chunkVector (the fake
+// vector lane) — see Fixture.SemanticAliases' doc comment for why it must
+// never reach corpus.Search's lexicalScore or chunkLexical (the fake
+// document/FTS lanes): folding a query's synonym into the lexical lane too
+// would let a paraphrase fixture pass via the LEXICAL lane, which defeats
+// the fixture's purpose of isolating what the vector lane alone recovers.
+func semanticAliasFold(groups [][]string) func(string) string {
+	if len(groups) == 0 {
+		return func(s string) string { return s }
+	}
+	type replacement struct{ from, to string }
+	var reps []replacement
+	for _, group := range groups {
+		if len(group) < 2 {
+			continue // validate() rejects this at Load time; defensive only.
+		}
+		canonical := group[0]
+		for _, member := range group[1:] {
+			if member == canonical {
+				continue
+			}
+			reps = append(reps, replacement{from: member, to: canonical})
+		}
+	}
+	sort.Slice(reps, func(i, j int) bool { return len(reps[i].from) > len(reps[j].from) })
+	return func(s string) string {
+		for _, r := range reps {
+			s = strings.ReplaceAll(s, r.from, r.to)
+		}
+		return s
+	}
 }
 
 // --- shared lexical helpers ---

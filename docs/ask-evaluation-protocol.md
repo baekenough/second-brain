@@ -91,6 +91,9 @@ for the authoritative field-by-field reference; summary:
   "question": "...",
   "standalone_question": "...",      // required iff history is non-empty
   "scripted_answer": "...",          // optional; bypasses the oracle
+  "semantic_aliases": [              // optional; see "semantic_aliases" below
+    ["마감일", "완료 기준일"]
+  ],
   "gold": {
     "answerable": true,
     "claims": ["..."], "support_doc_ids": ["call-1"], "support_spans": ["..."],
@@ -106,6 +109,56 @@ A corpus doc's `alias` (never a UUID) deterministically maps to the same
 `scripted_answer`'s `{{doc:<alias>}}` placeholders both resolve through the
 same function, so a fixture never needs to hardcode a UUID.
 
+### `semantic_aliases`: simulating a vector model's paraphrase recall
+
+`hashedEmbedder` (see the fake-dependency table above) is a **literal**
+character-bigram hash — it has no notion of meaning at all, so two Korean
+phrases that mean the same thing but share no characters (e.g. "마감일" and
+"완료 기준일") embed to unrelated vectors and never cosine-match. A real
+embedding backend recovers exactly this kind of paraphrase; this fake one
+cannot, which is a problem for any fixture that specifically needs to
+exercise "the chunk-vector lane finds a passage the question's own words do
+not literally contain" (the `call_transcript_mid_late` category's whole
+point — see below).
+
+`semantic_aliases` closes that gap in a narrow, explicit, deterministic way.
+Each entry is a synonym group; every member after the first ("canonical")
+member is folded to the canonical member — via `corpus.go`'s
+`semanticAliasFold` — before the bigram hash runs, for BOTH the query text
+and every chunk's text. Concretely, `[["마감일", "완료 기준일"]]` makes a
+chunk containing "완료 기준일" hash as if it said "마감일" instead, so a
+query that says "마감일" (and never literally says "완료 기준일") still
+cosine-matches it — simulating, crudely but deterministically, what a real
+embedding model does for that pair of phrases natively.
+
+**Scope — vector lane only.** `semanticAliasFold`'s output feeds ONLY
+`hashedEmbedder.Embed`/`EmbedBatch` and `corpus.chunkVector`'s own
+`hashEmbed` call. It is never applied to `corpus.Search`'s `lexicalScore` or
+to `chunkLexical` (the fake document-store and chunk-FTS lanes) — see
+`Fixture.SemanticAliases`' doc comment (`internal/askeval/fixture.go`) for
+the full rationale. This matters for correctness, not just tidiness: if a
+synonym leaked into the lexical lanes too, a fixture built to show "the
+chunk-vector lane alone recovers this paraphrase" would pass via the
+lexical lane as well, and would no longer distinguish anything —
+`TestSemanticAliasFold_AffectsOnlyVectorLane` (`internal/askeval/corpus_test.go`)
+pins this scoping directly, asserting the fake document lane and chunk-FTS
+lane both return zero results for a paraphrase query that the fake vector
+lane (after folding) does find.
+
+A naive fixture author's first instinct — just rewrite the question to
+literally quote the document's own wording — does not need this mechanism
+at all, and also does not test anything: `askPassage`'s pre-#267 lexical
+window search scans the WHOLE document for the query's own literal words,
+so a question containing the document's exact phrasing would already find
+the right passage even without issue #267's chunk-evidence propagation,
+making the fixture unable to tell the two states apart. `semantic_aliases`
+exists specifically for the fixture shape that DOES discriminate: a
+question phrased so its own words appear NOWHERE in the document (so the
+pre-#267 lexical fallback provably fails — see
+`call_transcript_mid_late`'s current fixtures, each engineered so
+`askPassage`'s window search scores `0` everywhere), while still being
+answerable because the (simulated) vector lane can bridge the paraphrase.
+
 ## Fixture mix (35 fixtures, ≥30 required)
 
 | Category | Count | What it exercises |
@@ -113,7 +166,7 @@ same function, so a fixture never needs to hardcode a UUID.
 | `single_turn` | 6 | One question, one supporting document, no history |
 | `korean_followup` | 5 | 지시어/pronoun resolution ("그 사람", "거기", "그 회의") across a 2-turn conversation, via the real query-rewrite call |
 | `period_source_filter` | 5 | `intent.DeterministicWindow` + `explicitRecordSources` narrowing the candidate pool by event-time window and/or source type |
-| `call_transcript_mid_late` | 5 | **Known baseline gap** — see below |
+| `call_transcript_mid_late` | 5 | Paraphrased/pronoun-follow-up questions whose gold fact sits in a LATE chunk of a long document — see below |
 | `conflicting_sources` | 3 | Two documents assert different values for the same fact; only the correct (gold) one should be cited |
 | `no_evidence` | 3 | Retrieval returns nothing relevant → `finish_reason: "no_evidence"` before synthesis ever runs |
 | `irrelevant_evidence` | 3 | Retrieval returns topically-adjacent but non-answering documents → synthesis reaches Stage 3 but must still abstain (`citation_status: "abstained"`), not fabricate |
@@ -164,31 +217,82 @@ the validator reaches the provoked verdict; answerable fixtures pass on
 correct-claim-plus-valid-citation; unanswerable fixtures pass on correct
 abstention).
 
-## Known baseline: `call_transcript_mid_late` (5/5 fail today)
+## `call_transcript_mid_late`: resolved by #267 (was a 5/5 known baseline gap)
 
-These five fixtures are a **known, currently-measured, and deliberately
-committed** baseline failure — the exact gap issue #267 exists to close,
-not a bug in this evaluator. Each fixture's one document has:
+These five fixtures were originally a **known, currently-measured, and
+deliberately committed** baseline failure — the exact gap issue #267
+closed, not a bug in this evaluator. Issue #267 (matched-chunk evidence
+propagation) fixed the underlying pipeline gap; the fixtures below are the
+ones that actually discriminate the before/after behaviour, and all five
+now pass. `TestRun_CallTranscriptMidLate_MatchedChunkEvidence`
+(`internal/askeval/runner_test.go`) pins this as a regression test.
 
-1. a **head** whose vocabulary strongly overlaps the question (so
-   retrieval finds and ranks it, and `askPassage`'s lexical-window search
-   anchors on the head);
-2. ~4.2 KB of filler with zero vocabulary overlap with the question;
-3. a **tail** carrying the actual fact, in vocabulary the question never
-   mentions.
+### Fixture shape
 
-`internal/api/ask_context.go`'s `buildBudgetedAskMessages` caps any single
-document's excerpt at `askExcerptBytes` (4096 bytes) **regardless of how
-many documents are being retrieved** (`perDoc = min(askExcerptBytes,
-(remaining-512)/count)`), so placing the fact past that offset — combined
-with a head that wins `askPassage`'s window search — guarantees the fact
-never reaches the synthesis prompt. Measured result for all five fixtures:
-`retrieval_hit=true`, `context_hit=false`, `citation_status="abstained"`.
-This is `/ask` correctly declining to fabricate an answer it cannot
-support — a safe failure mode, but a failure mode `#267` (matched-chunk
-evidence propagation) is designed to fix by preserving the chunk that
-actually matched, rather than re-deriving a window from the whole
-document's head.
+Each fixture's one document has:
+
+1. a **head paragraph** (~1.5 KB): an intro sentence plus filler text with
+   zero vocabulary overlap with the question;
+2. a **tail paragraph** (~1.5 KB, split into its own chunk by
+   `internal/chunker`): more filler, then the fact sentence, then a short
+   wrap-up sentence — the wrap-up exists so the fact is never the literal
+   last byte of the document (see "Why the tail needs trailing text" below);
+3. a **question** phrased so that NONE of its own words are a literal
+   substring anywhere in the document — a paraphrase (e.g. "마감일" for the
+   document's "완료 기준일") for `ctm-01`–`ctm-03`, or a Korean pronoun
+   follow-up ("그거 새로 뽑을 인력이 몇 명이래?") whose `standalone_question`
+   rewrite also paraphrases, for `ctm-04`/`ctm-05`. Both shapes make issue
+   #267's two independent fixes relevant: chunk-evidence propagation itself,
+   and `buildBudgetedAskMessages`'s `excerptQuery` parameter (the
+   standalone-rewritten question, not the user's literal follow-up wording,
+   drives the lexical FALLBACK window when evidence is absent).
+
+### Why the paraphrase is necessary, not decorative
+
+A naive fixture author's first instinct — rewrite the question to literally
+contain the document's own wording (e.g. ask "완료 기준일이 언제야?" instead
+of paraphrasing) — does not test anything: `internal/api/ask_context.go`'s
+`askPassage` scans the WHOLE document for literal word matches, so a
+question containing the document's exact phrasing finds the right window
+via plain lexical search alone, with or without issue #267. The fixtures
+here instead use `semantic_aliases` (see above) so the question's own words
+never appear anywhere in the document at all — confirmed by construction:
+a faithful port of `askPassage`'s window-scoring loop against each
+fixture's exact content/question pair scores `0` at every window position,
+meaning `askPassage` cannot distinguish the head from anywhere else and
+falls back to its initial value (the document's start).
+
+### Why the tail needs trailing text
+
+The chunk carrying the fact is also the LAST chunk of the document. Without
+a short wrap-up sentence after the fact,
+`internal/api/ask_context.go`'s `windowAround` — which centres the excerpt
+window on the located evidence span — clamps its window's right edge to
+`len(content)` (there is nothing further to include), then prepends a
+`"[앞부분 생략] "` marker; the combined text now exceeds the excerpt budget
+by the marker's byte length, and `clipAskText`'s safety-net re-clip trims
+that many bytes off the END — which, with no trailing buffer, is the fact
+itself. This is a genuine, if narrow, edge case in #267's `windowAround`/
+`clipAskText` interaction, confirmed by reproducing it against an earlier
+draft of these fixtures (see the fixing commit's message for the
+byte-offset evidence). Adding a short, natural wrap-up sentence after the
+fact keeps that edge case from ever touching the answer-bearing text,
+matching how a real transcript would end anyway (a call does not stop
+mid-sentence at the fact). This was judged a fixture-realism fix, not a
+workaround, and is disclosed here rather than silently baked in.
+
+### Control check (pre-#267 vs. HEAD)
+
+Re-running these fixtures against the pre-#267 code (`git revert` of #267's
+commit in a scratch worktree, current fixture files copied in) reproduces
+the original failure mode exactly: all five `retrieval_hit=true,
+context_hit=false, citation_status="abstained"` — the document IS found,
+but the excerpt never reaches the fact. At HEAD (#267 applied), all five
+`retrieval_hit=true, context_hit=true, answer_correct=true,
+citation_status="valid"`. Both runs share the same
+`fixture_set_hash`, so `cmd/askeval --baseline` diffs them directly:
+`improved=5 regressed=0 still_failing=0 still_passing=30`. See the fixing
+commit's message for the exact command transcript.
 
 ### Why "omitted-by-budget" is not one of the four adversarial-citation shapes
 

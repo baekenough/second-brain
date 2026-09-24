@@ -209,7 +209,11 @@ func runOne(ctx context.Context, f Fixture, opts RunOptions) CaseResult {
 	completer := newScriptedCompleter()
 	completer.forFixture(&f, cp.resolveAlias)
 
-	svc := search.NewService(cp, hashedEmbedder{}).WithChunkStore(cp)
+	// fold: cp.semanticFold — the SAME fold function cp.chunkVector applies
+	// to chunk text (corpus.go), so a fixture's semantic_aliases groups fold
+	// identically on both sides of the fake vector lane's cosine-similarity
+	// comparison (see Fixture.SemanticAliases' doc comment).
+	svc := search.NewService(cp, hashedEmbedder{fold: cp.semanticFold}).WithChunkStore(cp)
 
 	sessions := newMemSessions()
 	convID := uuid.New()
