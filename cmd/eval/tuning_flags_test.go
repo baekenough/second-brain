@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/baekenough/second-brain/internal/sparseq"
 )
 
 // defaultTuningFlags 는 플래그를 하나도 주지 않은 실행의 값이다. flag 패키지의
@@ -17,6 +18,7 @@ func defaultTuningFlags() model.SearchTuning {
 		RerankInput:       model.RerankInputHead,
 		RecencyAlpha:      model.DefaultRecencyAlpha,
 		ChunkSparse:       model.ChunkSparseFallback,
+		SparseQuery:       model.SparseQueryRaw,
 	}
 }
 
@@ -45,6 +47,10 @@ func TestValidateTuningFlags(t *testing.T) {
 		{"--recency-halflife-days 음수", func(t *model.SearchTuning) { t.RecencyHalfLifeDays = -1 }, true},
 		{"--recency-alpha 범위 밖", func(t *model.SearchTuning) { t.RecencyAlpha = 1.5 }, true},
 		{"--chunk-sparse 오타", func(t *model.SearchTuning) { t.ChunkSparse = "fuze" }, true},
+		{"--sparse-query=chunk", func(t *model.SearchTuning) { t.SparseQuery = model.SparseQueryChunk }, false},
+		{"--sparse-query=chunk_doc", func(t *model.SearchTuning) { t.SparseQuery = model.SparseQueryChunkDoc }, false},
+		{"--sparse-query 오타", func(t *model.SearchTuning) { t.SparseQuery = "chunkdoc" }, true},
+		{"--sparse-query 빈 값", func(t *model.SearchTuning) { t.SparseQuery = "" }, true},
 		{"--chunk-sparse=fuse_ctx + 유효한 버전", func(t *model.SearchTuning) {
 			t.ChunkSparse = model.ChunkSparseFuseCtx
 			t.ChunkSparseCtxVersion = model.ChunkSparseCtxV1TP
@@ -119,6 +125,16 @@ func TestApplyTuningProfile_NonDefaultSplitsBaseline(t *testing.T) {
 			},
 			wantKeys: []string{"chunk_sparse", "chunk_sparse_ctx_version"},
 		},
+		{
+			name:     "희소 질의 키워드는 어휘 판까지 함께 남긴다(chunk)",
+			mutate:   func(t *model.SearchTuning) { t.SparseQuery = model.SparseQueryChunk },
+			wantKeys: []string{"sparse_query", "sparse_terms_version"},
+		},
+		{
+			name:     "희소 질의 키워드는 어휘 판까지 함께 남긴다(chunk_doc)",
+			mutate:   func(t *model.SearchTuning) { t.SparseQuery = model.SparseQueryChunkDoc },
+			wantKeys: []string{"sparse_query", "sparse_terms_version"},
+		},
 	}
 
 	for _, tc := range tests {
@@ -160,5 +176,22 @@ func TestApplyTuningProfile_UnusedWeightsStayOut(t *testing.T) {
 	applyTuningProfile(profile, tuning.Normalized())
 	if len(profile) != 0 {
 		t.Errorf("효과 없는 값이 프로필에 들어갔다: %+v", profile)
+	}
+}
+
+// TestApplyTuningProfile_SparseTermsVersionValue 는 어휘 판 키가 실제
+// sparseq.Version 값을 담는지 본다. 키만 있고 값이 고정 문자열이면 어휘를
+// 바꿔 Version 을 올려도 baseline 계열이 갈리지 않는다.
+func TestApplyTuningProfile_SparseTermsVersionValue(t *testing.T) {
+	t.Parallel()
+	tuning := defaultTuningFlags()
+	tuning.SparseQuery = model.SparseQueryChunk
+	profile := map[string]any{}
+	applyTuningProfile(profile, tuning.Normalized())
+	if got := profile["sparse_terms_version"]; got != sparseq.Version {
+		t.Errorf("sparse_terms_version = %v, want %q", got, sparseq.Version)
+	}
+	if got := profile["sparse_query"]; got != model.SparseQueryChunk {
+		t.Errorf("sparse_query = %v, want %q", got, model.SparseQueryChunk)
 	}
 }

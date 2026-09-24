@@ -13,6 +13,7 @@ import (
 
 	"github.com/baekenough/second-brain/internal/config"
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/baekenough/second-brain/internal/sparseq"
 	"github.com/baekenough/second-brain/internal/store"
 	"github.com/baekenough/second-brain/internal/timeutil"
 )
@@ -144,6 +145,10 @@ func validateTuningFlags(t model.SearchTuning) error {
 		return fmt.Errorf("eval: --chunk-sparse=%s requires --chunk-sparse-ctx-version=%q or %q, got %q",
 			model.ChunkSparseFuseCtx, model.ChunkSparseCtxV1TP, model.ChunkSparseCtxV1Full, t.ChunkSparseCtxVersion)
 	}
+	if t.SparseQuery != model.SparseQueryRaw && t.SparseQuery != model.SparseQueryChunk && t.SparseQuery != model.SparseQueryChunkDoc {
+		return fmt.Errorf("eval: invalid --sparse-query %q (want %q, %q or %q)",
+			t.SparseQuery, model.SparseQueryRaw, model.SparseQueryChunk, model.SparseQueryChunkDoc)
+	}
 	return nil
 }
 
@@ -184,6 +189,14 @@ func applyTuningProfile(profile map[string]any, t model.SearchTuning) {
 			// baseline 을 가른다.
 			profile["chunk_sparse_ctx_version"] = t.ChunkSparseCtxVersion
 		}
+	}
+	if t.SparseQuery != model.SparseQueryRaw {
+		// 키워드 추출 어휘(불용어·조사·시간 표현)는 코드라서, 어휘가 바뀌면
+		// 같은 노브 값이라도 검색 결과가 달라진다. 판을 함께 남겨 어휘가 다른
+		// 실행이 같은 baseline 계열로 섞이지 않게 한다. raw 에서는 어휘가
+		// 쓰이지 않으므로 넣지 않는다.
+		profile["sparse_query"] = t.SparseQuery
+		profile["sparse_terms_version"] = sparseq.Version
 	}
 }
 

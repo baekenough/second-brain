@@ -425,7 +425,33 @@ type SearchQuery struct {
 	// 바꾸므로 검색 결과의 정체성 일부다. 평가 실행(cmd/eval)은 기본이 아닌
 	// 값을 config_hash 에 넣어 별도 baseline 계열이 되게 한다.
 	Tuning SearchTuning
+
+	// SparseTerms 는 희소 레인(FTS·bigm)이 질문 원문 대신 쓸 키워드다(#276).
+	// search.Service 만 채운다: 요청마다 먼저 비운 뒤 Tuning.SparseQuery 가
+	// 켠 범위의 레인에 넘기는 사본에만 internal/sparseq 추출 결과를 넣는다.
+	// 비어 있으면 저장소는 #276 이전과 바이트 단위로 같은 SQL 을 만든다.
+	//
+	// json:"-" 인 이유: REST·MCP 클라이언트가 이 필드로 임의의 tsquery 를
+	// 밀어 넣을 수 없어야 한다. 질문에서 파생된 개인 데이터이기도 하므로
+	// 로그·trace·덤프에 싣지 않는다(개수만).
+	SparseTerms SparseTerms `json:"-"`
 }
+
+// SparseTerms 는 저장소가 희소 레인에서 쓸 키워드다. model 이 leaf 패키지로
+// 남도록 internal/sparseq 를 임포트하지 않고, 이미 렌더링된 값만 싣는다.
+type SparseTerms struct {
+	// TSQuery 는 sparseq.TSQuery 가 만든 접두 OR tsquery 문자열이다
+	// ("'회의':* | '일정':*"). 반드시 바인딩 파라미터 하나로 to_tsquery 에
+	// 넘긴다. 비어 있으면 tsquery 조건은 거짓이 되고 LIKE 가 레인을 맡는다.
+	TSQuery string
+	// Like 는 키워드별 LIKE 부분 문자열이다. 저장소가 최대 8개까지
+	// 플레이스홀더 OR 로 펼친다.
+	Like []string
+}
+
+// Active 는 키워드가 하나라도 있는지 알린다. false 이면 저장소는 질문 원문
+// 경로(#276 이전 SQL)를 탄다.
+func (t SparseTerms) Active() bool { return t.TSQuery != "" || len(t.Like) > 0 }
 
 // SortRecent is the ONLY value of SearchQuery.Sort that ranks by time. Every
 // other value — including "" and "relevance" — ranks by relevance score. It is
