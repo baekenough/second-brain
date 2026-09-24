@@ -152,12 +152,78 @@ type Document struct {
 	SummaryEmbedding []float32 `json:"-"` // omit from REST: large vector
 }
 
+// MatchTypeChunkVector / MatchTypeChunkFTS are the MatchType values set
+// exclusively by internal/search's chunk-lane winner conversion
+// (chunkVecToSearchResult / chunkToSearchResult). A SearchResult carrying
+// one of these two values has Content set to the matched chunk's OWN text —
+// never the parent document's full body — because that conversion never had
+// the full document to begin with (the chunks table join deliberately omits
+// it; see store.ChunkSearchResult's doc comment).
+//
+// Every other MatchType value ("fulltext", "vector", "hybrid", ...) comes
+// from the document-lane search and carries Content as the full document
+// body, even when Evidence is also populated below (#267): a chunk-lane hit
+// fused into a document-lane primary via mergeRRFMode never replaces that
+// primary's Content — see mergeRRFMode's doc comment for why (replacing it
+// would change the cross-encoder rerank's default "head" input and regress
+// the golden ndcg baseline).
+//
+// /ask (internal/api/ask_context.go) reads these two constants to decide
+// whether Content itself is already the passage to show (chunk-lane-only)
+// or whether Evidence needs to be located INSIDE Content (document-lane
+// primary with fused chunk evidence).
+const (
+	MatchTypeChunkVector = "chunk-vector"
+	MatchTypeChunkFTS    = "chunk-fts"
+)
+
+// MatchedEvidence identifies one chunk-lane hit that contributed to a
+// SearchResult surviving RRF fusion (internal/search's mergeRRFMode). It is
+// the provenance #267 adds so /ask's excerpt selection
+// (internal/api/ask_context.go) can locate and prioritise the PASSAGE that
+// actually matched retrieval, instead of only ever seeing the document's
+// head — the bug this issue fixes: a document whose answer sits in a
+// mid/late chunk used to lose that chunk's text entirely once its chunk-lane
+// hit merged into a document-lane primary (mergeRRFMode kept the primary's
+// full-document Content and discarded the chunk text on overlap).
+//
+// Text carries the chunk's own body so a caller can use it even when the
+// chunk is not a byte-for-byte substring of Document.Content — the chunker
+// applies cleanup, heading prefixes, and paragraph merge/overlap before
+// storing a chunk (internal/chunker), so a literal-substring search can fail
+// even for a chunk that genuinely came from this document. Text is
+// deliberately excluded from JSON (`json:"-"`): SearchResult.Evidence is
+// consumed server-side within the /ask pipeline only, and re-exposing full
+// chunk bodies over HTTP/MCP would duplicate document content and grow
+// response payload size for no client-visible benefit.
+type MatchedEvidence struct {
+	// ChunkID / ChunkIndex identify the source row in the chunks table
+	// (store.Chunk). Chunks carry no stored byte-offset into the parent
+	// document (store.Chunk has no offset column) — any position information
+	// a caller needs must be derived by locating Text inside Content itself,
+	// never fabricated from ChunkIndex.
+	ChunkID    int64 `json:"chunk_id"`
+	ChunkIndex int   `json:"chunk_index"`
+	// Lane records which chunk lane produced this hit — MatchTypeChunkVector
+	// or MatchTypeChunkFTS above.
+	Lane  string  `json:"lane"`
+	Score float64 `json:"score"`
+	Text  string  `json:"-"`
+}
+
 // SearchResult wraps a Document with relevance scoring metadata.
 type SearchResult struct {
 	Document
 	Score     float64  `json:"score"`
 	MatchType string   `json:"match_type"`         // "fulltext", "vector", or "hybrid"
 	Entities  []Entity `json:"entities,omitempty"` // named entities extracted from the document; nil when not populated
+	// Evidence lists the chunk-lane hits that contributed to this document
+	// appearing in the result set. nil for a document-lane-only result;
+	// populated whenever a chunk lane (MatchTypeChunkVector/MatchTypeChunkFTS
+	// above) matched this document, whether or not that lane ended up as the
+	// PRIMARY source of Content (#267). Capped per-document by
+	// search.maxEvidencePerResult during fusion.
+	Evidence []MatchedEvidence `json:"evidence,omitempty"`
 }
 
 // SearchWeights controls RRF fusion behaviour.

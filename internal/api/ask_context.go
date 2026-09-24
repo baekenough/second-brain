@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -21,6 +22,16 @@ const (
 	askExcerptBytes  = 4 * 1024
 )
 const excerptMarker = " [발췌: 나머지 생략]"
+
+// unlocatedEvidenceMarker (#267) is appended when a matched chunk's text
+// exists (model.MatchedEvidence.Text is non-empty) but could not be located
+// verbatim inside its parent document's Content — see
+// model.MatchedEvidence's doc comment (chunker cleanup/heading
+// prefix/paragraph merge means a chunk is not always a byte-for-byte
+// substring of the document it came from). The chunk's own text is used
+// as-is in that case; this marker makes the fallback visible rather than
+// presenting it as a located, in-context passage.
+const unlocatedEvidenceMarker = " [발췌: 매칭된 문단, 원문 내 위치 미확인]"
 
 func clipAskText(text string, budget int) string {
 	if len(text) <= budget {
@@ -98,6 +109,161 @@ func askPassage(content, question string, budget int) (string, askEvidenceMode) 
 	return prefix + clipAskText(string(runes[bestStart:]), budget-len(prefix)), mode
 }
 
+// isChunkOnlyResult reports whether r's Content already IS a matched chunk's
+// own text rather than the parent document's full body — see
+// model.MatchTypeChunkVector's doc comment. Such a result needs no
+// evidence-location step: Content is already the passage.
+func isChunkOnlyResult(r *model.SearchResult) bool {
+	return r.MatchType == model.MatchTypeChunkVector || r.MatchType == model.MatchTypeChunkFTS
+}
+
+// evidenceSpan is a byte range located inside a document-lane primary's
+// Content that a model.MatchedEvidence's Text was found at.
+type evidenceSpan struct {
+	start, end int
+	score      float64
+}
+
+// locateEvidenceSpans finds every evidence entry whose Text is a literal
+// substring of content, merges overlapping/adjacent hits into single spans,
+// and returns them sorted by position. Entries whose Text is empty or not
+// found are silently skipped — #267 (deep-plan finding F3) forbids
+// fabricating a location for text that is not verifiably there.
+func locateEvidenceSpans(content string, evidence []model.MatchedEvidence) []evidenceSpan {
+	var spans []evidenceSpan
+	for _, ev := range evidence {
+		if ev.Text == "" {
+			continue
+		}
+		idx := strings.Index(content, ev.Text)
+		if idx < 0 {
+			continue
+		}
+		spans = append(spans, evidenceSpan{start: idx, end: idx + len(ev.Text), score: ev.Score})
+	}
+	if len(spans) == 0 {
+		return nil
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
+	merged := spans[:1]
+	for _, s := range spans[1:] {
+		last := &merged[len(merged)-1]
+		if s.start > last.end {
+			merged = append(merged, s)
+			continue
+		}
+		// Overlapping or touching: dedupe into one span (#267 "dedupe
+		// overlaps across multiple evidences").
+		if s.end > last.end {
+			last.end = s.end
+		}
+		if s.score > last.score {
+			last.score = s.score
+		}
+	}
+	return merged
+}
+
+// bestEvidenceByScore returns a pointer to the highest-scoring entry in
+// evidence, or nil for an empty slice.
+func bestEvidenceByScore(evidence []model.MatchedEvidence) *model.MatchedEvidence {
+	if len(evidence) == 0 {
+		return nil
+	}
+	best := &evidence[0]
+	for i := 1; i < len(evidence); i++ {
+		if evidence[i].Score > best.Score {
+			best = &evidence[i]
+		}
+	}
+	return best
+}
+
+// windowAround clips content to a budget-sized window straddling [start,
+// end), preferring to centre the window on the match. Prefix/suffix markers
+// make an omitted surrounding region explicit, matching askPassage's
+// "[앞부분 생략]" convention. The final clipAskText call is the same safety
+// net askPassage relies on: marker bytes can push the raw concatenation
+// slightly over budget, and clipAskText is the one place that enforces the
+// hard bound.
+func windowAround(content string, start, end, budget int) string {
+	if budget <= 0 {
+		return ""
+	}
+	matchLen := end - start
+	if matchLen >= budget {
+		return clipAskText(content[start:], budget)
+	}
+	extra := budget - matchLen
+	left := start - extra/2
+	if left < 0 {
+		left = 0
+	}
+	right := left + budget
+	if right > len(content) {
+		right = len(content)
+		left = right - budget
+		if left < 0 {
+			left = 0
+		}
+	}
+	for left > 0 && !utf8.RuneStart(content[left]) {
+		left--
+	}
+	for right < len(content) && !utf8.RuneStart(content[right]) {
+		right++
+	}
+	prefix := ""
+	if left > 0 {
+		prefix = "[앞부분 생략] "
+	}
+	suffix := ""
+	if right < len(content) {
+		suffix = " [뒷부분 생략]"
+	}
+	return clipAskText(prefix+content[left:right]+suffix, budget)
+}
+
+// evidencePassage builds a document-lane primary's excerpt from its fused
+// chunk Evidence (#267): the answer-bearing passage a chunk lane actually
+// matched, placed first, instead of always falling back to content's
+// beginning. Returns ("", "") when evidence exists but carries no usable
+// text at all, signalling the caller to fall back to askPassage's lexical
+// heuristic.
+//
+// content is the FULL document body (never Content from a chunk-only
+// result — see isChunkOnlyResult, handled separately by the caller).
+func evidencePassage(content string, evidence []model.MatchedEvidence, budget int) (string, askEvidenceMode) {
+	if spans := locateEvidenceSpans(content, evidence); len(spans) > 0 {
+		best := spans[0]
+		for _, s := range spans[1:] {
+			if s.score > best.score {
+				best = s
+			}
+		}
+		return windowAround(content, best.start, best.end, budget), askEvidenceModeMatchedChunk
+	}
+	// Not locatable in content: use the chunk's own text directly rather
+	// than guessing an offset (deep-plan #267 finding F3 / risk table).
+	if best := bestEvidenceByScore(evidence); best != nil && best.Text != "" {
+		return clipAskText(best.Text, budget-len(unlocatedEvidenceMarker)) + unlocatedEvidenceMarker, askEvidenceModeMatchedChunk
+	}
+	return "", ""
+}
+
+// evidenceChunkIDs collects the ChunkID of every entry in evidence, in
+// order, for askPromptEvidence.ChunkIDs manifest bookkeeping.
+func evidenceChunkIDs(evidence []model.MatchedEvidence) []int64 {
+	if len(evidence) == 0 {
+		return nil
+	}
+	ids := make([]int64, len(evidence))
+	for i, ev := range evidence {
+		ids[i] = ev.ChunkID
+	}
+	return ids
+}
+
 // buildBudgetedAskMessages assembles Stage 3's prompt AND the
 // askPromptManifest recording exactly which documents (and, for the ones
 // that fit, which excerpt mode) actually made it into that prompt. The
@@ -106,9 +272,23 @@ func askPassage(content, question string, budget int) (string, askEvidenceMode) 
 // written into the message builder, and the budget-exceeded break below
 // records everything it did NOT reach as Omitted, so the two never drift
 // apart.
-func buildBudgetedAskMessages(question string, result RetrievalResult, history []askHistoryTurn) ([]llm.Message, askPromptManifest) {
+//
+// question is the user-facing wording: it is clipped and placed as the
+// final turn Stage 3 answers, and it is what gets persisted (saveAskTurn).
+// excerptQuery is used ONLY to drive askPassage's lexical fallback window
+// (#267 deep-plan finding F12/§5): a Korean 지시어 follow-up like "그건 언제로
+// 정했지?" carries almost no searchable vocabulary of its own, so excerpt
+// selection needs the SAME standalone (rewritten) question Stage 2 retrieval
+// already searched with — see askHandler's rewriteStandaloneQuestion call.
+// When a document instead has model.SearchResult.Evidence populated,
+// neither question nor excerptQuery drives excerpt selection at all: the
+// passage is the chunk lane's own matched location (evidencePassage below).
+func buildBudgetedAskMessages(question, excerptQuery string, result RetrievalResult, history []askHistoryTurn) ([]llm.Message, askPromptManifest) {
 	result = selectAskEvidence(result)
 	question = clipAskText(question, askQuestionBytes)
+	if excerptQuery == "" {
+		excerptQuery = question
+	}
 	messages := make([]llm.Message, 0, len(history)*2+2)
 	remaining := askMessageBytes - len(question)
 	for _, h := range budgetAskHistory(history) {
@@ -135,14 +315,33 @@ func buildBudgetedAskMessages(question string, result RetrievalResult, history [
 				break
 			}
 			b.WriteString(header)
-			passage, mode := askPassage(r.Document.Content, question, perDoc-len(header)-1)
+			passageBudget := perDoc - len(header) - 1
+			// #267: prefer the passage a chunk lane actually matched over
+			// always falling back to the document's beginning.
+			var passage string
+			var mode askEvidenceMode
+			var chunkIDs []int64
+			switch {
+			case isChunkOnlyResult(r):
+				passage, mode = clipAskText(r.Document.Content, passageBudget), askEvidenceModeChunkOnly
+				chunkIDs = evidenceChunkIDs(r.Evidence)
+			case len(r.Evidence) > 0:
+				passage, mode = evidencePassage(r.Document.Content, r.Evidence, passageBudget)
+				if passage != "" {
+					chunkIDs = evidenceChunkIDs(r.Evidence)
+				}
+			}
+			if passage == "" {
+				passage, mode = askPassage(r.Document.Content, excerptQuery, passageBudget)
+			}
 			b.WriteString(passage)
 			b.WriteByte('\n')
 			manifest.Evidence = append(manifest.Evidence, askPromptEvidence{
-				ID:    r.Document.ID,
-				Layer: layer,
-				Mode:  mode,
-				Bytes: len(passage),
+				ID:       r.Document.ID,
+				Layer:    layer,
+				Mode:     mode,
+				Bytes:    len(passage),
+				ChunkIDs: chunkIDs,
 			})
 		}
 	}

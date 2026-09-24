@@ -32,6 +32,22 @@ const (
 	askEvidenceModeFull          askEvidenceMode = "full"
 	askEvidenceModeLexicalWindow askEvidenceMode = "lexical_window"
 	askEvidenceModeHead          askEvidenceMode = "head"
+	// askEvidenceModeMatchedChunk (#267): the excerpt was built from a
+	// model.SearchResult.Evidence entry — either a budget window located
+	// around the matched chunk's text inside the full document body, or,
+	// when that text could not be located verbatim (chunker cleanup/merge —
+	// model.MatchedEvidence's doc comment), the chunk's own text used
+	// directly. Distinct from askEvidenceModeLexicalWindow: that mode's
+	// window is a term-overlap HEURISTIC over the whole document with no
+	// retrieval-time signal behind it, while this mode's window is centred
+	// on evidence retrieval itself already verified as a match.
+	askEvidenceModeMatchedChunk askEvidenceMode = "matched_chunk"
+	// askEvidenceModeChunkOnly (#267): the SearchResult came from a
+	// chunk-lane winner that never merged with a document-lane primary
+	// (model.MatchTypeChunkVector/MatchTypeChunkFTS) — Content already IS
+	// the matched chunk's text, so the "excerpt" is the full available
+	// Content rather than a window into a larger document body.
+	askEvidenceModeChunkOnly askEvidenceMode = "chunk_only"
 )
 
 // askPromptEvidence is one document actually inserted into the Stage 3
@@ -39,8 +55,12 @@ const (
 // length (post-clip), not the source document's full size — it exists so a
 // future caller can audit how the excerpt budget (ask_context.go's
 // askExcerptBytes/perDoc split) was actually spent per document.
-// ChunkIDs is reserved for #267 (matched-chunk provenance) and is always
-// empty until that lands.
+// ChunkIDs (#267) lists the model.MatchedEvidence.ChunkID values available
+// for this document at excerpt-selection time — i.e. the chunk-lane
+// provenance behind Mode askEvidenceModeMatchedChunk/askEvidenceModeChunkOnly.
+// It is nil for a document whose excerpt came from askPassage's lexical
+// heuristic (Mode full/lexical_window/head): that path has no chunk
+// provenance to report.
 type askPromptEvidence struct {
 	ID       uuid.UUID
 	Layer    askEvidenceLayer

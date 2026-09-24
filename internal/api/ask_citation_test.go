@@ -242,7 +242,7 @@ func TestBuildBudgetedAskMessages_ManifestTracksEvidenceAndOmitted(t *testing.T)
 	dropped := model.SearchResult{Document: model.Document{ID: uuid.New(), SourceType: model.SourceType(strings.Repeat("x", 5000)), Title: "짧은제목", Content: strings.Repeat("본문내용", 5000)}}
 	result := RetrievalResult{Observed: []*model.SearchResult{&kept, &dropped}}
 
-	_, manifest := buildBudgetedAskMessages("질문", result, nil)
+	_, manifest := buildBudgetedAskMessages("질문", "질문", result, nil)
 
 	if len(manifest.Evidence) != 1 || manifest.Evidence[0].ID != kept.Document.ID {
 		t.Fatalf("manifest.Evidence = %+v, want exactly the kept document", manifest.Evidence)

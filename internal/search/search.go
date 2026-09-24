@@ -1118,6 +1118,34 @@ func mergeRRF(primary, secondary []*model.SearchResult, limit int) []*model.Sear
 	return mergeRRFMode(primary, secondary, limit, model.MergeAsymmetric)
 }
 
+// maxEvidencePerResult bounds how many model.MatchedEvidence entries
+// mergeRRFMode accumulates on a single SearchResult (#267). A document only
+// gains evidence when a chunk lane's per-document winner overlaps it, so in
+// practice this rarely binds today — but nothing prevents future callers
+// from running mergeRRFMode more than twice over the same candidate set
+// (e.g. a future third chunk-ish lane), and an unbounded slice here would
+// grow the /ask prompt-manifest ChunkIDs list and excerpt-selection cost
+// with it.
+const maxEvidencePerResult = 3
+
+// appendEvidenceCapped clones existing before appending added — existing may
+// still alias another SearchResult's backing array (mergeRRFMode's primary
+// loop and applyRerank/applyLowRetentionPenalty all shallow-copy
+// model.SearchResult, which copies the Evidence slice HEADER but not its
+// backing array) — then truncates to maxEvidencePerResult, keeping the
+// highest-scoring entries.
+func appendEvidenceCapped(existing, added []model.MatchedEvidence) []model.MatchedEvidence {
+	if len(added) == 0 {
+		return existing
+	}
+	combined := append(slices.Clone(existing), added...)
+	if len(combined) <= maxEvidencePerResult {
+		return combined
+	}
+	sort.SliceStable(combined, func(i, j int) bool { return combined[i].Score > combined[j].Score })
+	return combined[:maxEvidencePerResult]
+}
+
 // mergeRRFMode 는 mergeRRF 에 융합 방식 노브를 더한 형태다.
 //
 //   - model.MergeAsymmetric(기본): 위 mergeRRF 문서가 설명하는 현행 동작.
@@ -1159,6 +1187,17 @@ func mergeRRFMode(primary, secondary []*model.SearchResult, limit int, mode stri
 		rrf := 1.0 / (k + float64(rank+1))
 		if e, ok := merged[r.ID]; ok {
 			e.score += rrf
+			// #267: primary keeps its OWN Content (never replaced by
+			// secondary's — e.g. a full document body must not become a
+			// chunk snippet), but a chunk-lane secondary's Evidence — the
+			// provenance of WHERE inside that Content the match actually
+			// is — would otherwise be silently dropped by this `continue`.
+			// Clone before append: e.result's Evidence slice may still
+			// alias the caller's original backing array (see the shallow
+			// copies above and in applyRerank/applyLowRetentionPenalty),
+			// so appending in place could corrupt another result sharing
+			// that array.
+			e.result.Evidence = appendEvidenceCapped(e.result.Evidence, r.Evidence)
 			continue
 		}
 		if remaining <= 0 {
@@ -1261,7 +1300,19 @@ func chunkVecToSearchResult(r store.ChunkSearchResult) *model.SearchResult {
 			Metadata: r.DocumentMetadata,
 		},
 		Score:     r.Score,
-		MatchType: "chunk-vector",
+		MatchType: model.MatchTypeChunkVector,
+		// Evidence (#267): the winning chunk IS this result's Content — see
+		// model.MatchTypeChunkVector's doc comment — so /ask can use Content
+		// directly without a substring search when this result never merges
+		// with a document-lane primary. mergeRRFMode preserves/merges this
+		// slice when it does.
+		Evidence: []model.MatchedEvidence{{
+			ChunkID:    r.Chunk.ID,
+			ChunkIndex: r.Chunk.ChunkIndex,
+			Lane:       model.MatchTypeChunkVector,
+			Score:      r.Score,
+			Text:       r.Chunk.Content,
+		}},
 	}
 }
 
@@ -1312,7 +1363,15 @@ func chunkToSearchResult(r store.ChunkSearchResult) *model.SearchResult {
 			Metadata: r.DocumentMetadata,
 		},
 		Score:     r.Rank,
-		MatchType: "chunk-fts",
+		MatchType: model.MatchTypeChunkFTS,
+		// Evidence (#267): see chunkVecToSearchResult's identical field for why.
+		Evidence: []model.MatchedEvidence{{
+			ChunkID:    r.Chunk.ID,
+			ChunkIndex: r.Chunk.ChunkIndex,
+			Lane:       model.MatchTypeChunkFTS,
+			Score:      r.Rank,
+			Text:       r.Chunk.Content,
+		}},
 	}
 }
 

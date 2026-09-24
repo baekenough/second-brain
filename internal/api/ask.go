@@ -410,9 +410,15 @@ func (s *Server) askHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Stage 3: synthesis + streaming. question passed here is the user's
 	// ORIGINAL wording (not searchQuestion) — see the rewrite comment above.
-	// report is the deterministic citation-validation result (issue #268);
-	// see synthesize's doc comment for exactly when it is nil.
-	finishReason, answer, report := s.synthesize(ctx, w, flusher, req.Question, result, history)
+	// searchQuestion is passed separately as the excerpt-selection query
+	// (#267): it drives ONLY askPassage's lexical fallback window for
+	// documents with no chunk evidence, so a follow-up like "그건 언제로
+	// 정했지?" — which carries no vocabulary of its own — still selects the
+	// same passage retrieval already searched for, instead of falling back
+	// to the document's beginning. report is the deterministic
+	// citation-validation result (issue #268); see synthesize's doc comment
+	// for exactly when it is nil.
+	finishReason, answer, report := s.synthesize(ctx, w, flusher, req.Question, searchQuestion, result, history)
 	if finishReason == "" {
 		// Sentinel for "client disconnected mid-stream" (context.Canceled):
 		// the connection is already gone, so attempting a final "done"
@@ -501,13 +507,13 @@ func mapAskSources(results []*model.SearchResult) []AskSourceItem {
 // report is non-nil with Status askCitationUnverified rather than actually
 // validating a truncated answer (deep-plan #268 §2.2: "partial answer then
 // error -> unverified").
-func (s *Server) synthesize(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, question string, result RetrievalResult, history []askHistoryTurn) (finishReason, answer string, report *askCitationReport) {
+func (s *Server) synthesize(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, question, excerptQuery string, result RetrievalResult, history []askHistoryTurn) (finishReason, answer string, report *askCitationReport) {
 	if !s.llmClient.Enabled() {
 		_ = writeSSEEvent(w, flusher, "error", askErrorPayload{Message: "LLM is not configured"})
 		return "error", "", nil
 	}
 
-	messages, manifest := buildBudgetedAskMessages(question, result, history)
+	messages, manifest := buildBudgetedAskMessages(question, excerptQuery, result, history)
 	systemPrompt := buildAskSystemPrompt(s.nowFunc())
 
 	if sc, ok := s.llmClient.(llm.StreamCompleter); ok {
@@ -583,6 +589,10 @@ func unverifiedReportOrNil(text string, manifest askPromptManifest) *askCitation
 // says — the second half of the date-context fix (see buildAskSystemPrompt
 // for the first half, "what day is today").
 func buildAskMessages(question string, result RetrievalResult, history []askHistoryTurn) []llm.Message {
-	messages, _ := buildBudgetedAskMessages(question, result, history)
+	// excerptQuery == question: this wrapper has no separate
+	// standalone-rewrite input to offer (see buildBudgetedAskMessages'
+	// excerptQuery doc comment) — the only production caller, synthesize,
+	// calls buildBudgetedAskMessages directly with searchQuestion instead.
+	messages, _ := buildBudgetedAskMessages(question, question, result, history)
 	return messages
 }
