@@ -728,25 +728,36 @@ func boolVal(p *bool) bool { return p != nil && *p }
 // single extra hash collision — could silently flip which chunk the fake
 // vector lane ranks first, without any test failing to say so.
 //
-// ctm-06 was re-authored for this finding specifically: its head/tail were
-// rebalanced (short, signal-dense tail; longer, topically-neutral head) so
-// its margin is now ~0.28, comfortably over the requested >=0.02 floor.
+// ctm-06 was re-authored first (deep-verify #266) for exactly this finding:
+// its head/tail were rebalanced (short, signal-dense tail; longer,
+// topically-neutral head) so its margin rose from ~0.007 to ~0.28.
 //
-// ctm-01/02/03/04/05 are UNCHANGED — re-authoring them is out of this
-// fixture's scope (only ctm-06 was flagged). Measured at HEAD:
-// ctm-01=0.0041, ctm-02=0.0068, ctm-03=0.0019, ctm-04=0.0099,
-// ctm-05=0.0098 — all comfortably positive today, but far more fragile than
-// ctm-06's new margin. Their floors below are set with a buffer UNDER the
-// currently measured value (not an arbitrary target) so this test still
-// fails loudly — with the fixture ID and both scores in the message — if a
-// future change erodes them further or flips the ranking, without silently
-// demanding the same >=0.02 bar this fix only earned for ctm-06.
+// ctm-01–ctm-05 were re-authored later (issue #272, the scheduled follow-up
+// deep-verify #266 deferred — see docs/ask-evaluation-protocol.md's
+// "ctm-06's fake-vector ranking margin" section) using the SAME technique:
+// each document's head paragraph now repeats a topic-neutral filler
+// sentence chosen (via corpus.chunkVector against the fixture's own folded
+// question) to have LOW incidental cosine overlap with the query — the
+// original filler ("일반적인 진행 상황을 공유했고 특별한 이슈는 없었다.",
+// shared verbatim by head AND tail) happened to collide with several
+// fixtures' queries in the 48-dimension hashed-bigram space purely by
+// chance, which is what made the original margins so thin (ctm-01=0.0041,
+// ctm-02=0.0068, ctm-03=0.0019, ctm-04=0.0099, ctm-05=0.0098). The tail
+// paragraph keeps ctm-01–ctm-05's original structure (short distinct
+// filler, one sentence repeating the fact's semantic-alias vocabulary, the
+// gold fact sentence, THEN a trailing wrap-up sentence — unlike ctm-06,
+// whose gold fact is deliberately the document's literal last byte; see
+// TestRun_CallTranscriptMidLate_MatchedChunkEvidence's doc comment). Their
+// floors are now the same >=0.02 bar as ctm-06, each with a wide measured
+// buffer (~0.33-0.40 at HEAD) rather than a value merely under the current
+// measurement — see TestRun_CTMFakeVectorMargin's t.Logf output for the
+// exact current gold/runner_up/margin per fixture.
 var wantCTMVectorMargin = map[string]float64{
-	"ctm-01-deadline":        0.002,
-	"ctm-02-budget-final":    0.003,
-	"ctm-03-venue-change":    0.0008,
-	"ctm-04-headcount":       0.005,
-	"ctm-05-renewal-date":    0.005,
+	"ctm-01-deadline":        0.02,
+	"ctm-02-budget-final":    0.02,
+	"ctm-03-venue-change":    0.02,
+	"ctm-04-headcount":       0.02,
+	"ctm-05-renewal-date":    0.02,
 	"ctm-06-tail-conclusion": 0.02,
 }
 
@@ -803,6 +814,7 @@ func TestRun_CTMFakeVectorMargin(t *testing.T) {
 		}
 
 		margin := goldScore - runnerUp
+		t.Logf("%s: chunks=%d gold=%.6f runner_up=%.6f margin=%.6f floor=%.6f", f.ID, len(cp.allChunks), goldScore, runnerUp, margin, floor)
 		if margin < floor {
 			t.Errorf("%s: fake-vector margin (gold - runner_up) = %.6f, want >= %.6f (gold=%.6f runner_up=%.6f) — the chunk-vector lane's ranking signal for this fixture has eroded; re-widen the fixture content or deliberately lower this floor",
 				f.ID, margin, floor, goldScore, runnerUp)
