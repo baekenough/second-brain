@@ -115,6 +115,14 @@ type GroupMetric struct {
 	CILow   float64 `json:"ci_low,omitempty"`
 	CIHigh  float64 `json:"ci_high,omitempty"`
 	Verdict Verdict `json:"verdict"`
+	// BonferroniSignificant is non-nil only for a non-overall (diagnostic,
+	// Group.Gating == false) group whose HasCI is true. It reports, purely
+	// for information, whether this metric's bootstrap distribution would
+	// still exclude zero under a Bonferroni-corrected alpha
+	// (0.05 / number of non-overall groups in this report) instead of the
+	// uncorrected 0.05 used for Verdict. It never changes Verdict and never
+	// feeds Report.Regressed — only Group.Gating's group does that.
+	BonferroniSignificant *bool `json:"bonferroni_significant,omitempty"`
 }
 
 // LatencyMetric never gates a verdict (see package doc and #269 design):
@@ -127,11 +135,18 @@ type LatencyMetric struct {
 // Group is one slice's comparison: "overall", or an
 // "answer_source:"/"query_source:"/"tag:"-prefixed subset.
 type Group struct {
-	Name     string      `json:"name"`
-	NDCG10   GroupMetric `json:"ndcg10"`
-	Recall10 GroupMetric `json:"recall10"`
-	FP10     GroupMetric `json:"fp10"`
+	Name     string        `json:"name"`
+	NDCG10   GroupMetric   `json:"ndcg10"`
+	Recall10 GroupMetric   `json:"recall10"`
+	FP10     GroupMetric   `json:"fp10"`
 	Latency  LatencyMetric `json:"latency"`
+	// Gating is true only for the "overall" group. It is the only group
+	// whose ndcg10 verdict feeds Report.Regressed / cmd/evalcompare's exit
+	// code 1 — see Report.Regressed doc for why (deep-verify #269 HIGH
+	// finding: gating on any one of several independently-tested slices
+	// inflates the false-alarm rate well past the nominal 5%). Every other
+	// group's metrics below are reported for diagnosis only.
+	Gating bool `json:"gating"`
 	// WorstQueryIDs holds up to 3 query_id values with the most negative
 	// ndcg10 delta in this group — IDs only, never query text or document
 	// content (see cmd/eval/diagnostics.go's privacy contract, which this
@@ -165,11 +180,27 @@ type Report struct {
 
 	Groups []Group `json:"groups"`
 
-	// Regressed is true when any group's NDCG10 verdict is "regressed".
-	// Recall10/FP10/latency are reported for diagnosis but never gate this
-	// flag (see package doc for why: an fp10 or recall10 swing without an
-	// ndcg10 swing is not, by itself, this tool's definition of a
-	// regression). cmd/evalcompare maps this to exit code 1.
+	// Regressed is true only when the "overall" group's (see GroupOverall)
+	// NDCG10 verdict is "regressed". No other group can set this flag, even
+	// when its own verdict is "regressed" — those are reported on
+	// Groups[i] for diagnosis (Group.Gating is false for every group but
+	// overall) but deliberately excluded from the gate.
+	//
+	// This is a multiple-comparison correction, not an oversight: Compare
+	// runs an independent 95% bootstrap test per group per metric, and
+	// gating on "any group regressed" compounds their false-alarm rates.
+	// deep-verify's #269 review measured this directly — with 8 slices and
+	// no true difference, at least one slice falsely showed "regressed" in
+	// about 20% of 60 null trials, versus the ~5% a single test carries.
+	// Restricting the gate to one pre-designated group (overall) keeps the
+	// false-alarm rate at the nominal single-test level; see
+	// GroupMetric.BonferroniSignificant for an informational,
+	// correction-adjusted read on any individual slice.
+	//
+	// Recall10/FP10/latency never gate this flag either way (see package
+	// doc for why: an fp10 or recall10 swing without an ndcg10 swing is not,
+	// by itself, this tool's definition of a regression). cmd/evalcompare
+	// maps this to exit code 1.
 	Regressed bool `json:"regressed"`
 }
 
@@ -205,6 +236,15 @@ func Compare(baseline, candidate *evaldump.Dump, slices *Slices, opts Options) (
 
 	if id, side, ok := firstFailedRow(baseline, candidate); ok {
 		return nil, invalid("%s dump has a search_failed row for query %s; a failed run is not a valid baseline or candidate", side, id)
+	}
+
+	if dupIDs := duplicateQueryIDs(baseline.Rows); len(dupIDs) > 0 {
+		return nil, invalid("baseline dump has %d duplicate query_id value(s) (e.g. %s); each query_id must appear exactly once per dump — a duplicate previously collapsed silently (last row wins), which this check now refuses instead",
+			len(dupIDs), dupIDs[0])
+	}
+	if dupIDs := duplicateQueryIDs(candidate.Rows); len(dupIDs) > 0 {
+		return nil, invalid("candidate dump has %d duplicate query_id value(s) (e.g. %s); each query_id must appear exactly once per dump — a duplicate previously collapsed silently (last row wins), which this check now refuses instead",
+			len(dupIDs), dupIDs[0])
 	}
 
 	baseByID := indexRows(baseline.Rows)
@@ -254,15 +294,58 @@ func Compare(baseline, candidate *evaldump.Dump, slices *Slices, opts Options) (
 		report.CandidateConfigHash = candidate.Header.ConfigHash
 	}
 
+	// bonferroniM is the number of non-overall (diagnostic) groups this
+	// report computes — the divisor for GroupMetric.BonferroniSignificant's
+	// corrected alpha. It is 0 for the overall group itself, which skips
+	// that computation entirely (see buildGroup).
+	bonferroniM := 0
+	for _, name := range names {
+		if name != GroupOverall {
+			bonferroniM++
+		}
+	}
+
 	byID := deltasByID(deltas)
 	for _, name := range names {
-		group := buildGroup(name, groupIDs[name], byID, opts, provenanceUnknown)
+		gating := name == GroupOverall
+		m := bonferroniM
+		if gating {
+			m = 0
+		}
+		group := buildGroup(name, groupIDs[name], byID, opts, provenanceUnknown, m)
+		group.Gating = gating
 		report.Groups = append(report.Groups, group)
-		if group.NDCG10.Verdict == VerdictRegressed {
+		// Only the pre-designated gating group (overall) can set Regressed
+		// — see the Report.Regressed doc for the multiple-comparison
+		// rationale. Every other group's verdict, including "regressed", is
+		// diagnostic only.
+		if gating && group.NDCG10.Verdict == VerdictRegressed {
 			report.Regressed = true
 		}
 	}
 	return report, nil
+}
+
+// duplicateQueryIDs returns the sorted, de-duplicated set of query_id
+// values that appear on more than one row of rows. Before this check,
+// indexRows built its map by iterating rows in file order, so a dump with a
+// duplicate query_id (a writer bug in cmd/eval, or a hand-edited file)
+// silently kept only the last occurrence and compared against the wrong
+// row. Compare now rejects such a dump outright instead of guessing which
+// row was meant.
+func duplicateQueryIDs(rows []evaldump.Row) []string {
+	seen := make(map[string]int, len(rows))
+	for _, row := range rows {
+		seen[row.QueryID]++
+	}
+	var dups []string
+	for id, count := range seen {
+		if count > 1 {
+			dups = append(dups, id)
+		}
+	}
+	sort.Strings(dups)
+	return dups
 }
 
 func plural(n int) string {

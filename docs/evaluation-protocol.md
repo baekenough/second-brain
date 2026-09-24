@@ -173,13 +173,40 @@ the same two dumps, the same seed, and the same slices file always produce
 byte-identical output, and query row order never affects it (pairing is by
 `query_id`, sorted before resampling).
 
+**Minimum recommended iterations.** The CI bounds are the 2.5th/97.5th
+percentile of the resampled distribution using linear interpolation between
+order statistics, so they are never truncated toward zero the way a
+nearest-rank index would be — but low `--iterations` still means each
+percentile is estimated from fewer resamples and is noisier run to run for a
+*different* seed (a fixed seed always reproduces the same output). Keep the
+default 10000 for a reported comparison; only drop `--iterations` below
+~1000 for fast local iteration while tuning a knob, not for a number you
+intend to cite.
+
+**Only the `overall` group gates exit code 1.** Compare runs an independent
+95% bootstrap test per group per metric; gating the exit code on "any group
+regressed" compounds their false-alarm rates instead of holding to the
+nominal 5%. deep-verify's #269 review measured this directly: with 8 slices
+and no true difference between baseline and candidate, at least one slice
+falsely showed `regressed` in about 20% of 60 null trials. Every group's
+`ndcg10`/`recall10`/`fp10` verdict is still computed and printed — each
+`Group` in the JSON output carries a `gating` field (`true` only for
+`overall`) — but only `overall`'s `ndcg10` verdict can set `Report.Regressed`
+/ exit code 1. Non-`overall` groups whose CI has a value additionally carry
+an informational `bonferroni_significant` boolean: whether that same
+bootstrap distribution would still exclude zero at a Bonferroni-corrected
+alpha (`0.05 / <number of non-overall groups>`) instead of the uncorrected
+0.05 used for `verdict`. It never changes `verdict` and never feeds the
+gate — read it as "would this slice's regression survive strict multiple-
+comparison correction", nothing more.
+
 Exit codes:
 
 | Code | Meaning |
 |---|---|
-| 0 | Compared; no group's `ndcg10` verdict is `regressed`. |
-| 1 | At least one group's `ndcg10` verdict is `regressed` (its 95% CI for `candidate - baseline` falls entirely below zero). `recall10`/`fp10`/latency are reported for diagnosis but never gate this. |
-| 2 | The two dumps cannot be compared at all: `label_hash` mismatch, a query present on only one side, any `search_failed` row, a header reporting `failed > 0`, a v1 dump without `--allow-v1`, a slices file naming an unknown query id, or a row whose stored `ndcg10` disagrees with the value re-derived from its own `relevant_docs[].final_rank` by more than `1e-9` (a self-consistency check, independent of however the writer computed the field). |
+| 0 | Compared; the `overall` group's `ndcg10` verdict is not `regressed`. |
+| 1 | The `overall` group's `ndcg10` verdict is `regressed` (its 95% CI for `candidate - baseline` falls entirely below zero). A non-`overall` group showing `regressed` never sets this on its own — see "Only the `overall` group gates exit code 1" above. `recall10`/`fp10`/latency never gate this either way. |
+| 2 | The two dumps cannot be compared at all: `label_hash` mismatch, a query present on only one side, a duplicate `query_id` within one dump, any `search_failed` row, a header reporting `failed > 0`, a v1 dump without `--allow-v1`, a slices file naming an unknown query id, or a row whose stored `ndcg10` disagrees with the value re-derived from its own `relevant_docs[].final_rank` by more than `1e-9` (a self-consistency check, independent of however the writer computed the field). |
 | 3 | Usage error (missing/invalid flags, unreadable file). |
 
 `--allow-v1` downgrades a v1 dump from exit 2 to a compare that still runs,

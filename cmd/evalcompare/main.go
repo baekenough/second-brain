@@ -12,11 +12,16 @@
 // Exit codes:
 //
 //	0 — compared, no regression detected
-//	1 — a regression was detected (see Report.Regressed)
+//	1 — a regression was detected: the "overall" group's ndcg10 verdict is
+//	    "regressed" (see Report.Regressed). Per-slice verdicts are printed
+//	    for diagnosis but never set this exit code on their own — gating on
+//	    any one of several independently-tested slices would compound their
+//	    false-alarm rates (deep-verify #269: ~20% over 60 null trials with 8
+//	    slices, versus the ~5% a single test carries).
 //	2 — the two dumps cannot be compared at all (label_hash mismatch, a
 //	    v1/no-header dump without --allow-v1, mismatched query sets, a
-//	    failed run, or a corrupt dump whose stored ndcg10 disagrees with
-//	    its own rank evidence)
+//	    failed run, a duplicate query_id within one dump, or a corrupt dump
+//	    whose stored ndcg10 disagrees with its own rank evidence)
 //	3 — usage error (bad flags, unreadable file)
 package main
 

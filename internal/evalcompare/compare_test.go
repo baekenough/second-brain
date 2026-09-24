@@ -2,6 +2,8 @@ package evalcompare
 
 import (
 	"errors"
+	"fmt"
+	"math/rand/v2"
 	"path/filepath"
 	"testing"
 
@@ -21,18 +23,20 @@ func testdata(name string) string {
 	return filepath.Join("testdata", name)
 }
 
-// 완료 기준 1: 전체 평균은 개선되지만 특정 그룹(answer_source:call)은
-// 악화되는 합성 dump를 탐지해야 한다.
-func TestCompare_GroupRegressionDetectedDespiteOverallImprovement(t *testing.T) {
+// 완료 기준 1 (HIGH #269 반영): 특정 그룹(answer_source:call)의 악화는
+// 여전히 그룹 단위로 탐지·보고되어야 하지만, overall 그룹 자체가 뚜렷하게
+// 악화된 것이 아니라면 더 이상 Report.Regressed(=exit 1)를 켜서는 안 된다 —
+// 이 dump는 improve 3건 + regress 3건이 상쇄되도록 설계되어 있어 overall의
+// 신호는 no_detectable_change 근처가 된다. 개별 슬라이스 검정을 게이트로
+// 쓰면 다중비교로 인한 거짓 경보가 발생한다는 것이 바로 deep-verify가 지적한
+// 결함이며, 이 테스트는 그 결함이 재발하지 않는지 확인한다.
+func TestCompare_SliceRegressionIsDiagnosticNotGating(t *testing.T) {
 	baseline := mustRead(t, testdata("regress_baseline.jsonl"))
 	candidate := mustRead(t, testdata("regress_candidate.jsonl"))
 
 	report, err := Compare(baseline, candidate, nil, Options{Seed: 1, Iterations: 2000, MinN: 3})
 	if err != nil {
 		t.Fatalf("Compare: %v", err)
-	}
-	if !report.Regressed {
-		t.Fatal("Regressed = false, want true (answer_source:call must be flagged)")
 	}
 
 	var call, gmail, overall *Group
@@ -49,6 +53,8 @@ func TestCompare_GroupRegressionDetectedDespiteOverallImprovement(t *testing.T) 
 	if call == nil || gmail == nil || overall == nil {
 		t.Fatalf("missing expected groups: %+v", report.Groups)
 	}
+
+	// Diagnostic signal: still detected and still reported, per group.
 	if call.NDCG10.Verdict != VerdictRegressed {
 		t.Fatalf("answer_source:call ndcg10 verdict = %s, want %s", call.NDCG10.Verdict, VerdictRegressed)
 	}
@@ -58,11 +64,32 @@ func TestCompare_GroupRegressionDetectedDespiteOverallImprovement(t *testing.T) 
 	if len(call.WorstQueryIDs) == 0 {
 		t.Fatal("regressed group must list its worst queries")
 	}
+	if call.Gating {
+		t.Fatal("answer_source:call.Gating = true, want false — only the overall group gates")
+	}
+	if gmail.Gating {
+		t.Fatal("answer_source:gmail.Gating = true, want false — only the overall group gates")
+	}
 	// overall mixes 3 improved + 3 regressed queries of equal magnitude;
 	// the point of this test is that the per-group signal survives even
 	// though nothing about the overall mean forces attention to it.
 	if overall.NDCG10.N != 6 {
 		t.Fatalf("overall n = %d, want 6", overall.NDCG10.N)
+	}
+	if !overall.Gating {
+		t.Fatal("overall.Gating = false, want true")
+	}
+
+	// Gating signal: overall's own verdict — not any slice's — decides
+	// Report.Regressed. The offsetting improve/regress construction keeps
+	// overall's CI straddling zero, so the gate must stay closed even
+	// though a real, individually-significant slice regression exists.
+	if overall.NDCG10.Verdict == VerdictRegressed {
+		t.Fatal("overall ndcg10 verdict = regressed for a mean-neutral mix — the test fixture no longer exercises this test's premise")
+	}
+	if report.Regressed {
+		t.Fatal("Regressed = true, want false — only overall gates, and overall is not regressed here " +
+			"(a per-slice regression must stay diagnostic; see Report.Regressed doc / deep-verify #269 HIGH finding)")
 	}
 }
 
@@ -269,10 +296,10 @@ func TestCompare_InvalidComparisons(t *testing.T) {
 			opts:      Options{Seed: 1},
 		},
 		{
-			name:     "header_reports_failed",
-			baseline: &evaldump.Dump{Version: 2, Header: &evaldump.Header{DumpVersion: 2, LabelHash: "lh", ConfigHash: "ch-base", Failed: 1}, Rows: oneRow},
+			name:      "header_reports_failed",
+			baseline:  &evaldump.Dump{Version: 2, Header: &evaldump.Header{DumpVersion: 2, LabelHash: "lh", ConfigHash: "ch-base", Failed: 1}, Rows: oneRow},
 			candidate: &evaldump.Dump{Version: 2, Header: &evaldump.Header{DumpVersion: 2, LabelHash: "lh", ConfigHash: "ch-cand"}, Rows: oneRow},
-			opts: Options{Seed: 1},
+			opts:      Options{Seed: 1},
 		},
 		{
 			name:      "search_failed_row",
@@ -284,6 +311,21 @@ func TestCompare_InvalidComparisons(t *testing.T) {
 			name:      "ndcg_cross_check_mismatch",
 			baseline:  &evaldump.Dump{Version: 2, Header: &baseHeader, Rows: []evaldump.Row{corruptedNDCGRow("q1")}},
 			candidate: &evaldump.Dump{Version: 2, Header: &evaldump.Header{DumpVersion: 2, LabelHash: "lh", ConfigHash: "ch-cand"}, Rows: oneRow},
+			opts:      Options{Seed: 1},
+		},
+		{
+			// MEDIUM #269: a dump with the same query_id on two rows used
+			// to be silently collapsed by indexRows (last row wins) instead
+			// of being rejected. See duplicateQueryIDs.
+			name:      "duplicate_query_id_baseline",
+			baseline:  &evaldump.Dump{Version: 2, Header: &baseHeader, Rows: []evaldump.Row{mustConsistentRow("q1", 1, "call"), mustConsistentRow("q1", 2, "call")}},
+			candidate: &evaldump.Dump{Version: 2, Header: &evaldump.Header{DumpVersion: 2, LabelHash: "lh", ConfigHash: "ch-cand"}, Rows: oneRow},
+			opts:      Options{Seed: 1},
+		},
+		{
+			name:      "duplicate_query_id_candidate",
+			baseline:  &evaldump.Dump{Version: 2, Header: &baseHeader, Rows: oneRow},
+			candidate: &evaldump.Dump{Version: 2, Header: &evaldump.Header{DumpVersion: 2, LabelHash: "lh", ConfigHash: "ch-cand"}, Rows: []evaldump.Row{mustConsistentRow("q1", 1, "call"), mustConsistentRow("q1", 2, "call")}},
 			opts:      Options{Seed: 1},
 		},
 		{
@@ -355,5 +397,164 @@ func TestCompare_AllowV1ForcesInconclusive(t *testing.T) {
 	}
 	if len(report.Warnings) == 0 {
 		t.Fatal("AllowV1 compare must warn that provenance is unknown")
+	}
+}
+
+// --- HIGH #269 null-simulation: fixed-seed reproduction of the
+// deep-verify measurement (8 slices, no true difference, ~20% chance at
+// least one falsely showed "regressed" under the old any-group gate) and a
+// check that the new overall-only gate does not inherit that inflation. ---
+
+// buildSlicedDumps constructs a baseline/candidate dump pair with numSlices
+// query_source slices of perSlice queries each, using raw ndcg10 values
+// (no relevant_docs, so crossCheckNDCG has nothing to re-derive and
+// performs no check — see its "no rank evidence" early return). Every
+// query's candidate ndcg10 is baseline (a fixed 0.5) plus symmetric
+// fixed-seed noise plus shiftFn(slice), letting a caller dial in "no true
+// difference anywhere" (shiftFn always 0), "a uniform regression"
+// (shiftFn constant and negative for every slice), or "exactly one slice
+// regressed" (shiftFn nonzero for one slice index only).
+func buildSlicedDumps(seed uint64, numSlices, perSlice int, shiftFn func(slice int) float64) (baseline, candidate *evaldump.Dump) {
+	rng := rand.New(rand.NewPCG(seed, seed^0xabcdef1234))
+	header := func(cfg string) *evaldump.Header {
+		return &evaldump.Header{DumpVersion: 2, LabelHash: "lh-null-sim", ConfigHash: cfg}
+	}
+	baseline = &evaldump.Dump{Version: 2, Header: header("ch-base")}
+	candidate = &evaldump.Dump{Version: 2, Header: header("ch-cand")}
+	const baseNDCG = 0.5
+	for s := 0; s < numSlices; s++ {
+		shift := shiftFn(s)
+		for i := 0; i < perSlice; i++ {
+			id := fmt.Sprintf("s%d-q%d", s, i)
+			source := fmt.Sprintf("slice%d", s)
+			noise := (rng.Float64()*2 - 1) * 0.15 // symmetric, uniform(-0.15, 0.15), mean 0
+			b := baseNDCG
+			c := baseNDCG + noise + shift
+			baseline.Rows = append(baseline.Rows, evaldump.Row{Kind: "query", QueryID: id, QuerySource: source, NDCG10: ptrFloat(b)})
+			candidate.Rows = append(candidate.Rows, evaldump.Row{Kind: "query", QueryID: id, QuerySource: source, NDCG10: ptrFloat(c)})
+		}
+	}
+	return baseline, candidate
+}
+
+func ptrFloat(v float64) *float64 { return &v }
+
+func zeroShift(int) float64 { return 0 }
+
+// 완료 기준 (HIGH #269, null simulation part 1/3): across many independent
+// null trials (8 slices each, no true difference anywhere), the gate
+// (Report.Regressed, which only reads the overall group) must stay closed
+// far more often than the old any-slice gate did. deep-verify measured the
+// old behavior at ~20% false-alarm trials (8 slices, 60 trials); this test
+// asserts the new gate's false-alarm rate over the same slice count and a
+// comparable trial count stays close to the nominal single-test 5%, not
+// inflated by the slice count.
+func TestCompare_NullSimulation_GateFalsePositiveRateStaysAtSingleTestLevel(t *testing.T) {
+	const trials = 60
+	const numSlices = 8
+	const perSlice = 30 // >= default MinN(20), so every slice's verdict is conclusive
+
+	gateFalsePositives := 0
+	anySliceFalsePositives := 0
+	for trial := 0; trial < trials; trial++ {
+		baseline, candidate := buildSlicedDumps(uint64(1000+trial), numSlices, perSlice, zeroShift)
+		report, err := Compare(baseline, candidate, nil, Options{Seed: uint64(trial) + 1, Iterations: 2000})
+		if err != nil {
+			t.Fatalf("trial %d: Compare: %v", trial, err)
+		}
+		if report.Regressed {
+			gateFalsePositives++
+		}
+		for _, g := range report.Groups {
+			if !g.Gating && g.NDCG10.Verdict == VerdictRegressed {
+				anySliceFalsePositives++
+				break
+			}
+		}
+	}
+	t.Logf("null simulation (%d trials x %d slices, no true difference): gate false positives=%d, "+
+		"trials with >=1 diagnostic slice falsely regressed=%d", trials, numSlices, gateFalsePositives, anySliceFalsePositives)
+	// A generous upper bound: the pre-fix any-of-8-slices gate measured
+	// ~20% (deep-verify #269). A single 95% test should false-alarm at
+	// roughly 5%; trials/6 (~17%) is well below the pre-fix rate while
+	// leaving headroom for this fixed-seed run's actual count.
+	if gateFalsePositives > trials/6 {
+		t.Fatalf("gate false positives = %d/%d, want well under the pre-fix ~20%% multiple-comparison rate", gateFalsePositives, trials)
+	}
+}
+
+// 완료 기준 (HIGH #269, null simulation part 2/3): a real, uniform
+// regression across every slice must still set Report.Regressed — the fix
+// narrows the gate to the overall group, it does not turn it off.
+func TestCompare_NullSimulation_RealOverallRegressionSetsGate(t *testing.T) {
+	baseline, candidate := buildSlicedDumps(42, 8, 30, func(int) float64 { return -0.3 })
+	report, err := Compare(baseline, candidate, nil, Options{Seed: 42, Iterations: 2000})
+	if err != nil {
+		t.Fatalf("Compare: %v", err)
+	}
+	var overall *Group
+	for i := range report.Groups {
+		if report.Groups[i].Name == GroupOverall {
+			overall = &report.Groups[i]
+		}
+	}
+	if overall == nil {
+		t.Fatal("missing overall group")
+	}
+	if overall.NDCG10.Verdict != VerdictRegressed {
+		t.Fatalf("overall ndcg10 verdict = %s, want regressed for a uniform -0.3 shift across every slice", overall.NDCG10.Verdict)
+	}
+	if !report.Regressed {
+		t.Fatal("Regressed = false, want true for a real overall regression")
+	}
+}
+
+// 완료 기준 (HIGH #269, null simulation part 3/3): a regression confined to
+// exactly one slice out of many, diluted enough that the overall mean stays
+// inside its bootstrap CI, must NOT set Report.Regressed — but the affected
+// slice's own verdict must still show regressed, diagnostically.
+func TestCompare_NullSimulation_SliceOnlyRegressionFlaggedNotGated(t *testing.T) {
+	const numSlices = 40
+	const perSlice = 20
+	const regressedSlice = 3
+	const shift = -0.15 // strong enough to be individually significant at n=20, diluted 40x in the n=800 overall pool
+	shiftFn := func(s int) float64 {
+		if s == regressedSlice {
+			return shift
+		}
+		return 0
+	}
+	baseline, candidate := buildSlicedDumps(7, numSlices, perSlice, shiftFn)
+	report, err := Compare(baseline, candidate, nil, Options{Seed: 7, Iterations: 4000})
+	if err != nil {
+		t.Fatalf("Compare: %v", err)
+	}
+
+	var overall, regressed *Group
+	for i := range report.Groups {
+		switch report.Groups[i].Name {
+		case GroupOverall:
+			overall = &report.Groups[i]
+		case fmt.Sprintf("query_source:slice%d", regressedSlice):
+			regressed = &report.Groups[i]
+		}
+	}
+	if overall == nil || regressed == nil {
+		t.Fatalf("missing expected groups: %+v", report.Groups)
+	}
+	t.Logf("overall ndcg10: mean_delta=%.4f ci=[%.4f,%.4f] verdict=%s", overall.NDCG10.MeanDelta, overall.NDCG10.CILow, overall.NDCG10.CIHigh, overall.NDCG10.Verdict)
+	t.Logf("slice%d ndcg10: mean_delta=%.4f ci=[%.4f,%.4f] verdict=%s", regressedSlice, regressed.NDCG10.MeanDelta, regressed.NDCG10.CILow, regressed.NDCG10.CIHigh, regressed.NDCG10.Verdict)
+
+	if regressed.NDCG10.Verdict != VerdictRegressed {
+		t.Fatalf("slice%d ndcg10 verdict = %s, want regressed (diagnostic)", regressedSlice, regressed.NDCG10.Verdict)
+	}
+	if regressed.Gating {
+		t.Fatalf("slice%d.Gating = true, want false", regressedSlice)
+	}
+	if overall.NDCG10.Verdict == VerdictRegressed {
+		t.Fatal("overall ndcg10 verdict = regressed — the dilution in this fixture no longer holds; tighten shift or grow numSlices")
+	}
+	if report.Regressed {
+		t.Fatal("Regressed = true, want false — a single diluted slice regression must not gate exit code 1")
 	}
 }

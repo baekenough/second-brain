@@ -37,10 +37,17 @@ func (r *Report) Text() string {
 	for _, w := range r.Warnings {
 		fmt.Fprintf(&b, "[warning] %s\n", w)
 	}
+	b.WriteString("note: only the \"overall\" group's ndcg10 verdict gates exit code 1 (Report.Regressed); " +
+		"every other group below is diagnostic — no multiple-comparison correction is applied to its verdict " +
+		"beyond the optional bonferroni_significant flag\n")
 	b.WriteString("\n")
 
 	for _, g := range r.Groups {
-		fmt.Fprintf(&b, "== %s ==\n", g.Name)
+		gateNote := " (diagnostic only, not gating)"
+		if g.Gating {
+			gateNote = " (gates exit code 1)"
+		}
+		fmt.Fprintf(&b, "== %s ==%s\n", g.Name, gateNote)
 		writeMetricLine(&b, "ndcg10", g.NDCG10)
 		writeMetricLine(&b, "recall10", g.Recall10)
 		writeMetricLine(&b, "fp10", g.FP10)
@@ -53,7 +60,7 @@ func (r *Report) Text() string {
 	}
 
 	if r.Regressed {
-		b.WriteString("RESULT: regression detected (see any group with verdict=regressed on ndcg10)\n")
+		b.WriteString("RESULT: regression detected (overall group's ndcg10 verdict = regressed)\n")
 	} else {
 		b.WriteString("RESULT: no regression detected\n")
 	}
@@ -61,10 +68,14 @@ func (r *Report) Text() string {
 }
 
 func writeMetricLine(b *strings.Builder, name string, m GroupMetric) {
+	bonferroni := ""
+	if m.BonferroniSignificant != nil {
+		bonferroni = fmt.Sprintf(" bonferroni_significant=%t", *m.BonferroniSignificant)
+	}
 	if !m.HasCI {
-		fmt.Fprintf(b, "  %-8s n=%d mean_delta=%.4f verdict=%s\n", name, m.N, m.MeanDelta, m.Verdict)
+		fmt.Fprintf(b, "  %-8s n=%d mean_delta=%.4f verdict=%s%s\n", name, m.N, m.MeanDelta, m.Verdict, bonferroni)
 		return
 	}
-	fmt.Fprintf(b, "  %-8s n=%d mean_delta=%.4f ci95=[%.4f, %.4f] verdict=%s\n",
-		name, m.N, m.MeanDelta, m.CILow, m.CIHigh, m.Verdict)
+	fmt.Fprintf(b, "  %-8s n=%d mean_delta=%.4f ci95=[%.4f, %.4f] verdict=%s%s\n",
+		name, m.N, m.MeanDelta, m.CILow, m.CIHigh, m.Verdict, bonferroni)
 }

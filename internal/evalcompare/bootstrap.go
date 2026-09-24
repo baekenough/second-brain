@@ -8,18 +8,21 @@ import (
 
 // buildGroup computes the full comparison for one slice: n/mean/CI/verdict
 // for ndcg10, recall10 and fp10, the median-only latency summary, and the
-// worst (most regressed) query IDs by ndcg10 delta.
-func buildGroup(name string, ids []string, byID map[string]queryDelta, opts Options, provenanceUnknown bool) Group {
+// worst (most regressed) query IDs by ndcg10 delta. bonferroniM is the
+// Bonferroni divisor for GroupMetric.BonferroniSignificant — 0 for the
+// overall (gating) group, which skips that computation, and the number of
+// non-overall groups in the report otherwise (see Compare).
+func buildGroup(name string, ids []string, byID map[string]queryDelta, opts Options, provenanceUnknown bool, bonferroniM int) Group {
 	group := Group{Name: name}
 
 	_, ndcgValues := collect(ids, byID, func(d queryDelta) *float64 { return d.NDCG10 })
-	group.NDCG10 = groupMetric(name, "ndcg10", ndcgValues, opts, provenanceUnknown)
+	group.NDCG10 = groupMetric(name, "ndcg10", ndcgValues, opts, provenanceUnknown, bonferroniM)
 
 	_, recallValues := collect(ids, byID, func(d queryDelta) *float64 { return d.Recall10 })
-	group.Recall10 = groupMetric(name, "recall10", recallValues, opts, provenanceUnknown)
+	group.Recall10 = groupMetric(name, "recall10", recallValues, opts, provenanceUnknown, bonferroniM)
 
 	_, fpValues := collect(ids, byID, func(d queryDelta) *float64 { return d.FP10 })
-	group.FP10 = groupMetric(name, "fp10", fpValues, opts, provenanceUnknown)
+	group.FP10 = groupMetric(name, "fp10", fpValues, opts, provenanceUnknown, bonferroniM)
 
 	_, latValues := collect(ids, byID, func(d queryDelta) *float64 { return d.LatencyMs })
 	group.Latency = LatencyMetric{N: len(latValues), MedianDelta: median(latValues)}
@@ -51,7 +54,10 @@ func collect(ids []string, byID map[string]queryDelta, pick func(queryDelta) *fl
 // pair. n < opts.MinN, or an unknown-provenance compare (AllowV1), forces
 // VerdictInconclusive without touching the RNG — an inconclusive verdict
 // must never depend on random draws to reach the same answer twice.
-func groupMetric(groupName, metricName string, values []float64, opts Options, provenanceUnknown bool) GroupMetric {
+// bonferroniM > 0 additionally populates BonferroniSignificant from the
+// same resampled distribution at a corrected alpha; pass 0 for the gating
+// (overall) group, which never needs that computation.
+func groupMetric(groupName, metricName string, values []float64, opts Options, provenanceUnknown bool, bonferroniM int) GroupMetric {
 	n := len(values)
 	metric := GroupMetric{N: n, MeanDelta: mean(values)}
 	if n < opts.MinN || provenanceUnknown {
@@ -72,9 +78,9 @@ func groupMetric(groupName, metricName string, values []float64, opts Options, p
 		resampled[it] = sum / float64(n)
 	}
 	sort.Float64s(resampled)
-	lo, hi := percentileIndices(len(resampled))
 	metric.HasCI = true
-	metric.CILow, metric.CIHigh = resampled[lo], resampled[hi]
+	metric.CILow = percentile(resampled, 0.025)
+	metric.CIHigh = percentile(resampled, 0.975)
 
 	switch {
 	case metric.CIHigh < 0:
@@ -84,28 +90,49 @@ func groupMetric(groupName, metricName string, values []float64, opts Options, p
 	default:
 		metric.Verdict = VerdictNoChange
 	}
+
+	if bonferroniM > 0 {
+		alpha := 0.05 / float64(bonferroniM)
+		lo := percentile(resampled, alpha/2)
+		hi := percentile(resampled, 1-alpha/2)
+		sig := hi < 0 || lo > 0
+		metric.BonferroniSignificant = &sig
+	}
 	return metric
 }
 
-// percentileIndices returns the nearest-rank indices for a 95% CI (2.5th and
-// 97.5th percentile) into a sorted slice of length n. n is always
-// opts.Iterations, which normalized() guarantees is >= 1.
-func percentileIndices(n int) (lo, hi int) {
-	lo = int(0.025 * float64(n))
-	hi = int(0.975*float64(n)) - 1
+// percentile returns the p-th percentile (0 <= p <= 1) of sorted, a slice
+// already in ascending order, using linear interpolation between the two
+// bracketing order statistics (the method NumPy calls "linear", also known
+// as Hazen's or the R-7 estimator: rank = p*(n-1), then interpolate).
+//
+// The previous implementation, percentileIndices, took nearest-rank
+// integer indices lo=int(0.025*n) and hi=int(0.975*n)-1. Truncating instead
+// of interpolating pulls both bounds inward — at n=1000 that is index 24
+// instead of the linear-interpolation rank 24.975, and index 973 instead of
+// rank 973.025 — so the reported 95% CI is narrower than nominal, most
+// visibly at low --iterations counts (see docs/evaluation-protocol.md's
+// minimum-iterations note). See TestPercentile for the exact numbers at
+// n=40 and n=100.
+func percentile(sorted []float64, p float64) float64 {
+	n := len(sorted)
+	if n == 0 {
+		return 0
+	}
+	if n == 1 || p <= 0 {
+		return sorted[0]
+	}
+	if p >= 1 {
+		return sorted[n-1]
+	}
+	rank := p * float64(n-1)
+	lo := int(rank)
+	hi := lo + 1
 	if hi >= n {
-		hi = n - 1
+		return sorted[lo]
 	}
-	if hi < 0 {
-		hi = 0
-	}
-	if lo < 0 {
-		lo = 0
-	}
-	if lo > hi {
-		lo = hi
-	}
-	return lo, hi
+	frac := rank - float64(lo)
+	return sorted[lo] + frac*(sorted[hi]-sorted[lo])
 }
 
 func mean(values []float64) float64 {
