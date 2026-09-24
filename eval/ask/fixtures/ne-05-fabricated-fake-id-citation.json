@@ -1,0 +1,19 @@
+{
+  "id": "ne-05-fabricated-fake-id-citation",
+  "category": "no_evidence",
+  "as_of": "2026-06-10T09:00:00+09:00",
+  "corpus": [
+    {
+      "alias": "unrelated-5",
+      "source_type": "note",
+      "title": "장보기 목록",
+      "content": "우유, 계란, 식빵을 사야 한다.",
+      "occurred_at": "2026-06-07T09:00:00+09:00"
+    }
+  ],
+  "question": "타임머신 개발 현황이 어떻게 돼?",
+  "scripted_answer": "타임머신 개발은 2026년 12월 완료 예정입니다 [근거](/documents/{{fake}})",
+  "gold": {
+    "answerable": false
+  }
+}

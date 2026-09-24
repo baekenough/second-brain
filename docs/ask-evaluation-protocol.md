@@ -159,7 +159,7 @@ pre-#267 lexical fallback provably fails — see
 `askPassage`'s window search scores `0` everywhere), while still being
 answerable because the (simulated) vector lane can bridge the paraphrase.
 
-## Fixture mix (36 fixtures, ≥30 required)
+## Fixture mix (40 fixtures, ≥30 required)
 
 | Category | Count | What it exercises |
 |---|---:|---|
@@ -168,10 +168,55 @@ answerable because the (simulated) vector lane can bridge the paraphrase.
 | `period_source_filter` | 5 | `intent.DeterministicWindow` + `explicitRecordSources` narrowing the candidate pool by event-time window and/or source type |
 | `call_transcript_mid_late` | 6 | Paraphrased/pronoun-follow-up questions whose gold fact sits in a LATE chunk of a long document, including one (`ctm-06`) at the document's exact tail — see below |
 | `conflicting_sources` | 3 | Two documents assert different values for the same fact; only the correct (gold) one should be cited |
-| `no_evidence` | 3 | Retrieval returns nothing relevant → `finish_reason: "no_evidence"` before synthesis ever runs |
-| `irrelevant_evidence` | 3 | Retrieval returns topically-adjacent but non-answering documents → synthesis reaches Stage 3 but must still abstain (`citation_status: "abstained"`), not fabricate |
+| `no_evidence` | 5 | 3 abstention fixtures + 2 fabrication self-tests (`ne-04`/`ne-05`) — see "`no_evidence`/`irrelevant_evidence`: two different things being tested" below |
+| `irrelevant_evidence` | 5 | 3 abstention fixtures + 2 fabrication self-tests (`ie-04`/`ie-05`) — see below |
 | `adversarial_citation` | 4 | Fabricated UUID, malformed link, a real-but-unshown document ID, and an allowed-but-flagged inferred-layer citation — see "Adversarial citations" below |
 | `document_injection` | 1 | A retrieved document's own content tries to instruct the model to cite a fabricated ID; `validateAskCitations` never trusts document content, only the server-built manifest |
+
+### `no_evidence`/`irrelevant_evidence`: two different things being tested
+
+Each of these categories carries two DIFFERENT kinds of fixture, and it
+matters which kind a reader is looking at:
+
+1. **Abstention fixtures** (`ne-01`–`ne-03`, `ie-01`–`ie-03` — no
+   `scripted_answer`). These exercise the REAL pipeline's abstention
+   plumbing end to end: retrieval genuinely finds nothing usable (or
+   something topically adjacent but non-answering), synthesis is reached (or
+   skipped, for `no_evidence`), and the resulting `finish_reason`/
+   `citation_status` is checked. **They test the pipeline's actual
+   behavior for an unanswerable question.**
+
+2. **Fabrication self-tests** (`ne-04`/`ne-05`, `ie-04`/`ie-05` —
+   `scripted_answer` set). These do NOT test the pipeline's own resistance
+   to fabrication at all — the "scripted LLM" section above explains why:
+   `scriptedCompleter`'s default oracle ALWAYS returns the fixed abstention
+   phrase whenever `gold.support_spans` is empty, which is true for every
+   `no_evidence`/`irrelevant_evidence` fixture regardless of what the real
+   prompt actually contained (reproduced: injecting an answering document
+   into `ne-01`'s corpus still PASSes, because the oracle never even looks
+   at the prompt for a fixture with no spans to find). Before these four
+   fixtures existed, that meant `no_evidence`/`irrelevant_evidence` could
+   **never fail**, no matter how badly a real regression broke abstention
+   handling — nothing ever exercised the "the pipeline answered anyway"
+   path.
+   `ne-04`/`ne-05`/`ie-04`/`ie-05` close that gap by setting
+   `scripted_answer` to FORCE a fabricated, non-abstaining, cited answer
+   past the oracle, so `metrics.go`'s `fabricated_answer` detector (see
+   below) has something real to catch — proving the harness's OWN
+   fabrication-detection metric still works, the same way
+   `adversarial_citation`'s fixtures prove issue #268's validator still
+   works. The PASSING outcome for these four is that
+   `fabricated_answer=true` fires (see `TestRun_DistinguishesFabricatedAnswers`,
+   `internal/askeval/runner_test.go`) — not that the scripted answer
+   abstains, which it deliberately does not.
+   `ie-04` in particular exercises the sharpest edge: its corpus document IS
+   topically close enough to be retrieved and shown (the "irrelevant
+   evidence" shape), so citing its own real document ID reaches
+   `citation_status: "valid"` even though the specific fact stated is wrong
+   (a different project's budget) — issue #268's validator only proves a
+   cited ID was actually shown to the model, never that it supports the
+   claim next to it. `fabricated_answer` is deliberately independent of
+   `citation_status` for exactly this reason.
 
 ## Metrics (`internal/askeval/metrics.go`)
 
@@ -180,15 +225,22 @@ pipeline produced — never a semantic judge (see "Judge mode" below):
 
 - **`retrieval_hit`** — every `gold.support_doc_ids` entry's ID appears in
   the `sources` SSE event. Retrieval FOUND the evidence, independent of the
-  excerpt budget.
+  excerpt budget. **Omitted from the JSON report** (Go: `*bool`, nil) for
+  any fixture shape where it is not evaluated at all (e.g. an unanswerable
+  fixture with no `support_doc_ids`) — a bare `false` there would read as a
+  real negative result to a report consumer scanning JSON, when in fact
+  retrieval was never checked for that fixture.
 - **`context_hit`** — every `gold.support_spans` string is a literal
   substring of the exact text the oracle actually saw. This is the
   "context assembly succeeded" half; `retrieval_hit=true, context_hit=false`
   is the specific "retrieval succeeded, context assembly failed" case this
   issue's completion criteria ask to distinguish from a plain retrieval
-  miss (`retrieval_hit=false`).
+  miss (`retrieval_hit=false`). Omitted (nil) when not applicable, same as
+  `retrieval_hit`.
 - **`answer_correct`** — every `gold.claims` string is a literal substring
-  of the produced answer text.
+  of the produced answer text. Omitted (nil) for any fixture shape outside
+  the plain answerable case (adversarial-citation and unanswerable
+  fixtures never populate this field).
 - **`citation_status`** — copied from the `done` SSE event's
   `verification.citation_status` (issue #268's `askCitationStatus`:
   `valid|invalid|missing|abstained|unverified`), or `"no_evidence"` when
@@ -199,6 +251,14 @@ pipeline produced — never a semantic judge (see "Judge mode" below):
   fixture, did it abstain; for an answerable fixture, did it WRONGLY
   abstain (issue #266 completion criteria: report loss on ordinary
   questions, not just gains on adversarial ones).
+- **`fabricated_answer`** — for an unanswerable fixture (no
+  `expected_citation_status`), did the pipeline produce a NON-abstaining
+  answer that actually cited something anyway. Computed independently of
+  `citation_status` (it does not care whether the citation resolved) so a
+  future loosening of the abstention-phrase/citation-status logic itself
+  cannot silently make this pass by definition. See "`no_evidence`/
+  `irrelevant_evidence`: two different things being tested" above for why
+  this metric exists and which fixtures exercise it.
 - **`answer_bytes`** / **`prompt_bytes`** — byte-size **cost proxies**.
   These are NOT a token count: actual cost depends on the configured
   model's tokenizer, which this offline scripted run never calls. Treat
@@ -212,10 +272,12 @@ pipeline produced — never a semantic judge (see "Judge mode" below):
 
 `Pass` is the single rollup `report.go`'s category counts and
 `FailingCaseIDs` are built from — see `metrics.go`'s `computeMetrics` for
-the exact rule per fixture shape (adversarial-citation fixtures pass when
+the exact rule per fixture shape: adversarial-citation fixtures pass when
 the validator reaches the provoked verdict; answerable fixtures pass on
 correct-claim-plus-valid-citation; unanswerable fixtures pass on correct
-abstention).
+abstention — UNLESS `scripted_answer` is set (the fabrication self-tests),
+in which case Pass tracks `fabricated_answer` instead, because the
+fixture's whole point is that the scripted answer does NOT abstain.
 
 ## `call_transcript_mid_late`: resolved by #267 (was a 5/5 known baseline gap)
 
@@ -297,6 +359,29 @@ if `windowAround`'s reserve-before-sizing invariant ever regresses.
 `TestRun_CallTranscriptMidLate_MatchedChunkEvidence`
 (`internal/askeval/runner_test.go`) covers all six `call_transcript_mid_late`
 fixtures, `ctm-06` included.
+
+### `ctm-06`'s fake-vector ranking margin
+
+`ctm-06`'s content was originally authored the same way as `ctm-01`–`ctm-05`
+(one long, mostly-identical filler sentence repeated across both the head
+and tail halves) and its gold chunk's `hashedEmbedder` cosine score beat the
+runner-up chunk by only ~0.007 (0.3818 vs 0.3748) — fragile enough that an
+unrelated `hashEmbed`/`semanticAliasFold` change, or even a single extra
+hash collision in the 48-dimension fake embedding space, could silently
+flip which chunk the fake vector lane ranks first without any test failing
+to say so. It has since been re-authored: the head is longer and uses
+topic-neutral filler with no vocabulary overlap with the gold fact, and the
+tail is short and dense with the gold fact's own vocabulary (repeating the
+`semantic_aliases`-folded "승인 기한" phrase once more before the final
+sentence), pushing the margin to ~0.28. `TestRun_CTMFakeVectorMargin`
+(`internal/askeval/runner_test.go`) asserts a per-fixture floor for every
+`call_transcript_mid_late` fixture's own margin (`ctm-06`'s floor is 0.02;
+`ctm-01`–`ctm-05` keep their original, more fragile margins and floors set
+with headroom under their currently-measured values — re-authoring them is
+a separate, not-yet-scheduled follow-up), so a future regression that
+erodes or flips any of these margins fails loudly with the fixture ID and
+both scores in the message, instead of silently relying on the fixture
+still happening to rank correctly.
 
 ### Control check (pre-#267 vs. HEAD)
 
