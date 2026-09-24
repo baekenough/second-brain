@@ -35,7 +35,7 @@ var wantCategoryCounts = map[string]int{
 	"single_turn":              6,
 	"korean_followup":          5,
 	"period_source_filter":     5,
-	"call_transcript_mid_late": 5,
+	"call_transcript_mid_late": 6,
 	"conflicting_sources":      3,
 	"no_evidence":              3,
 	"irrelevant_evidence":      3,
@@ -148,6 +148,13 @@ func TestRun_FullFixtureSet_Baseline(t *testing.T) {
 // docs/ask-evaluation-protocol.md's "semantic_aliases" section for why a
 // naive question rewrite alone would not discriminate pre-#267 from
 // post-#267 behaviour here.
+//
+// ctm-06 additionally pins the #267 follow-up fix: its gold fact is the
+// LITERAL LAST byte of its document (no trailing wrap-up sentence, unlike
+// ctm-01–ctm-05 — see docs/ask-evaluation-protocol.md's "Why the tail needs
+// trailing text" section), so it regression-guards windowAround's
+// reserve-markers-before-sizing invariant in internal/api/ask_context.go
+// directly, not just the chunk-evidence propagation ctm-01–ctm-05 cover.
 func TestRun_CallTranscriptMidLate_MatchedChunkEvidence(t *testing.T) {
 	fixtures, err := Load(fixturesDir(t))
 	if err != nil {
@@ -159,8 +166,8 @@ func TestRun_CallTranscriptMidLate_MatchedChunkEvidence(t *testing.T) {
 			ctm = append(ctm, f)
 		}
 	}
-	if len(ctm) != 5 {
-		t.Fatalf("want 5 call_transcript_mid_late fixtures, got %d", len(ctm))
+	if len(ctm) != 6 {
+		t.Fatalf("want 6 call_transcript_mid_late fixtures, got %d", len(ctm))
 	}
 	results := Run(context.Background(), ctm, DefaultRunOptions())
 	for _, r := range results {

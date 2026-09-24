@@ -23,6 +23,19 @@ const (
 )
 const excerptMarker = " [발췌: 나머지 생략]"
 
+// evidencePrefixMarker and evidenceSuffixMarker mark an evidence passage's
+// omitted head/tail (askPassage's lexical fallback and windowAround's
+// located-span window both use them). Their byte lengths must be reserved
+// BEFORE the surrounding window is sized — see windowAround's doc comment
+// for why: a prior version sized the window against the raw budget first
+// and relied on clipAskText's end-trim safety net to absorb any marker
+// overflow afterward, which silently deleted the evidence itself whenever
+// the located span sat at the very end of the document (#267 follow-up).
+const (
+	evidencePrefixMarker = "[앞부분 생략] "
+	evidenceSuffixMarker = " [뒷부분 생략]"
+)
+
 // unlocatedEvidenceMarker (#267) is appended when a matched chunk's text
 // exists (model.MatchedEvidence.Text is non-empty) but could not be located
 // verbatim inside its parent document's Content — see
@@ -103,7 +116,7 @@ func askPassage(content, question string, budget int) (string, askEvidenceMode) 
 	prefix := ""
 	mode := askEvidenceModeHead
 	if bestStart > 0 {
-		prefix = "[앞부분 생략] "
+		prefix = evidencePrefixMarker
 		mode = askEvidenceModeLexicalWindow
 	}
 	return prefix + clipAskText(string(runes[bestStart:]), budget-len(prefix)), mode
@@ -182,46 +195,83 @@ func bestEvidenceByScore(evidence []model.MatchedEvidence) *model.MatchedEvidenc
 // windowAround clips content to a budget-sized window straddling [start,
 // end), preferring to centre the window on the match. Prefix/suffix markers
 // make an omitted surrounding region explicit, matching askPassage's
-// "[앞부분 생략]" convention. The final clipAskText call is the same safety
-// net askPassage relies on: marker bytes can push the raw concatenation
-// slightly over budget, and clipAskText is the one place that enforces the
-// hard bound.
+// "[앞부분 생략]" convention.
+//
+// Marker bytes are reserved out of budget BEFORE the window itself is sized
+// (evidencePrefixMarker/evidenceSuffixMarker's doc comment) — the window
+// plus whichever markers end up attached is therefore guaranteed to fit
+// budget without ever needing to trim afterward. This matters because
+// [start, end) is always included whole once it is inside the window (see
+// the invariant argued below), so trimming after the fact — as a prior
+// version did via clipAskText's end-trim safety net — would delete part of
+// the evidence itself whenever it happened to sit at the window's tail
+// (#267 follow-up: a call transcript's answer-bearing sentence was often
+// its very last sentence).
 func windowAround(content string, start, end, budget int) string {
 	if budget <= 0 {
 		return ""
 	}
+	if len(content) <= budget {
+		// Whole document already fits: no window, no markers needed.
+		return content
+	}
 	matchLen := end - start
 	if matchLen >= budget {
+		// The evidence alone doesn't fit; there is no room left for markers
+		// either. Defined behaviour: return as much of the evidence as
+		// budget allows, starting at its own beginning.
 		return clipAskText(content[start:], budget)
 	}
-	extra := budget - matchLen
+
+	reserveLeft, reserveRight := len(evidencePrefixMarker), len(evidenceSuffixMarker)
+	contentBudget := budget - reserveLeft - reserveRight
+	if contentBudget < matchLen {
+		// Not enough room for both markers AND the full span: drop the
+		// markers rather than trim the evidence they would otherwise
+		// annotate.
+		contentBudget, reserveLeft, reserveRight = matchLen, 0, 0
+	}
+
+	// left <= start <= end <= right by construction: extra is the total
+	// slack beyond the match, split (roughly) evenly on each side, then
+	// clamped to content's bounds — clamping one side can only push the
+	// other further toward the match, never past it, since contentBudget >=
+	// matchLen throughout.
+	extra := contentBudget - matchLen
 	left := start - extra/2
 	if left < 0 {
 		left = 0
 	}
-	right := left + budget
+	right := left + contentBudget
 	if right > len(content) {
 		right = len(content)
-		left = right - budget
+		left = right - contentBudget
 		if left < 0 {
 			left = 0
 		}
 	}
-	for left > 0 && !utf8.RuneStart(content[left]) {
-		left--
+	// [start, end) is always a valid rune-boundary pair — it came from
+	// strings.Index over valid UTF-8 text — so shrinking (never growing)
+	// toward the nearest valid boundary can only narrow the non-evidence
+	// context on either side; it can never eat into the evidence span
+	// itself, and it can never push the window's byte length back over
+	// contentBudget the way growing outward would have.
+	for left < start && !utf8.RuneStart(content[left]) {
+		left++
 	}
-	for right < len(content) && !utf8.RuneStart(content[right]) {
-		right++
+	for right > end && right < len(content) && !utf8.RuneStart(content[right]) {
+		right--
 	}
+
 	prefix := ""
-	if left > 0 {
-		prefix = "[앞부분 생략] "
+	if reserveLeft > 0 && left > 0 {
+		prefix = evidencePrefixMarker
 	}
 	suffix := ""
-	if right < len(content) {
-		suffix = " [뒷부분 생략]"
+	if reserveRight > 0 && right < len(content) {
+		suffix = evidenceSuffixMarker
 	}
-	return clipAskText(prefix+content[left:right]+suffix, budget)
+	return prefix + content[left:right] + suffix
 }
 
 // evidencePassage builds a document-lane primary's excerpt from its fused

@@ -159,14 +159,14 @@ pre-#267 lexical fallback provably fails — see
 `askPassage`'s window search scores `0` everywhere), while still being
 answerable because the (simulated) vector lane can bridge the paraphrase.
 
-## Fixture mix (35 fixtures, ≥30 required)
+## Fixture mix (36 fixtures, ≥30 required)
 
 | Category | Count | What it exercises |
 |---|---:|---|
 | `single_turn` | 6 | One question, one supporting document, no history |
 | `korean_followup` | 5 | 지시어/pronoun resolution ("그 사람", "거기", "그 회의") across a 2-turn conversation, via the real query-rewrite call |
 | `period_source_filter` | 5 | `intent.DeterministicWindow` + `explicitRecordSources` narrowing the candidate pool by event-time window and/or source type |
-| `call_transcript_mid_late` | 5 | Paraphrased/pronoun-follow-up questions whose gold fact sits in a LATE chunk of a long document — see below |
+| `call_transcript_mid_late` | 6 | Paraphrased/pronoun-follow-up questions whose gold fact sits in a LATE chunk of a long document, including one (`ctm-06`) at the document's exact tail — see below |
 | `conflicting_sources` | 3 | Two documents assert different values for the same fact; only the correct (gold) one should be cited |
 | `no_evidence` | 3 | Retrieval returns nothing relevant → `finish_reason: "no_evidence"` before synthesis ever runs |
 | `irrelevant_evidence` | 3 | Retrieval returns topically-adjacent but non-answering documents → synthesis reaches Stage 3 but must still abstain (`citation_status: "abstained"`), not fabricate |
@@ -262,24 +262,41 @@ fixture's exact content/question pair scores `0` at every window position,
 meaning `askPassage` cannot distinguish the head from anywhere else and
 falls back to its initial value (the document's start).
 
-### Why the tail needs trailing text
+### Why the tail needs trailing text (historical — fixed, see ctm-06)
 
-The chunk carrying the fact is also the LAST chunk of the document. Without
-a short wrap-up sentence after the fact,
-`internal/api/ask_context.go`'s `windowAround` — which centres the excerpt
-window on the located evidence span — clamps its window's right edge to
-`len(content)` (there is nothing further to include), then prepends a
-`"[앞부분 생략] "` marker; the combined text now exceeds the excerpt budget
-by the marker's byte length, and `clipAskText`'s safety-net re-clip trims
-that many bytes off the END — which, with no trailing buffer, is the fact
-itself. This is a genuine, if narrow, edge case in #267's `windowAround`/
-`clipAskText` interaction, confirmed by reproducing it against an earlier
-draft of these fixtures (see the fixing commit's message for the
-byte-offset evidence). Adding a short, natural wrap-up sentence after the
-fact keeps that edge case from ever touching the answer-bearing text,
-matching how a real transcript would end anyway (a call does not stop
-mid-sentence at the fact). This was judged a fixture-realism fix, not a
-workaround, and is disclosed here rather than silently baked in.
+`ctm-01` through `ctm-05` each carry a short wrap-up sentence after their
+gold fact, so the fact is never the literal last byte of the document. That
+was originally a fixture-side workaround for a genuine product bug: without
+a trailing sentence, `internal/api/ask_context.go`'s `windowAround` — which
+centres the excerpt window on the located evidence span — clamped its
+window's right edge to `len(content)` (there is nothing further to
+include), then prepended a `"[앞부분 생략] "` marker; the combined text now
+exceeded the excerpt budget by the marker's byte length, and
+`clipAskText`'s safety-net re-clip trimmed that many bytes off the END —
+which, with no trailing buffer, was the fact itself. Confirmed by
+reproducing it against an earlier draft of these fixtures (see the fixing
+commit's message for the byte-offset evidence).
+
+**This bug is now fixed for real, not worked around.** `windowAround`
+reserves the prefix/suffix marker bytes out of budget BEFORE the
+surrounding window is sized (`evidencePrefixMarker`/`evidenceSuffixMarker`
+in `internal/api/ask_context.go`), so the window itself — plus whichever
+markers end up attached — is guaranteed to fit budget without ever needing
+to trim into the evidence afterward. When the located span sits at the
+window's tail, the window's LEFT edge simply gives up more room instead;
+nothing is trimmed off the fact. This holds regardless of where the
+evidence sits (head / middle / exact tail) as long as the span itself fits
+within budget minus both markers.
+
+`ctm-01`–`ctm-05` keep their trailing wrap-up sentences unchanged — they
+still read as realistic transcript endings, and removing them now would
+just be churn. **`ctm-06-tail-conclusion`** is the new, dedicated regression
+fixture: its gold fact IS the literal last byte of the document (no
+wrap-up sentence follows it at all), specifically to catch this exact bug
+if `windowAround`'s reserve-before-sizing invariant ever regresses.
+`TestRun_CallTranscriptMidLate_MatchedChunkEvidence`
+(`internal/askeval/runner_test.go`) covers all six `call_transcript_mid_late`
+fixtures, `ctm-06` included.
 
 ### Control check (pre-#267 vs. HEAD)
 

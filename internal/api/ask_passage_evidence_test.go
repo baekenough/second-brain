@@ -1,8 +1,10 @@
 package api
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/google/uuid"
@@ -200,4 +202,167 @@ func truncateForTest(s string) string {
 		return s[:500] + "...(truncated)"
 	}
 	return s
+}
+
+// --- #267 follow-up: windowAround must never let its own omission markers
+// push the evidence span itself out of budget. clipAskText's end-trim
+// safety net was previously the only thing enforcing the hard bound, and
+// trimming from the end deletes the evidence whenever it sits at the
+// window's tail — a call transcript's answer-bearing sentence is often its
+// very last sentence. These tests call windowAround directly (rather than
+// through buildBudgetedAskMessages) to pin down the exact contract: a
+// located evidence span that fits within budget minus markers must always
+// survive whole, regardless of where inside content it sits.
+
+// windowAroundTailEvidence is deliberately concrete Korean prose (not a
+// synthesized filler pattern) so a regression is easy to eyeball in a
+// failing test's `got` output.
+const windowAroundTailEvidence = "완료 기준일은 8월 15일로 정해졌다."
+
+func TestWindowAround_EvidenceSurvivesAtExactTail(t *testing.T) {
+	t.Parallel()
+
+	content := strings.Repeat("무관한 앞부분 문단입니다. ", 400) + windowAroundTailEvidence
+	start := strings.Index(content, windowAroundTailEvidence)
+	if start < 0 {
+		t.Fatal("test setup bug: evidence not found in content")
+	}
+	end := start + len(windowAroundTailEvidence)
+	if end != len(content) {
+		t.Fatalf("test setup bug: evidence must end exactly at content's end, end=%d len(content)=%d", end, len(content))
+	}
+	const budget = 200
+
+	got := windowAround(content, start, end, budget)
+
+	if len(got) > budget {
+		t.Fatalf("windowAround exceeded budget: len=%d budget=%d passage=%q", len(got), budget, got)
+	}
+	if !strings.Contains(got, windowAroundTailEvidence) {
+		t.Fatalf("evidence at exact tail was cut off instead of the window shifting left: %q", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("result is not valid UTF-8: %q", got)
+	}
+	// No suffix marker: the window's right edge IS content's true end, so
+	// there is nothing after it to mark as omitted.
+	if strings.Contains(got, "뒷부분 생략") {
+		t.Fatalf("spurious suffix marker on a window that already reaches content's end: %q", got)
+	}
+}
+
+func TestWindowAround_EvidenceSurvivesAtExactHead(t *testing.T) {
+	t.Parallel()
+
+	content := windowAroundTailEvidence + strings.Repeat(" 무관한 뒷부분 문단입니다.", 400)
+	start := 0
+	end := len(windowAroundTailEvidence)
+	const budget = 200
+
+	got := windowAround(content, start, end, budget)
+
+	if len(got) > budget {
+		t.Fatalf("windowAround exceeded budget: len=%d budget=%d passage=%q", len(got), budget, got)
+	}
+	if !strings.Contains(got, windowAroundTailEvidence) {
+		t.Fatalf("evidence at exact head was cut off: %q", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("result is not valid UTF-8: %q", got)
+	}
+	// No prefix marker: the window's left edge IS content's true start.
+	if strings.Contains(got, "앞부분 생략") {
+		t.Fatalf("spurious prefix marker on a window that already starts at content's start: %q", got)
+	}
+}
+
+func TestWindowAround_EvidenceSurvivesInMiddle(t *testing.T) {
+	t.Parallel()
+
+	content := strings.Repeat("무관한 앞부분 문단입니다. ", 400) + windowAroundTailEvidence + strings.Repeat(" 무관한 뒷부분 문단입니다.", 400)
+	start := strings.Index(content, windowAroundTailEvidence)
+	end := start + len(windowAroundTailEvidence)
+	const budget = 200
+
+	got := windowAround(content, start, end, budget)
+
+	if len(got) > budget {
+		t.Fatalf("windowAround exceeded budget: len=%d budget=%d passage=%q", len(got), budget, got)
+	}
+	if !strings.Contains(got, windowAroundTailEvidence) {
+		t.Fatalf("evidence in the middle was cut off: %q", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("result is not valid UTF-8: %q", got)
+	}
+	if !strings.Contains(got, "앞부분 생략") || !strings.Contains(got, "뒷부분 생략") {
+		t.Fatalf("expected both omission markers around a mid-document window: %q", got)
+	}
+}
+
+// TestWindowAround_SpanLargerThanBudget_NoPanic covers the defined-but-not-
+// fully-guaranteed case: the evidence span itself is bigger than budget, so
+// it cannot possibly survive whole. windowAround must still return a
+// budget-bounded, valid-UTF-8 result rather than panicking.
+func TestWindowAround_SpanLargerThanBudget_NoPanic(t *testing.T) {
+	t.Parallel()
+
+	evidence := strings.Repeat("가나다라", 100) // 1200 bytes, well over budget below
+	content := "머리말 문단입니다. " + evidence + " 꼬리말 문단입니다."
+	start := strings.Index(content, evidence)
+	end := start + len(evidence)
+	const budget = 100
+
+	var got string
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("windowAround panicked: %v", r)
+			}
+		}()
+		got = windowAround(content, start, end, budget)
+	}()
+
+	if len(got) > budget {
+		t.Fatalf("windowAround exceeded budget: len=%d budget=%d", len(got), budget)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("result is not valid UTF-8: %q", got)
+	}
+}
+
+// TestWindowAround_MultiByteBoundariesNeverSplitARune sweeps a range of
+// budgets over Korean (3-byte) content so the window's naturally computed
+// [left, right) offsets land mid-rune for at least some budgets, exercising
+// the shrink-to-valid-boundary loops without ever cutting the located
+// evidence span itself.
+func TestWindowAround_MultiByteBoundariesNeverSplitARune(t *testing.T) {
+	t.Parallel()
+
+	content := strings.Repeat("무관한 문단입니다. ", 300) + windowAroundTailEvidence + strings.Repeat(" 무관한 문단입니다.", 300)
+	start := strings.Index(content, windowAroundTailEvidence)
+	end := start + len(windowAroundTailEvidence)
+
+	// Literal marker length, not the package constant: this test (and the
+	// revert-check that runs it against the pre-fix windowAround) must keep
+	// compiling even when evidencePrefixMarker/evidenceSuffixMarker do not
+	// exist yet.
+	const markerBytesEachSide = len("[앞부분 생략] ")
+
+	for budget := 60; budget < 260; budget += 7 { // odd stride to hit misaligned offsets
+		budget := budget
+		t.Run(fmt.Sprintf("budget=%d", budget), func(t *testing.T) {
+			t.Parallel()
+			got := windowAround(content, start, end, budget)
+			if len(got) > budget {
+				t.Fatalf("budget=%d: windowAround exceeded budget: len=%d passage=%q", budget, len(got), got)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("budget=%d: result is not valid UTF-8: %q", budget, got)
+			}
+			if budget-2*markerBytesEachSide >= len(windowAroundTailEvidence) && !strings.Contains(got, windowAroundTailEvidence) {
+				t.Fatalf("budget=%d: evidence should have fit but was cut: %q", budget, got)
+			}
+		})
+	}
 }
