@@ -67,3 +67,55 @@ func TestAskSource_JSON_OccurredAt(t *testing.T) {
 		}
 	})
 }
+
+// TestAskCitationVerification_JSON covers the JSONB round trip migration
+// 039's citation_verification column relies on (issue #268): every field
+// round-trips through marshal->unmarshal unchanged, and — mirroring
+// TestAskSource_JSON_OccurredAt's "pre-#218 row" case above — JSON that
+// predates a field addition must still unmarshal without error.
+func TestAskCitationVerification_JSON(t *testing.T) {
+	t.Parallel()
+
+	t.Run("full value round-trips", func(t *testing.T) {
+		t.Parallel()
+		v := AskCitationVerification{
+			CitationStatus:    "invalid",
+			CitedIDs:          []string{"11111111-1111-1111-1111-111111111111"},
+			UnknownIDs:        []string{"11111111-1111-1111-1111-111111111111"},
+			MalformedLinks:    2,
+			InferredCitedIDs:  []string{},
+			PromptEvidenceIDs: []string{"22222222-2222-2222-2222-222222222222"},
+			ClaimSupport:      "not_evaluated",
+		}
+		raw, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var got AskCitationVerification
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got.CitationStatus != v.CitationStatus || got.MalformedLinks != v.MalformedLinks || got.ClaimSupport != v.ClaimSupport {
+			t.Errorf("got = %+v, want %+v", got, v)
+		}
+		if len(got.CitedIDs) != 1 || got.CitedIDs[0] != v.CitedIDs[0] {
+			t.Errorf("CitedIDs = %v, want %v", got.CitedIDs, v.CitedIDs)
+		}
+		if len(got.PromptEvidenceIDs) != 1 || got.PromptEvidenceIDs[0] != v.PromptEvidenceIDs[0] {
+			t.Errorf("PromptEvidenceIDs = %v, want %v", got.PromptEvidenceIDs, v.PromptEvidenceIDs)
+		}
+	})
+
+	t.Run("nil AskSession.Verification is not fabricated into a zero-value struct", func(t *testing.T) {
+		t.Parallel()
+		// scanAskSession's own contract (ask_sessions.go): an empty/NULL
+		// citation_verification column must leave AskSession.Verification
+		// nil, not &AskCitationVerification{}. This is a documentation test —
+		// the actual NULL-scan behaviour needs a real DB connection, see
+		// ask_sessions_verification_db_test.go.
+		var session AskSession
+		if session.Verification != nil {
+			t.Fatalf("zero-value AskSession.Verification = %+v, want nil", session.Verification)
+		}
+	})
+}

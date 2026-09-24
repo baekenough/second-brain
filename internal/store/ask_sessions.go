@@ -35,6 +35,28 @@ type AskSource struct {
 	OccurredAt *time.Time `json:"occurred_at"`
 }
 
+// AskCitationVerification mirrors internal/api.askVerificationPayload's wire
+// shape exactly (all ID fields are already the string form, matching that
+// package's newAskVerificationPayload — see AskSource's doc comment above
+// for why the shape is duplicated here rather than imported: store must not
+// depend on api). Keep field names/JSON tags in sync if either changes.
+//
+// This is migration 039's citation_verification JSONB column (issue #268):
+// the deterministic citation-validation result for one turn's generated
+// answer, persisted so (a) a page reload can show the same verdict without
+// re-deriving it, and (b) recentAskHistory (ask_history.go) can filter out
+// "invalid"/"unverified" turns before replaying them into a later prompt
+// without re-parsing stored answer text.
+type AskCitationVerification struct {
+	CitationStatus    string   `json:"citation_status"`
+	CitedIDs          []string `json:"cited_ids"`
+	UnknownIDs        []string `json:"unknown_ids"`
+	MalformedLinks    int      `json:"malformed_links"`
+	InferredCitedIDs  []string `json:"inferred_cited_ids"`
+	PromptEvidenceIDs []string `json:"prompt_evidence_ids"`
+	ClaimSupport      string   `json:"claim_support"`
+}
+
 // AskSession represents one row in ask_sessions (migration 024): a single
 // turn (one question/answer exchange) within a multi-turn conversation,
 // persisted so a page refresh does not lose the answer. TurnIndex is 0-based
@@ -50,7 +72,12 @@ type AskSession struct {
 	Answer         string
 	FinishReason   string // "stop" | "error" | "no_evidence"
 	Sources        []AskSource
-	CreatedAt      time.Time
+	// Verification is migration 039's citation_verification column: nil for
+	// every row written before that migration, and for rows where
+	// synthesize (internal/api) never produced a report at all (see
+	// AskCitationVerification's doc comment) — never fabricated.
+	Verification *AskCitationVerification
+	CreatedAt    time.Time
 }
 
 // AskSessionStore provides persistence for ask_sessions (migration 024).
@@ -81,6 +108,15 @@ func NewAskSessionStore(pg *Postgres) *AskSessionStore {
 // Sources defaults to an empty slice (never nil) before marshaling so the
 // stored JSONB is always a valid array, matching the column's
 // NOT NULL DEFAULT '[]'::jsonb.
+//
+// session.Verification, unlike Sources, is allowed to stay nil — migration
+// 039's citation_verification column is JSONB NULL (not NOT NULL DEFAULT),
+// because unlike "which documents backed this answer" (always knowable),
+// "was this answer's citations checked" genuinely has no value for a
+// no_evidence turn or a pre-migration-039 row, and NULL is the honest way to
+// say that (mirrors AskSource.OccurredAt's pre-#218-row reasoning above). A
+// nil Verification is passed through as a Go nil interface{} parameter,
+// which pgx encodes as SQL NULL regardless of the $8::jsonb cast.
 func (s *AskSessionStore) Insert(ctx context.Context, session AskSession) (AskSession, error) {
 	if session.Sources == nil {
 		session.Sources = []AskSource{}
@@ -90,14 +126,23 @@ func (s *AskSessionStore) Insert(ctx context.Context, session AskSession) (AskSe
 		return AskSession{}, fmt.Errorf("ask session insert: marshal sources: %w", err)
 	}
 
+	var verificationParam any
+	if session.Verification != nil {
+		verificationJSON, err := json.Marshal(session.Verification)
+		if err != nil {
+			return AskSession{}, fmt.Errorf("ask session insert: marshal verification: %w", err)
+		}
+		verificationParam = string(verificationJSON)
+	}
+
 	const q = `
-		INSERT INTO ask_sessions (id, conversation_id, turn_index, question, answer, finish_reason, sources)
-		VALUES (COALESCE(NULLIF($1, '00000000-0000-0000-0000-000000000000'::uuid), gen_random_uuid()), $2, $3, $4, $5, $6, $7::jsonb)
+		INSERT INTO ask_sessions (id, conversation_id, turn_index, question, answer, finish_reason, sources, citation_verification)
+		VALUES (COALESCE(NULLIF($1, '00000000-0000-0000-0000-000000000000'::uuid), gen_random_uuid()), $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb)
 		RETURNING id, created_at`
 
 	row := s.pg.pool.QueryRow(ctx, q,
 		session.ID, session.ConversationID, session.TurnIndex,
-		session.Question, session.Answer, session.FinishReason, string(sourcesJSON),
+		session.Question, session.Answer, session.FinishReason, string(sourcesJSON), verificationParam,
 	)
 	if err := row.Scan(&session.ID, &session.CreatedAt); err != nil {
 		return AskSession{}, fmt.Errorf("ask session insert: %w", err)
@@ -111,7 +156,7 @@ func (s *AskSessionStore) Insert(ctx context.Context, session AskSession) (AskSe
 // a page refresh.
 func (s *AskSessionStore) ListConversationTurns(ctx context.Context, conversationID uuid.UUID) ([]AskSession, error) {
 	const q = `
-		SELECT id, conversation_id, turn_index, question, answer, finish_reason, sources, created_at
+		SELECT id, conversation_id, turn_index, question, answer, finish_reason, sources, citation_verification, created_at
 		FROM ask_sessions
 		WHERE conversation_id = $1
 		ORDER BY turn_index ASC`
@@ -159,10 +204,10 @@ func (s *AskSessionStore) ListRecentConversations(ctx context.Context, limit int
 	}
 
 	const q = `
-		SELECT id, conversation_id, turn_index, question, answer, finish_reason, sources, created_at
+		SELECT id, conversation_id, turn_index, question, answer, finish_reason, sources, citation_verification, created_at
 		FROM (
 			SELECT DISTINCT ON (conversation_id)
-				id, conversation_id, turn_index, question, answer, finish_reason, sources, created_at
+				id, conversation_id, turn_index, question, answer, finish_reason, sources, citation_verification, created_at
 			FROM ask_sessions
 			ORDER BY conversation_id, created_at DESC
 		) latest_turn
@@ -194,7 +239,7 @@ func (s *AskSessionStore) ListRecentConversations(ctx context.Context, limit int
 // EvalMetricsStore.Latest), leaving 404-vs-500 handling to the caller.
 func (s *AskSessionStore) Get(ctx context.Context, id uuid.UUID) (*AskSession, error) {
 	const q = `
-		SELECT id, conversation_id, turn_index, question, answer, finish_reason, sources, created_at
+		SELECT id, conversation_id, turn_index, question, answer, finish_reason, sources, citation_verification, created_at
 		FROM ask_sessions
 		WHERE id = $1`
 
@@ -217,18 +262,32 @@ type askSessionScanner interface {
 
 func scanAskSession(row askSessionScanner) (AskSession, error) {
 	var (
-		session     AskSession
-		sourcesJSON []byte
+		session          AskSession
+		sourcesJSON      []byte
+		verificationJSON []byte
 	)
 	if err := row.Scan(
 		&session.ID, &session.ConversationID, &session.TurnIndex,
 		&session.Question, &session.Answer, &session.FinishReason,
-		&sourcesJSON, &session.CreatedAt,
+		&sourcesJSON, &verificationJSON, &session.CreatedAt,
 	); err != nil {
 		return AskSession{}, err
 	}
 	if err := json.Unmarshal(sourcesJSON, &session.Sources); err != nil {
 		return AskSession{}, fmt.Errorf("unmarshal sources: %w", err)
+	}
+	// citation_verification is JSONB NULL (migration 039): a NULL column
+	// scans into a nil/zero-length []byte, not an error, and MUST stay nil
+	// on AskSession rather than becoming a zero-value AskCitationVerification
+	// — a row that predates migration 039 or a no_evidence turn both mean
+	// "no verification exists for this turn", and a fabricated empty struct
+	// would read back as "checked and everything was empty" instead.
+	if len(verificationJSON) > 0 {
+		var v AskCitationVerification
+		if err := json.Unmarshal(verificationJSON, &v); err != nil {
+			return AskSession{}, fmt.Errorf("unmarshal citation_verification: %w", err)
+		}
+		session.Verification = &v
 	}
 	return session, nil
 }

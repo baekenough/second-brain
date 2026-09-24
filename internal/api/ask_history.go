@@ -39,6 +39,18 @@ type askHistoryTurn struct {
 // — see buildAskRewritePrompt/buildAskMessages for where this cap is spent.
 const askMaxHistoryTurns = 6
 
+// askHistoryExcludedCitationStatuses are the store.AskCitationVerification
+// statuses a past turn must NOT have to be replayed into a later prompt
+// (issue #268, extending the #258 FinishReason filter below with the same
+// reasoning): "invalid" means that turn cited a document it was never shown,
+// and "unverified" means synthesis never finished cleanly enough to check —
+// replaying either back into a new prompt would let a known-bad past answer
+// shape the model's next one.
+var askHistoryExcludedCitationStatuses = map[string]bool{
+	string(askCitationInvalid):    true,
+	string(askCitationUnverified): true,
+}
+
 // recentAskHistory trims turns (already ordered turn_index ASC, per
 // AskSessionStore.ListConversationTurns) down to the most recent max
 // entries and projects them to askHistoryTurn.
@@ -48,7 +60,14 @@ func recentAskHistory(turns []store.AskSession, max int) []askHistoryTurn {
 		if (t.FinishReason != "stop" && t.FinishReason != "no_evidence") || strings.TrimSpace(t.Answer) == "" {
 			continue
 		}
-		history = append(history, askHistoryTurn{Question: t.Question, Answer: t.Answer})
+		if t.Verification != nil && askHistoryExcludedCitationStatuses[t.Verification.CitationStatus] {
+			continue
+		}
+		// stripAskDocumentLinks (ask_citation.go): a replayed citation link
+		// is validated against a LATER turn's manifest, which it almost
+		// never resolves against — see that function's doc comment
+		// (deep-plan #268 §7 risk).
+		history = append(history, askHistoryTurn{Question: t.Question, Answer: stripAskDocumentLinks(t.Answer)})
 	}
 	if max > 0 && len(history) > max {
 		history = history[len(history)-max:]
@@ -111,7 +130,14 @@ func (s *Server) resolveConversation(ctx context.Context, requestedID string) (c
 // detached context instead of the dead one — otherwise every disconnect
 // would also silently skip persistence, defeating the point of saving a
 // partial answer at all (see askHandler's finishReason=="" branch).
-func (s *Server) saveAskTurn(ctx context.Context, conversationID uuid.UUID, turnIndex int, question, answer, finishReason string, sources []AskSourceItem) {
+//
+// report is the same *askCitationReport askHandler received from synthesize
+// (issue #268) — nil for "no_evidence" turns (nothing was synthesized) and
+// for an "error" turn with no answer text. It is projected to
+// store.AskCitationVerification and persisted so a page reload and the
+// history-replay filter above (askHistoryExcludedCitationStatuses) can both
+// see it without re-deriving it from stored answer text.
+func (s *Server) saveAskTurn(ctx context.Context, conversationID uuid.UUID, turnIndex int, question, answer, finishReason string, sources []AskSourceItem, report *askCitationReport) {
 	if s.askSessions == nil {
 		return
 	}
@@ -131,6 +157,20 @@ func (s *Server) saveAskTurn(ctx context.Context, conversationID uuid.UUID, turn
 		})
 	}
 
+	var verification *store.AskCitationVerification
+	if report != nil {
+		payload := newAskVerificationPayload(*report)
+		verification = &store.AskCitationVerification{
+			CitationStatus:    payload.CitationStatus,
+			CitedIDs:          payload.CitedIDs,
+			UnknownIDs:        payload.UnknownIDs,
+			MalformedLinks:    payload.MalformedLinks,
+			InferredCitedIDs:  payload.InferredCitedIDs,
+			PromptEvidenceIDs: payload.PromptEvidenceIDs,
+			ClaimSupport:      payload.ClaimSupport,
+		}
+	}
+
 	if _, err := s.askSessions.Insert(saveCtx, store.AskSession{
 		ConversationID: conversationID,
 		TurnIndex:      turnIndex,
@@ -138,6 +178,7 @@ func (s *Server) saveAskTurn(ctx context.Context, conversationID uuid.UUID, turn
 		Answer:         answer,
 		FinishReason:   finishReason,
 		Sources:        storeSources,
+		Verification:   verification,
 	}); err != nil {
 		slog.Error("ask: failed to save conversation turn",
 			"error", err, "conversation_id", conversationID, "turn_index", turnIndex)

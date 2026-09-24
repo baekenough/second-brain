@@ -60,9 +60,14 @@ func budgetAskHistory(history []askHistoryTurn) []askHistoryTurn {
 // For long documents select the window with most distinct query-term matches.
 // This deterministic lexical heuristic is bounded; it is not an entailment or
 // semantic relevance verifier. Missing matches retain the beginning.
-func askPassage(content, question string, budget int) string {
+//
+// The returned askEvidenceMode records which of the three outcomes happened
+// (askPromptEvidence's doc comment) — it is manifest bookkeeping for
+// citation validation (ask_citation.go), not something that changes the
+// excerpt text itself.
+func askPassage(content, question string, budget int) (string, askEvidenceMode) {
 	if len(content) <= budget {
-		return content
+		return content, askEvidenceModeFull
 	}
 	terms := strings.FieldsFunc(strings.ToLower(question), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsNumber(r) })
 	runes := []rune(content)
@@ -85,13 +90,23 @@ func askPassage(content, question string, budget int) string {
 	}
 	// Prefix marker makes an omitted beginning explicit as well.
 	prefix := ""
+	mode := askEvidenceModeHead
 	if bestStart > 0 {
 		prefix = "[앞부분 생략] "
+		mode = askEvidenceModeLexicalWindow
 	}
-	return prefix + clipAskText(string(runes[bestStart:]), budget-len(prefix))
+	return prefix + clipAskText(string(runes[bestStart:]), budget-len(prefix)), mode
 }
 
-func buildBudgetedAskMessages(question string, result RetrievalResult, history []askHistoryTurn) []llm.Message {
+// buildBudgetedAskMessages assembles Stage 3's prompt AND the
+// askPromptManifest recording exactly which documents (and, for the ones
+// that fit, which excerpt mode) actually made it into that prompt. The
+// manifest is citation validation's allow-list (ask_citation.go) — every
+// askPromptEvidence entry below is appended at the SAME point the excerpt is
+// written into the message builder, and the budget-exceeded break below
+// records everything it did NOT reach as Omitted, so the two never drift
+// apart.
+func buildBudgetedAskMessages(question string, result RetrievalResult, history []askHistoryTurn) ([]llm.Message, askPromptManifest) {
 	result = selectAskEvidence(result)
 	question = clipAskText(question, askQuestionBytes)
 	messages := make([]llm.Message, 0, len(history)*2+2)
@@ -100,6 +115,7 @@ func buildBudgetedAskMessages(question string, result RetrievalResult, history [
 		messages = append(messages, llm.Message{Role: "user", Content: h.Question}, llm.Message{Role: "assistant", Content: h.Answer})
 		remaining -= len(h.Question) + len(h.Answer)
 	}
+	var manifest askPromptManifest
 	var b strings.Builder
 	b.WriteString("[관측된 사실]\n[입력 예산 내 선택한 근거이며 전체 자료가 아닙니다]\n")
 	if len(result.Observed) == 0 {
@@ -108,25 +124,35 @@ func buildBudgetedAskMessages(question string, result RetrievalResult, history [
 	count := len(result.Observed) + len(result.Inferred)
 	// Reserve section/omission overhead; share evidence space across sources.
 	perDoc := min(askExcerptBytes, max(0, (remaining-512)/max(1, count)))
-	appendDocs := func(docs []*model.SearchResult) {
-		for _, r := range docs {
+	appendDocs := func(docs []*model.SearchResult, layer askEvidenceLayer) {
+		for i, r := range docs {
 			header := fmt.Sprintf("- [근거 ID: %s](/documents/%s) (%s) %s [발생: %s]: ", r.Document.ID, r.Document.ID, r.Document.SourceType, clipAskText(r.Document.Title, 256), formatOccurredAt(r.Document.OccurredAt))
 			if perDoc <= len(header)+len(excerptMarker) || b.Len()+perDoc > remaining-128 {
 				b.WriteString("[입력 예산으로 추가 문서 생략]\n")
+				for _, omitted := range docs[i:] {
+					manifest.Omitted = append(manifest.Omitted, omitted.Document.ID)
+				}
 				break
 			}
 			b.WriteString(header)
-			b.WriteString(askPassage(r.Document.Content, question, perDoc-len(header)-1))
+			passage, mode := askPassage(r.Document.Content, question, perDoc-len(header)-1)
+			b.WriteString(passage)
 			b.WriteByte('\n')
+			manifest.Evidence = append(manifest.Evidence, askPromptEvidence{
+				ID:    r.Document.ID,
+				Layer: layer,
+				Mode:  mode,
+				Bytes: len(passage),
+			})
 		}
 	}
-	appendDocs(result.Observed)
+	appendDocs(result.Observed, askEvidenceObserved)
 	if len(result.Inferred) > 0 {
 		b.WriteString("\n[추론 — 가설이며 사실로 인용 불가]\n")
-		appendDocs(result.Inferred)
+		appendDocs(result.Inferred, askEvidenceInferred)
 	}
 	messages = append(messages, llm.Message{Role: "user", Content: b.String()}, llm.Message{Role: "user", Content: question})
-	return messages
+	return messages, manifest
 }
 
 // Bound source count as well as bytes so every advertised source receives a
