@@ -1,0 +1,2546 @@
+==== hybrid/entity_on/base ====
+
+		WITH fts AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY GREATEST(
+			           ts_rank(tsv, plainto_tsquery('simple', $1)),
+			           ts_rank(tsv, plainto_tsquery('english', $1))
+			       ) DESC) AS rank
+			FROM documents
+			WHERE (tsv @@ plainto_tsquery('simple', $1)
+			   OR tsv @@ plainto_tsquery('english', $1))
+			AND status = 'active'
+			
+			
+			
+			
+			LIMIT $3
+		),
+		vec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE embedding IS NOT NULL
+			AND status = 'active'
+			
+			
+			
+			
+			LIMIT $3
+		),
+		bigm AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY
+			           GREATEST(
+			               bigm_similarity(content, $1),
+			               bigm_similarity(title,   $1),
+			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
+			           ) DESC, id ASC) AS rank
+			FROM documents
+			WHERE (content LIKE '%%' || $1 || '%%'
+			    OR title   LIKE '%%' || $1 || '%%'
+			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+			AND status = 'active'
+			
+			
+			
+			
+			LIMIT $3
+		),
+		summvec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE summary_embedding IS NOT NULL
+			AND status = 'active'
+			
+			
+			
+			
+			LIMIT $3
+		),
+		entity AS (
+			SELECT de.document_id AS id,
+			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			FROM document_entities de
+			JOIN entities e ON e.id = de.entity_id
+			JOIN documents d ON d.id = de.document_id
+			WHERE e.normalized_name LIKE '%%' || $4 || '%%'
+			AND d.status = 'active'
+			
+			
+			
+			
+			GROUP BY de.document_id
+			LIMIT $3
+		),
+		rrf AS (
+			SELECT
+				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) AS id,
+				COALESCE(1::float8/(60::float8 + fts.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + vec.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + bigm.rank),    0)
+				+ COALESCE(0.8::float8/(60::float8 + summvec.rank), 0)
+				+ COALESCE(0.5::float8/(60::float8 + entity.rank),  0) AS score
+			FROM fts
+			FULL OUTER JOIN vec     ON fts.id = vec.id
+			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
+			FULL OUTER JOIN summvec ON COALESCE(fts.id, vec.id, bigm.id) = summvec.id
+			FULL OUTER JOIN entity  ON COALESCE(fts.id, vec.id, bigm.id, summvec.id) = entity.id
+		)
+		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
+		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
+		       d.title_summary, d.bullet_summary, d.summary_embedding,
+		       rrf.score
+		FROM rrf
+		JOIN documents d ON d.id = rrf.id
+		ORDER BY score DESC
+		LIMIT $3
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = vector[0.1 0.2 0.3 0.4]
+$3 = int 20
+$4 = string "이번 주 회의 일정 알려줘"
+==== hybrid/entity_off/base ====
+
+		WITH fts AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY GREATEST(
+			           ts_rank(tsv, plainto_tsquery('simple', $1)),
+			           ts_rank(tsv, plainto_tsquery('english', $1))
+			       ) DESC) AS rank
+			FROM documents
+			WHERE (tsv @@ plainto_tsquery('simple', $1)
+			   OR tsv @@ plainto_tsquery('english', $1))
+			AND status = 'active'
+			
+			
+			
+			
+			LIMIT $3
+		),
+		vec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE embedding IS NOT NULL
+			AND status = 'active'
+			
+			
+			
+			
+			LIMIT $3
+		),
+		bigm AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY
+			           GREATEST(
+			               bigm_similarity(content, $1),
+			               bigm_similarity(title,   $1),
+			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
+			           ) DESC, id ASC) AS rank
+			FROM documents
+			WHERE (content LIKE '%%' || $1 || '%%'
+			    OR title   LIKE '%%' || $1 || '%%'
+			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+			AND status = 'active'
+			
+			
+			
+			
+			LIMIT $3
+		),
+		summvec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE summary_embedding IS NOT NULL
+			AND status = 'active'
+			
+			
+			
+			
+			LIMIT $3
+		),
+		entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false),
+		rrf AS (
+			SELECT
+				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) AS id,
+				COALESCE(1::float8/(60::float8 + fts.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + vec.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + bigm.rank),    0)
+				+ COALESCE(0::float8/(60::float8 + summvec.rank), 0)
+				+ COALESCE(0::float8/(60::float8 + entity.rank),  0) AS score
+			FROM fts
+			FULL OUTER JOIN vec     ON fts.id = vec.id
+			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
+			FULL OUTER JOIN summvec ON COALESCE(fts.id, vec.id, bigm.id) = summvec.id
+			FULL OUTER JOIN entity  ON COALESCE(fts.id, vec.id, bigm.id, summvec.id) = entity.id
+		)
+		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
+		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
+		       d.title_summary, d.bullet_summary, d.summary_embedding,
+		       rrf.score
+		FROM rrf
+		JOIN documents d ON d.id = rrf.id
+		ORDER BY score DESC
+		LIMIT $3
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = vector[0.1 0.2 0.3 0.4]
+$3 = int 20
+==== fulltext/base ====
+
+		SELECT id, source_type, source_id, title, content, metadata, embedding,
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding,
+		       GREATEST(
+		           ts_rank(tsv, plainto_tsquery('simple', $1)),
+		           ts_rank(tsv, plainto_tsquery('english', $1))
+		       ) AS score
+		FROM documents
+		WHERE (tsv @@ plainto_tsquery('simple', $1)
+		   OR tsv @@ plainto_tsquery('english', $1)
+		   OR content LIKE '%' || $1 || '%'
+		   OR title   LIKE '%' || $1 || '%'
+		   OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+		AND status = 'active'
+		
+		
+		
+		
+		ORDER BY score DESC
+		LIMIT $2
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 10
+==== chunk_fts/base ====
+
+		SELECT
+			c.id,
+			c.document_id,
+			c.chunk_index,
+			c.content,
+			c.byte_size,
+			c.created_at,
+			GREATEST(
+				ts_rank(c.content_tsv, plainto_tsquery('simple', $1)),
+				CASE WHEN c.content LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+			) AS rank,
+			d.title          AS document_title,
+			d.source_type    AS document_source,
+			d.status         AS document_status,
+			d.occurred_at    AS document_occurred_at,
+			d.collected_at   AS document_collected_at,
+			d.metadata       AS document_metadata
+		FROM chunks c
+		JOIN documents d ON d.id = c.document_id
+		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
+		   OR c.content LIKE '%%' || $1 || '%%')
+		  AND d.status = 'active'   
+		ORDER BY rank DESC
+		LIMIT $2
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 30
+==== sparse_ctx/base ====
+
+		WITH fresh AS (
+			SELECT
+				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
+				GREATEST(
+					ts_rank(sc.sparse_tsv, plainto_tsquery('simple', $1)),
+					CASE WHEN sc.sparse_text LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+				) AS rank,
+				d.title          AS document_title,
+				d.source_type    AS document_source,
+				d.status         AS document_status,
+				d.occurred_at    AS document_occurred_at,
+				d.collected_at   AS document_collected_at,
+				d.metadata       AS document_metadata
+			FROM chunk_sparse_context sc
+			JOIN chunks c ON c.id = sc.chunk_id
+			JOIN documents d ON d.id = c.document_id
+			WHERE sc.context_version = $3
+			  AND sc.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
+			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
+			  AND d.status = 'active'   
+			ORDER BY rank DESC
+			LIMIT $2
+		),
+		raw AS (
+			SELECT
+				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
+				GREATEST(
+					ts_rank(c.content_tsv, plainto_tsquery('simple', $1)),
+					CASE WHEN c.content LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+				) AS rank,
+				d.title          AS document_title,
+				d.source_type    AS document_source,
+				d.status         AS document_status,
+				d.occurred_at    AS document_occurred_at,
+				d.collected_at   AS document_collected_at,
+				d.metadata       AS document_metadata
+			FROM chunks c
+			JOIN documents d ON d.id = c.document_id
+			WHERE NOT EXISTS (
+				SELECT 1 FROM chunk_sparse_context sc2
+				WHERE sc2.chunk_id = c.id
+				  AND sc2.context_version = $3
+				  AND sc2.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
+			)
+			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
+			AND d.status = 'active'   
+			ORDER BY rank DESC
+			LIMIT $2
+		)
+		SELECT * FROM fresh
+		UNION ALL
+		SELECT * FROM raw
+		ORDER BY rank DESC
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 30
+$3 = string "v1-tp"
+==== hybrid/entity_on/source ====
+
+		WITH fts AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY GREATEST(
+			           ts_rank(tsv, plainto_tsquery('simple', $1)),
+			           ts_rank(tsv, plainto_tsquery('english', $1))
+			       ) DESC) AS rank
+			FROM documents
+			WHERE (tsv @@ plainto_tsquery('simple', $1)
+			   OR tsv @@ plainto_tsquery('english', $1))
+			AND status = 'active'
+			AND source_type = ANY($4)
+			
+			
+			
+			LIMIT $3
+		),
+		vec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE embedding IS NOT NULL
+			AND status = 'active'
+			AND source_type = ANY($4)
+			
+			
+			
+			LIMIT $3
+		),
+		bigm AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY
+			           GREATEST(
+			               bigm_similarity(content, $1),
+			               bigm_similarity(title,   $1),
+			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
+			           ) DESC, id ASC) AS rank
+			FROM documents
+			WHERE (content LIKE '%%' || $1 || '%%'
+			    OR title   LIKE '%%' || $1 || '%%'
+			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+			AND status = 'active'
+			AND source_type = ANY($4)
+			
+			
+			
+			LIMIT $3
+		),
+		summvec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE summary_embedding IS NOT NULL
+			AND status = 'active'
+			AND source_type = ANY($4)
+			
+			
+			
+			LIMIT $3
+		),
+		entity AS (
+			SELECT de.document_id AS id,
+			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			FROM document_entities de
+			JOIN entities e ON e.id = de.entity_id
+			JOIN documents d ON d.id = de.document_id
+			WHERE e.normalized_name LIKE '%%' || $5 || '%%'
+			AND d.status = 'active'
+			AND d.source_type = ANY($4)
+			
+			
+			
+			GROUP BY de.document_id
+			LIMIT $3
+		),
+		rrf AS (
+			SELECT
+				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) AS id,
+				COALESCE(1::float8/(60::float8 + fts.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + vec.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + bigm.rank),    0)
+				+ COALESCE(0.8::float8/(60::float8 + summvec.rank), 0)
+				+ COALESCE(0.5::float8/(60::float8 + entity.rank),  0) AS score
+			FROM fts
+			FULL OUTER JOIN vec     ON fts.id = vec.id
+			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
+			FULL OUTER JOIN summvec ON COALESCE(fts.id, vec.id, bigm.id) = summvec.id
+			FULL OUTER JOIN entity  ON COALESCE(fts.id, vec.id, bigm.id, summvec.id) = entity.id
+		)
+		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
+		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
+		       d.title_summary, d.bullet_summary, d.summary_embedding,
+		       rrf.score
+		FROM rrf
+		JOIN documents d ON d.id = rrf.id
+		ORDER BY score DESC
+		LIMIT $3
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = vector[0.1 0.2 0.3 0.4]
+$3 = int 20
+$4 = []model.SourceType []model.SourceType{"calendar"}
+$5 = string "이번 주 회의 일정 알려줘"
+==== hybrid/entity_off/source ====
+
+		WITH fts AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY GREATEST(
+			           ts_rank(tsv, plainto_tsquery('simple', $1)),
+			           ts_rank(tsv, plainto_tsquery('english', $1))
+			       ) DESC) AS rank
+			FROM documents
+			WHERE (tsv @@ plainto_tsquery('simple', $1)
+			   OR tsv @@ plainto_tsquery('english', $1))
+			AND status = 'active'
+			AND source_type = ANY($4)
+			
+			
+			
+			LIMIT $3
+		),
+		vec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE embedding IS NOT NULL
+			AND status = 'active'
+			AND source_type = ANY($4)
+			
+			
+			
+			LIMIT $3
+		),
+		bigm AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY
+			           GREATEST(
+			               bigm_similarity(content, $1),
+			               bigm_similarity(title,   $1),
+			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
+			           ) DESC, id ASC) AS rank
+			FROM documents
+			WHERE (content LIKE '%%' || $1 || '%%'
+			    OR title   LIKE '%%' || $1 || '%%'
+			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+			AND status = 'active'
+			AND source_type = ANY($4)
+			
+			
+			
+			LIMIT $3
+		),
+		summvec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE summary_embedding IS NOT NULL
+			AND status = 'active'
+			AND source_type = ANY($4)
+			
+			
+			
+			LIMIT $3
+		),
+		entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false),
+		rrf AS (
+			SELECT
+				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) AS id,
+				COALESCE(1::float8/(60::float8 + fts.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + vec.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + bigm.rank),    0)
+				+ COALESCE(0::float8/(60::float8 + summvec.rank), 0)
+				+ COALESCE(0::float8/(60::float8 + entity.rank),  0) AS score
+			FROM fts
+			FULL OUTER JOIN vec     ON fts.id = vec.id
+			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
+			FULL OUTER JOIN summvec ON COALESCE(fts.id, vec.id, bigm.id) = summvec.id
+			FULL OUTER JOIN entity  ON COALESCE(fts.id, vec.id, bigm.id, summvec.id) = entity.id
+		)
+		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
+		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
+		       d.title_summary, d.bullet_summary, d.summary_embedding,
+		       rrf.score
+		FROM rrf
+		JOIN documents d ON d.id = rrf.id
+		ORDER BY score DESC
+		LIMIT $3
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = vector[0.1 0.2 0.3 0.4]
+$3 = int 20
+$4 = []model.SourceType []model.SourceType{"calendar"}
+==== fulltext/source ====
+
+		SELECT id, source_type, source_id, title, content, metadata, embedding,
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding,
+		       GREATEST(
+		           ts_rank(tsv, plainto_tsquery('simple', $1)),
+		           ts_rank(tsv, plainto_tsquery('english', $1))
+		       ) AS score
+		FROM documents
+		WHERE (tsv @@ plainto_tsquery('simple', $1)
+		   OR tsv @@ plainto_tsquery('english', $1)
+		   OR content LIKE '%' || $1 || '%'
+		   OR title   LIKE '%' || $1 || '%'
+		   OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+		AND status = 'active'
+		AND source_type = ANY($3)
+		
+		
+		
+		ORDER BY score DESC
+		LIMIT $2
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 10
+$3 = []model.SourceType []model.SourceType{"calendar"}
+==== chunk_fts/source ====
+
+		SELECT
+			c.id,
+			c.document_id,
+			c.chunk_index,
+			c.content,
+			c.byte_size,
+			c.created_at,
+			GREATEST(
+				ts_rank(c.content_tsv, plainto_tsquery('simple', $1)),
+				CASE WHEN c.content LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+			) AS rank,
+			d.title          AS document_title,
+			d.source_type    AS document_source,
+			d.status         AS document_status,
+			d.occurred_at    AS document_occurred_at,
+			d.collected_at   AS document_collected_at,
+			d.metadata       AS document_metadata
+		FROM chunks c
+		JOIN documents d ON d.id = c.document_id
+		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
+		   OR c.content LIKE '%%' || $1 || '%%')
+		  AND d.status = 'active'  AND d.source_type = ANY($3)  
+		ORDER BY rank DESC
+		LIMIT $2
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 30
+$3 = []model.SourceType []model.SourceType{"calendar"}
+==== sparse_ctx/source ====
+
+		WITH fresh AS (
+			SELECT
+				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
+				GREATEST(
+					ts_rank(sc.sparse_tsv, plainto_tsquery('simple', $1)),
+					CASE WHEN sc.sparse_text LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+				) AS rank,
+				d.title          AS document_title,
+				d.source_type    AS document_source,
+				d.status         AS document_status,
+				d.occurred_at    AS document_occurred_at,
+				d.collected_at   AS document_collected_at,
+				d.metadata       AS document_metadata
+			FROM chunk_sparse_context sc
+			JOIN chunks c ON c.id = sc.chunk_id
+			JOIN documents d ON d.id = c.document_id
+			WHERE sc.context_version = $3
+			  AND sc.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
+			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
+			  AND d.status = 'active'  AND d.source_type = ANY($4)  
+			ORDER BY rank DESC
+			LIMIT $2
+		),
+		raw AS (
+			SELECT
+				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
+				GREATEST(
+					ts_rank(c.content_tsv, plainto_tsquery('simple', $1)),
+					CASE WHEN c.content LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+				) AS rank,
+				d.title          AS document_title,
+				d.source_type    AS document_source,
+				d.status         AS document_status,
+				d.occurred_at    AS document_occurred_at,
+				d.collected_at   AS document_collected_at,
+				d.metadata       AS document_metadata
+			FROM chunks c
+			JOIN documents d ON d.id = c.document_id
+			WHERE NOT EXISTS (
+				SELECT 1 FROM chunk_sparse_context sc2
+				WHERE sc2.chunk_id = c.id
+				  AND sc2.context_version = $3
+				  AND sc2.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
+			)
+			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
+			AND d.status = 'active'  AND d.source_type = ANY($4)  
+			ORDER BY rank DESC
+			LIMIT $2
+		)
+		SELECT * FROM fresh
+		UNION ALL
+		SELECT * FROM raw
+		ORDER BY rank DESC
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 30
+$3 = string "v1-tp"
+$4 = []model.SourceType []model.SourceType{"calendar"}
+==== hybrid/entity_on/exclude ====
+
+		WITH fts AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY GREATEST(
+			           ts_rank(tsv, plainto_tsquery('simple', $1)),
+			           ts_rank(tsv, plainto_tsquery('english', $1))
+			       ) DESC) AS rank
+			FROM documents
+			WHERE (tsv @@ plainto_tsquery('simple', $1)
+			   OR tsv @@ plainto_tsquery('english', $1))
+			AND status = 'active'
+			
+			AND source_type <> ALL($4)
+			
+			
+			LIMIT $3
+		),
+		vec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE embedding IS NOT NULL
+			AND status = 'active'
+			
+			AND source_type <> ALL($4)
+			
+			
+			LIMIT $3
+		),
+		bigm AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY
+			           GREATEST(
+			               bigm_similarity(content, $1),
+			               bigm_similarity(title,   $1),
+			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
+			           ) DESC, id ASC) AS rank
+			FROM documents
+			WHERE (content LIKE '%%' || $1 || '%%'
+			    OR title   LIKE '%%' || $1 || '%%'
+			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+			AND status = 'active'
+			
+			AND source_type <> ALL($4)
+			
+			
+			LIMIT $3
+		),
+		summvec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE summary_embedding IS NOT NULL
+			AND status = 'active'
+			
+			AND source_type <> ALL($4)
+			
+			
+			LIMIT $3
+		),
+		entity AS (
+			SELECT de.document_id AS id,
+			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			FROM document_entities de
+			JOIN entities e ON e.id = de.entity_id
+			JOIN documents d ON d.id = de.document_id
+			WHERE e.normalized_name LIKE '%%' || $5 || '%%'
+			AND d.status = 'active'
+			
+			AND d.source_type <> ALL($4)
+			
+			
+			GROUP BY de.document_id
+			LIMIT $3
+		),
+		rrf AS (
+			SELECT
+				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) AS id,
+				COALESCE(1::float8/(60::float8 + fts.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + vec.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + bigm.rank),    0)
+				+ COALESCE(0.8::float8/(60::float8 + summvec.rank), 0)
+				+ COALESCE(0.5::float8/(60::float8 + entity.rank),  0) AS score
+			FROM fts
+			FULL OUTER JOIN vec     ON fts.id = vec.id
+			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
+			FULL OUTER JOIN summvec ON COALESCE(fts.id, vec.id, bigm.id) = summvec.id
+			FULL OUTER JOIN entity  ON COALESCE(fts.id, vec.id, bigm.id, summvec.id) = entity.id
+		)
+		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
+		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
+		       d.title_summary, d.bullet_summary, d.summary_embedding,
+		       rrf.score
+		FROM rrf
+		JOIN documents d ON d.id = rrf.id
+		ORDER BY score DESC
+		LIMIT $3
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = vector[0.1 0.2 0.3 0.4]
+$3 = int 20
+$4 = []model.SourceType []model.SourceType{"insight", "gmail"}
+$5 = string "이번 주 회의 일정 알려줘"
+==== hybrid/entity_off/exclude ====
+
+		WITH fts AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY GREATEST(
+			           ts_rank(tsv, plainto_tsquery('simple', $1)),
+			           ts_rank(tsv, plainto_tsquery('english', $1))
+			       ) DESC) AS rank
+			FROM documents
+			WHERE (tsv @@ plainto_tsquery('simple', $1)
+			   OR tsv @@ plainto_tsquery('english', $1))
+			AND status = 'active'
+			
+			AND source_type <> ALL($4)
+			
+			
+			LIMIT $3
+		),
+		vec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE embedding IS NOT NULL
+			AND status = 'active'
+			
+			AND source_type <> ALL($4)
+			
+			
+			LIMIT $3
+		),
+		bigm AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY
+			           GREATEST(
+			               bigm_similarity(content, $1),
+			               bigm_similarity(title,   $1),
+			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
+			           ) DESC, id ASC) AS rank
+			FROM documents
+			WHERE (content LIKE '%%' || $1 || '%%'
+			    OR title   LIKE '%%' || $1 || '%%'
+			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+			AND status = 'active'
+			
+			AND source_type <> ALL($4)
+			
+			
+			LIMIT $3
+		),
+		summvec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE summary_embedding IS NOT NULL
+			AND status = 'active'
+			
+			AND source_type <> ALL($4)
+			
+			
+			LIMIT $3
+		),
+		entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false),
+		rrf AS (
+			SELECT
+				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) AS id,
+				COALESCE(1::float8/(60::float8 + fts.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + vec.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + bigm.rank),    0)
+				+ COALESCE(0::float8/(60::float8 + summvec.rank), 0)
+				+ COALESCE(0::float8/(60::float8 + entity.rank),  0) AS score
+			FROM fts
+			FULL OUTER JOIN vec     ON fts.id = vec.id
+			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
+			FULL OUTER JOIN summvec ON COALESCE(fts.id, vec.id, bigm.id) = summvec.id
+			FULL OUTER JOIN entity  ON COALESCE(fts.id, vec.id, bigm.id, summvec.id) = entity.id
+		)
+		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
+		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
+		       d.title_summary, d.bullet_summary, d.summary_embedding,
+		       rrf.score
+		FROM rrf
+		JOIN documents d ON d.id = rrf.id
+		ORDER BY score DESC
+		LIMIT $3
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = vector[0.1 0.2 0.3 0.4]
+$3 = int 20
+$4 = []model.SourceType []model.SourceType{"insight", "gmail"}
+==== fulltext/exclude ====
+
+		SELECT id, source_type, source_id, title, content, metadata, embedding,
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding,
+		       GREATEST(
+		           ts_rank(tsv, plainto_tsquery('simple', $1)),
+		           ts_rank(tsv, plainto_tsquery('english', $1))
+		       ) AS score
+		FROM documents
+		WHERE (tsv @@ plainto_tsquery('simple', $1)
+		   OR tsv @@ plainto_tsquery('english', $1)
+		   OR content LIKE '%' || $1 || '%'
+		   OR title   LIKE '%' || $1 || '%'
+		   OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+		AND status = 'active'
+		
+		AND source_type <> ALL($3)
+		
+		
+		ORDER BY score DESC
+		LIMIT $2
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 10
+$3 = []model.SourceType []model.SourceType{"insight", "gmail"}
+==== chunk_fts/exclude ====
+
+		SELECT
+			c.id,
+			c.document_id,
+			c.chunk_index,
+			c.content,
+			c.byte_size,
+			c.created_at,
+			GREATEST(
+				ts_rank(c.content_tsv, plainto_tsquery('simple', $1)),
+				CASE WHEN c.content LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+			) AS rank,
+			d.title          AS document_title,
+			d.source_type    AS document_source,
+			d.status         AS document_status,
+			d.occurred_at    AS document_occurred_at,
+			d.collected_at   AS document_collected_at,
+			d.metadata       AS document_metadata
+		FROM chunks c
+		JOIN documents d ON d.id = c.document_id
+		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
+		   OR c.content LIKE '%%' || $1 || '%%')
+		  AND d.status = 'active'  AND d.source_type <> ALL($3)  
+		ORDER BY rank DESC
+		LIMIT $2
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 30
+$3 = []model.SourceType []model.SourceType{"insight", "gmail"}
+==== sparse_ctx/exclude ====
+
+		WITH fresh AS (
+			SELECT
+				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
+				GREATEST(
+					ts_rank(sc.sparse_tsv, plainto_tsquery('simple', $1)),
+					CASE WHEN sc.sparse_text LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+				) AS rank,
+				d.title          AS document_title,
+				d.source_type    AS document_source,
+				d.status         AS document_status,
+				d.occurred_at    AS document_occurred_at,
+				d.collected_at   AS document_collected_at,
+				d.metadata       AS document_metadata
+			FROM chunk_sparse_context sc
+			JOIN chunks c ON c.id = sc.chunk_id
+			JOIN documents d ON d.id = c.document_id
+			WHERE sc.context_version = $3
+			  AND sc.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
+			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
+			  AND d.status = 'active'  AND d.source_type <> ALL($4)  
+			ORDER BY rank DESC
+			LIMIT $2
+		),
+		raw AS (
+			SELECT
+				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
+				GREATEST(
+					ts_rank(c.content_tsv, plainto_tsquery('simple', $1)),
+					CASE WHEN c.content LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+				) AS rank,
+				d.title          AS document_title,
+				d.source_type    AS document_source,
+				d.status         AS document_status,
+				d.occurred_at    AS document_occurred_at,
+				d.collected_at   AS document_collected_at,
+				d.metadata       AS document_metadata
+			FROM chunks c
+			JOIN documents d ON d.id = c.document_id
+			WHERE NOT EXISTS (
+				SELECT 1 FROM chunk_sparse_context sc2
+				WHERE sc2.chunk_id = c.id
+				  AND sc2.context_version = $3
+				  AND sc2.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
+			)
+			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
+			AND d.status = 'active'  AND d.source_type <> ALL($4)  
+			ORDER BY rank DESC
+			LIMIT $2
+		)
+		SELECT * FROM fresh
+		UNION ALL
+		SELECT * FROM raw
+		ORDER BY rank DESC
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 30
+$3 = string "v1-tp"
+$4 = []model.SourceType []model.SourceType{"insight", "gmail"}
+==== hybrid/entity_on/retention ====
+
+		WITH fts AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY GREATEST(
+			           ts_rank(tsv, plainto_tsquery('simple', $1)),
+			           ts_rank(tsv, plainto_tsquery('english', $1))
+			       ) DESC) AS rank
+			FROM documents
+			WHERE (tsv @@ plainto_tsquery('simple', $1)
+			   OR tsv @@ plainto_tsquery('english', $1))
+			AND status = 'active'
+			
+			
+			AND COALESCE(metadata->>'retention', '') <> ALL($4)
+			
+			LIMIT $3
+		),
+		vec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE embedding IS NOT NULL
+			AND status = 'active'
+			
+			
+			AND COALESCE(metadata->>'retention', '') <> ALL($4)
+			
+			LIMIT $3
+		),
+		bigm AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY
+			           GREATEST(
+			               bigm_similarity(content, $1),
+			               bigm_similarity(title,   $1),
+			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
+			           ) DESC, id ASC) AS rank
+			FROM documents
+			WHERE (content LIKE '%%' || $1 || '%%'
+			    OR title   LIKE '%%' || $1 || '%%'
+			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+			AND status = 'active'
+			
+			
+			AND COALESCE(metadata->>'retention', '') <> ALL($4)
+			
+			LIMIT $3
+		),
+		summvec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE summary_embedding IS NOT NULL
+			AND status = 'active'
+			
+			
+			AND COALESCE(metadata->>'retention', '') <> ALL($4)
+			
+			LIMIT $3
+		),
+		entity AS (
+			SELECT de.document_id AS id,
+			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			FROM document_entities de
+			JOIN entities e ON e.id = de.entity_id
+			JOIN documents d ON d.id = de.document_id
+			WHERE e.normalized_name LIKE '%%' || $5 || '%%'
+			AND d.status = 'active'
+			
+			
+			AND COALESCE(d.metadata->>'retention', '') <> ALL($4)
+			
+			GROUP BY de.document_id
+			LIMIT $3
+		),
+		rrf AS (
+			SELECT
+				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) AS id,
+				COALESCE(1::float8/(60::float8 + fts.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + vec.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + bigm.rank),    0)
+				+ COALESCE(0.8::float8/(60::float8 + summvec.rank), 0)
+				+ COALESCE(0.5::float8/(60::float8 + entity.rank),  0) AS score
+			FROM fts
+			FULL OUTER JOIN vec     ON fts.id = vec.id
+			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
+			FULL OUTER JOIN summvec ON COALESCE(fts.id, vec.id, bigm.id) = summvec.id
+			FULL OUTER JOIN entity  ON COALESCE(fts.id, vec.id, bigm.id, summvec.id) = entity.id
+		)
+		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
+		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
+		       d.title_summary, d.bullet_summary, d.summary_embedding,
+		       rrf.score
+		FROM rrf
+		JOIN documents d ON d.id = rrf.id
+		ORDER BY score DESC
+		LIMIT $3
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = vector[0.1 0.2 0.3 0.4]
+$3 = int 20
+$4 = []string []string{"disposable"}
+$5 = string "이번 주 회의 일정 알려줘"
+==== hybrid/entity_off/retention ====
+
+		WITH fts AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY GREATEST(
+			           ts_rank(tsv, plainto_tsquery('simple', $1)),
+			           ts_rank(tsv, plainto_tsquery('english', $1))
+			       ) DESC) AS rank
+			FROM documents
+			WHERE (tsv @@ plainto_tsquery('simple', $1)
+			   OR tsv @@ plainto_tsquery('english', $1))
+			AND status = 'active'
+			
+			
+			AND COALESCE(metadata->>'retention', '') <> ALL($4)
+			
+			LIMIT $3
+		),
+		vec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE embedding IS NOT NULL
+			AND status = 'active'
+			
+			
+			AND COALESCE(metadata->>'retention', '') <> ALL($4)
+			
+			LIMIT $3
+		),
+		bigm AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY
+			           GREATEST(
+			               bigm_similarity(content, $1),
+			               bigm_similarity(title,   $1),
+			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
+			           ) DESC, id ASC) AS rank
+			FROM documents
+			WHERE (content LIKE '%%' || $1 || '%%'
+			    OR title   LIKE '%%' || $1 || '%%'
+			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+			AND status = 'active'
+			
+			
+			AND COALESCE(metadata->>'retention', '') <> ALL($4)
+			
+			LIMIT $3
+		),
+		summvec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE summary_embedding IS NOT NULL
+			AND status = 'active'
+			
+			
+			AND COALESCE(metadata->>'retention', '') <> ALL($4)
+			
+			LIMIT $3
+		),
+		entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false),
+		rrf AS (
+			SELECT
+				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) AS id,
+				COALESCE(1::float8/(60::float8 + fts.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + vec.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + bigm.rank),    0)
+				+ COALESCE(0::float8/(60::float8 + summvec.rank), 0)
+				+ COALESCE(0::float8/(60::float8 + entity.rank),  0) AS score
+			FROM fts
+			FULL OUTER JOIN vec     ON fts.id = vec.id
+			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
+			FULL OUTER JOIN summvec ON COALESCE(fts.id, vec.id, bigm.id) = summvec.id
+			FULL OUTER JOIN entity  ON COALESCE(fts.id, vec.id, bigm.id, summvec.id) = entity.id
+		)
+		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
+		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
+		       d.title_summary, d.bullet_summary, d.summary_embedding,
+		       rrf.score
+		FROM rrf
+		JOIN documents d ON d.id = rrf.id
+		ORDER BY score DESC
+		LIMIT $3
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = vector[0.1 0.2 0.3 0.4]
+$3 = int 20
+$4 = []string []string{"disposable"}
+==== fulltext/retention ====
+
+		SELECT id, source_type, source_id, title, content, metadata, embedding,
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding,
+		       GREATEST(
+		           ts_rank(tsv, plainto_tsquery('simple', $1)),
+		           ts_rank(tsv, plainto_tsquery('english', $1))
+		       ) AS score
+		FROM documents
+		WHERE (tsv @@ plainto_tsquery('simple', $1)
+		   OR tsv @@ plainto_tsquery('english', $1)
+		   OR content LIKE '%' || $1 || '%'
+		   OR title   LIKE '%' || $1 || '%'
+		   OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+		AND status = 'active'
+		
+		
+		AND COALESCE(metadata->>'retention', '') <> ALL($3)
+		
+		ORDER BY score DESC
+		LIMIT $2
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 10
+$3 = []string []string{"disposable"}
+==== chunk_fts/retention ====
+
+		SELECT
+			c.id,
+			c.document_id,
+			c.chunk_index,
+			c.content,
+			c.byte_size,
+			c.created_at,
+			GREATEST(
+				ts_rank(c.content_tsv, plainto_tsquery('simple', $1)),
+				CASE WHEN c.content LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+			) AS rank,
+			d.title          AS document_title,
+			d.source_type    AS document_source,
+			d.status         AS document_status,
+			d.occurred_at    AS document_occurred_at,
+			d.collected_at   AS document_collected_at,
+			d.metadata       AS document_metadata
+		FROM chunks c
+		JOIN documents d ON d.id = c.document_id
+		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
+		   OR c.content LIKE '%%' || $1 || '%%')
+		  AND d.status = 'active'   AND COALESCE(d.metadata->>'retention', '') <> ALL($3)
+		ORDER BY rank DESC
+		LIMIT $2
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 30
+$3 = []string []string{"disposable"}
+==== sparse_ctx/retention ====
+
+		WITH fresh AS (
+			SELECT
+				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
+				GREATEST(
+					ts_rank(sc.sparse_tsv, plainto_tsquery('simple', $1)),
+					CASE WHEN sc.sparse_text LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+				) AS rank,
+				d.title          AS document_title,
+				d.source_type    AS document_source,
+				d.status         AS document_status,
+				d.occurred_at    AS document_occurred_at,
+				d.collected_at   AS document_collected_at,
+				d.metadata       AS document_metadata
+			FROM chunk_sparse_context sc
+			JOIN chunks c ON c.id = sc.chunk_id
+			JOIN documents d ON d.id = c.document_id
+			WHERE sc.context_version = $3
+			  AND sc.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
+			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
+			  AND d.status = 'active'   AND COALESCE(d.metadata->>'retention', '') <> ALL($4)
+			ORDER BY rank DESC
+			LIMIT $2
+		),
+		raw AS (
+			SELECT
+				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
+				GREATEST(
+					ts_rank(c.content_tsv, plainto_tsquery('simple', $1)),
+					CASE WHEN c.content LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+				) AS rank,
+				d.title          AS document_title,
+				d.source_type    AS document_source,
+				d.status         AS document_status,
+				d.occurred_at    AS document_occurred_at,
+				d.collected_at   AS document_collected_at,
+				d.metadata       AS document_metadata
+			FROM chunks c
+			JOIN documents d ON d.id = c.document_id
+			WHERE NOT EXISTS (
+				SELECT 1 FROM chunk_sparse_context sc2
+				WHERE sc2.chunk_id = c.id
+				  AND sc2.context_version = $3
+				  AND sc2.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
+			)
+			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
+			AND d.status = 'active'   AND COALESCE(d.metadata->>'retention', '') <> ALL($4)
+			ORDER BY rank DESC
+			LIMIT $2
+		)
+		SELECT * FROM fresh
+		UNION ALL
+		SELECT * FROM raw
+		ORDER BY rank DESC
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 30
+$3 = string "v1-tp"
+$4 = []string []string{"disposable"}
+==== hybrid/entity_on/window ====
+
+		WITH fts AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY GREATEST(
+			           ts_rank(tsv, plainto_tsquery('simple', $1)),
+			           ts_rank(tsv, plainto_tsquery('english', $1))
+			       ) DESC) AS rank
+			FROM documents
+			WHERE (tsv @@ plainto_tsquery('simple', $1)
+			   OR tsv @@ plainto_tsquery('english', $1))
+			AND status = 'active'
+			
+			
+			
+			AND occurred_at >= $4
+			AND occurred_at < $5
+			LIMIT $3
+		),
+		vec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE embedding IS NOT NULL
+			AND status = 'active'
+			
+			
+			
+			AND occurred_at >= $4
+			AND occurred_at < $5
+			LIMIT $3
+		),
+		bigm AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY
+			           GREATEST(
+			               bigm_similarity(content, $1),
+			               bigm_similarity(title,   $1),
+			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
+			           ) DESC, id ASC) AS rank
+			FROM documents
+			WHERE (content LIKE '%%' || $1 || '%%'
+			    OR title   LIKE '%%' || $1 || '%%'
+			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+			AND status = 'active'
+			
+			
+			
+			AND occurred_at >= $4
+			AND occurred_at < $5
+			LIMIT $3
+		),
+		summvec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE summary_embedding IS NOT NULL
+			AND status = 'active'
+			
+			
+			
+			AND occurred_at >= $4
+			AND occurred_at < $5
+			LIMIT $3
+		),
+		entity AS (
+			SELECT de.document_id AS id,
+			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			FROM document_entities de
+			JOIN entities e ON e.id = de.entity_id
+			JOIN documents d ON d.id = de.document_id
+			WHERE e.normalized_name LIKE '%%' || $6 || '%%'
+			AND d.status = 'active'
+			
+			
+			
+			AND d.occurred_at >= $4
+			AND d.occurred_at < $5
+			GROUP BY de.document_id
+			LIMIT $3
+		),
+		rrf AS (
+			SELECT
+				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) AS id,
+				COALESCE(1::float8/(60::float8 + fts.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + vec.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + bigm.rank),    0)
+				+ COALESCE(0.8::float8/(60::float8 + summvec.rank), 0)
+				+ COALESCE(0.5::float8/(60::float8 + entity.rank),  0) AS score
+			FROM fts
+			FULL OUTER JOIN vec     ON fts.id = vec.id
+			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
+			FULL OUTER JOIN summvec ON COALESCE(fts.id, vec.id, bigm.id) = summvec.id
+			FULL OUTER JOIN entity  ON COALESCE(fts.id, vec.id, bigm.id, summvec.id) = entity.id
+		)
+		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
+		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
+		       d.title_summary, d.bullet_summary, d.summary_embedding,
+		       rrf.score
+		FROM rrf
+		JOIN documents d ON d.id = rrf.id
+		ORDER BY score DESC
+		LIMIT $3
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = vector[0.1 0.2 0.3 0.4]
+$3 = int 20
+$4 = 2026-08-17T00:00:00Z
+$5 = 2026-08-24T00:00:00Z
+$6 = string "이번 주 회의 일정 알려줘"
+==== hybrid/entity_off/window ====
+
+		WITH fts AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY GREATEST(
+			           ts_rank(tsv, plainto_tsquery('simple', $1)),
+			           ts_rank(tsv, plainto_tsquery('english', $1))
+			       ) DESC) AS rank
+			FROM documents
+			WHERE (tsv @@ plainto_tsquery('simple', $1)
+			   OR tsv @@ plainto_tsquery('english', $1))
+			AND status = 'active'
+			
+			
+			
+			AND occurred_at >= $4
+			AND occurred_at < $5
+			LIMIT $3
+		),
+		vec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE embedding IS NOT NULL
+			AND status = 'active'
+			
+			
+			
+			AND occurred_at >= $4
+			AND occurred_at < $5
+			LIMIT $3
+		),
+		bigm AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY
+			           GREATEST(
+			               bigm_similarity(content, $1),
+			               bigm_similarity(title,   $1),
+			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
+			           ) DESC, id ASC) AS rank
+			FROM documents
+			WHERE (content LIKE '%%' || $1 || '%%'
+			    OR title   LIKE '%%' || $1 || '%%'
+			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+			AND status = 'active'
+			
+			
+			
+			AND occurred_at >= $4
+			AND occurred_at < $5
+			LIMIT $3
+		),
+		summvec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE summary_embedding IS NOT NULL
+			AND status = 'active'
+			
+			
+			
+			AND occurred_at >= $4
+			AND occurred_at < $5
+			LIMIT $3
+		),
+		entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false),
+		rrf AS (
+			SELECT
+				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) AS id,
+				COALESCE(1::float8/(60::float8 + fts.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + vec.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + bigm.rank),    0)
+				+ COALESCE(0::float8/(60::float8 + summvec.rank), 0)
+				+ COALESCE(0::float8/(60::float8 + entity.rank),  0) AS score
+			FROM fts
+			FULL OUTER JOIN vec     ON fts.id = vec.id
+			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
+			FULL OUTER JOIN summvec ON COALESCE(fts.id, vec.id, bigm.id) = summvec.id
+			FULL OUTER JOIN entity  ON COALESCE(fts.id, vec.id, bigm.id, summvec.id) = entity.id
+		)
+		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
+		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
+		       d.title_summary, d.bullet_summary, d.summary_embedding,
+		       rrf.score
+		FROM rrf
+		JOIN documents d ON d.id = rrf.id
+		ORDER BY score DESC
+		LIMIT $3
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = vector[0.1 0.2 0.3 0.4]
+$3 = int 20
+$4 = 2026-08-17T00:00:00Z
+$5 = 2026-08-24T00:00:00Z
+==== fulltext/window ====
+
+		SELECT id, source_type, source_id, title, content, metadata, embedding,
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding,
+		       GREATEST(
+		           ts_rank(tsv, plainto_tsquery('simple', $1)),
+		           ts_rank(tsv, plainto_tsquery('english', $1))
+		       ) AS score
+		FROM documents
+		WHERE (tsv @@ plainto_tsquery('simple', $1)
+		   OR tsv @@ plainto_tsquery('english', $1)
+		   OR content LIKE '%' || $1 || '%'
+		   OR title   LIKE '%' || $1 || '%'
+		   OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+		AND status = 'active'
+		
+		
+		
+		AND occurred_at >= $3
+			AND occurred_at < $4
+		ORDER BY score DESC
+		LIMIT $2
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 10
+$3 = 2026-08-17T00:00:00Z
+$4 = 2026-08-24T00:00:00Z
+==== chunk_fts/window ====
+
+		SELECT
+			c.id,
+			c.document_id,
+			c.chunk_index,
+			c.content,
+			c.byte_size,
+			c.created_at,
+			GREATEST(
+				ts_rank(c.content_tsv, plainto_tsquery('simple', $1)),
+				CASE WHEN c.content LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+			) AS rank,
+			d.title          AS document_title,
+			d.source_type    AS document_source,
+			d.status         AS document_status,
+			d.occurred_at    AS document_occurred_at,
+			d.collected_at   AS document_collected_at,
+			d.metadata       AS document_metadata
+		FROM chunks c
+		JOIN documents d ON d.id = c.document_id
+		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
+		   OR c.content LIKE '%%' || $1 || '%%')
+		  AND d.status = 'active'  AND d.occurred_at >= $3
+			AND d.occurred_at < $4 
+		ORDER BY rank DESC
+		LIMIT $2
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 30
+$3 = 2026-08-17T00:00:00Z
+$4 = 2026-08-24T00:00:00Z
+==== sparse_ctx/window ====
+
+		WITH fresh AS (
+			SELECT
+				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
+				GREATEST(
+					ts_rank(sc.sparse_tsv, plainto_tsquery('simple', $1)),
+					CASE WHEN sc.sparse_text LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+				) AS rank,
+				d.title          AS document_title,
+				d.source_type    AS document_source,
+				d.status         AS document_status,
+				d.occurred_at    AS document_occurred_at,
+				d.collected_at   AS document_collected_at,
+				d.metadata       AS document_metadata
+			FROM chunk_sparse_context sc
+			JOIN chunks c ON c.id = sc.chunk_id
+			JOIN documents d ON d.id = c.document_id
+			WHERE sc.context_version = $3
+			  AND sc.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
+			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
+			  AND d.status = 'active'  AND d.occurred_at >= $4
+			AND d.occurred_at < $5 
+			ORDER BY rank DESC
+			LIMIT $2
+		),
+		raw AS (
+			SELECT
+				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
+				GREATEST(
+					ts_rank(c.content_tsv, plainto_tsquery('simple', $1)),
+					CASE WHEN c.content LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+				) AS rank,
+				d.title          AS document_title,
+				d.source_type    AS document_source,
+				d.status         AS document_status,
+				d.occurred_at    AS document_occurred_at,
+				d.collected_at   AS document_collected_at,
+				d.metadata       AS document_metadata
+			FROM chunks c
+			JOIN documents d ON d.id = c.document_id
+			WHERE NOT EXISTS (
+				SELECT 1 FROM chunk_sparse_context sc2
+				WHERE sc2.chunk_id = c.id
+				  AND sc2.context_version = $3
+				  AND sc2.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
+			)
+			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
+			AND d.status = 'active'  AND d.occurred_at >= $4
+			AND d.occurred_at < $5 
+			ORDER BY rank DESC
+			LIMIT $2
+		)
+		SELECT * FROM fresh
+		UNION ALL
+		SELECT * FROM raw
+		ORDER BY rank DESC
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 30
+$3 = string "v1-tp"
+$4 = 2026-08-17T00:00:00Z
+$5 = 2026-08-24T00:00:00Z
+==== hybrid/entity_on/all ====
+
+		WITH fts AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY GREATEST(
+			           ts_rank(tsv, plainto_tsquery('simple', $1)),
+			           ts_rank(tsv, plainto_tsquery('english', $1))
+			       ) DESC) AS rank
+			FROM documents
+			WHERE (tsv @@ plainto_tsquery('simple', $1)
+			   OR tsv @@ plainto_tsquery('english', $1))
+			AND status = 'active'
+			AND source_type = ANY($4)
+			AND source_type <> ALL($5)
+			AND COALESCE(metadata->>'retention', '') <> ALL($6)
+			AND occurred_at >= $7
+			AND occurred_at < $8
+			LIMIT $3
+		),
+		vec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE embedding IS NOT NULL
+			AND status = 'active'
+			AND source_type = ANY($4)
+			AND source_type <> ALL($5)
+			AND COALESCE(metadata->>'retention', '') <> ALL($6)
+			AND occurred_at >= $7
+			AND occurred_at < $8
+			LIMIT $3
+		),
+		bigm AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY
+			           GREATEST(
+			               bigm_similarity(content, $1),
+			               bigm_similarity(title,   $1),
+			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
+			           ) DESC, id ASC) AS rank
+			FROM documents
+			WHERE (content LIKE '%%' || $1 || '%%'
+			    OR title   LIKE '%%' || $1 || '%%'
+			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+			AND status = 'active'
+			AND source_type = ANY($4)
+			AND source_type <> ALL($5)
+			AND COALESCE(metadata->>'retention', '') <> ALL($6)
+			AND occurred_at >= $7
+			AND occurred_at < $8
+			LIMIT $3
+		),
+		summvec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE summary_embedding IS NOT NULL
+			AND status = 'active'
+			AND source_type = ANY($4)
+			AND source_type <> ALL($5)
+			AND COALESCE(metadata->>'retention', '') <> ALL($6)
+			AND occurred_at >= $7
+			AND occurred_at < $8
+			LIMIT $3
+		),
+		entity AS (
+			SELECT de.document_id AS id,
+			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			FROM document_entities de
+			JOIN entities e ON e.id = de.entity_id
+			JOIN documents d ON d.id = de.document_id
+			WHERE e.normalized_name LIKE '%%' || $9 || '%%'
+			AND d.status = 'active'
+			AND d.source_type = ANY($4)
+			AND d.source_type <> ALL($5)
+			AND COALESCE(d.metadata->>'retention', '') <> ALL($6)
+			AND d.occurred_at >= $7
+			AND d.occurred_at < $8
+			GROUP BY de.document_id
+			LIMIT $3
+		),
+		rrf AS (
+			SELECT
+				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) AS id,
+				COALESCE(1::float8/(60::float8 + fts.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + vec.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + bigm.rank),    0)
+				+ COALESCE(0.8::float8/(60::float8 + summvec.rank), 0)
+				+ COALESCE(0.5::float8/(60::float8 + entity.rank),  0) AS score
+			FROM fts
+			FULL OUTER JOIN vec     ON fts.id = vec.id
+			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
+			FULL OUTER JOIN summvec ON COALESCE(fts.id, vec.id, bigm.id) = summvec.id
+			FULL OUTER JOIN entity  ON COALESCE(fts.id, vec.id, bigm.id, summvec.id) = entity.id
+		)
+		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
+		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
+		       d.title_summary, d.bullet_summary, d.summary_embedding,
+		       rrf.score
+		FROM rrf
+		JOIN documents d ON d.id = rrf.id
+		ORDER BY score DESC
+		LIMIT $3
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = vector[0.1 0.2 0.3 0.4]
+$3 = int 20
+$4 = []model.SourceType []model.SourceType{"calendar", "call"}
+$5 = []model.SourceType []model.SourceType{"insight"}
+$6 = []string []string{"disposable"}
+$7 = 2026-08-17T00:00:00Z
+$8 = 2026-08-24T00:00:00Z
+$9 = string "이번 주 회의 일정 알려줘"
+==== hybrid/entity_off/all ====
+
+		WITH fts AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY GREATEST(
+			           ts_rank(tsv, plainto_tsquery('simple', $1)),
+			           ts_rank(tsv, plainto_tsquery('english', $1))
+			       ) DESC) AS rank
+			FROM documents
+			WHERE (tsv @@ plainto_tsquery('simple', $1)
+			   OR tsv @@ plainto_tsquery('english', $1))
+			AND status = 'active'
+			AND source_type = ANY($4)
+			AND source_type <> ALL($5)
+			AND COALESCE(metadata->>'retention', '') <> ALL($6)
+			AND occurred_at >= $7
+			AND occurred_at < $8
+			LIMIT $3
+		),
+		vec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE embedding IS NOT NULL
+			AND status = 'active'
+			AND source_type = ANY($4)
+			AND source_type <> ALL($5)
+			AND COALESCE(metadata->>'retention', '') <> ALL($6)
+			AND occurred_at >= $7
+			AND occurred_at < $8
+			LIMIT $3
+		),
+		bigm AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY
+			           GREATEST(
+			               bigm_similarity(content, $1),
+			               bigm_similarity(title,   $1),
+			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
+			           ) DESC, id ASC) AS rank
+			FROM documents
+			WHERE (content LIKE '%%' || $1 || '%%'
+			    OR title   LIKE '%%' || $1 || '%%'
+			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+			AND status = 'active'
+			AND source_type = ANY($4)
+			AND source_type <> ALL($5)
+			AND COALESCE(metadata->>'retention', '') <> ALL($6)
+			AND occurred_at >= $7
+			AND occurred_at < $8
+			LIMIT $3
+		),
+		summvec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE summary_embedding IS NOT NULL
+			AND status = 'active'
+			AND source_type = ANY($4)
+			AND source_type <> ALL($5)
+			AND COALESCE(metadata->>'retention', '') <> ALL($6)
+			AND occurred_at >= $7
+			AND occurred_at < $8
+			LIMIT $3
+		),
+		entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false),
+		rrf AS (
+			SELECT
+				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) AS id,
+				COALESCE(1::float8/(60::float8 + fts.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + vec.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + bigm.rank),    0)
+				+ COALESCE(0::float8/(60::float8 + summvec.rank), 0)
+				+ COALESCE(0::float8/(60::float8 + entity.rank),  0) AS score
+			FROM fts
+			FULL OUTER JOIN vec     ON fts.id = vec.id
+			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
+			FULL OUTER JOIN summvec ON COALESCE(fts.id, vec.id, bigm.id) = summvec.id
+			FULL OUTER JOIN entity  ON COALESCE(fts.id, vec.id, bigm.id, summvec.id) = entity.id
+		)
+		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
+		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
+		       d.title_summary, d.bullet_summary, d.summary_embedding,
+		       rrf.score
+		FROM rrf
+		JOIN documents d ON d.id = rrf.id
+		ORDER BY score DESC
+		LIMIT $3
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = vector[0.1 0.2 0.3 0.4]
+$3 = int 20
+$4 = []model.SourceType []model.SourceType{"calendar", "call"}
+$5 = []model.SourceType []model.SourceType{"insight"}
+$6 = []string []string{"disposable"}
+$7 = 2026-08-17T00:00:00Z
+$8 = 2026-08-24T00:00:00Z
+==== fulltext/all ====
+
+		SELECT id, source_type, source_id, title, content, metadata, embedding,
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding,
+		       GREATEST(
+		           ts_rank(tsv, plainto_tsquery('simple', $1)),
+		           ts_rank(tsv, plainto_tsquery('english', $1))
+		       ) AS score
+		FROM documents
+		WHERE (tsv @@ plainto_tsquery('simple', $1)
+		   OR tsv @@ plainto_tsquery('english', $1)
+		   OR content LIKE '%' || $1 || '%'
+		   OR title   LIKE '%' || $1 || '%'
+		   OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+		AND status = 'active'
+		AND source_type = ANY($3)
+		AND source_type <> ALL($4)
+		AND COALESCE(metadata->>'retention', '') <> ALL($5)
+		AND occurred_at >= $6
+			AND occurred_at < $7
+		ORDER BY score DESC
+		LIMIT $2
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 10
+$3 = []model.SourceType []model.SourceType{"calendar", "call"}
+$4 = []model.SourceType []model.SourceType{"insight"}
+$5 = []string []string{"disposable"}
+$6 = 2026-08-17T00:00:00Z
+$7 = 2026-08-24T00:00:00Z
+==== chunk_fts/all ====
+
+		SELECT
+			c.id,
+			c.document_id,
+			c.chunk_index,
+			c.content,
+			c.byte_size,
+			c.created_at,
+			GREATEST(
+				ts_rank(c.content_tsv, plainto_tsquery('simple', $1)),
+				CASE WHEN c.content LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+			) AS rank,
+			d.title          AS document_title,
+			d.source_type    AS document_source,
+			d.status         AS document_status,
+			d.occurred_at    AS document_occurred_at,
+			d.collected_at   AS document_collected_at,
+			d.metadata       AS document_metadata
+		FROM chunks c
+		JOIN documents d ON d.id = c.document_id
+		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
+		   OR c.content LIKE '%%' || $1 || '%%')
+		  AND d.status = 'active'  AND d.source_type = ANY($3) AND d.source_type <> ALL($4) AND d.occurred_at >= $5
+			AND d.occurred_at < $6 AND COALESCE(d.metadata->>'retention', '') <> ALL($7)
+		ORDER BY rank DESC
+		LIMIT $2
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 30
+$3 = []model.SourceType []model.SourceType{"calendar", "call"}
+$4 = []model.SourceType []model.SourceType{"insight"}
+$5 = 2026-08-17T00:00:00Z
+$6 = 2026-08-24T00:00:00Z
+$7 = []string []string{"disposable"}
+==== sparse_ctx/all ====
+
+		WITH fresh AS (
+			SELECT
+				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
+				GREATEST(
+					ts_rank(sc.sparse_tsv, plainto_tsquery('simple', $1)),
+					CASE WHEN sc.sparse_text LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+				) AS rank,
+				d.title          AS document_title,
+				d.source_type    AS document_source,
+				d.status         AS document_status,
+				d.occurred_at    AS document_occurred_at,
+				d.collected_at   AS document_collected_at,
+				d.metadata       AS document_metadata
+			FROM chunk_sparse_context sc
+			JOIN chunks c ON c.id = sc.chunk_id
+			JOIN documents d ON d.id = c.document_id
+			WHERE sc.context_version = $3
+			  AND sc.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
+			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
+			  AND d.status = 'active'  AND d.source_type = ANY($4) AND d.source_type <> ALL($5) AND d.occurred_at >= $6
+			AND d.occurred_at < $7 AND COALESCE(d.metadata->>'retention', '') <> ALL($8)
+			ORDER BY rank DESC
+			LIMIT $2
+		),
+		raw AS (
+			SELECT
+				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
+				GREATEST(
+					ts_rank(c.content_tsv, plainto_tsquery('simple', $1)),
+					CASE WHEN c.content LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+				) AS rank,
+				d.title          AS document_title,
+				d.source_type    AS document_source,
+				d.status         AS document_status,
+				d.occurred_at    AS document_occurred_at,
+				d.collected_at   AS document_collected_at,
+				d.metadata       AS document_metadata
+			FROM chunks c
+			JOIN documents d ON d.id = c.document_id
+			WHERE NOT EXISTS (
+				SELECT 1 FROM chunk_sparse_context sc2
+				WHERE sc2.chunk_id = c.id
+				  AND sc2.context_version = $3
+				  AND sc2.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
+			)
+			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
+			AND d.status = 'active'  AND d.source_type = ANY($4) AND d.source_type <> ALL($5) AND d.occurred_at >= $6
+			AND d.occurred_at < $7 AND COALESCE(d.metadata->>'retention', '') <> ALL($8)
+			ORDER BY rank DESC
+			LIMIT $2
+		)
+		SELECT * FROM fresh
+		UNION ALL
+		SELECT * FROM raw
+		ORDER BY rank DESC
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 30
+$3 = string "v1-tp"
+$4 = []model.SourceType []model.SourceType{"calendar", "call"}
+$5 = []model.SourceType []model.SourceType{"insight"}
+$6 = 2026-08-17T00:00:00Z
+$7 = 2026-08-24T00:00:00Z
+$8 = []string []string{"disposable"}
+==== hybrid/entity_on/include_deleted ====
+
+		WITH fts AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY GREATEST(
+			           ts_rank(tsv, plainto_tsquery('simple', $1)),
+			           ts_rank(tsv, plainto_tsquery('english', $1))
+			       ) DESC) AS rank
+			FROM documents
+			WHERE (tsv @@ plainto_tsquery('simple', $1)
+			   OR tsv @@ plainto_tsquery('english', $1))
+			
+			
+			
+			
+			
+			LIMIT $3
+		),
+		vec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE embedding IS NOT NULL
+			
+			
+			
+			
+			
+			LIMIT $3
+		),
+		bigm AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY
+			           GREATEST(
+			               bigm_similarity(content, $1),
+			               bigm_similarity(title,   $1),
+			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
+			           ) DESC, id ASC) AS rank
+			FROM documents
+			WHERE (content LIKE '%%' || $1 || '%%'
+			    OR title   LIKE '%%' || $1 || '%%'
+			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+			
+			
+			
+			
+			
+			LIMIT $3
+		),
+		summvec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE summary_embedding IS NOT NULL
+			
+			
+			
+			
+			
+			LIMIT $3
+		),
+		entity AS (
+			SELECT de.document_id AS id,
+			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			FROM document_entities de
+			JOIN entities e ON e.id = de.entity_id
+			JOIN documents d ON d.id = de.document_id
+			WHERE e.normalized_name LIKE '%%' || $4 || '%%'
+			
+			
+			
+			
+			
+			GROUP BY de.document_id
+			LIMIT $3
+		),
+		rrf AS (
+			SELECT
+				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) AS id,
+				COALESCE(1::float8/(60::float8 + fts.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + vec.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + bigm.rank),    0)
+				+ COALESCE(0.8::float8/(60::float8 + summvec.rank), 0)
+				+ COALESCE(0.5::float8/(60::float8 + entity.rank),  0) AS score
+			FROM fts
+			FULL OUTER JOIN vec     ON fts.id = vec.id
+			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
+			FULL OUTER JOIN summvec ON COALESCE(fts.id, vec.id, bigm.id) = summvec.id
+			FULL OUTER JOIN entity  ON COALESCE(fts.id, vec.id, bigm.id, summvec.id) = entity.id
+		)
+		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
+		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
+		       d.title_summary, d.bullet_summary, d.summary_embedding,
+		       rrf.score
+		FROM rrf
+		JOIN documents d ON d.id = rrf.id
+		ORDER BY score DESC
+		LIMIT $3
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = vector[0.1 0.2 0.3 0.4]
+$3 = int 20
+$4 = string "이번 주 회의 일정 알려줘"
+==== hybrid/entity_off/include_deleted ====
+
+		WITH fts AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY GREATEST(
+			           ts_rank(tsv, plainto_tsquery('simple', $1)),
+			           ts_rank(tsv, plainto_tsquery('english', $1))
+			       ) DESC) AS rank
+			FROM documents
+			WHERE (tsv @@ plainto_tsquery('simple', $1)
+			   OR tsv @@ plainto_tsquery('english', $1))
+			
+			
+			
+			
+			
+			LIMIT $3
+		),
+		vec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE embedding IS NOT NULL
+			
+			
+			
+			
+			
+			LIMIT $3
+		),
+		bigm AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY
+			           GREATEST(
+			               bigm_similarity(content, $1),
+			               bigm_similarity(title,   $1),
+			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
+			           ) DESC, id ASC) AS rank
+			FROM documents
+			WHERE (content LIKE '%%' || $1 || '%%'
+			    OR title   LIKE '%%' || $1 || '%%'
+			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+			
+			
+			
+			
+			
+			LIMIT $3
+		),
+		summvec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE summary_embedding IS NOT NULL
+			
+			
+			
+			
+			
+			LIMIT $3
+		),
+		entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false),
+		rrf AS (
+			SELECT
+				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) AS id,
+				COALESCE(1::float8/(60::float8 + fts.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + vec.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + bigm.rank),    0)
+				+ COALESCE(0::float8/(60::float8 + summvec.rank), 0)
+				+ COALESCE(0::float8/(60::float8 + entity.rank),  0) AS score
+			FROM fts
+			FULL OUTER JOIN vec     ON fts.id = vec.id
+			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
+			FULL OUTER JOIN summvec ON COALESCE(fts.id, vec.id, bigm.id) = summvec.id
+			FULL OUTER JOIN entity  ON COALESCE(fts.id, vec.id, bigm.id, summvec.id) = entity.id
+		)
+		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
+		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
+		       d.title_summary, d.bullet_summary, d.summary_embedding,
+		       rrf.score
+		FROM rrf
+		JOIN documents d ON d.id = rrf.id
+		ORDER BY score DESC
+		LIMIT $3
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = vector[0.1 0.2 0.3 0.4]
+$3 = int 20
+==== fulltext/include_deleted ====
+
+		SELECT id, source_type, source_id, title, content, metadata, embedding,
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding,
+		       GREATEST(
+		           ts_rank(tsv, plainto_tsquery('simple', $1)),
+		           ts_rank(tsv, plainto_tsquery('english', $1))
+		       ) AS score
+		FROM documents
+		WHERE (tsv @@ plainto_tsquery('simple', $1)
+		   OR tsv @@ plainto_tsquery('english', $1)
+		   OR content LIKE '%' || $1 || '%'
+		   OR title   LIKE '%' || $1 || '%'
+		   OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+		
+		
+		
+		
+		
+		ORDER BY score DESC
+		LIMIT $2
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 10
+==== chunk_fts/include_deleted ====
+
+		SELECT
+			c.id,
+			c.document_id,
+			c.chunk_index,
+			c.content,
+			c.byte_size,
+			c.created_at,
+			GREATEST(
+				ts_rank(c.content_tsv, plainto_tsquery('simple', $1)),
+				CASE WHEN c.content LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+			) AS rank,
+			d.title          AS document_title,
+			d.source_type    AS document_source,
+			d.status         AS document_status,
+			d.occurred_at    AS document_occurred_at,
+			d.collected_at   AS document_collected_at,
+			d.metadata       AS document_metadata
+		FROM chunks c
+		JOIN documents d ON d.id = c.document_id
+		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
+		   OR c.content LIKE '%%' || $1 || '%%')
+		  AND d.status = 'active'   
+		ORDER BY rank DESC
+		LIMIT $2
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 30
+==== sparse_ctx/include_deleted ====
+
+		WITH fresh AS (
+			SELECT
+				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
+				GREATEST(
+					ts_rank(sc.sparse_tsv, plainto_tsquery('simple', $1)),
+					CASE WHEN sc.sparse_text LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+				) AS rank,
+				d.title          AS document_title,
+				d.source_type    AS document_source,
+				d.status         AS document_status,
+				d.occurred_at    AS document_occurred_at,
+				d.collected_at   AS document_collected_at,
+				d.metadata       AS document_metadata
+			FROM chunk_sparse_context sc
+			JOIN chunks c ON c.id = sc.chunk_id
+			JOIN documents d ON d.id = c.document_id
+			WHERE sc.context_version = $3
+			  AND sc.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
+			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
+			  AND d.status = 'active'   
+			ORDER BY rank DESC
+			LIMIT $2
+		),
+		raw AS (
+			SELECT
+				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
+				GREATEST(
+					ts_rank(c.content_tsv, plainto_tsquery('simple', $1)),
+					CASE WHEN c.content LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+				) AS rank,
+				d.title          AS document_title,
+				d.source_type    AS document_source,
+				d.status         AS document_status,
+				d.occurred_at    AS document_occurred_at,
+				d.collected_at   AS document_collected_at,
+				d.metadata       AS document_metadata
+			FROM chunks c
+			JOIN documents d ON d.id = c.document_id
+			WHERE NOT EXISTS (
+				SELECT 1 FROM chunk_sparse_context sc2
+				WHERE sc2.chunk_id = c.id
+				  AND sc2.context_version = $3
+				  AND sc2.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
+			)
+			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
+			AND d.status = 'active'   
+			ORDER BY rank DESC
+			LIMIT $2
+		)
+		SELECT * FROM fresh
+		UNION ALL
+		SELECT * FROM raw
+		ORDER BY rank DESC
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 30
+$3 = string "v1-tp"
+==== hybrid/entity_on/recent_past_window ====
+
+		WITH fts AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY GREATEST(
+			           ts_rank(tsv, plainto_tsquery('simple', $1)),
+			           ts_rank(tsv, plainto_tsquery('english', $1))
+			       ) DESC) AS rank
+			FROM documents
+			WHERE (tsv @@ plainto_tsquery('simple', $1)
+			   OR tsv @@ plainto_tsquery('english', $1))
+			AND status = 'active'
+			AND source_type = ANY($4)
+			AND source_type <> ALL($5)
+			AND COALESCE(metadata->>'retention', '') <> ALL($6)
+			AND occurred_at >= $7
+			AND occurred_at < $8
+			LIMIT $3
+		),
+		vec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE embedding IS NOT NULL
+			AND status = 'active'
+			AND source_type = ANY($4)
+			AND source_type <> ALL($5)
+			AND COALESCE(metadata->>'retention', '') <> ALL($6)
+			AND occurred_at >= $7
+			AND occurred_at < $8
+			LIMIT $3
+		),
+		bigm AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY
+			           GREATEST(
+			               bigm_similarity(content, $1),
+			               bigm_similarity(title,   $1),
+			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
+			           ) DESC, id ASC) AS rank
+			FROM documents
+			WHERE (content LIKE '%%' || $1 || '%%'
+			    OR title   LIKE '%%' || $1 || '%%'
+			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+			AND status = 'active'
+			AND source_type = ANY($4)
+			AND source_type <> ALL($5)
+			AND COALESCE(metadata->>'retention', '') <> ALL($6)
+			AND occurred_at >= $7
+			AND occurred_at < $8
+			LIMIT $3
+		),
+		summvec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE summary_embedding IS NOT NULL
+			AND status = 'active'
+			AND source_type = ANY($4)
+			AND source_type <> ALL($5)
+			AND COALESCE(metadata->>'retention', '') <> ALL($6)
+			AND occurred_at >= $7
+			AND occurred_at < $8
+			LIMIT $3
+		),
+		entity AS (
+			SELECT de.document_id AS id,
+			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			FROM document_entities de
+			JOIN entities e ON e.id = de.entity_id
+			JOIN documents d ON d.id = de.document_id
+			WHERE e.normalized_name LIKE '%%' || $9 || '%%'
+			AND d.status = 'active'
+			AND d.source_type = ANY($4)
+			AND d.source_type <> ALL($5)
+			AND COALESCE(d.metadata->>'retention', '') <> ALL($6)
+			AND d.occurred_at >= $7
+			AND d.occurred_at < $8
+			GROUP BY de.document_id
+			LIMIT $3
+		),
+		rrf AS (
+			SELECT
+				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) AS id,
+				COALESCE(1::float8/(60::float8 + fts.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + vec.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + bigm.rank),    0)
+				+ COALESCE(0.8::float8/(60::float8 + summvec.rank), 0)
+				+ COALESCE(0.5::float8/(60::float8 + entity.rank),  0) AS score
+			FROM fts
+			FULL OUTER JOIN vec     ON fts.id = vec.id
+			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
+			FULL OUTER JOIN summvec ON COALESCE(fts.id, vec.id, bigm.id) = summvec.id
+			FULL OUTER JOIN entity  ON COALESCE(fts.id, vec.id, bigm.id, summvec.id) = entity.id
+		)
+		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
+		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
+		       d.title_summary, d.bullet_summary, d.summary_embedding,
+		       rrf.score
+		FROM rrf
+		JOIN documents d ON d.id = rrf.id
+		ORDER BY COALESCE(d.occurred_at, d.collected_at) DESC
+		LIMIT $3
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = vector[0.1 0.2 0.3 0.4]
+$3 = int 20
+$4 = []model.SourceType []model.SourceType{"calendar", "call"}
+$5 = []model.SourceType []model.SourceType{"insight"}
+$6 = []string []string{"disposable"}
+$7 = 2026-08-17T00:00:00Z
+$8 = 2026-08-24T00:00:00Z
+$9 = string "이번 주 회의 일정 알려줘"
+==== hybrid/entity_off/recent_past_window ====
+
+		WITH fts AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY GREATEST(
+			           ts_rank(tsv, plainto_tsquery('simple', $1)),
+			           ts_rank(tsv, plainto_tsquery('english', $1))
+			       ) DESC) AS rank
+			FROM documents
+			WHERE (tsv @@ plainto_tsquery('simple', $1)
+			   OR tsv @@ plainto_tsquery('english', $1))
+			AND status = 'active'
+			AND source_type = ANY($4)
+			AND source_type <> ALL($5)
+			AND COALESCE(metadata->>'retention', '') <> ALL($6)
+			AND occurred_at >= $7
+			AND occurred_at < $8
+			LIMIT $3
+		),
+		vec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE embedding IS NOT NULL
+			AND status = 'active'
+			AND source_type = ANY($4)
+			AND source_type <> ALL($5)
+			AND COALESCE(metadata->>'retention', '') <> ALL($6)
+			AND occurred_at >= $7
+			AND occurred_at < $8
+			LIMIT $3
+		),
+		bigm AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY
+			           GREATEST(
+			               bigm_similarity(content, $1),
+			               bigm_similarity(title,   $1),
+			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
+			           ) DESC, id ASC) AS rank
+			FROM documents
+			WHERE (content LIKE '%%' || $1 || '%%'
+			    OR title   LIKE '%%' || $1 || '%%'
+			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+			AND status = 'active'
+			AND source_type = ANY($4)
+			AND source_type <> ALL($5)
+			AND COALESCE(metadata->>'retention', '') <> ALL($6)
+			AND occurred_at >= $7
+			AND occurred_at < $8
+			LIMIT $3
+		),
+		summvec AS (
+			SELECT id,
+			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
+			FROM documents
+			WHERE summary_embedding IS NOT NULL
+			AND status = 'active'
+			AND source_type = ANY($4)
+			AND source_type <> ALL($5)
+			AND COALESCE(metadata->>'retention', '') <> ALL($6)
+			AND occurred_at >= $7
+			AND occurred_at < $8
+			LIMIT $3
+		),
+		entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false),
+		rrf AS (
+			SELECT
+				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) AS id,
+				COALESCE(1::float8/(60::float8 + fts.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + vec.rank),     0)
+				+ COALESCE(1::float8/(60::float8 + bigm.rank),    0)
+				+ COALESCE(0::float8/(60::float8 + summvec.rank), 0)
+				+ COALESCE(0::float8/(60::float8 + entity.rank),  0) AS score
+			FROM fts
+			FULL OUTER JOIN vec     ON fts.id = vec.id
+			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
+			FULL OUTER JOIN summvec ON COALESCE(fts.id, vec.id, bigm.id) = summvec.id
+			FULL OUTER JOIN entity  ON COALESCE(fts.id, vec.id, bigm.id, summvec.id) = entity.id
+		)
+		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
+		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
+		       d.title_summary, d.bullet_summary, d.summary_embedding,
+		       rrf.score
+		FROM rrf
+		JOIN documents d ON d.id = rrf.id
+		ORDER BY COALESCE(d.occurred_at, d.collected_at) DESC
+		LIMIT $3
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = vector[0.1 0.2 0.3 0.4]
+$3 = int 20
+$4 = []model.SourceType []model.SourceType{"calendar", "call"}
+$5 = []model.SourceType []model.SourceType{"insight"}
+$6 = []string []string{"disposable"}
+$7 = 2026-08-17T00:00:00Z
+$8 = 2026-08-24T00:00:00Z
+==== fulltext/recent_past_window ====
+
+		SELECT id, source_type, source_id, title, content, metadata, embedding,
+		       status, deleted_at, occurred_at, collected_at, created_at, updated_at,
+		       title_summary, bullet_summary, summary_embedding,
+		       GREATEST(
+		           ts_rank(tsv, plainto_tsquery('simple', $1)),
+		           ts_rank(tsv, plainto_tsquery('english', $1))
+		       ) AS score
+		FROM documents
+		WHERE (tsv @@ plainto_tsquery('simple', $1)
+		   OR tsv @@ plainto_tsquery('english', $1)
+		   OR content LIKE '%' || $1 || '%'
+		   OR title   LIKE '%' || $1 || '%'
+		   OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
+		AND status = 'active'
+		AND source_type = ANY($3)
+		AND source_type <> ALL($4)
+		AND COALESCE(metadata->>'retention', '') <> ALL($5)
+		AND occurred_at >= $6
+			AND occurred_at < $7
+		ORDER BY COALESCE(occurred_at, collected_at) DESC
+		LIMIT $2
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 10
+$3 = []model.SourceType []model.SourceType{"calendar", "call"}
+$4 = []model.SourceType []model.SourceType{"insight"}
+$5 = []string []string{"disposable"}
+$6 = 2026-08-17T00:00:00Z
+$7 = 2026-08-24T00:00:00Z
+==== chunk_fts/recent_past_window ====
+
+		SELECT
+			c.id,
+			c.document_id,
+			c.chunk_index,
+			c.content,
+			c.byte_size,
+			c.created_at,
+			GREATEST(
+				ts_rank(c.content_tsv, plainto_tsquery('simple', $1)),
+				CASE WHEN c.content LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+			) AS rank,
+			d.title          AS document_title,
+			d.source_type    AS document_source,
+			d.status         AS document_status,
+			d.occurred_at    AS document_occurred_at,
+			d.collected_at   AS document_collected_at,
+			d.metadata       AS document_metadata
+		FROM chunks c
+		JOIN documents d ON d.id = c.document_id
+		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
+		   OR c.content LIKE '%%' || $1 || '%%')
+		  AND d.status = 'active'  AND d.source_type = ANY($3) AND d.source_type <> ALL($4) AND d.occurred_at >= $5
+			AND d.occurred_at < $6 AND COALESCE(d.metadata->>'retention', '') <> ALL($7)
+		ORDER BY rank DESC
+		LIMIT $2
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 30
+$3 = []model.SourceType []model.SourceType{"calendar", "call"}
+$4 = []model.SourceType []model.SourceType{"insight"}
+$5 = 2026-08-17T00:00:00Z
+$6 = 2026-08-24T00:00:00Z
+$7 = []string []string{"disposable"}
+==== sparse_ctx/recent_past_window ====
+
+		WITH fresh AS (
+			SELECT
+				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
+				GREATEST(
+					ts_rank(sc.sparse_tsv, plainto_tsquery('simple', $1)),
+					CASE WHEN sc.sparse_text LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+				) AS rank,
+				d.title          AS document_title,
+				d.source_type    AS document_source,
+				d.status         AS document_status,
+				d.occurred_at    AS document_occurred_at,
+				d.collected_at   AS document_collected_at,
+				d.metadata       AS document_metadata
+			FROM chunk_sparse_context sc
+			JOIN chunks c ON c.id = sc.chunk_id
+			JOIN documents d ON d.id = c.document_id
+			WHERE sc.context_version = $3
+			  AND sc.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
+			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
+			  AND d.status = 'active'  AND d.source_type = ANY($4) AND d.source_type <> ALL($5) AND d.occurred_at >= $6
+			AND d.occurred_at < $7 AND COALESCE(d.metadata->>'retention', '') <> ALL($8)
+			ORDER BY rank DESC
+			LIMIT $2
+		),
+		raw AS (
+			SELECT
+				c.id, c.document_id, c.chunk_index, c.content, c.byte_size, c.created_at,
+				GREATEST(
+					ts_rank(c.content_tsv, plainto_tsquery('simple', $1)),
+					CASE WHEN c.content LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
+				) AS rank,
+				d.title          AS document_title,
+				d.source_type    AS document_source,
+				d.status         AS document_status,
+				d.occurred_at    AS document_occurred_at,
+				d.collected_at   AS document_collected_at,
+				d.metadata       AS document_metadata
+			FROM chunks c
+			JOIN documents d ON d.id = c.document_id
+			WHERE NOT EXISTS (
+				SELECT 1 FROM chunk_sparse_context sc2
+				WHERE sc2.chunk_id = c.id
+				  AND sc2.context_version = $3
+				  AND sc2.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
+			)
+			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
+			AND d.status = 'active'  AND d.source_type = ANY($4) AND d.source_type <> ALL($5) AND d.occurred_at >= $6
+			AND d.occurred_at < $7 AND COALESCE(d.metadata->>'retention', '') <> ALL($8)
+			ORDER BY rank DESC
+			LIMIT $2
+		)
+		SELECT * FROM fresh
+		UNION ALL
+		SELECT * FROM raw
+		ORDER BY rank DESC
+---- args ----
+$1 = string "이번 주 회의 일정 알려줘"
+$2 = int 30
+$3 = string "v1-tp"
+$4 = []model.SourceType []model.SourceType{"calendar", "call"}
+$5 = []model.SourceType []model.SourceType{"insight"}
+$6 = 2026-08-17T00:00:00Z
+$7 = 2026-08-24T00:00:00Z
+$8 = []string []string{"disposable"}

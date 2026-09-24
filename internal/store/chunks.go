@@ -150,45 +150,11 @@ func (s *ChunkStore) SearchFTS(ctx context.Context, query string, limit int) ([]
 
 // SearchFTSFiltered applies document eligibility before the chunk candidate LIMIT.
 func (s *ChunkStore) SearchFTSFiltered(ctx context.Context, filter model.SearchQuery, limit int) ([]ChunkSearchResult, error) {
-	query := filter.Query
 	if limit <= 0 {
 		limit = 20
 	}
 
-	// The WHERE clause uses both the tsvector (GIN idx_chunks_tsv) and the
-	// pg_bigm LIKE condition (GIN idx_chunks_content_bigm) so that Korean
-	// partial-match queries that do not produce tsquery tokens still hit the
-	// bigm index (#146). The GREATEST() rank expression prefers the FTS rank
-	// when both conditions match; the bigm lane adds a small constant (0.01)
-	// so bigm-only matches rank above zero but well below true FTS hits.
-	// 0.01 (not 0.1) avoids over-weighting bigm-only matches relative to the
-	// ts_rank distribution, which typically ranges from 0.01 to ~0.5 (#146).
-	args, filters := chunkEligibilitySQL([]interface{}{query, limit}, filter)
-	q := `
-		SELECT
-			c.id,
-			c.document_id,
-			c.chunk_index,
-			c.content,
-			c.byte_size,
-			c.created_at,
-			GREATEST(
-				ts_rank(c.content_tsv, plainto_tsquery('simple', $1)),
-				CASE WHEN c.content LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END
-			) AS rank,
-			d.title          AS document_title,
-			d.source_type    AS document_source,
-			d.status         AS document_status,
-			d.occurred_at    AS document_occurred_at,
-			d.collected_at   AS document_collected_at,
-			d.metadata       AS document_metadata
-		FROM chunks c
-		JOIN documents d ON d.id = c.document_id
-		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
-		   OR c.content LIKE '%%' || $1 || '%%')
-		  AND d.status = 'active' ` + filters + `
-		ORDER BY rank DESC
-		LIMIT $2`
+	q, args := buildChunkFTSQuery(filter, limit)
 
 	rows, err := s.pg.pool.Query(ctx, q, args...)
 	if err != nil {
@@ -224,6 +190,54 @@ func (s *ChunkStore) SearchFTSFiltered(ctx context.Context, filter model.SearchQ
 		return nil, fmt.Errorf("chunks search FTS iter: %w", err)
 	}
 	return results, nil
+}
+
+// buildChunkFTSQuery 는 SearchFTSFiltered 의 SQL 과 인자를 만든다. DB 없이
+// SQL 을 검사할 수 있게 떼어 냈다(buildHybridSearchQuery 와 같은 이유).
+func buildChunkFTSQuery(filter model.SearchQuery, limit int) (string, []interface{}) {
+	query := filter.Query
+	// The WHERE clause uses both the tsvector (GIN idx_chunks_tsv) and the
+	// pg_bigm LIKE condition (GIN idx_chunks_content_bigm) so that Korean
+	// partial-match queries that do not produce tsquery tokens still hit the
+	// bigm index (#146). The GREATEST() rank expression prefers the FTS rank
+	// when both conditions match; the bigm lane adds a small constant (0.01)
+	// so bigm-only matches rank above zero but well below true FTS hits.
+	// 0.01 (not 0.1) avoids over-weighting bigm-only matches relative to the
+	// ts_rank distribution, which typically ranges from 0.01 to ~0.5 (#146).
+	//
+	// #276: filter.SparseTerms 가 있으면 질문 원문 대신 키워드를 쓴다 — 접두
+	// OR tsquery 와 키워드별 LIKE(chunkSparseExprs 참고). 없으면 아래 SQL 은
+	// #276 이전과 바이트 단위로 같다.
+	args, filters := chunkEligibilitySQL([]interface{}{query, limit}, filter)
+	args, sp := bindChunkSparse(args, filter.SparseTerms)
+	e := chunkSparseExprs(sp, "c.content_tsv", "c.content")
+	q := `
+		SELECT
+			c.id,
+			c.document_id,
+			c.chunk_index,
+			c.content,
+			c.byte_size,
+			c.created_at,
+			GREATEST(
+				` + e.rankTS + `,
+				` + e.rankBigm + `
+			) AS rank,
+			d.title          AS document_title,
+			d.source_type    AS document_source,
+			d.status         AS document_status,
+			d.occurred_at    AS document_occurred_at,
+			d.collected_at   AS document_collected_at,
+			d.metadata       AS document_metadata
+		FROM chunks c
+		JOIN documents d ON d.id = c.document_id
+		WHERE (` + e.matchTS + `
+		   OR ` + e.matchLike + `)
+		  AND d.status = 'active' ` + filters + `
+		ORDER BY rank DESC
+		LIMIT $2`
+
+	return q, args
 }
 
 // decodeChunkDocumentMetadata decodes a chunk-lane row's joined
