@@ -1,14 +1,14 @@
 // Package sparsectx runs the #270 phase B backfill: it fills
 // chunk_sparse_context (migration 040) with deterministic sparse-matching
-// text (internal/chunkctx.BuildSparseText) for every chunk, in checkpointed
-// batches so a run can be interrupted and resumed without re-scanning
-// everything or losing progress.
+// text (internal/chunkctx.BuildSparseText) for every chunk, in batches so a
+// run can be interrupted and resumed without re-scanning everything or
+// losing progress.
 //
 // This package contains no SQL — internal/store.ChunkStore does the reading
-// and writing (FetchSparseContextCandidates, UpsertSparseContextBatch,
-// SparseBackfillCheckpoint, ResetSparseBackfillCheckpoint); this package only
-// sequences those calls and turns internal/chunkctx.BuildSparseText's output
-// into rows. See cmd/sparsectx for the CLI wrapper.
+// and writing (FetchSparseContextCandidates, UpsertSparseContextBatch); this
+// package only sequences those calls and turns
+// internal/chunkctx.BuildSparseText's output into rows. See cmd/sparsectx
+// for the CLI wrapper.
 package sparsectx
 
 import (
@@ -24,11 +24,18 @@ import (
 // Store is the subset of *store.ChunkStore this package needs. Defined here
 // (rather than depending on the concrete type directly) purely for test
 // substitutability — production always passes a *store.ChunkStore.
+//
+// Only two methods: FetchSparseContextCandidates now decides what still
+// needs work directly from the data (an anti-join against
+// chunk_sparse_context, #270 deep-verify HIGH), so Run no longer reads or
+// resets a persisted checkpoint before starting a pass — see
+// FetchSparseContextCandidates' doc comment (internal/store/chunk_sparse_context.go)
+// for why a checkpoint-based `WHERE c.id > $checkpoint` filter could
+// permanently skip a chunk whose insert commits out of id order, and for
+// what its afterChunkID parameter is (and is not) for.
 type Store interface {
-	FetchSparseContextCandidates(ctx context.Context, afterChunkID int64, batchSize int) ([]store.SparseContextCandidate, error)
+	FetchSparseContextCandidates(ctx context.Context, version string, sweep bool, afterChunkID int64, batchSize int) ([]store.SparseContextCandidate, error)
 	UpsertSparseContextBatch(ctx context.Context, version string, rows []store.SparseContextRow, checkpoint int64) (int64, error)
-	SparseBackfillCheckpoint(ctx context.Context, version string) (int64, error)
-	ResetSparseBackfillCheckpoint(ctx context.Context, version string) error
 }
 
 // Config controls one Run invocation.
@@ -47,15 +54,17 @@ type Config struct {
 	Sleep time.Duration
 
 	// DryRun computes candidates and would-be sparse_text but performs no
-	// database write (no INSERT, no checkpoint advance).
+	// database write (no INSERT).
 	DryRun bool
 
-	// Sweep restarts the checkpoint at 0 before running, so every chunk is
-	// re-examined and any row whose document changed since the last full
-	// pass (title edit, metadata merge, PII redaction) is recomputed. Rows
-	// unchanged since the last pass are skipped by
-	// UpsertSparseContextBatch's fingerprint comparison — Sweep does not
-	// force a rewrite of already-current rows.
+	// Sweep makes FetchSparseContextCandidates also re-examine chunks whose
+	// chunk_sparse_context row EXISTS but has gone stale — its fingerprint no
+	// longer matches the parent document's current one (title edit, metadata
+	// merge, PII redaction). A plain (Sweep=false) pass only picks up chunks
+	// with NO row yet, e.g. newly chunked documents; rows unchanged since the
+	// last write are skipped either way by UpsertSparseContextBatch's
+	// fingerprint comparison — Sweep does not force a rewrite of
+	// already-current rows, it only widens which chunks are considered.
 	Sweep bool
 
 	// MaxBatches caps how many batches this Run call performs. 0 means no
@@ -65,13 +74,17 @@ type Config struct {
 
 // Summary reports what one Run call did.
 type Summary struct {
-	BatchesRun  int
-	Candidates  int
-	Written     int64
+	BatchesRun int
+	Candidates int
+	Written    int64
+	// LastChunkID is the highest chunk_id seen in the LAST batch this call
+	// processed — a progress indicator for logging only (#270 deep-verify
+	// HIGH follow-up: Run no longer uses any checkpoint to decide what to
+	// fetch, so this field carries no resume semantics).
 	LastChunkID int64
-	// Done is true when the pass reached the end of the chunks table (the
-	// last FetchSparseContextCandidates call returned zero rows) — as
-	// opposed to stopping because MaxBatches was reached.
+	// Done is true when the pass found nothing left needing work (the last
+	// FetchSparseContextCandidates call returned zero rows) — as opposed to
+	// stopping because MaxBatches was reached.
 	Done bool
 }
 
@@ -81,13 +94,32 @@ type Summary struct {
 // "discard").
 type LogFunc func(format string, args ...any)
 
-// Run performs a checkpointed backfill pass and returns when either
+// Run performs one backfill pass and returns when either
 // FetchSparseContextCandidates is exhausted (Summary.Done=true) or
-// cfg.MaxBatches batches have run, whichever comes first. ctx cancellation
-// is checked between batches and during the inter-batch sleep — a run always
-// stops at a batch boundary, never mid-transaction, so the checkpoint it
-// leaves behind is always consistent with what was actually written (see
-// store.ChunkStore.UpsertSparseContextBatch's doc comment).
+// cfg.MaxBatches batches have run, whichever comes first. ctx cancellation is
+// checked between batches and during the inter-batch sleep.
+//
+// Run holds no state ACROSS CALLS and needs none for its real (writing)
+// path: FetchSparseContextCandidates decides what still needs work directly
+// from chunk_sparse_context's contents (an anti-join, #270 deep-verify HIGH
+// — see its doc comment in internal/store/chunk_sparse_context.go), so
+// interrupting a run and calling Run again with the same Config simply
+// continues — a chunk already written (and still fresh, for Sweep=false)
+// stops matching and is never re-fetched. Every non-dry-run batch passes
+// afterChunkID=0, so nothing here can cause a WRITE to skip a chunk,
+// including one whose insert committed, out of id order, after an earlier
+// batch — even one earlier in THIS SAME Run call — already looked past its
+// id.
+//
+// --dry-run is the one exception, and needs a small amount of state WITHIN
+// a single call: it never writes anything, so nothing else can advance the
+// anti-join between its batches — without SOME way to page forward, a
+// dry-run spanning more chunks than one batch would refetch the identical
+// first batch forever. Run tracks a local, in-memory-only cursor for this
+// case (see FetchSparseContextCandidates' afterChunkID doc comment for why
+// this is safe: a dry-run preview "skipping" a late-arriving low-id chunk
+// has no lasting effect, since it writes nothing — the very next real run
+// recomputes everything from scratch via the anti-join).
 func Run(ctx context.Context, s Store, cfg Config, logf LogFunc) (Summary, error) {
 	if logf == nil {
 		logf = func(string, ...any) {}
@@ -101,24 +133,14 @@ func Run(ctx context.Context, s Store, cfg Config, logf LogFunc) (Summary, error
 	}
 
 	version := cfg.Recipe
-	var checkpoint int64
 	if cfg.Sweep {
-		logf("sweep: restarting %s from chunk_id 0 (stale rows are skipped by the fingerprint check, not force-rewritten)", version)
-		if !cfg.DryRun {
-			if err := s.ResetSparseBackfillCheckpoint(ctx, version); err != nil {
-				return Summary{}, fmt.Errorf("reset checkpoint: %w", err)
-			}
-		}
+		logf("sweep: %s will also re-examine chunks whose row has gone stale (fingerprint mismatch)", version)
 	} else {
-		cp, err := s.SparseBackfillCheckpoint(ctx, version)
-		if err != nil {
-			return Summary{}, fmt.Errorf("read checkpoint: %w", err)
-		}
-		checkpoint = cp
-		logf("resuming %s from chunk_id %d", version, checkpoint)
+		logf("running %s (chunks with no row yet)", version)
 	}
 
-	summary := Summary{LastChunkID: checkpoint}
+	var summary Summary
+	var dryRunCursor int64 // only read/advanced when cfg.DryRun; always 0 otherwise (see doc comment above)
 	for {
 		if ctx.Err() != nil {
 			return summary, ctx.Err()
@@ -128,19 +150,20 @@ func Run(ctx context.Context, s Store, cfg Config, logf LogFunc) (Summary, error
 			break
 		}
 
-		candidates, err := s.FetchSparseContextCandidates(ctx, checkpoint, batchSize)
+		candidates, err := s.FetchSparseContextCandidates(ctx, version, cfg.Sweep, dryRunCursor, batchSize)
 		if err != nil {
 			return summary, fmt.Errorf("fetch candidates: %w", err)
 		}
 		if len(candidates) == 0 {
 			summary.Done = true
-			logf("done: no more chunks after chunk_id %d", checkpoint)
+			logf("done: no chunks left needing a %s row", version)
 			break
 		}
 		summary.BatchesRun++
 		summary.Candidates += len(candidates)
 
 		rows := make([]store.SparseContextRow, 0, len(candidates))
+		var batchLastID int64
 		for _, c := range candidates {
 			text, ok := chunkctx.BuildSparseText(cfg.Recipe, c.Doc, c.Content)
 			if !ok {
@@ -154,33 +177,35 @@ func Run(ctx context.Context, s Store, cfg Config, logf LogFunc) (Summary, error
 				Fingerprint: c.Fingerprint,
 				SparseText:  text,
 			})
-			checkpoint = c.ChunkID // candidates are ordered by c.id ascending (FetchSparseContextCandidates)
+			if c.ChunkID > batchLastID { // candidates arrive ascending by c.id (FetchSparseContextCandidates), so this is simply the last element's id
+				batchLastID = c.ChunkID
+			}
 		}
+		summary.LastChunkID = batchLastID
 
 		if cfg.DryRun {
-			logf("dry-run: batch %d would process %d chunk(s), checkpoint would advance to %d",
-				summary.BatchesRun, len(rows), checkpoint)
+			dryRunCursor = batchLastID // advance the LOCAL preview-only cursor so the next fetch pages forward instead of repeating this batch
+			logf("dry-run: batch %d would process %d chunk(s), up through chunk_id %d",
+				summary.BatchesRun, len(rows), batchLastID)
 		} else {
-			written, err := s.UpsertSparseContextBatch(ctx, version, rows, checkpoint)
+			written, err := s.UpsertSparseContextBatch(ctx, version, rows, batchLastID)
 			if err != nil {
 				return summary, fmt.Errorf("upsert batch: %w", err)
 			}
 			summary.Written += written
-			logf("batch %d: %d candidate(s), %d written, checkpoint=%d",
-				summary.BatchesRun, len(rows), written, checkpoint)
+			logf("batch %d: %d candidate(s), %d written, up through chunk_id %d",
+				summary.BatchesRun, len(rows), written, batchLastID)
 		}
 
 		if cfg.Sleep > 0 {
 			select {
 			case <-time.After(cfg.Sleep):
 			case <-ctx.Done():
-				summary.LastChunkID = checkpoint
 				return summary, ctx.Err()
 			}
 		}
 	}
 
-	summary.LastChunkID = checkpoint
 	return summary, nil
 }
 

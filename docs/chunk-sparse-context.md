@@ -79,6 +79,17 @@ disagree.
 2. **raw** — ordinary `chunks.content` matching, for any chunk that has
    `NOT EXISTS` a fresh row in branch 1.
 
+Each branch applies its own `ORDER BY rank DESC LIMIT` BEFORE the
+`UNION ALL` (#270 deep-verify MEDIUM), not once afterward on the combined
+set — `fresh.rank` (over the header+body `sparse_tsv`) and `raw.rank` (over
+plain `content_tsv`) are not on a comparable scale, so a single post-union
+limit let a flood of ordinary raw matches crowd every fresh (header) match
+out of the result entirely. Limiting per branch guarantees up to `limit`
+matches of EACH kind survive; the caller
+(`fuseChunkSparseCtx`, `internal/search/chunk_sparse_lane.go`) already
+over-fetches and re-aggregates/truncates in Go, so returning up to
+`2*limit` rows here is intentional.
+
 A title edit, a metadata merge, or a PII-redaction rewrite (the
 `pii_name_redacted` branch of `DocumentStore.AttachTranscript`) changes the
 fingerprint on the very next read — before any backfill worker re-runs — so
@@ -94,7 +105,10 @@ staleness (a wrong/stale header is never used).
 
 Verified against a real Postgres database in
 `internal/store/chunk_sparse_context_db_test.go`:
-`TestChunkSparseContext_StaleAfterTitleOnlyUpdate` and
+`TestSearchSparseContextFiltered_FreshNotCrowdedOutByRawVolume` (per-branch
+LIMIT), `TestSearchSparseContextFiltered_ExcludesSoftDeletedDocument`
+(neither branch returns a `status='deleted'` document, even with an
+existing context row), `TestChunkSparseContext_StaleAfterTitleOnlyUpdate` and
 `TestChunkSparseContext_PIIRedaction_OldNameStopsMatching`.
 
 ## Storage: why a separate table, not a `chunks` column
@@ -110,6 +124,14 @@ feature that may never become the default.
 `ON DELETE CASCADE` FK to `chunks.id`. `chunks` and `documents` are never
 touched by this feature — rollback is deleting rows from (or dropping) this
 one table and flipping the knob back.
+
+The FK itself does briefly touch `chunks`: PostgreSQL takes a
+`ShareRowExclusiveLock` on the referenced table (`chunks`) for the duration
+of the `CREATE TABLE ... REFERENCES chunks(id)` statement, to validate the
+constraint is satisfiable — on an empty `chunk_sparse_context` table this is
+milliseconds, not a concern, but it means the FIRST application of this
+migration briefly blocks concurrent DDL on `chunks` (not normal reads/writes,
+which `ShareRowExclusiveLock` does not conflict with).
 
 ```sql
 CREATE TABLE IF NOT EXISTS chunk_sparse_context (
@@ -138,27 +160,59 @@ sparsectx --recipe=v1-tp [--batch 500] [--sleep 200ms] [--dry-run=true|false] [-
 | Flag | Meaning |
 |---|---|
 | `--recipe` | `v1-tp` or `v1-full` — also becomes the row's `context_version`. Required. |
-| `--batch` | Chunks per transaction (fetch + upsert + checkpoint advance, all in ONE transaction — see `store.ChunkStore.UpsertSparseContextBatch`). Default 500. |
+| `--batch` | Chunks per transaction (fetch + upsert, in ONE transaction — see `store.ChunkStore.UpsertSparseContextBatch`). Default 500. |
 | `--sleep` | Pause between batches, to throttle load against a database serving live traffic. Default 200ms. |
 | `--dry-run` | Default **true** (matches `cmd/recordingbackfill`'s dry-run-by-default convention for scripts that mutate production data). Pass `--dry-run=false` to actually write. |
-| `--sweep` | Restart the checkpoint at 0 and re-examine every chunk. Rows whose document has not changed since the last pass still write 0 (see idempotency below) — a sweep is cheap once the corpus is mostly caught up. Use it to pick up documents that went stale (title/metadata edits) since the last full pass. |
+| `--sweep` | Also re-examine chunks whose row EXISTS but has gone stale (fingerprint no longer matches the document's current one). A plain run only picks up chunks with NO row yet — see idempotency below. |
 | `--limit` | Caps the total chunks processed THIS invocation (converted to `ceil(limit/batch)` batches internally). For staged rollout. |
 
-**Idempotent and resumable.** Each batch is one transaction: fetch
-candidates, compute `sparse_text` in Go
-(`internal/chunkctx.BuildSparseText`), `INSERT ... ON CONFLICT (chunk_id,
-context_version) DO UPDATE ... WHERE fingerprint/sparse_text differs`, and
-advance `chunk_sparse_backfill_state.last_chunk_id` — all committed
-together. A process killed mid-batch leaves the checkpoint exactly where the
-last FULLY COMMITTED batch left it, so re-running never skips a chunk and
-never double-processes one either. Re-running an already-current pass writes
-0 rows (the `WHERE ... IS DISTINCT FROM` clause skips unchanged rows).
+**Idempotent and resumable, with no coordination needed between runs.** Each
+batch is one transaction: fetch candidates, compute `sparse_text` in Go
+(`internal/chunkctx.BuildSparseText`), and `INSERT ... ON CONFLICT (chunk_id,
+context_version) DO UPDATE ... WHERE fingerprint/sparse_text differs`.
+
+Unlike an early version of this feature, candidates are selected by an
+**anti-join against `chunk_sparse_context`** — "does this chunk already have
+a row (fresh row, for `--sweep`) for this `context_version`" — not by a
+`chunk_id > checkpoint` cursor. A cursor can permanently skip a chunk: `id`
+values are assigned in statement-call order (`BIGSERIAL`), not commit order,
+so two concurrent inserts can commit out of id order; a cursor that has
+already advanced past the higher id never looks at the lower one again once
+it finally commits. The anti-join has no such blind spot — it asks about
+each chunk directly, every call, so a chunk that becomes visible late is
+picked up by whichever run happens next. `chunk_sparse_backfill_state.last_chunk_id`
+still gets written each batch, but purely as an operator-facing progress
+marker; nothing reads it to decide what to fetch.
+
+The one exception is `--dry-run` (never writes anything, so nothing else can
+advance the anti-join between ITS OWN batches): `internal/sparsectx.Run`
+keeps a small, purely local, in-memory cursor for that single invocation, so
+a multi-batch preview pages forward instead of re-fetching batch 1 forever.
+This is safe specifically because dry-run writes nothing — the very next
+invocation (dry-run or real) recomputes candidates from scratch via the
+anti-join, so nothing is ever permanently skipped. The real (`--dry-run=false`)
+path never uses this cursor, even across many batches within one long-running
+process — every write batch queries the anti-join alone.
+
+One consequence: because there is no cursor to resume from, plain
+(non-`--sweep`) runs only ever discover chunks with **no row yet** — new
+documents the collector chunked since the last pass. `--sweep` is what picks
+up **edited** documents (title rename, metadata merge, PII redaction) whose
+existing row went stale. Run the backfill **periodically** (e.g. a
+recurring off-peak job), not just once during the initial rollout — a
+one-time backfill plus an occasional manual `--sweep` is not enough to keep
+a live, continuously-collecting corpus caught up.
 
 Verified in `internal/sparsectx/sparsectx_test.go` (in-memory fake store:
-full pass, `--max-batches` early stop, resume, idempotent re-run, dry-run
-writes nothing, fetch-error propagation) and against a real Postgres
-database in `internal/store/chunk_sparse_context_db_test.go`
+full pass, `--max-batches` early stop, second pass only picks up
+still-missing chunks, plain pass finds nothing once caught up, `--sweep`
+re-examines only stale rows and leaves fresh ones alone, dry-run writes
+nothing AND correctly paginates across multiple batches instead of hanging
+(`TestRun_DryRun_PaginatesAcrossBatches_WithoutHanging`), fetch-error
+propagation) and against a real Postgres database in
+`internal/store/chunk_sparse_context_db_test.go`
 (`TestChunkSparseContext_BackfillRoundTrip_Idempotent`,
+`TestChunkSparseContext_Backfill_NoSkipOnOutOfOrderCommit`,
 `TestChunkSparseContext_BackfillResume_AfterSimulatedMidPassStop`,
 `TestChunkSparseContext_CascadeOnChunkReplace`).
 
@@ -181,9 +235,13 @@ database in `internal/store/chunk_sparse_context_db_test.go`
    printed in any check — count/size queries only).
 5. Run the full pass off-peak: `sparsectx --recipe=v1-tp --dry-run=false
    --sleep=200ms` (no `--limit`). Watch `pg_stat_activity` and search p95.
-   Interrupting and re-running resumes from the checkpoint.
+   Interrupting and re-running continues where it left off — no cursor to
+   restore, see idempotency above.
 6. Run `--sweep` once after the full pass to pick up any document that
-   changed mid-pass.
+   changed mid-pass. Keep running the backfill (with or without `--sweep`,
+   depending on whether you only need new chunks or also edited ones)
+   periodically afterward — the collector never writes
+   `chunk_sparse_context` rows itself.
 7. Repeat 3–6 for `v1-full` if that recipe is also being measured.
 8. Record index size (`pg_total_relation_size('chunk_sparse_context')`),
    backfill wall time, and search p95 on issue #270.

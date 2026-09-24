@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/store"
@@ -11,10 +12,14 @@ import (
 
 // fakeStore is an in-memory Store for testing Run's sequencing without a
 // database. It models chunks as an ordered slice (index+1 == chunk_id, like
-// BIGSERIAL) and a single checkpoint per context_version.
+// BIGSERIAL) and mirrors FetchSparseContextCandidates' real anti-join
+// semantics (internal/store/chunk_sparse_context.go) against its own
+// `upserted` map, rather than tracking a checkpoint — Run no longer has one
+// to pass in, and a fake that still filtered by "afterChunkID" would not
+// catch a regression back to the checkpoint-based query the #270 deep-verify
+// HIGH fix replaced.
 type fakeStore struct {
-	chunks      []store.SparseContextCandidate // ordered by ChunkID ascending
-	checkpoints map[string]int64
+	chunks []store.SparseContextCandidate // ordered by ChunkID ascending
 
 	upserted   map[string]map[int64]store.SparseContextRow // version -> chunk_id -> row
 	upsertErr  error
@@ -33,30 +38,43 @@ func newFakeStore(n int) *fakeStore {
 		}
 	}
 	return &fakeStore{
-		chunks:      chunks,
-		checkpoints: map[string]int64{},
-		upserted:    map[string]map[int64]store.SparseContextRow{},
+		chunks:   chunks,
+		upserted: map[string]map[int64]store.SparseContextRow{},
 	}
 }
 
-func (f *fakeStore) FetchSparseContextCandidates(_ context.Context, afterChunkID int64, batchSize int) ([]store.SparseContextCandidate, error) {
+// FetchSparseContextCandidates mirrors the real anti-join: a chunk qualifies
+// when it has no row yet for version (sweep=false), or additionally when its
+// existing row's fingerprint no longer matches the chunk's CURRENT
+// fingerprint (sweep=true) — see store.ChunkStore.FetchSparseContextCandidates'
+// doc comment. afterChunkID mirrors that method's pagination-hint parameter
+// (`c.id > afterChunkID`) — Run only ever passes a non-zero value for its
+// --dry-run local cursor; the real (write) path always passes 0.
+func (f *fakeStore) FetchSparseContextCandidates(_ context.Context, version string, sweep bool, afterChunkID int64, batchSize int) ([]store.SparseContextCandidate, error) {
 	f.fetchCalls++
 	if f.fetchErr != nil {
 		return nil, f.fetchErr
 	}
+	existing := f.upserted[version]
 	var out []store.SparseContextCandidate
 	for _, c := range f.chunks {
-		if c.ChunkID > afterChunkID {
-			out = append(out, c)
-			if len(out) >= batchSize {
-				break
+		if c.ChunkID <= afterChunkID {
+			continue
+		}
+		if row, has := existing[c.ChunkID]; has {
+			if !sweep || row.Fingerprint == c.Fingerprint {
+				continue // already has what it needs
 			}
+		}
+		out = append(out, c)
+		if len(out) >= batchSize {
+			break
 		}
 	}
 	return out, nil
 }
 
-func (f *fakeStore) UpsertSparseContextBatch(_ context.Context, version string, rows []store.SparseContextRow, checkpoint int64) (int64, error) {
+func (f *fakeStore) UpsertSparseContextBatch(_ context.Context, version string, rows []store.SparseContextRow, _ int64) (int64, error) {
 	if f.upsertErr != nil {
 		return 0, f.upsertErr
 	}
@@ -71,17 +89,7 @@ func (f *fakeStore) UpsertSparseContextBatch(_ context.Context, version string, 
 		}
 		f.upserted[version][r.ChunkID] = r
 	}
-	f.checkpoints[version] = checkpoint
 	return written, nil
-}
-
-func (f *fakeStore) SparseBackfillCheckpoint(_ context.Context, version string) (int64, error) {
-	return f.checkpoints[version], nil
-}
-
-func (f *fakeStore) ResetSparseBackfillCheckpoint(_ context.Context, version string) error {
-	f.checkpoints[version] = 0
-	return nil
 }
 
 func TestRun_UnknownRecipe_FailsBeforeAnyDBCall(t *testing.T) {
@@ -146,37 +154,41 @@ func TestRun_MaxBatches_StopsEarly_NotDone(t *testing.T) {
 	}
 }
 
-// TestRun_ResumesFromCheckpoint proves a second Run call, without --sweep,
-// picks up exactly where the checkpoint left off rather than re-scanning
-// from the start.
-func TestRun_ResumesFromCheckpoint(t *testing.T) {
+// TestRun_SecondPass_OnlyPicksUpChunksMissingARow proves a second Run call,
+// without --sweep, only returns the chunks the first (MaxBatches-limited)
+// call never wrote — driven purely by FetchSparseContextCandidates' anti-join
+// against what got upserted, not by any checkpoint value (#270 deep-verify
+// HIGH: Run holds no checkpoint state between calls at all now).
+func TestRun_SecondPass_OnlyPicksUpChunksMissingARow(t *testing.T) {
 	t.Parallel()
 
 	fs := newFakeStore(10)
 	if _, err := Run(context.Background(), fs, Config{Recipe: "v1-tp", BatchSize: 4, MaxBatches: 1}, nil); err != nil {
 		t.Fatalf("first Run: %v", err)
 	}
-	if fs.checkpoints["v1-tp"] != 4 {
-		t.Fatalf("checkpoint after first run = %d, want 4", fs.checkpoints["v1-tp"])
+	if got := len(fs.upserted["v1-tp"]); got != 4 {
+		t.Fatalf("rows written after first run = %d, want 4", got)
 	}
 
 	summary, err := Run(context.Background(), fs, Config{Recipe: "v1-tp", BatchSize: 4}, nil)
 	if err != nil {
 		t.Fatalf("second Run: %v", err)
 	}
-	if summary.Candidates != 6 { // chunks 5..10
-		t.Errorf("second run Candidates = %d, want 6 (resumed after chunk_id 4)", summary.Candidates)
+	if summary.Candidates != 6 { // chunks 5..10 (1..4 already have a row)
+		t.Errorf("second run Candidates = %d, want 6 (only chunks still missing a row)", summary.Candidates)
 	}
 	if !summary.Done {
 		t.Errorf("second run Done = false, want true")
 	}
 }
 
-// TestRun_Idempotent_SecondPassWritesZero proves re-running an already
-// up-to-date pass (same documents, same recipe) writes zero rows — the
-// property store.ChunkStore.UpsertSparseContextBatch's fingerprint/text
-// comparison exists to guarantee, exercised here through Run's sequencing.
-func TestRun_Idempotent_SecondPassWritesZero(t *testing.T) {
+// TestRun_SecondPass_Plain_FindsNothingLeft proves re-running an
+// already-fully-backfilled pass (Sweep=false, same documents, same recipe)
+// finds ZERO candidates on the very first fetch — not "fetches everything
+// again but writes nothing", which was the old (pre-#270-deep-verify)
+// checkpoint-driven design. The anti-join already excludes any chunk with an
+// existing row, so an up-to-date corpus short-circuits immediately.
+func TestRun_SecondPass_Plain_FindsNothingLeft(t *testing.T) {
 	t.Parallel()
 
 	fs := newFakeStore(5)
@@ -184,23 +196,69 @@ func TestRun_Idempotent_SecondPassWritesZero(t *testing.T) {
 		t.Fatalf("first Run: %v", err)
 	}
 
-	// --sweep re-examines every chunk from 0 without changing any document,
-	// so the second pass must write 0 rows even though it re-fetches all 5.
-	summary, err := Run(context.Background(), fs, Config{Recipe: "v1-tp", BatchSize: 5, Sweep: true}, nil)
+	summary, err := Run(context.Background(), fs, Config{Recipe: "v1-tp", BatchSize: 5}, nil)
 	if err != nil {
-		t.Fatalf("sweep Run: %v", err)
+		t.Fatalf("second Run: %v", err)
 	}
-	if summary.Candidates != 5 {
-		t.Errorf("sweep Candidates = %d, want 5 (sweep re-examines everything)", summary.Candidates)
+	if summary.Candidates != 0 {
+		t.Errorf("second run Candidates = %d, want 0 (every chunk already has a fresh row)", summary.Candidates)
 	}
-	if summary.Written != 0 {
-		t.Errorf("sweep Written = %d, want 0 (no document changed since the first pass)", summary.Written)
+	if summary.BatchesRun != 0 {
+		t.Errorf("second run BatchesRun = %d, want 0", summary.BatchesRun)
+	}
+	if !summary.Done {
+		t.Errorf("second run Done = false, want true")
 	}
 }
 
-// TestRun_DryRun_NoWrites proves --dry-run computes candidates but calls
-// neither UpsertSparseContextBatch nor ResetSparseBackfillCheckpoint (the
-// mutating store methods) — only FetchSparseContextCandidates is exercised.
+// TestRun_Sweep_ReExaminesOnlyStaleRows proves --sweep's actual contract:
+// it re-queues a chunk whose row has gone stale (fingerprint no longer
+// matches — a title/metadata edit happened after the row was written) but
+// leaves every still-fresh row untouched, neither re-fetching nor
+// re-upserting it. This is the behavior chunk_sparse_context.go's fix
+// (#270 deep-verify HIGH) enables: sweep no longer needs to blindly re-scan
+// the whole corpus to find the few documents that actually changed.
+func TestRun_Sweep_ReExaminesOnlyStaleRows(t *testing.T) {
+	t.Parallel()
+
+	fs := newFakeStore(5)
+	if _, err := Run(context.Background(), fs, Config{Recipe: "v1-tp", BatchSize: 5}, nil); err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+
+	// Simulate chunk_id=3's parent document changing (title edit): its
+	// CURRENT fingerprint no longer matches the one baked into the row
+	// UpsertSparseContextBatch already wrote.
+	fs.chunks[2].Fingerprint = "fp-v2"
+
+	// A plain (non-sweep) pass must NOT pick it up — that is exactly the
+	// staleness gap SearchSparseContextFiltered's raw-content fallback
+	// covers until a sweep runs.
+	plain, err := Run(context.Background(), fs, Config{Recipe: "v1-tp", BatchSize: 5}, nil)
+	if err != nil {
+		t.Fatalf("plain Run: %v", err)
+	}
+	if plain.Candidates != 0 {
+		t.Errorf("plain run Candidates = %d, want 0 (sweep=false must not chase stale fingerprints)", plain.Candidates)
+	}
+
+	sweep, err := Run(context.Background(), fs, Config{Recipe: "v1-tp", BatchSize: 5, Sweep: true}, nil)
+	if err != nil {
+		t.Fatalf("sweep Run: %v", err)
+	}
+	if sweep.Candidates != 1 {
+		t.Errorf("sweep Candidates = %d, want 1 (only the stale chunk)", sweep.Candidates)
+	}
+	if sweep.Written != 1 {
+		t.Errorf("sweep Written = %d, want 1", sweep.Written)
+	}
+	if got := fs.upserted["v1-tp"][3].Fingerprint; got != "fp-v2" {
+		t.Errorf("stored fingerprint after sweep = %q, want %q (row must be refreshed)", got, "fp-v2")
+	}
+}
+
+// TestRun_DryRun_NoWrites proves --dry-run computes candidates but never
+// calls the mutating store method (UpsertSparseContextBatch).
 func TestRun_DryRun_NoWrites(t *testing.T) {
 	t.Parallel()
 
@@ -215,8 +273,46 @@ func TestRun_DryRun_NoWrites(t *testing.T) {
 	if len(fs.upserted["v1-tp"]) != 0 {
 		t.Errorf("dry-run wrote %d rows, want 0", len(fs.upserted["v1-tp"]))
 	}
-	if fs.checkpoints["v1-tp"] != 0 {
-		t.Errorf("dry-run checkpoint = %d, want 0 (unadvanced)", fs.checkpoints["v1-tp"])
+}
+
+// TestRun_DryRun_PaginatesAcrossBatches_WithoutHanging is a regression test:
+// --dry-run never calls UpsertSparseContextBatch, so nothing advances the
+// anti-join between batches on its own. An earlier version of this fix
+// dropped the pagination cursor entirely (relying purely on the anti-join,
+// correct for the WRITE path) and broke this — a multi-batch dry-run with no
+// --max-batches would refetch the exact same first batch forever, hanging.
+// This corpus (9 chunks, batch size 4 => 3 batches) exercises exactly that:
+// t.Deadline()-bounded, so a real hang fails the test instead of the suite.
+func TestRun_DryRun_PaginatesAcrossBatches_WithoutHanging(t *testing.T) {
+	t.Parallel()
+
+	fs := newFakeStore(9)
+	done := make(chan struct{})
+	var summary Summary
+	var err error
+	go func() {
+		summary, err = Run(context.Background(), fs, Config{Recipe: "v1-tp", BatchSize: 4, DryRun: true}, nil)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run(DryRun=true) did not return within 5s — likely refetching the same batch forever")
+	}
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if !summary.Done {
+		t.Errorf("Done = false, want true")
+	}
+	if summary.Candidates != 9 {
+		t.Errorf("Candidates = %d, want 9 (must see every chunk exactly once across 3 batches, not repeat batch 1)", summary.Candidates)
+	}
+	if summary.BatchesRun != 3 {
+		t.Errorf("BatchesRun = %d, want 3", summary.BatchesRun)
+	}
+	if got := len(fs.upserted["v1-tp"]); got != 0 {
+		t.Errorf("dry-run wrote %d rows, want 0", got)
 	}
 }
 

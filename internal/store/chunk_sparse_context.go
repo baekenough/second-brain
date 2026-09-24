@@ -42,18 +42,67 @@ type SparseContextCandidate struct {
 	Doc         model.Document // SourceType, Title, OccurredAt, Metadata only
 }
 
-// FetchSparseContextCandidates returns up to batchSize chunks with
-// c.id > afterChunkID, ordered by c.id, each joined to its parent document's
-// header-relevant fields and current fingerprint. The caller
-// (internal/sparsectx) builds sparse_text from these via
+// FetchSparseContextCandidates returns up to batchSize chunks that still
+// need a chunk_sparse_context row for version, ordered by c.id, each joined
+// to its parent document's header-relevant fields and current fingerprint.
+// The caller (internal/sparsectx) builds sparse_text from these via
 // internal/chunkctx.BuildSparseText and writes them back with
 // UpsertSparseContextBatch — in a SEPARATE call, deliberately: building
 // sparse_text needs no database access, and keeping it out of this method
 // keeps store free of internal/chunkctx (search/store -> chunkctx is fine;
 // this file just does not need to import it).
-func (s *ChunkStore) FetchSparseContextCandidates(ctx context.Context, afterChunkID int64, batchSize int) ([]SparseContextCandidate, error) {
+//
+// "Still needs a row" is an anti-join against chunk_sparse_context, NOT a
+// c.id > checkpoint filter (#270 deep-verify HIGH): a chunk whose INSERT
+// commits with a LOWER id than one already scanned by an earlier batch — a
+// real race, since chunks.id (BIGSERIAL) is assigned in statement-call
+// order, not commit order, so two concurrent inserters can commit
+// out-of-order — must still be found by the NEXT call. A checkpoint
+// (`WHERE c.id > $checkpoint`) can permanently skip that chunk once the
+// checkpoint has advanced past its id; the anti-join cannot, because it asks
+// "does chunk_sparse_context already have what I need for THIS chunk", never
+// "have I already looked past this id".
+//
+//   - sweep=false (a plain pass): a chunk qualifies if it has NO row at all
+//     for version — the common case, picking up newly chunked documents.
+//     A chunk whose row exists but has gone stale (title/metadata edit)
+//     is NOT re-queued here; SearchSparseContextFiltered already falls back
+//     to raw content matching for it in the meantime (chunk_sparse_search.go).
+//   - sweep=true: a chunk also qualifies if its row's fingerprint no longer
+//     matches the document's CURRENT fingerprint (chunkSparseFingerprintSQL,
+//     evaluated fresh here) — i.e. it exists but is stale. This is how
+//     --sweep "catches up" documents edited since the last full pass,
+//     without needing to re-verify every already-fresh row on every call.
+//
+// This makes the method naturally idempotent and safe to call repeatedly
+// with no coordination: rows already written (and still fresh, for the
+// sweep=false case) simply stop matching the anti-join and are never
+// returned again — resumability falls out of that property for free, with
+// no checkpoint read required before the first call of a pass.
+//
+// afterChunkID is an OPTIONAL pagination hint (`AND c.id > afterChunkID`),
+// NOT a correctness mechanism — pass 0 to consider every chunk. It exists
+// for exactly one caller: internal/sparsectx.Run's --dry-run path, which
+// never writes anything, so nothing else can advance the anti-join between
+// its batches; Run tracks a local, in-memory cursor there purely to page
+// through a read-only preview. The real (writing) path in Run always passes
+// 0 — using a non-zero afterChunkID there would reintroduce exactly the
+// skip bug the anti-join fixes (#270 deep-verify HIGH): a chunk whose commit
+// lands, out of id order, behind a cursor a PRIOR real batch already
+// advanced past would never be looked at again. A dry-run "skipping" such a
+// chunk in its preview has no such consequence — it writes nothing, so the
+// very next (real or dry-run) invocation recomputes candidates from
+// scratch via the anti-join with a fresh cursor of its own.
+func (s *ChunkStore) FetchSparseContextCandidates(ctx context.Context, version string, sweep bool, afterChunkID int64, batchSize int) ([]SparseContextCandidate, error) {
 	if batchSize <= 0 {
 		batchSize = 500
+	}
+	staleCheck := ""
+	if sweep {
+		// Sweep also excludes a row whose fingerprint is CURRENTLY fresh —
+		// so only fresh rows count as "already has what it needs"; a stale
+		// row (present but outdated) still qualifies as a candidate.
+		staleCheck = ` AND sc.fingerprint = ` + chunkSparseFingerprintSQL
 	}
 	q := `
 		SELECT c.id, c.content, ` + chunkSparseFingerprintSQL + `,
@@ -61,10 +110,14 @@ func (s *ChunkStore) FetchSparseContextCandidates(ctx context.Context, afterChun
 		FROM chunks c
 		JOIN documents d ON d.id = c.document_id
 		WHERE c.id > $1
+		  AND NOT EXISTS (
+			SELECT 1 FROM chunk_sparse_context sc
+			WHERE sc.chunk_id = c.id AND sc.context_version = $2` + staleCheck + `
+		)
 		ORDER BY c.id
-		LIMIT $2`
+		LIMIT $3`
 
-	rows, err := s.pg.pool.Query(ctx, q, afterChunkID, batchSize)
+	rows, err := s.pg.pool.Query(ctx, q, afterChunkID, version, batchSize)
 	if err != nil {
 		return nil, fmt.Errorf("fetch sparse context candidates: %w", err)
 	}
@@ -98,10 +151,14 @@ type SparseContextRow struct {
 }
 
 // UpsertSparseContextBatch writes rows for context_version in ONE
-// transaction and advances the batch's checkpoint (chunk_sparse_backfill_state)
-// in the SAME transaction — a process killed mid-batch never leaves the
-// checkpoint ahead of what was actually committed, so resuming from the
-// checkpoint never skips a chunk.
+// transaction and records the batch's highest chunk_id in
+// chunk_sparse_backfill_state in the SAME transaction, purely as an
+// observability/progress marker for operators (e.g. "how far has any pass
+// ever written up to") — correctness no longer depends on this value.
+// FetchSparseContextCandidates' anti-join (chunk_sparse_context.go) decides
+// what still needs work from the data itself, not from this checkpoint, so a
+// process killed mid-batch (leaving the checkpoint behind, ahead of, or
+// exactly at what committed) can never cause the NEXT call to skip a chunk.
 //
 // The upsert is idempotent by design: ON CONFLICT only writes when the
 // fingerprint or sparse_text actually differs from what is already stored,
@@ -109,9 +166,9 @@ type SparseContextRow struct {
 // written (see the WHERE clause below) even though the checkpoint UPDATE
 // still runs.
 //
-// checkpoint is the last (highest) chunk_id in rows — the caller
-// (internal/sparsectx) is responsible for passing candidates in ascending
-// c.id order (FetchSparseContextCandidates already returns them that way).
+// checkpoint is the highest chunk_id in rows — the caller (internal/sparsectx)
+// is responsible for passing candidates in ascending c.id order
+// (FetchSparseContextCandidates already returns them that way).
 func (s *ChunkStore) UpsertSparseContextBatch(ctx context.Context, version string, rows []SparseContextRow, checkpoint int64) (written int64, err error) {
 	tx, err := s.pg.pool.Begin(ctx)
 	if err != nil {
@@ -155,7 +212,11 @@ func (s *ChunkStore) UpsertSparseContextBatch(ctx context.Context, version strin
 }
 
 // SparseBackfillCheckpoint returns the last chunk_id processed for version,
-// or 0 if no pass has ever run (or completed a batch) for it.
+// or 0 if no pass has ever run (or completed a batch) for it. Informational
+// only (see UpsertSparseContextBatch's doc comment) — internal/sparsectx.Run
+// no longer reads this before deciding what to fetch next;
+// FetchSparseContextCandidates' anti-join answers that from the data
+// directly. Exposed for operators who want to check backfill progress.
 func (s *ChunkStore) SparseBackfillCheckpoint(ctx context.Context, version string) (int64, error) {
 	var last int64
 	err := s.pg.pool.QueryRow(ctx,
@@ -171,9 +232,12 @@ func (s *ChunkStore) SparseBackfillCheckpoint(ctx context.Context, version strin
 	return last, nil
 }
 
-// ResetSparseBackfillCheckpoint restarts version's checkpoint from 0 —
-// backing cmd/sparsectx's --sweep flag, which recomputes every chunk so
-// fingerprints that went stale after the LAST pass finished are refreshed.
+// ResetSparseBackfillCheckpoint restarts version's checkpoint marker at 0.
+// --sweep (cmd/sparsectx) no longer needs this to force a full re-scan —
+// FetchSparseContextCandidates(ctx, version, sweep=true, ...) already
+// re-examines stale rows regardless of this value — kept only so the
+// informational checkpoint does not read as "already past everything" after
+// an operator explicitly asks for a sweep.
 func (s *ChunkStore) ResetSparseBackfillCheckpoint(ctx context.Context, version string) error {
 	_, err := s.pg.pool.Exec(ctx, `
 		INSERT INTO chunk_sparse_backfill_state (context_version, last_chunk_id, pass_started_at, updated_at)

@@ -26,6 +26,21 @@ import (
 // filters applies the SAME document eligibility (source/window/retention)
 // chunkEligibilitySQL already defines for every other chunk lane, applied
 // identically inside BOTH branches below (both alias documents as `d`).
+//
+// LIMIT is applied INSIDE each CTE (#270 deep-verify MEDIUM), not once on
+// the UNION ALL of both — fresh.rank (over sparse_tsv, header+body) and
+// raw.rank (over content_tsv, body only) come from two different tsvector
+// populations and are not calibrated against each other; a raw-content
+// lane with many high-frequency matches can outnumber and outrank every
+// fresh match, and a single post-union LIMIT would then drop fresh rows
+// entirely — even though a fresh match (a name findable only via the
+// header) is exactly the result this lane exists to surface. Limiting each
+// branch independently first guarantees up to `limit` of EACH kind survive
+// into the combined result; the caller (fuseChunkSparseCtx,
+// internal/search/chunk_sparse_lane.go) already over-fetches (limit*3) and
+// does its own per-document aggregation/truncation in Go, so returning up
+// to 2*limit rows here (rather than a single hard cap) is intentional, not
+// a leak.
 func (s *ChunkStore) SearchSparseContextFiltered(ctx context.Context, filter model.SearchQuery, limit int, version string) ([]ChunkSearchResult, error) {
 	query := filter.Query
 	if limit <= 0 {
@@ -57,6 +72,8 @@ func (s *ChunkStore) SearchSparseContextFiltered(ctx context.Context, filter mod
 			  AND sc.fingerprint = ` + chunkSparseFingerprintSQL + `
 			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
 			  AND d.status = 'active' ` + filters + `
+			ORDER BY rank DESC
+			LIMIT $2
 		),
 		raw AS (
 			SELECT
@@ -81,12 +98,13 @@ func (s *ChunkStore) SearchSparseContextFiltered(ctx context.Context, filter mod
 			)
 			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
 			AND d.status = 'active' ` + filters + `
+			ORDER BY rank DESC
+			LIMIT $2
 		)
 		SELECT * FROM fresh
 		UNION ALL
 		SELECT * FROM raw
-		ORDER BY rank DESC
-		LIMIT $2`
+		ORDER BY rank DESC`
 
 	rows, err := s.pg.pool.Query(ctx, q, args...)
 	if err != nil {

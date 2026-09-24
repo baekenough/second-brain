@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -136,7 +137,7 @@ func TestChunkSparseContext_BackfillRoundTrip_Idempotent(t *testing.T) {
 	docID := seedSparseCtxDoc(t, pg, "note", "예산 회의록", nil)
 	chunkID := seedSparseCtxChunk(t, pg, docID, "3분기 예산안을 논의했다")
 
-	candidates, err := cs.FetchSparseContextCandidates(ctx, chunkID-1, 10)
+	candidates, err := cs.FetchSparseContextCandidates(ctx, "v1-tp", false, 0, 10)
 	if err != nil {
 		t.Fatalf("FetchSparseContextCandidates: %v", err)
 	}
@@ -255,7 +256,7 @@ func TestChunkSparseContext_StaleAfterTitleOnlyUpdate(t *testing.T) {
 	docID := seedSparseCtxDoc(t, pg, "note", "원래 제목", nil)
 	chunkID := seedSparseCtxChunk(t, pg, docID, "본문 내용")
 
-	candidates, err := cs.FetchSparseContextCandidates(ctx, chunkID-1, 1)
+	candidates, err := cs.FetchSparseContextCandidates(ctx, "v1-tp", false, 0, 1)
 	if err != nil || len(candidates) != 1 {
 		t.Fatalf("FetchSparseContextCandidates: %v (%d rows)", err, len(candidates))
 	}
@@ -296,7 +297,10 @@ func TestChunkSparseContext_StaleAfterTitleOnlyUpdate(t *testing.T) {
 
 	// The fingerprint recomputed from the CURRENT document row must now
 	// differ from what was stored — proving the context row reads as stale.
-	refreshed, err := cs.FetchSparseContextCandidates(ctx, chunkID-1, 1)
+	// sweep=true: the row EXISTS (from the UpsertSparseContextBatch call
+	// above), so only a stale-fingerprint check surfaces it as a candidate —
+	// a plain (sweep=false) fetch would correctly NOT return it here.
+	refreshed, err := cs.FetchSparseContextCandidates(ctx, "v1-tp", true, 0, 1)
 	if err != nil || len(refreshed) != 1 {
 		t.Fatalf("FetchSparseContextCandidates (post-update): %v (%d rows)", err, len(refreshed))
 	}
@@ -370,7 +374,7 @@ func TestChunkSparseContext_PIIRedaction_OldNameStopsMatching(t *testing.T) {
 
 	chunkID := seedSparseCtxChunk(t, pg, doc.ID, doc.Content)
 
-	candidates, err := cs.FetchSparseContextCandidates(ctx, chunkID-1, 1)
+	candidates, err := cs.FetchSparseContextCandidates(ctx, "v1-tp", false, 0, 1)
 	if err != nil || len(candidates) != 1 {
 		t.Fatalf("FetchSparseContextCandidates: %v (%d rows)", err, len(candidates))
 	}
@@ -399,7 +403,9 @@ func TestChunkSparseContext_PIIRedaction_OldNameStopsMatching(t *testing.T) {
 		t.Fatalf("content_changed = false after redaction, want true (redaction must force chunk rebuild eligibility)")
 	}
 
-	refreshed, err := cs.FetchSparseContextCandidates(ctx, chunkID-1, 1)
+	// sweep=true: the pre-redaction row still exists (if the chunk itself
+	// was not rebuilt), so only a stale-fingerprint check can surface it.
+	refreshed, err := cs.FetchSparseContextCandidates(ctx, "v1-tp", true, 0, 1)
 	if err != nil || len(refreshed) != 1 {
 		// The chunk may have been rebuilt (new chunk_id) if the caller
 		// re-chunks on content_changed=true — either way, the OLD chunk_id's
@@ -457,14 +463,17 @@ func TestSearchSparseContextFiltered_FiltersPreserved(t *testing.T) {
 
 func sourceTypePtr(st model.SourceType) *model.SourceType { return &st }
 
-// TestChunkSparseContext_BackfillResume_AfterSimulatedMidPassStop proves the
-// checkpoint (chunk_sparse_backfill_state) survives a simulated interruption
-// — a batch that runs and commits, then a process restart that must resume
-// from the LAST COMMITTED chunk_id rather than re-scanning from 0 or losing
-// progress. Uses a unique context_version string (not one of the two
-// production recipe names) so this test's checkpoint can never collide with
-// any other test in this file that writes "v1-tp"/"v1-full" rows against the
-// SAME shared disposable database.
+// TestChunkSparseContext_BackfillResume_AfterSimulatedMidPassStop proves a
+// simulated interruption — a batch that runs and commits, then a process
+// restart — never re-processes already-committed chunks and never loses the
+// remaining ones, driven entirely by FetchSparseContextCandidates' anti-join
+// (#270 deep-verify HIGH), with chunk_sparse_backfill_state's checkpoint
+// checked only as the informational marker it now is (see
+// UpsertSparseContextBatch's doc comment) — NOT as what the "restart" fetch
+// call below reads from. Uses a unique context_version string (not one of
+// the two production recipe names) so this test's rows can never collide
+// with any other test in this file that writes "v1-tp"/"v1-full" rows
+// against the SAME shared disposable database.
 func TestChunkSparseContext_BackfillResume_AfterSimulatedMidPassStop(t *testing.T) {
 	pg := sparseCtxTestDB(t)
 	cs := NewChunkStore(pg)
@@ -476,11 +485,10 @@ func TestChunkSparseContext_BackfillResume_AfterSimulatedMidPassStop(t *testing.
 		docID := seedSparseCtxDoc(t, pg, "note", "재개 테스트", nil)
 		chunkIDs = append(chunkIDs, seedSparseCtxChunk(t, pg, docID, "청크"))
 	}
-	lowestChunkID := chunkIDs[0] // ReplaceDocument/BIGSERIAL: ascending per insert order
 
-	// Batch 1: process only the first 2 chunks (>= lowestChunkID-1), commit,
-	// and record the checkpoint — simulating a process that then stops.
-	batch1, err := cs.FetchSparseContextCandidates(ctx, lowestChunkID-1, 2)
+	// Batch 1: process only the first 2 chunks, commit, and record the
+	// (informational) checkpoint — simulating a process that then stops.
+	batch1, err := cs.FetchSparseContextCandidates(ctx, version, false, 0, 2)
 	if err != nil || len(batch1) != 2 {
 		t.Fatalf("FetchSparseContextCandidates batch1: %v (%d rows)", err, len(batch1))
 	}
@@ -500,10 +508,10 @@ func TestChunkSparseContext_BackfillResume_AfterSimulatedMidPassStop(t *testing.
 		t.Fatalf("checkpoint after batch1 = %d, want %d", cpAfterBatch1, batch1[1].ChunkID)
 	}
 
-	// "Restart": a fresh read of the checkpoint (simulating a new process)
-	// must resume from cpAfterBatch1, not 0 — the remaining 3 chunks this
-	// test seeded (and nothing already-processed) come back.
-	resumed, err := cs.FetchSparseContextCandidates(ctx, cpAfterBatch1, 100)
+	// "Restart": a FRESH call — passing no positional cursor at all, just
+	// (version, sweep=false) — must still return exactly the 3 chunks batch1
+	// did not process, and none it did. Nothing here reads cpAfterBatch1.
+	resumed, err := cs.FetchSparseContextCandidates(ctx, version, false, 0, 100)
 	if err != nil {
 		t.Fatalf("FetchSparseContextCandidates on resume: %v", err)
 	}
@@ -556,5 +564,225 @@ func TestChunkSparseContext_BackfillResume_AfterSimulatedMidPassStop(t *testing.
 	}
 	if count != 5 {
 		t.Errorf("final row count = %d, want 5 (all seeded chunks backfilled exactly once)", count)
+	}
+}
+
+// TestChunkSparseContext_Backfill_NoSkipOnOutOfOrderCommit reproduces the
+// #270 deep-verify HIGH race directly against real Postgres MVCC: chunks.id
+// (BIGSERIAL) is assigned in statement-call order, NOT commit order, so a
+// transaction that inserts FIRST but commits LAST leaves a LOWER chunk_id
+// becoming visible to other sessions only AFTER a batch has already looked
+// at (and moved past) a HIGHER id from a transaction that inserted later but
+// committed first. A `WHERE c.id > $checkpoint` query can never see that
+// low-id chunk again once a checkpoint derived from the earlier batch has
+// advanced past it. FetchSparseContextCandidates' anti-join
+// (chunk_sparse_context.go) has no such blind spot: it asks "does THIS
+// chunk already have what it needs" on every call, never "have I already
+// looked past this id" — so re-running after the commit lands must still
+// find it.
+func TestChunkSparseContext_Backfill_NoSkipOnOutOfOrderCommit(t *testing.T) {
+	pg := sparseCtxTestDB(t)
+	cs := NewChunkStore(pg)
+	ctx := context.Background()
+	version := "zz-test-race-" + uuid.NewString()[:8]
+
+	// Two SEPARATE documents (avoids the chunks(document_id, chunk_index)
+	// UNIQUE constraint blocking on the still-open transaction below).
+	lowDocID := seedSparseCtxDoc(t, pg, "note", "낮은 id 문서", nil)
+	highDocID := seedSparseCtxDoc(t, pg, "note", "높은 id 문서", nil)
+
+	// Session A: begin a transaction and insert lowDocID's chunk WITHOUT
+	// committing. The chunk_id sequence value is allocated immediately
+	// (BIGSERIAL sequences are non-transactional), but the ROW stays
+	// invisible to every OTHER session (MVCC) until this transaction
+	// commits — simulating a slow/long-running writer (e.g. a large
+	// document still being chunked).
+	txA, err := pg.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin txA: %v", err)
+	}
+	t.Cleanup(func() { _ = txA.Rollback(context.Background()) }) // no-op if already committed
+	var lowChunkID int64
+	if err := txA.QueryRow(ctx,
+		`INSERT INTO chunks (document_id, chunk_index, content, byte_size) VALUES ($1, 0, $2, 10) RETURNING id`,
+		lowDocID, "낮은 id 청크",
+	).Scan(&lowChunkID); err != nil {
+		t.Fatalf("insert low-id chunk (uncommitted): %v", err)
+	}
+
+	// Session B: a SEPARATE connection (via the pool, not txA) inserts and
+	// COMMITS highDocID's chunk, which gets a HIGHER id — the sequence
+	// already advanced past lowChunkID by the time this statement runs —
+	// even though ITS transaction commits FIRST.
+	highChunkID := seedSparseCtxChunk(t, pg, highDocID, "높은 id 청크")
+	if highChunkID <= lowChunkID {
+		t.Fatalf("test setup broken: highChunkID=%d must be > lowChunkID=%d", highChunkID, lowChunkID)
+	}
+
+	// A batch runs while txA is STILL OPEN: the low-id chunk is invisible to
+	// every other session, so only the high-id chunk can possibly be seen.
+	batch1, err := cs.FetchSparseContextCandidates(ctx, version, false, 0, 10)
+	if err != nil {
+		t.Fatalf("FetchSparseContextCandidates (batch 1): %v", err)
+	}
+	var sawHigh, sawLow bool
+	for _, c := range batch1 {
+		if c.ChunkID == highChunkID {
+			sawHigh = true
+		}
+		if c.ChunkID == lowChunkID {
+			sawLow = true
+		}
+	}
+	if sawLow {
+		t.Fatalf("batch 1 saw the still-uncommitted low-id chunk_id=%d — MVCC violation in the test setup itself", lowChunkID)
+	}
+	if !sawHigh {
+		t.Fatalf("batch 1 did not see the committed high-id chunk_id=%d: %+v", highChunkID, batch1)
+	}
+	rows1 := make([]SparseContextRow, 0, len(batch1))
+	for _, c := range batch1 {
+		rows1 = append(rows1, SparseContextRow{ChunkID: c.ChunkID, Fingerprint: c.Fingerprint, SparseText: "제목: 높은 id 문서\n\n높은 id 청크"})
+	}
+	if _, err := cs.UpsertSparseContextBatch(ctx, version, rows1, highChunkID); err != nil {
+		t.Fatalf("UpsertSparseContextBatch (batch 1): %v", err)
+	}
+
+	// NOW txA commits — the low-id chunk becomes visible for the FIRST time,
+	// AFTER a batch already wrote a row for a chunk with a HIGHER id.
+	if err := txA.Commit(ctx); err != nil {
+		t.Fatalf("commit txA: %v", err)
+	}
+
+	// A later batch (the periodic re-run every real backfill worker does —
+	// see docs/chunk-sparse-context.md) MUST still pick up the low-id chunk:
+	// it has no row yet, so the anti-join matches it regardless of any id it
+	// is numerically "behind".
+	batch2, err := cs.FetchSparseContextCandidates(ctx, version, false, 0, 10)
+	if err != nil {
+		t.Fatalf("FetchSparseContextCandidates (batch 2): %v", err)
+	}
+	var sawLowBatch2 bool
+	for _, c := range batch2 {
+		if c.ChunkID == lowChunkID {
+			sawLowBatch2 = true
+		}
+	}
+	if !sawLowBatch2 {
+		t.Fatalf("batch 2 (after txA committed) did not pick up low-id chunk_id=%d — a checkpoint-based `WHERE c.id > checkpoint` query would skip it forever here, because a checkpoint derived from batch 1 already advanced past it (%d)", lowChunkID, highChunkID)
+	}
+}
+
+// TestSearchSparseContextFiltered_FreshNotCrowdedOutByRawVolume proves the
+// #270 deep-verify MEDIUM fix: LIMIT is applied INSIDE each CTE before the
+// UNION ALL, so a flood of high-rank raw-content matches can never push a
+// fresh (header) match out of the result entirely. fresh.rank (over
+// sc.sparse_tsv) and raw.rank (over c.content_tsv) are computed from
+// different tsvector populations and are not on a comparable scale, so a
+// SINGLE limit applied after combining both would let raw volume alone
+// decide the outcome — even when the fresh branch found exactly the
+// document this lane exists to surface (a name reachable only via the
+// header, never the body).
+func TestSearchSparseContextFiltered_FreshNotCrowdedOutByRawVolume(t *testing.T) {
+	pg := sparseCtxTestDB(t)
+	cs := NewChunkStore(pg)
+	ctx := context.Background()
+
+	term := "유일토큰" + uuid.NewString()[:8]
+
+	// The ONE fresh match: the term appears ONLY in the header (title), not
+	// in the chunk body — findable exclusively via sc.sparse_tsv.
+	freshDocID := seedSparseCtxDoc(t, pg, "note", term+" 프로젝트", nil)
+	freshChunkID := seedSparseCtxChunk(t, pg, freshDocID, "예산 논의")
+
+	freshCandidates, err := cs.FetchSparseContextCandidates(ctx, "v1-tp", false, 0, 50)
+	if err != nil {
+		t.Fatalf("FetchSparseContextCandidates: %v", err)
+	}
+	var freshFingerprint string
+	for _, c := range freshCandidates {
+		if c.ChunkID == freshChunkID {
+			freshFingerprint = c.Fingerprint
+		}
+	}
+	if freshFingerprint == "" {
+		t.Fatalf("fresh candidate for chunk_id=%d not found among %d fetched", freshChunkID, len(freshCandidates))
+	}
+	if _, err := cs.UpsertSparseContextBatch(ctx, "v1-tp", []SparseContextRow{
+		{ChunkID: freshChunkID, Fingerprint: freshFingerprint, SparseText: "제목: " + term + " 프로젝트\n\n예산 논의"},
+	}, freshChunkID); err != nil {
+		t.Fatalf("UpsertSparseContextBatch: %v", err)
+	}
+
+	// Five RAW-only matches (no context row at all — never upserted), each
+	// repeating the term heavily so ts_rank ranks every one of them well
+	// above the fresh chunk's single header occurrence.
+	for i := 0; i < 5; i++ {
+		docID := seedSparseCtxDoc(t, pg, "note", "잡음 문서", nil)
+		seedSparseCtxChunk(t, pg, docID, strings.Repeat(term+" ", 10))
+	}
+
+	// limit=2: small enough that, pre-fix, all 2 slots would be consumed by
+	// higher-ranked raw matches and the fresh chunk would never appear.
+	results, err := cs.SearchSparseContextFiltered(ctx, model.SearchQuery{Query: term}, 2, "v1-tp")
+	if err != nil {
+		t.Fatalf("SearchSparseContextFiltered: %v", err)
+	}
+	var foundFresh bool
+	for _, r := range results {
+		if r.ID == freshChunkID {
+			foundFresh = true
+		}
+	}
+	if !foundFresh {
+		t.Errorf("fresh chunk_id=%d crowded out by raw-volume matches: %+v", freshChunkID, results)
+	}
+}
+
+// TestSearchSparseContextFiltered_ExcludesSoftDeletedDocument proves (#270
+// deep-verify LOW) that a soft-deleted document (status='deleted') is
+// excluded from BOTH branches of SearchSparseContextFiltered — even one
+// with an existing, fingerprint-fresh chunk_sparse_context row whose header
+// contains a name unique enough to only match through this document.
+func TestSearchSparseContextFiltered_ExcludesSoftDeletedDocument(t *testing.T) {
+	pg := sparseCtxTestDB(t)
+	cs := NewChunkStore(pg)
+	ctx := context.Background()
+
+	name := "삭제된사용자" + uuid.NewString()[:8]
+	docID := seedSparseCtxDoc(t, pg, "note", name+" 메모", nil)
+	chunkID := seedSparseCtxChunk(t, pg, docID, "본문 내용")
+
+	candidates, err := cs.FetchSparseContextCandidates(ctx, "v1-tp", false, 0, 50)
+	if err != nil {
+		t.Fatalf("FetchSparseContextCandidates: %v", err)
+	}
+	var fingerprint string
+	for _, c := range candidates {
+		if c.ChunkID == chunkID {
+			fingerprint = c.Fingerprint
+		}
+	}
+	if fingerprint == "" {
+		t.Fatalf("candidate for chunk_id=%d not found among %d fetched", chunkID, len(candidates))
+	}
+	if _, err := cs.UpsertSparseContextBatch(ctx, "v1-tp", []SparseContextRow{
+		{ChunkID: chunkID, Fingerprint: fingerprint, SparseText: "제목: " + name + " 메모\n\n본문 내용"},
+	}, chunkID); err != nil {
+		t.Fatalf("UpsertSparseContextBatch: %v", err)
+	}
+
+	if _, err := pg.pool.Exec(ctx, `UPDATE documents SET status = 'deleted' WHERE id = $1`, docID); err != nil {
+		t.Fatalf("soft-delete document: %v", err)
+	}
+
+	results, err := cs.SearchSparseContextFiltered(ctx, model.SearchQuery{Query: name}, 10, "v1-tp")
+	if err != nil {
+		t.Fatalf("SearchSparseContextFiltered: %v", err)
+	}
+	for _, r := range results {
+		if r.ID == chunkID {
+			t.Errorf("soft-deleted document's chunk_id=%d returned via SearchSparseContextFiltered: %+v", chunkID, r)
+		}
 	}
 }

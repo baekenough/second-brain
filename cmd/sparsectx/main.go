@@ -15,20 +15,31 @@
 // dry-run-by-default convention for scripts that touch production data.
 // Pass --dry-run=false to actually write.
 //
-// --sweep restarts the checkpoint at 0 so every chunk is re-examined; rows
-// whose document has not changed since the last pass are still skipped
-// (UpsertSparseContextBatch's fingerprint comparison), so a sweep is cheap
-// once the corpus is mostly caught up.
+// --sweep additionally re-examines chunks whose chunk_sparse_context row
+// EXISTS but has gone stale (its fingerprint no longer matches the parent
+// document's current one — a title/metadata edit landed after the row was
+// written); a plain run only picks up chunks with NO row yet. Either way,
+// only what actually changed gets written — UpsertSparseContextBatch's
+// fingerprint/text comparison skips a row that is already correct.
 //
 // --limit caps the total number of chunks processed in this invocation
 // (converted internally to a --batch-sized number of batches) — for staged
 // production rollout: dry-run, then a couple of small batches, then the full
 // off-peak pass (see docs/chunk-sparse-context.md).
 //
-// Idempotent and resumable: interrupting a run (or the process being killed)
-// leaves the checkpoint at the last FULLY COMMITTED batch — see
-// internal/store.ChunkStore.UpsertSparseContextBatch's doc comment. Re-running
-// with the same flags picks up from there.
+// Idempotent and resumable without any coordination between runs: each
+// batch decides what still needs work directly from chunk_sparse_context's
+// contents (see internal/store.ChunkStore.FetchSparseContextCandidates' doc
+// comment), so interrupting a run (or the process being killed) and
+// re-running with the same flags simply continues — no chunk is ever
+// skipped, including one whose insert commits, out of id order, after an
+// earlier run already looked past its id. Because there is no positional
+// checkpoint to catch up on, --sweep should also be run PERIODICALLY (e.g. a
+// cron alongside the initial backfill), not just once: the collector never
+// writes chunk_sparse_context rows itself, so a plain (non-sweep) run only
+// picks up brand-new chunks, and only --sweep catches documents that were
+// edited (title rename, metadata merge, PII redaction) after their row was
+// already written.
 package main
 
 import (
@@ -65,7 +76,7 @@ func run() error {
 	batch := flag.Int("batch", 500, "chunks per transaction (fetch + upsert + checkpoint advance)")
 	sleep := flag.Duration("sleep", 200*time.Millisecond, "pause between batches (throttles load against a live database)")
 	dryRun := flag.Bool("dry-run", true, "plan and log only, no database mutation. Pass --dry-run=false to actually write chunk_sparse_context rows and advance the checkpoint.")
-	sweep := flag.Bool("sweep", false, "restart the checkpoint at 0 and re-examine every chunk (recomputes stale rows; unchanged rows still write 0)")
+	sweep := flag.Bool("sweep", false, "also re-examine chunks whose row exists but has gone stale (fingerprint mismatch); a plain run only picks up chunks with no row yet")
 	limit := flag.Int("limit", 0, "cap the total chunks processed this run (0 = unlimited, i.e. run until exhausted or interrupted)")
 	flag.Parse()
 
