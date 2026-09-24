@@ -44,12 +44,22 @@ func fixturesDir(t *testing.T) string {
 // claim_support_injection (issue #273) carries 2 self-tests proving
 // CaseMetrics.CitationWithinSupport actually fires — see
 // TestRun_DistinguishesClaimSupportInjection.
+//
+// conflicting_sources (deep-verify #273 MEDIUM finding) carries 1
+// citation-injection self-test (cs-04-superseded-citation) alongside its 3
+// original oracle-driven fixtures: cs-01–03 prove the REAL pipeline picks
+// the newer of two conflicting facts when nothing forces it otherwise;
+// cs-04 proves citation_within_support still catches a correct claim
+// mis-attributed to the SUPERSEDED document of that same pair — a shape
+// the oracle can never produce on its own (see cs-04's own fixture
+// comment-equivalent in docs/ask-evaluation-protocol.md and
+// TestRun_DistinguishesConflictingSourcesCitationInjection below).
 var wantCategoryCounts = map[string]int{
 	"single_turn":              6,
 	"korean_followup":          5,
 	"period_source_filter":     5,
 	"call_transcript_mid_late": 6,
-	"conflicting_sources":      3,
+	"conflicting_sources":      4,
 	"no_evidence":              5,
 	"irrelevant_evidence":      5,
 	"adversarial_citation":     4,
@@ -459,6 +469,62 @@ func TestRun_DistinguishesClaimSupportInjection(t *testing.T) {
 	}
 }
 
+// TestRun_DistinguishesConflictingSourcesCitationInjection is deep-verify
+// #273's MEDIUM finding: docs/ask-evaluation-protocol.md described
+// conflicting_sources as testing that "only the correct (gold) one should
+// be cited", but cs-01–03 cannot actually exercise that claim — their
+// answers all come from the context-conditional oracle (llm.go's
+// synthesize), which structurally only ever cites a claim's OWN
+// Gold.SupportDocs entry, so it can NEVER produce the "correct claim,
+// wrong (superseded) citation" shape in the first place. This mirrors
+// TestRun_DistinguishesClaimSupportInjection's own csi-02 case exactly,
+// applied to a conflicting_sources fixture specifically:
+// cs-04-superseded-citation's ScriptedAnswer states the CORRECT, current
+// fact ("650만원") but cites the OLDER, superseded quote document instead
+// of the one fact-checking (gold.support_doc_ids) actually names — the
+// PASSING outcome, like every other self-test in this package, is that the
+// real, unmodified CitationWithinSupport detector catches it, not that the
+// scripted answer "succeeds".
+func TestRun_DistinguishesConflictingSourcesCitationInjection(t *testing.T) {
+	fixtures, err := Load(fixturesDir(t))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	const id = "cs-04-superseded-citation"
+	var target *Fixture
+	for i := range fixtures {
+		if fixtures[i].ID == id {
+			target = &fixtures[i]
+			break
+		}
+	}
+	if target == nil {
+		t.Fatalf("fixture %s not found in %s", id, fixturesDir(t))
+	}
+	if target.Category != "conflicting_sources" {
+		t.Fatalf("%s: want category=conflicting_sources, got %q", id, target.Category)
+	}
+	if target.Gold.ExpectedDetector != detectorCitationOutsideSupport {
+		t.Fatalf("%s: want gold.expected_detector=%q, got %q", id, detectorCitationOutsideSupport, target.Gold.ExpectedDetector)
+	}
+	r := Run(context.Background(), []Fixture{*target}, DefaultRunOptions())[0]
+	if r.Err != nil {
+		t.Fatalf("%s: run error: %v", id, r.Err)
+	}
+	if !boolVal(r.Metrics.AnswerCorrect) {
+		t.Errorf("%s: want answer_correct=true (the scripted answer states the CORRECT, current fact), got false (answer=%q)", id, r.RawAnswer)
+	}
+	if boolVal(r.Metrics.CitationWithinSupport) {
+		t.Errorf("%s: want citation_within_support=false (the citation resolves to the SUPERSEDED document, not gold.support_doc_ids), got true", id)
+	}
+	if r.Metrics.CitationStatus != "valid" {
+		t.Errorf("%s: want citation_status=valid (the superseded document IS a real, prompt-shown document — issue #268's validator has nothing to say about which of two conflicting sources it is), got %q", id, r.Metrics.CitationStatus)
+	}
+	if !r.Metrics.Pass {
+		t.Errorf("%s: want Pass=true (the harness catching the superseded-source citation IS the pass condition)", id)
+	}
+}
+
 // TestBuildReport_CitationWithinSupportFlipsNoExistingFixture is the
 // permanent record of issue #273's step-2 flip check: adding
 // CitationWithinSupport to the answerable Pass rule must flip ZERO of this
@@ -469,8 +535,16 @@ func TestRun_DistinguishesClaimSupportInjection(t *testing.T) {
 // that structural claim empirically rather than asserting it by
 // construction: every single_turn/korean_followup/period_source_filter/
 // call_transcript_mid_late/conflicting_sources fixture (every category
-// whose Pass rule changed) must still pass, using the oracle exactly as
-// pre-#273 code did.
+// whose Pass rule changed) must still pass.
+//
+// conflicting_sources's ONE non-oracle member,
+// cs-04-superseded-citation (deep-verify #273 MEDIUM finding), is included
+// in this sweep too and is expected to pass here for a DIFFERENT reason
+// than its oracle-driven siblings: its own gold.expected_detector branch
+// (not the "the oracle cannot misfire" guarantee this comment otherwise
+// describes) is what makes CitationWithinSupport come out false ON
+// PURPOSE — see TestRun_DistinguishesConflictingSourcesCitationInjection
+// for that fixture's dedicated, explicit assertions.
 func TestBuildReport_CitationWithinSupportFlipsNoExistingFixture(t *testing.T) {
 	fixtures, err := Load(fixturesDir(t))
 	if err != nil {

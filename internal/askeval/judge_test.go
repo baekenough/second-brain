@@ -3,7 +3,9 @@ package askeval
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/baekenough/second-brain/internal/llm"
@@ -271,6 +273,109 @@ func TestNewRemoteClaimJudge_RefusesWithoutGuards(t *testing.T) {
 			t.Fatal("want an error when a *_DATABASE_URL variable is set in the environment")
 		}
 	})
+}
+
+// dummyJudge is a deliberately-mixed ClaimJudge (deep-verify #273 MEDIUM
+// finding) — NEITHER fakeJudge (judge_fake.go), whose every verdict is
+// DERIVED from the very Gold.ClaimSupport annotations
+// TestFakeJudge_MatchesGoldAnnotations/expectedVerdict compare it against,
+// so every prior test exercising HumanAgree/HumanDisagree only ever
+// checked a judge agreeing or disagreeing with ITSELF (tautological — a
+// judge that reads the answer key can never independently confirm the
+// scoring machinery around it actually works), nor a real judge. It
+// answers purely from the cited document's own excerpt text, with no
+// knowledge of any fixture's Gold at all — an INDEPENDENT verdict source,
+// deliberately built here to be correct on one unit and wrong (a hard
+// error) on another, so TestRunShadowJudge_CountsDisagreementAndErrors can
+// prove RunShadowJudge/ShadowSummary correctly tally a genuine agreement
+// and a genuine judge failure against a judge that provably is not just
+// echoing the annotation back.
+type dummyJudge struct{}
+
+func (dummyJudge) Judge(_ context.Context, _, excerpt string) (Verdict, error) {
+	switch {
+	case strings.Contains(excerpt, "5천만원"):
+		return VerdictSupported, nil
+	case strings.Contains(excerpt, "6월 30일"):
+		return VerdictError, errors.New("dummyJudge: deliberate judge failure for this test")
+	default:
+		return VerdictError, fmt.Errorf("dummyJudge: unrecognized excerpt %q", excerpt)
+	}
+}
+
+// TestRunShadowJudge_CountsDisagreementAndErrors proves
+// RunShadowJudge/ShadowSummary actually COUNT a real judge's disagreement
+// and errors against a human (gold) label — every OTHER test in this file
+// that touches HumanAgree/HumanDisagree does so exclusively through
+// fakeJudge, whose verdicts are the SAME data HumanAgree/HumanDisagree
+// compare them against (see dummyJudge's own doc comment), so none of them
+// could have caught a regression that broke the counting itself, only one
+// that broke fakeJudge's own annotation lookup. dummyJudge instead answers
+// independently of Gold:
+//
+//   - one unit (doc-1, "5천만원") dummyJudge verdicts VerdictSupported —
+//     which happens to MATCH that unit's own gold.claim_support
+//     expectation, a genuine (not tautological) agreement;
+//   - the other unit (doc-2, "6월 30일") dummyJudge returns a hard ERROR
+//     on — proving a judge FAILURE, not just a wrong verdict, is also
+//     counted as HumanDisagree (RunShadowJudge's own doc comment: "judge
+//     실패/불일치를 정상 통과로 처리하지 않는다" — a judge error must never
+//     be silently excluded from the disagreement tally).
+//
+// This never runs Run/the real /ask pipeline — CaseResult and Fixture are
+// hand-built directly (RawAnswer with two real citation markers, resolved
+// via aliasID exactly as the real pipeline would produce them), the same
+// direct-construction technique TestComputeMetrics_CitationWithinSupportGatesPass
+// (runner_test.go) uses to exercise a shape no fixture-loader-validated
+// fixture is allowed to express on disk.
+func TestRunShadowJudge_CountsDisagreementAndErrors(t *testing.T) {
+	f := Fixture{
+		ID: "scratch-shadow-dummy",
+		Corpus: []CorpusDoc{
+			{Alias: "doc-1", SourceType: "note", Title: "t1", Content: "예산은 5천만원이다"},
+			{Alias: "doc-2", SourceType: "note", Title: "t2", Content: "일정은 6월 30일이다"},
+		},
+		Gold: Gold{
+			ClaimSupport: []ClaimSupportAnnotation{
+				{DocAlias: "doc-1", SentenceContains: "5천만원", Expected: VerdictSupported},
+				{DocAlias: "doc-2", SentenceContains: "6월 30일", Expected: VerdictUnsupported},
+			},
+		},
+	}
+	id1, id2 := aliasID("doc-1").String(), aliasID("doc-2").String()
+	answer := fmt.Sprintf(
+		"예산은 5천만원이다 [근거](/documents/%s) 일정은 6월 30일이다 [근거](/documents/%s)",
+		id1, id2,
+	)
+
+	results := []CaseResult{{Fixture: f, RawAnswer: answer}}
+	RunShadowJudge(context.Background(), dummyJudge{}, results)
+
+	shadow := results[0].Metrics.Shadow
+	if shadow == nil {
+		t.Fatal("want a non-nil Shadow (the fixture declares gold.claim_support and the answer cites both documents)")
+	}
+	if shadow.Units != 2 {
+		t.Fatalf("want 2 judge units, got %d", shadow.Units)
+	}
+	if shadow.Supported != 1 {
+		t.Errorf("want supported=1 (doc-1's unit), got %d", shadow.Supported)
+	}
+	if shadow.Errors != 1 {
+		t.Errorf("want errors=1 (doc-2's unit — a deliberate judge failure), got %d", shadow.Errors)
+	}
+	if shadow.HumanAgree != 1 {
+		t.Errorf("want human_agree=1 (doc-1's independent verdict matched gold.claim_support), got %d", shadow.HumanAgree)
+	}
+	if shadow.HumanDisagree != 1 {
+		t.Errorf("want human_disagree=1 (doc-2's judge ERROR must count as a disagreement, not be silently excluded), got %d", shadow.HumanDisagree)
+	}
+
+	rep := BuildReport(results, Provenance{JudgeMode: "shadow", JudgeBackend: "dummy-test-double"})
+	want := ShadowSummary{Cases: 1, Units: 2, Supported: 1, Unsupported: 0, Errors: 1, HumanAgree: 1, HumanDisagree: 1}
+	if rep.Shadow != want {
+		t.Errorf("report-level Shadow summary = %+v, want %+v (must match the per-case tally exactly)", rep.Shadow, want)
+	}
 }
 
 // llmConfigWithKey returns a syntactically valid llm.Config (base URL,

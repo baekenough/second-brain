@@ -1,6 +1,7 @@
 package askeval
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/baekenough/second-brain/internal/llm"
@@ -71,20 +73,154 @@ func NewRemoteClaimJudge(cfg RemoteJudgeConfig) (ClaimJudge, error) {
 	return &remoteJudge{client: client}, nil
 }
 
+// repoModule is this repository's own module path (go.mod's "module"
+// line) — repoRoot's anchor for recognizing "the directory containing
+// go.mod IS this repo" rather than some unrelated Go module that also
+// happens to have an eval/ask/fixtures-shaped subtree.
+const repoModule = "github.com/baekenough/second-brain"
+
+// repoRoot locates this repository's root directory purely from this
+// SOURCE FILE's own compile-time path (runtime.Caller), walking upward
+// until it finds a go.mod whose module line is exactly repoModule — never
+// from the process's current working directory, an environment variable,
+// or an exec'd `git rev-parse --show-toplevel` (deep-verify #273 HIGH
+// finding's own suggestion: "prefer no exec if a pure-Go approach is
+// reliable"). A cwd- or env-based root is exactly the kind of thing an
+// operator's mistake (or a malicious --fixtures value) could manipulate;
+// this file's own path on disk cannot be influenced by either.
+//
+// Returns an error (never a best-guess fallback) when go.mod cannot be
+// found above this file, or — deliberately — when this binary was built
+// with `-trimpath`: runtime.Caller then returns a module-relative path
+// with no corresponding real directory on this machine, so the go.mod walk
+// fails closed rather than silently resolving to something unintended.
+// requireFixturesUnderRepo's callers (NewRemoteClaimJudge) treat that
+// failure exactly like every other guard failure: refuse to start.
+func repoRoot() (string, error) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		return "", errors.New("askeval: runtime.Caller failed while locating this repository's root")
+	}
+	dir := filepath.Dir(file) // .../internal/askeval
+	for {
+		if b, err := os.ReadFile(filepath.Join(dir, "go.mod")); err == nil && goModDeclaresModule(b, repoModule) {
+			resolved, err := filepath.EvalSymlinks(dir)
+			if err != nil {
+				return "", fmt.Errorf("resolving repo root %q: %w", dir, err)
+			}
+			return resolved, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("askeval: no go.mod declaring module %q found above %s", repoModule, filepath.Dir(file))
+		}
+		dir = parent
+	}
+}
+
+// goModDeclaresModule reports whether go.mod's content b declares exactly
+// "module "+module on its first line (go.mod's module directive is always
+// the first non-comment, non-blank line in every go.mod this repo's own
+// tooling writes; a stricter full-file scan is unnecessary for a check
+// that only needs to recognize THIS repository, not validate an arbitrary
+// go.mod's syntax).
+func goModDeclaresModule(b []byte, module string) bool {
+	line, _, _ := bytes.Cut(b, []byte("\n"))
+	return string(bytes.TrimSpace(line)) == "module "+module
+}
+
 // requireFixturesUnderRepo rejects any --fixtures path that does not
-// resolve under an "eval/ask/fixtures" directory component — a coarse but
-// structural guard (issue #273's "합성 fixture만 쓴다"), independent of
-// cmd/askeval's own --fixtures default.
+// resolve — after following every symlink in its own path AND in the
+// repo's own eval/ask/fixtures path — into this repository's
+// eval/ask/fixtures tree (issue #273's "합성 fixture만 쓴다"), independent
+// of cmd/askeval's own --fixtures default.
+//
+// This replaces a plain filepath.Abs + strings.Contains(abs,
+// "/eval/ask/fixtures") check (deep-verify #273 HIGH finding), which two
+// distinct attacks could defeat:
+//
+//  1. A path OUTSIDE the repo whose trailing components merely happen to
+//     spell "eval/ask/fixtures" (e.g. /tmp/evil/eval/ask/fixtures) —
+//     contained the substring, so the old check passed it, even though it
+//     shares nothing with this repo's actual fixtures tree.
+//  2. A directory (or an individual *.json file inside an otherwise
+//     legitimate-looking directory) that is a SYMLINK resolving outside
+//     the repo — the old check never called filepath.EvalSymlinks, so it
+//     judged the symlink's own (repo-shaped) path, never where it actually
+//     points.
+//
+// Both are closed by resolving symlinks on both sides of the comparison
+// and checking filepath.Rel for a "does not escape" result, plus rejecting
+// any symlinked *.json entry found directly inside the (already-resolved)
+// directory.
 func requireFixturesUnderRepo(dir string) error {
 	if dir == "" {
 		return errors.New("fixtures dir is empty")
 	}
-	abs, err := filepath.Abs(dir)
+	root, err := repoRoot()
+	if err != nil {
+		return fmt.Errorf("resolving this repository's root: %w", err)
+	}
+	fixturesRoot, err := filepath.EvalSymlinks(filepath.Join(root, "eval", "ask", "fixtures"))
+	if err != nil {
+		return fmt.Errorf("resolving this repository's eval/ask/fixtures directory: %w", err)
+	}
+	resolvedDir, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		return fmt.Errorf("resolving fixtures dir %q: %w", dir, err)
 	}
-	if !strings.Contains(filepath.ToSlash(abs), "/eval/ask/fixtures") {
-		return fmt.Errorf("fixtures dir %q does not resolve under eval/ask/fixtures", dir)
+	if err := requireWithin(fixturesRoot, resolvedDir); err != nil {
+		return fmt.Errorf("fixtures dir %q: %w", dir, err)
+	}
+	return rejectSymlinkedJSONOutside(resolvedDir, fixturesRoot)
+}
+
+// requireWithin returns an error unless target is root itself or a
+// descendant of root, evaluated on filepath.Rel's result — the only
+// unambiguous way to tell "inside" from "outside" once both paths have
+// already been symlink-resolved and made absolute by their callers.
+func requireWithin(root, target string) error {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return fmt.Errorf("computing relative path to %q: %w", root, err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("resolves to %q, outside %q", target, root)
+	}
+	return nil
+}
+
+// rejectSymlinkedJSONOutside inspects every direct *.json entry of dir
+// (never a recursive walk — Load itself, fixture.go, only ever reads
+// dir's own top-level *.json files, so nothing deeper needs checking) and
+// refuses if any of them is a symlink whose resolved target escapes
+// allowedRoot. os.ReadDir's DirEntry.Info() reports the entry itself
+// (an Lstat, not a Stat) — exactly what is needed to detect a symlink
+// without following it first.
+func rejectSymlinkedJSONOutside(dir, allowedRoot string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("reading fixtures dir %q: %w", dir, err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		info, err := e.Info()
+		if err != nil {
+			return fmt.Errorf("stat %q: %w", path, err)
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			continue
+		}
+		target, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return fmt.Errorf("resolving symlink %q: %w", path, err)
+		}
+		if err := requireWithin(allowedRoot, target); err != nil {
+			return fmt.Errorf("fixture file %q is a symlink that %w", path, err)
+		}
 	}
 	return nil
 }

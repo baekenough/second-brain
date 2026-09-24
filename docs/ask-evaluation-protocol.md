@@ -159,7 +159,7 @@ pre-#267 lexical fallback provably fails — see
 `askPassage`'s window search scores `0` everywhere), while still being
 answerable because the (simulated) vector lane can bridge the paraphrase.
 
-## Fixture mix (42 fixtures, ≥30 required)
+## Fixture mix (43 fixtures, ≥30 required)
 
 | Category | Count | What it exercises |
 |---|---:|---|
@@ -167,7 +167,7 @@ answerable because the (simulated) vector lane can bridge the paraphrase.
 | `korean_followup` | 5 | 지시어/pronoun resolution ("그 사람", "거기", "그 회의") across a 2-turn conversation, via the real query-rewrite call |
 | `period_source_filter` | 5 | `intent.DeterministicWindow` + `explicitRecordSources` narrowing the candidate pool by event-time window and/or source type |
 | `call_transcript_mid_late` | 6 | Paraphrased/pronoun-follow-up questions whose gold fact sits in a LATE chunk of a long document, including one (`ctm-06`) at the document's exact tail — see below |
-| `conflicting_sources` | 3 | Two documents assert different values for the same fact; only the correct (gold) one should be cited |
+| `conflicting_sources` | 4 | 3 oracle-driven fixtures (`cs-01`–`cs-03`) proving the REAL pipeline cites the newer of two conflicting facts, plus 1 citation-injection self-test (`cs-04`) proving `citation_within_support` still catches a correct claim mis-attributed to the SUPERSEDED source — see "`conflicting_sources`: what `cs-01`–`03` test, and what they cannot" below |
 | `no_evidence` | 5 | 3 abstention fixtures + 2 fabrication self-tests (`ne-04`/`ne-05`) — see "`no_evidence`/`irrelevant_evidence`: two different things being tested" below |
 | `irrelevant_evidence` | 5 | 3 abstention fixtures + 2 fabrication self-tests (`ie-04`/`ie-05`) — see below |
 | `adversarial_citation` | 4 | Fabricated UUID, malformed link, a real-but-unshown document ID, and an allowed-but-flagged inferred-layer citation — see "Adversarial citations" below |
@@ -218,6 +218,44 @@ matters which kind a reader is looking at:
    cited ID was actually shown to the model, never that it supports the
    claim next to it. `fabricated_answer` is deliberately independent of
    `citation_status` for exactly this reason.
+
+### `conflicting_sources`: what `cs-01`–`03` test, and what they cannot (deep-verify #273)
+
+`cs-01`–`cs-03` each give the pipeline two documents asserting different
+values for the same fact (an older meeting-room announcement superseded by
+a newer one, an initial quote superseded by a final one, an initial
+deadline superseded by a rescheduled one) and check that the REAL
+pipeline's answer states the NEWER value and cites the NEWER document —
+`gold.support_doc_ids` names only the newer document, so `answer_correct`
+and the pre-existing `citation_within_support` gate both require it. **This
+precisely tests that the real retrieval/synthesis path resolves the
+conflict correctly on its own** — the same oracle-driven framing as
+`single_turn`/`korean_followup`/etc.
+
+What `cs-01`–`03` do NOT test — and, before `cs-04` existed, COULD not
+test — is the harness's own ability to catch a citation that gets this
+wrong: the context-conditional oracle (`llm.go`'s `synthesize`) only ever
+cites a claim's own `gold.support_doc_ids[i]` entry, so it is structurally
+incapable of producing a "correct value, but cited to the superseded
+document" answer, for exactly the reason `claim_support_injection`'s own
+section below explains for the general case. `cs-04-superseded-citation`
+closes that gap the same way `csi-02-citation-outside-support` does:
+`scripted_answer` states the CORRECT, current quote amount but cites the
+OLDER quote document instead of the one `gold.support_doc_ids` actually
+names, and `gold.expected_detector: "citation_outside_support"` switches
+`computeMetrics` into the same self-test branch `csi-02` uses. The PASSING
+outcome is that `citation_within_support` comes out `false` — see
+`TestRun_DistinguishesConflictingSourcesCitationInjection`
+(`internal/askeval/runner_test.go`).
+
+`cs-04` deliberately reuses `cs-02`'s own corpus wording (the two quote
+documents) rather than inventing new content: `cs-02` already proves this
+exact corpus shape is genuinely retrieved and shown for this question (both
+the old and new quote documents reach the manifest, not just the winning
+one), which is the same property `csi-02`'s own doc comment describes
+needing from `ie-04`'s wording — `citation_status` must reach `"valid"`,
+not `"invalid"`, for `citation_within_support` (not issue #268's validator)
+to be the detector that catches this.
 
 ### `claim_support_injection`: closing the citation-target gap (issue #273)
 
@@ -426,6 +464,23 @@ evaluated", never a zero-value tally); an error or a disagreement with a
 human-labelled annotation is tallied as a shadow failure, never as
 `"supported"`. `report.go`'s `Report.Shadow` aggregates every case's tally
 into a report-level summary.
+
+**`human_agree`/`human_disagree` is only meaningful against a non-`fake`
+judge (deep-verify #273 MEDIUM finding).** `fakeJudge`'s own verdict is
+DERIVED from the exact same `gold.claim_support` annotation
+`expectedVerdict` (`judge.go`) then compares it against — so running
+`--judge-backend=fake` and reading `human_agree`/`human_disagree` off the
+report only ever measures "did `fakeJudge` agree with itself", which is
+true by construction and proves nothing about judge quality. These two
+fields exist for the `remote` backend (a real model, an independent
+verdict source) — that is the only backend for which a
+`human_agree`/`human_disagree` count is a meaningful signal.
+`TestRunShadowJudge_CountsDisagreementAndErrors`
+(`internal/askeval/judge_test.go`) proves the COUNTING MACHINERY itself
+(not `fakeJudge`) is correct, using a deliberately-independent,
+deliberately-partly-wrong test double (`dummyJudge`) that answers from the
+cited excerpt text alone, with no access to `gold.claim_support` at all —
+the same independence a real `remote` judge would have.
 
 **Backends** (`cmd/askeval --judge-backend`):
 
