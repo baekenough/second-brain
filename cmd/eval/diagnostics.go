@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/baekenough/second-brain/internal/evaldump"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
@@ -25,6 +26,11 @@ const dumpFileMode os.FileMode = 0o600
 // 질의를 지목해야 할 때는 golden_queries.id 나 질의 텍스트의 해시 접두사만
 // 쓰고, 길이(query_len)로 대략의 형태만 남긴다.
 type queryDiagnostics struct {
+	// Kind is empty on a v1 dump (the shape that shipped before #269) and
+	// "query" on v2, set by attachQueryMetrics. internal/evaldump.Read uses
+	// it, together with line 1, to tell the two formats apart.
+	Kind string `json:"kind"`
+
 	QueryID     string `json:"query_id"`
 	QuerySource string `json:"query_source"`
 	QueryLen    int    `json:"query_len"`
@@ -48,6 +54,17 @@ type queryDiagnostics struct {
 	RerankRequested bool `json:"rerank_requested"`
 	RerankAttempted bool `json:"rerank_attempted"`
 	RerankFailed    bool `json:"rerank_failed"`
+
+	// --- Dump v2 (#269): filled by attachQueryMetrics, never by
+	// buildDiagnostics itself. NDCG10/Recall10 stay nil for a query with no
+	// positive labels — 0 and "not scoreable" are different facts, and a
+	// group-level comparator must not average the two together.
+	LatencyMs *float64 `json:"latency_ms"`
+	NDCG10    *float64 `json:"ndcg10"`
+	Recall10  *float64 `json:"recall10"`
+	// FP10 mirrors NegativeInTop10 under the dump-v2 metric name (issue #269
+	// design: fp10 is the same count, not a re-derivation).
+	FP10 *int `json:"fp10"`
 }
 
 // dumpWindow 는 적용된 시간창의 반열린 구간 [from, to) 이다.
@@ -150,6 +167,51 @@ func buildDiagnostics(pair store.EvalPair, window *dumpWindow, results []*model.
 	return diag
 }
 
+// attachQueryMetrics 는 dump v2 를 위해 질의별 지연시간과 NDCG10/Recall10/FP10 을
+// 채운다. diags 와 latencies 는 evaluatePairs 가 만든 순서 그대로다(pairs 와
+// 같은 순서, evaluation.Latencies 도 마찬가지).
+//
+// NDCG10 은 search.NDCGK(top10, positives, 10) — Aggregate 가 macro-average 를
+// 낼 때 쓰는 바로 그 함수 — 로 계산한다. 따로 구현하면 언젠가 두 계산이
+// 갈라지고, 그 어긋남은 집계 점수와 덤프 점수가 서로 다른 이야기를 하는 채로
+// 발견되지 않는다. diags[i].Top10IDs 와 RelevantDocIDs 는 buildDiagnostics 가
+// 이미 채운 값이므로 evaluatePairs 쪽 인자를 새로 받을 필요가 없다.
+func attachQueryMetrics(diags []queryDiagnostics, latencies []float64) {
+	for i := range diags {
+		diags[i].Kind = "query"
+
+		fp := diags[i].NegativeInTop10
+		diags[i].FP10 = &fp
+
+		if i < len(latencies) {
+			ms := latencies[i]
+			diags[i].LatencyMs = &ms
+		}
+
+		if len(diags[i].RelevantDocIDs) == 0 {
+			// 정답 라벨이 없는 질의(부정 전용 질의 등) — NDCG/Recall 은
+			// 잴 대상이 없다. 0 으로 채우면 "재봤더니 0 점"과 구분이 안 된다.
+			continue
+		}
+		relevant := make(map[string]bool, len(diags[i].RelevantDocIDs))
+		for _, id := range diags[i].RelevantDocIDs {
+			relevant[id] = true
+		}
+
+		ndcg := search.NDCGK(diags[i].Top10IDs, relevant, 10)
+		diags[i].NDCG10 = &ndcg
+
+		hit := 0
+		for _, id := range diags[i].Top10IDs {
+			if relevant[id] {
+				hit++
+			}
+		}
+		recall := float64(hit) / float64(len(relevant))
+		diags[i].Recall10 = &recall
+	}
+}
+
 func traceIDs(trace *search.SearchTrace, pick func(*search.SearchTrace) []uuid.UUID) []uuid.UUID {
 	if trace == nil {
 		return nil
@@ -206,9 +268,14 @@ func enrichDiagnostics(diags []queryDiagnostics, facts map[string]store.EvalLabe
 	}
 }
 
-// writeDiagnostics 는 진단 행들을 JSON Lines 로 path 에 쓴다. 파일은 소유자만
-// 읽고 쓸 수 있게 만들며, 이미 있던 파일이 더 느슨한 퍼미션이었다면 조인다.
-func writeDiagnostics(path string, diags []queryDiagnostics) error {
+// writeDiagnostics 는 헤더 한 줄과 진단 행들을 JSON Lines 로 path 에 쓴다
+// (dump v2, #269). 파일은 소유자만 읽고 쓸 수 있게 만들며, 이미 있던 파일이
+// 더 느슨한 퍼미션이었다면 조인다.
+//
+// diags 는 호출 전에 attachQueryMetrics 를 거쳐야 kind/latency_ms/ndcg10/
+// recall10/fp10 이 채워진다 — writeDiagnostics 자신은 그 값을 계산하지 않고
+// 있는 그대로 직렬화만 한다.
+func writeDiagnostics(path string, header evaldump.Header, diags []queryDiagnostics) error {
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, dumpFileMode)
 	if err != nil {
 		return fmt.Errorf("eval: open dump file: %w", err)
@@ -218,6 +285,13 @@ func writeDiagnostics(path string, diags []queryDiagnostics) error {
 		return fmt.Errorf("eval: restrict dump file mode: %w", err)
 	}
 	enc := json.NewEncoder(file)
+	header.Kind = "header"
+	if header.DumpVersion == 0 {
+		header.DumpVersion = evaldump.SchemaVersion
+	}
+	if err := enc.Encode(header); err != nil {
+		return fmt.Errorf("eval: write dump header: %w", err)
+	}
 	for _, diag := range diags {
 		if err := enc.Encode(diag); err != nil {
 			return fmt.Errorf("eval: write dump line: %w", err)

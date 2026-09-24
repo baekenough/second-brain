@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/baekenough/second-brain/internal/askeval"
+	"github.com/baekenough/second-brain/internal/llm"
 )
 
 func main() {
@@ -33,6 +34,7 @@ func run(args []string) int {
 	baseline := fs.String("baseline", "", "path to a prior JSON report (from --out) to diff this run against")
 	llmMode := fs.String("llm", "scripted", "scripted|configured — issue #266 scope only implements scripted (deterministic, offline); configured is reserved for future work")
 	judgeMode := fs.String("judge", "off", "off|shadow — a judge is NEVER a pass gate; shadow only records disagreement for future analysis")
+	judgeBackend := fs.String("judge-backend", "fake", "fake|remote — only meaningful with --judge=shadow. fake is deterministic/offline (the only backend go test/CI ever construct). remote calls a real API and refuses to start unless ASKEVAL_JUDGE_API_KEY is set, --fixtures resolves under eval/ask/fixtures, and no *_DATABASE_URL is set in the environment")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -45,6 +47,32 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, "askeval: --judge must be \"off\" or \"shadow\"")
 		return 2
 	}
+	if *judgeBackend != "fake" && *judgeBackend != "remote" {
+		fmt.Fprintln(os.Stderr, "askeval: --judge-backend must be \"fake\" or \"remote\"")
+		return 2
+	}
+
+	var judge askeval.ClaimJudge
+	if *judgeMode == "shadow" {
+		switch *judgeBackend {
+		case "fake":
+			judge = askeval.NewFakeJudge()
+		case "remote":
+			j, err := askeval.NewRemoteClaimJudge(askeval.RemoteJudgeConfig{
+				Config: llm.Config{
+					BaseURL: os.Getenv("ASKEVAL_JUDGE_BASE_URL"),
+					Model:   os.Getenv("ASKEVAL_JUDGE_MODEL"),
+					APIKey:  os.Getenv("ASKEVAL_JUDGE_API_KEY"),
+				},
+				FixturesDir: *fixturesDir,
+			})
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "askeval:", err)
+				return 2
+			}
+			judge = j
+		}
+	}
 
 	fixtures, err := askeval.Load(*fixturesDir)
 	if err != nil {
@@ -53,6 +81,9 @@ func run(args []string) int {
 	}
 
 	results := askeval.Run(context.Background(), fixtures, askeval.DefaultRunOptions())
+	if *judgeMode == "shadow" {
+		askeval.RunShadowJudge(context.Background(), judge, results)
+	}
 
 	prov := askeval.Provenance{
 		GitRev:         gitRev(),
@@ -60,6 +91,13 @@ func run(args []string) int {
 		Cases:          len(fixtures),
 		Mode:           *llmMode,
 		JudgeMode:      *judgeMode,
+	}
+	if *judgeMode == "shadow" {
+		prov.JudgeBackend = *judgeBackend
+		if *judgeBackend == "remote" {
+			prov.JudgeModel = os.Getenv("ASKEVAL_JUDGE_MODEL")
+			prov.JudgePromptHash = askeval.RemoteJudgePromptHash()
+		}
 	}
 	report := askeval.BuildReport(results, prov)
 	fmt.Print(report.Text())

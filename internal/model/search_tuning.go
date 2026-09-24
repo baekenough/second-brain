@@ -39,6 +39,33 @@ const (
 	// 본문을 보낸다. 통화 전사·긴 메일처럼 근거가 앞부분에 없는 문서를
 	// 겨냥한다.
 	RerankInputBestChunk = "best_chunk"
+
+	// ChunkSparseFallback 은 현행 동작이다(#270). 청크 FTS/bigm 레인은
+	// 1차 경로(문서 하이브리드 + 청크 벡터 + OpenSearch)가 결과를 하나도
+	// 못 찾았을 때만 폴백으로 돈다.
+	ChunkSparseFallback = "fallback"
+	// ChunkSparseFuse 는 청크 FTS/bigm 레인을 1차 경로 결과 유무와 무관하게
+	// 항상 RRF 융합에 참여시킨다(실험용). 스키마 변경 없음 — chunks.content
+	// 만 매칭·반환한다(#270 phase A).
+	ChunkSparseFuse = "fuse"
+	// ChunkSparseFuseCtx 는 ChunkSparseFuse 와 같되, chunk_sparse_context
+	// (마이그레이션 040)에 미리 계산해 둔 파생 문맥(제목·참여자 헤더 +
+	// 청크 본문)을 매칭 대상으로 우선 쓴다. 문서가 갱신돼 파생 문맥이
+	// stale 해진 청크는 자동으로 raw 청크 본문 매칭으로 빠진다(#270 phase B).
+	ChunkSparseFuseCtx = "fuse_ctx"
+
+	// ChunkSparseCtxV1TP 는 제목+참여자만 담는 sparse-context 레시피다
+	// (internal/chunkctx.RecipeTP). 날짜·소스 라벨은 넣지 않는다 — 소스
+	// 라벨 토큰("메일", "통화")이 그 단어를 포함한 질의에서 오탐을 키울 수
+	// 있어 ablation 조건으로 분리한다.
+	ChunkSparseCtxV1TP = "v1-tp"
+	// ChunkSparseCtxV1Full 은 임베딩 헤더(BuildChunkContextHeader)와 정확히
+	// 같은 구성을 쓴다(internal/chunkctx.RecipeFull).
+	//
+	// 이 두 상수는 internal/chunkctx 가 아니라 여기 model 패키지에 있다 —
+	// internal/chunkctx 가 이미 이 패키지를 임포트하므로(model.Document),
+	// 반대 방향 임포트는 순환이 된다.
+	ChunkSparseCtxV1Full = "v1-full"
 )
 
 // 노브 기본값. 제로값이 곧 "현행 동작" 이 되도록 잡았다 — 새 필드가 생겼다는
@@ -93,6 +120,14 @@ type SearchTuning struct {
 	// 승수는 (1-alpha) + alpha*exp(-ln2*age/halflife) 이므로 alpha=1 이면
 	// 반감기마다 점수가 절반이 되고, alpha=0 이면 감쇠가 없다.
 	RecencyAlpha float64
+
+	// ChunkSparse 는 ChunkSparseFallback(기본)·ChunkSparseFuse·
+	// ChunkSparseFuseCtx 중 하나.
+	ChunkSparse string
+	// ChunkSparseCtxVersion 은 ChunkSparse==ChunkSparseFuseCtx 일 때만
+	// 쓰인다. ChunkSparseCtxV1TP 또는 ChunkSparseCtxV1Full. 그 외 값(또는
+	// fuse_ctx 가 아닌데 채워진 값)은 Normalized 가 안전하게 비운다.
+	ChunkSparseCtxVersion string
 }
 
 // IsZero 는 노브가 하나도 설정되지 않았는지 — 즉 "현행 동작" 인지 — 알린다.
@@ -128,6 +163,19 @@ func (t SearchTuning) Normalized() SearchTuning {
 	if t.RecencyAlpha > 1 {
 		t.RecencyAlpha = 1
 	}
+	if t.ChunkSparse != ChunkSparseFuse && t.ChunkSparse != ChunkSparseFuseCtx {
+		t.ChunkSparse = ChunkSparseFallback
+	}
+	if t.ChunkSparse == ChunkSparseFuseCtx &&
+		t.ChunkSparseCtxVersion != ChunkSparseCtxV1TP && t.ChunkSparseCtxVersion != ChunkSparseCtxV1Full {
+		// 버전이 없거나 알 수 없으면 fuse_ctx 를 켰다고 믿지만 매 요청이
+		// 아무 문맥도 찾지 못해 조용히 새는 상태가 된다 — 그보다는 검색이
+		// 멈추지 않는 현행 동작(fallback)으로 되돌린다.
+		t.ChunkSparse = ChunkSparseFallback
+	}
+	if t.ChunkSparse != ChunkSparseFuseCtx {
+		t.ChunkSparseCtxVersion = ""
+	}
 	return t
 }
 
@@ -142,13 +190,15 @@ func (t SearchTuning) Normalized() SearchTuning {
 // 잘못된 값은 경고를 남기고 무시한다 — 오타 하나로 검색이 멈추면 안 된다.
 func EnvSearchTuning() SearchTuning {
 	return SearchTuning{
-		RerankOverfetch:     envTuningInt("SEARCH_RERANK_OVERFETCH"),
-		MergeMode:           envTuningChoice("SEARCH_MERGE_MODE", MergeAsymmetric, MergeSymmetric),
-		RerankBlend:         envTuningChoice("SEARCH_RERANK_BLEND", RerankBlendReplace, RerankBlendRRF),
-		RerankBlendWeight:   envTuningFloat("SEARCH_RERANK_BLEND_WEIGHT"),
-		RerankInput:         envTuningChoice("SEARCH_RERANK_INPUT", RerankInputHead, RerankInputBestChunk),
-		RecencyHalfLifeDays: envTuningFloat("SEARCH_RECENCY_HALFLIFE_DAYS"),
-		RecencyAlpha:        envTuningFloat("SEARCH_RECENCY_ALPHA"),
+		RerankOverfetch:       envTuningInt("SEARCH_RERANK_OVERFETCH"),
+		MergeMode:             envTuningChoice("SEARCH_MERGE_MODE", MergeAsymmetric, MergeSymmetric),
+		RerankBlend:           envTuningChoice("SEARCH_RERANK_BLEND", RerankBlendReplace, RerankBlendRRF),
+		RerankBlendWeight:     envTuningFloat("SEARCH_RERANK_BLEND_WEIGHT"),
+		RerankInput:           envTuningChoice("SEARCH_RERANK_INPUT", RerankInputHead, RerankInputBestChunk),
+		RecencyHalfLifeDays:   envTuningFloat("SEARCH_RECENCY_HALFLIFE_DAYS"),
+		RecencyAlpha:          envTuningFloat("SEARCH_RECENCY_ALPHA"),
+		ChunkSparse:           envTuningChoice("SEARCH_CHUNK_SPARSE", ChunkSparseFallback, ChunkSparseFuse, ChunkSparseFuseCtx),
+		ChunkSparseCtxVersion: envChunkSparseCtxVersion(),
 	}.Normalized()
 }
 
@@ -176,6 +226,22 @@ func envTuningFloat(key string) float64 {
 		return 0
 	}
 	return f
+}
+
+// envChunkSparseCtxVersion 은 SEARCH_CHUNK_SPARSE_CTX 를 읽는다. envTuningChoice
+// 를 쓰지 않는 이유: 이 값은 "설정 안 함"(빈 문자열)이 그 자체로 유효한
+// 기본값이고, fuse_ctx 가 아닌 모드에서는 있어도 무시되므로 강제할 기본값이
+// 없다 — SearchTuning.Normalized 가 fuse_ctx 조합에서만 비어 있는지 검사한다.
+func envChunkSparseCtxVersion() string {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("SEARCH_CHUNK_SPARSE_CTX")))
+	switch raw {
+	case "", ChunkSparseCtxV1TP, ChunkSparseCtxV1Full:
+		return raw
+	default:
+		slog.Warn("search tuning: unknown value, ignoring",
+			"key", "SEARCH_CHUNK_SPARSE_CTX", "value", raw)
+		return ""
+	}
 }
 
 // envTuningChoice 는 허용된 값 목록 중 하나만 받는다. 목록의 첫 값이 기본값이며,

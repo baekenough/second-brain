@@ -72,6 +72,33 @@ type Gold struct {
 	// exercise. Only meaningful alongside ExpectedCitationStatus=="valid"
 	// (citing an inferred-layer document is ALLOWED, just flagged).
 	ExpectInferredCitation bool `json:"expect_inferred_citation,omitempty"`
+	// ExpectedDetector, when set, switches computeMetrics into a second
+	// self-test mode, parallel to ExpectedCitationStatus above but
+	// targeting a different pair of detectors (issue #273): the fixture's
+	// own ScriptedAnswer deliberately attaches a REAL, PROVIDED citation
+	// to either a false claim ("claim_mismatch": the real, unmodified
+	// AnswerCorrect detector must come out false) or a correct claim cited
+	// to a real, provided document outside SupportDocs
+	// ("citation_outside_support": the real, unmodified
+	// CitationWithinSupport detector must come out false) — closing the
+	// gap where askCitationStatus "valid" only proves a cited ID was
+	// SHOWN to the model, never that it is one of THIS question's own
+	// support documents (deep-plan #273 finding F5). The PASSING outcome,
+	// like every other self-test category in this package, is that the
+	// targeted detector actually fires — see computeMetrics'
+	// ExpectedDetector branch. Must be "claim_mismatch" or
+	// "citation_outside_support"; validateExpectedDetector rejects any
+	// other non-empty value.
+	ExpectedDetector string `json:"expected_detector,omitempty"`
+	// ClaimSupport is an OPTIONAL set of human-labelled expectations the
+	// shadow ClaimJudge's verdicts are compared against (issue #273 step
+	// 3, judge.go) — purely for measuring judge/human agreement, NEVER a
+	// Pass gate (JudgeShadow's own doc comment). A fixture with zero
+	// ClaimSupport entries is simply never judged at all: judge.go's
+	// RunShadowJudge skips it entirely ("not evaluated"), rather than
+	// judging it and reporting a meaningless zero-annotation agreement
+	// rate.
+	ClaimSupport []ClaimSupportAnnotation `json:"claim_support,omitempty"`
 }
 
 // CorpusDoc is one document a fixture's isolated corpus contains.
@@ -119,10 +146,17 @@ type Fixture struct {
 	// "{{doc:<alias>}}"/"{{fake}}" placeholder substitution — see llm.go)
 	// as the synthesis answer, overriding the default evidence-echo oracle.
 	// Required for every adversarial-citation fixture (Gold.
-	// ExpectedCitationStatus set); must be empty for every other category,
-	// so the default context-conditional oracle — and therefore the
-	// RetrievalHit/ContextHit detectors, which read the REAL prompt the
-	// oracle saw — actually runs.
+	// ExpectedCitationStatus set) and every claim-support-injection
+	// self-test (Gold.ExpectedDetector set). Permitted on an UNANSWERABLE
+	// fixture (Gold.Answerable==false) with neither set — the fabrication
+	// self-tests (ne-04/05, ie-04/05) use exactly this shape, since
+	// AbstainedCorrectly/FabricatedAnswer read the citation report rather
+	// than the real prompt. MUST be empty on an ANSWERABLE fixture
+	// (Gold.Answerable==true) unless Gold.ExpectedDetector is also set —
+	// validate rejects that combination, because it would silently bypass
+	// the default context-conditional oracle and break RetrievalHit/
+	// ContextHit's real-prompt grounding for a fixture shape no self-test
+	// framing accounts for.
 	ScriptedAnswer string `json:"scripted_answer,omitempty"`
 	// SemanticAliases declares synonym groups the FAKE VECTOR EMBEDDER
 	// (corpus.go's hashedEmbedder/hashEmbed, via semanticAliasFold) treats
@@ -237,10 +271,24 @@ func validate(f Fixture) error {
 	if len(f.History) > 0 && f.StandaloneQuestion == "" {
 		return fmt.Errorf("fixture %s: has history but no standalone_question (rewriteStandaloneQuestion will call the scripted LLM)", f.ID)
 	}
+	// ScriptedAnswer is permitted on an answerable fixture ONLY when
+	// ExpectedDetector also declares which self-test shape it exercises —
+	// see Fixture.ScriptedAnswer's doc comment for why an unmarked
+	// bypass would silently break RetrievalHit/ContextHit's grounding in
+	// the real prompt. Checked before the switch below so it applies
+	// regardless of which case ExpectedDetector/ExpectedCitationStatus
+	// would otherwise select.
+	if f.Gold.Answerable && f.ScriptedAnswer != "" && f.Gold.ExpectedDetector == "" {
+		return fmt.Errorf("fixture %s: scripted_answer set on an answerable fixture with no expected_detector (bypasses the context-conditional oracle — see Fixture.ScriptedAnswer's doc comment); set gold.expected_detector or clear scripted_answer", f.ID)
+	}
 	switch {
 	case f.Gold.ExpectedCitationStatus != "":
 		if f.ScriptedAnswer == "" {
 			return fmt.Errorf("fixture %s: expected_citation_status set but scripted_answer is empty", f.ID)
+		}
+	case f.Gold.ExpectedDetector != "":
+		if err := validateExpectedDetector(f); err != nil {
+			return err
 		}
 	case f.Gold.Answerable:
 		if len(f.Gold.Claims) == 0 || len(f.Gold.SupportDocs) == 0 || len(f.Gold.SupportSpans) == 0 {
@@ -255,8 +303,37 @@ func validate(f Fixture) error {
 			return fmt.Errorf("fixture %s: gold support_doc_ids references unknown corpus alias %q", f.ID, alias)
 		}
 	}
+	for _, cs := range f.Gold.ClaimSupport {
+		if !aliases[cs.DocAlias] {
+			return fmt.Errorf("fixture %s: gold claim_support references unknown corpus alias %q", f.ID, cs.DocAlias)
+		}
+		switch cs.Expected {
+		case VerdictSupported, VerdictUnsupported:
+		default:
+			return fmt.Errorf("fixture %s: gold claim_support[%q].expected must be %q or %q, got %q", f.ID, cs.DocAlias, VerdictSupported, VerdictUnsupported, cs.Expected)
+		}
+	}
 	if err := validateSemanticAliases(f); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateExpectedDetector checks the invariants computeMetrics'
+// ExpectedDetector branch (metrics.go) relies on: a recognized detector
+// value, a non-empty ScriptedAnswer to provoke it, and at least one
+// support document to check the ScriptedAnswer's citation against.
+func validateExpectedDetector(f Fixture) error {
+	switch f.Gold.ExpectedDetector {
+	case detectorClaimMismatch, detectorCitationOutsideSupport:
+	default:
+		return fmt.Errorf("fixture %s: expected_detector must be %q or %q, got %q", f.ID, detectorClaimMismatch, detectorCitationOutsideSupport, f.Gold.ExpectedDetector)
+	}
+	if f.ScriptedAnswer == "" {
+		return fmt.Errorf("fixture %s: expected_detector set but scripted_answer is empty", f.ID)
+	}
+	if len(f.Gold.SupportDocs) == 0 {
+		return fmt.Errorf("fixture %s: expected_detector fixtures need support_doc_ids (the real, provided documents the injection is checked against)", f.ID)
 	}
 	return nil
 }

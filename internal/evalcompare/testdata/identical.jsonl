@@ -1,0 +1,4 @@
+{"kind":"header","dump_version":2,"label_hash":"lh-identical","config_hash":"ch-same","code_revision":"rev-same","attempted":3,"failed":0,"label_source":"golden-user","split":"all","window_mode":"none","created_at":"2026-09-24T00:00:00Z"}
+{"kind":"query","query_id":"q-a","query_source":"seed","relevant_docs":[{"doc_id":"d1","final_rank":2,"source_type":"call"}],"search_failed":false,"negative_ids_in_top10":1,"latency_ms":15,"ndcg10":0.6309297535714575,"recall10":1,"fp10":1}
+{"kind":"query","query_id":"q-b","query_source":"seed","relevant_docs":[{"doc_id":"d2","final_rank":null,"source_type":"gmail"}],"search_failed":false,"negative_ids_in_top10":0,"latency_ms":8,"ndcg10":0,"recall10":0,"fp10":0}
+{"kind":"query","query_id":"q-c","query_source":"ask_history","relevant_docs":[],"search_failed":false,"negative_ids_in_top10":2,"latency_ms":20,"ndcg10":null,"recall10":null,"fp10":2}

@@ -2,6 +2,7 @@ package askeval
 
 import (
 	"context"
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -39,16 +40,31 @@ func fixturesDir(t *testing.T) string {
 // self-tests (ne-04/05, ie-04/05 — see TestRun_DistinguishesFabricatedAnswers)
 // on top of their original 3 natural-abstention fixtures each (deep-verify
 // #266 HIGH finding).
+//
+// claim_support_injection (issue #273) carries 2 self-tests proving
+// CaseMetrics.CitationWithinSupport actually fires — see
+// TestRun_DistinguishesClaimSupportInjection.
+//
+// conflicting_sources (deep-verify #273 MEDIUM finding) carries 1
+// citation-injection self-test (cs-04-superseded-citation) alongside its 3
+// original oracle-driven fixtures: cs-01–03 prove the REAL pipeline picks
+// the newer of two conflicting facts when nothing forces it otherwise;
+// cs-04 proves citation_within_support still catches a correct claim
+// mis-attributed to the SUPERSEDED document of that same pair — a shape
+// the oracle can never produce on its own (see cs-04's own fixture
+// comment-equivalent in docs/ask-evaluation-protocol.md and
+// TestRun_DistinguishesConflictingSourcesCitationInjection below).
 var wantCategoryCounts = map[string]int{
 	"single_turn":              6,
 	"korean_followup":          5,
 	"period_source_filter":     5,
 	"call_transcript_mid_late": 6,
-	"conflicting_sources":      3,
+	"conflicting_sources":      4,
 	"no_evidence":              5,
 	"irrelevant_evidence":      5,
 	"adversarial_citation":     4,
 	"document_injection":       1,
+	"claim_support_injection":  2,
 }
 
 func TestLoad_FixtureSetShape(t *testing.T) {
@@ -56,7 +72,7 @@ func TestLoad_FixtureSetShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	const wantTotal = 30
+	const wantTotal = 32
 	if len(fixtures) < wantTotal {
 		t.Fatalf("want >= %d fixtures, got %d", wantTotal, len(fixtures))
 	}
@@ -396,6 +412,307 @@ func TestRun_DistinguishesFabricatedAnswers(t *testing.T) {
 		}
 	}
 }
+
+// TestRun_DistinguishesClaimSupportInjection asserts, per
+// claim_support_injection fixture (issue #273), that the specific
+// deterministic detector each fixture targets actually fires —
+// csi-01-claim-mismatch's AnswerCorrect must come out false (the
+// ScriptedAnswer cites a real, provided support document but attaches a
+// FALSE claim to it), and csi-02-citation-outside-support's
+// CitationWithinSupport must come out false (the ScriptedAnswer makes a
+// CORRECT claim but cites a real, provided document outside
+// Gold.SupportDocs). Both mirror TestRun_DistinguishesAdversarialCitationShapes'
+// and TestRun_DistinguishesFabricatedAnswers' own framing: the PASSING
+// outcome is that the harness's own detector catches the injection, not
+// that the scripted answer "succeeds".
+func TestRun_DistinguishesClaimSupportInjection(t *testing.T) {
+	fixtures, err := Load(fixturesDir(t))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	byID := map[string]Fixture{}
+	for _, f := range fixtures {
+		byID[f.ID] = f
+	}
+	cases := []struct {
+		id                     string
+		wantAnswerCorrect      bool
+		wantCitationWithinSupp bool
+	}{
+		{"csi-01-claim-mismatch", false, true},
+		{"csi-02-citation-outside-support", true, false},
+	}
+	for _, c := range cases {
+		f, ok := byID[c.id]
+		if !ok {
+			t.Fatalf("fixture %s not found in %s", c.id, fixturesDir(t))
+		}
+		if f.Gold.ExpectedDetector == "" {
+			t.Fatalf("%s: expected an expected_detector fixture", c.id)
+		}
+		r := Run(context.Background(), []Fixture{f}, DefaultRunOptions())[0]
+		if r.Err != nil {
+			t.Fatalf("%s: run error: %v", c.id, r.Err)
+		}
+		if boolVal(r.Metrics.AnswerCorrect) != c.wantAnswerCorrect {
+			t.Errorf("%s: want answer_correct=%v, got %v (answer=%q)", c.id, c.wantAnswerCorrect, boolVal(r.Metrics.AnswerCorrect), r.RawAnswer)
+		}
+		if boolVal(r.Metrics.CitationWithinSupport) != c.wantCitationWithinSupp {
+			t.Errorf("%s: want citation_within_support=%v, got %v", c.id, c.wantCitationWithinSupp, boolVal(r.Metrics.CitationWithinSupport))
+		}
+		if r.Metrics.CitationStatus != "valid" {
+			t.Errorf("%s: want citation_status=valid (the citation IS a real, prompt-shown document — issue #268's validator has nothing to say about it), got %q", c.id, r.Metrics.CitationStatus)
+		}
+		if !r.Metrics.Pass {
+			t.Errorf("%s: want Pass=true (the harness catching the injection IS the pass condition)", c.id)
+		}
+	}
+}
+
+// TestRun_DistinguishesConflictingSourcesCitationInjection is deep-verify
+// #273's MEDIUM finding: docs/ask-evaluation-protocol.md described
+// conflicting_sources as testing that "only the correct (gold) one should
+// be cited", but cs-01–03 cannot actually exercise that claim — their
+// answers all come from the context-conditional oracle (llm.go's
+// synthesize), which structurally only ever cites a claim's OWN
+// Gold.SupportDocs entry, so it can NEVER produce the "correct claim,
+// wrong (superseded) citation" shape in the first place. This mirrors
+// TestRun_DistinguishesClaimSupportInjection's own csi-02 case exactly,
+// applied to a conflicting_sources fixture specifically:
+// cs-04-superseded-citation's ScriptedAnswer states the CORRECT, current
+// fact ("650만원") but cites the OLDER, superseded quote document instead
+// of the one fact-checking (gold.support_doc_ids) actually names — the
+// PASSING outcome, like every other self-test in this package, is that the
+// real, unmodified CitationWithinSupport detector catches it, not that the
+// scripted answer "succeeds".
+func TestRun_DistinguishesConflictingSourcesCitationInjection(t *testing.T) {
+	fixtures, err := Load(fixturesDir(t))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	const id = "cs-04-superseded-citation"
+	var target *Fixture
+	for i := range fixtures {
+		if fixtures[i].ID == id {
+			target = &fixtures[i]
+			break
+		}
+	}
+	if target == nil {
+		t.Fatalf("fixture %s not found in %s", id, fixturesDir(t))
+	}
+	if target.Category != "conflicting_sources" {
+		t.Fatalf("%s: want category=conflicting_sources, got %q", id, target.Category)
+	}
+	if target.Gold.ExpectedDetector != detectorCitationOutsideSupport {
+		t.Fatalf("%s: want gold.expected_detector=%q, got %q", id, detectorCitationOutsideSupport, target.Gold.ExpectedDetector)
+	}
+	r := Run(context.Background(), []Fixture{*target}, DefaultRunOptions())[0]
+	if r.Err != nil {
+		t.Fatalf("%s: run error: %v", id, r.Err)
+	}
+	if !boolVal(r.Metrics.AnswerCorrect) {
+		t.Errorf("%s: want answer_correct=true (the scripted answer states the CORRECT, current fact), got false (answer=%q)", id, r.RawAnswer)
+	}
+	if boolVal(r.Metrics.CitationWithinSupport) {
+		t.Errorf("%s: want citation_within_support=false (the citation resolves to the SUPERSEDED document, not gold.support_doc_ids), got true", id)
+	}
+	if r.Metrics.CitationStatus != "valid" {
+		t.Errorf("%s: want citation_status=valid (the superseded document IS a real, prompt-shown document — issue #268's validator has nothing to say about which of two conflicting sources it is), got %q", id, r.Metrics.CitationStatus)
+	}
+	if !r.Metrics.Pass {
+		t.Errorf("%s: want Pass=true (the harness catching the superseded-source citation IS the pass condition)", id)
+	}
+}
+
+// TestBuildReport_CitationWithinSupportFlipsNoExistingFixture is the
+// permanent record of issue #273's step-2 flip check: adding
+// CitationWithinSupport to the answerable Pass rule must flip ZERO of this
+// repository's pre-existing (pre-#273) fixtures, because the real oracle
+// (llm.go's synthesize) only ever cites a claim's OWN Gold.SupportDocs
+// entry — it structurally cannot produce the citation_within_support=false
+// shape computeMetrics' answerable branch now checks for. This test proves
+// that structural claim empirically rather than asserting it by
+// construction: every single_turn/korean_followup/period_source_filter/
+// call_transcript_mid_late/conflicting_sources fixture (every category
+// whose Pass rule changed) must still pass.
+//
+// conflicting_sources's ONE non-oracle member,
+// cs-04-superseded-citation (deep-verify #273 MEDIUM finding), is included
+// in this sweep too and is expected to pass here for a DIFFERENT reason
+// than its oracle-driven siblings: its own gold.expected_detector branch
+// (not the "the oracle cannot misfire" guarantee this comment otherwise
+// describes) is what makes CitationWithinSupport come out false ON
+// PURPOSE — see TestRun_DistinguishesConflictingSourcesCitationInjection
+// for that fixture's dedicated, explicit assertions.
+func TestBuildReport_CitationWithinSupportFlipsNoExistingFixture(t *testing.T) {
+	fixtures, err := Load(fixturesDir(t))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	oracleCategories := map[string]bool{
+		"single_turn":              true,
+		"korean_followup":          true,
+		"period_source_filter":     true,
+		"call_transcript_mid_late": true,
+		"conflicting_sources":      true,
+	}
+	var affected []Fixture
+	for _, f := range fixtures {
+		if oracleCategories[f.Category] {
+			affected = append(affected, f)
+		}
+	}
+	if len(affected) == 0 {
+		t.Fatal("no oracle-driven answerable fixtures found — wantCategoryCounts and oracleCategories have drifted apart")
+	}
+	results := Run(context.Background(), affected, DefaultRunOptions())
+	var flipped []string
+	for _, r := range results {
+		if r.Err != nil {
+			t.Fatalf("%s: run error: %v", r.Fixture.ID, r.Err)
+		}
+		if !r.Metrics.Pass {
+			flipped = append(flipped, r.Fixture.ID)
+		}
+	}
+	if len(flipped) > 0 {
+		t.Errorf("citation_within_support flipped %d pre-existing fixture(s) from pass to fail: %v — this was supposed to be impossible (the oracle only ever cites Gold.SupportDocs); investigate before merging", len(flipped), flipped)
+	}
+}
+
+// TestBuildReport_AbstentionStats exercises report.go's BuildReport
+// directly against hand-built CaseResults (not a real Run) so the
+// abstention precision/recall accounting itself — including the
+// ScriptedAnswer/harness-error exclusion rule — can be pinned in
+// isolation from retrieval/synthesis behaviour.
+// TestComputeMetrics_CitationWithinSupportGatesPass proves the
+// citation_within_support gate can both PASS and FAIL an answerable case,
+// bypassing the fixture-loader (validate rejects a ScriptedAnswer on a
+// plain answerable fixture — see fixture.go — precisely so the real
+// oracle's own structural guarantee holds: it never cites outside
+// Gold.SupportDocs, which is exactly why
+// TestBuildReport_CitationWithinSupportFlipsNoExistingFixture finds zero
+// flips over the real fixture set). This test instead calls computeMetrics
+// directly with a hand-built CaseResult, so it can exercise the "cited a
+// real, retrieved, but non-support document" shape no fixture (self-test
+// or otherwise) is allowed to express on disk.
+func TestComputeMetrics_CitationWithinSupportGatesPass(t *testing.T) {
+	f := Fixture{
+		ID: "scratch", Category: "single_turn", AsOf: "2026-06-10T09:00:00+09:00",
+		Corpus: []CorpusDoc{
+			{Alias: "call-1", SourceType: "call", Title: "t1", Content: "content1"},
+			{Alias: "mail-other", SourceType: "gmail", Title: "t2", Content: "content2"},
+		},
+		Question: "q?",
+		Gold: Gold{
+			Answerable:   true,
+			Claims:       []string{"5천만원"},
+			SupportDocs:  []string{"call-1"},
+			SupportSpans: []string{"근거span"},
+		},
+	}
+	asOf, err := time.Parse(time.RFC3339, f.AsOf)
+	if err != nil {
+		t.Fatalf("as_of: %v", err)
+	}
+	cp, err := buildCorpus(f, asOf)
+	if err != nil {
+		t.Fatalf("buildCorpus: %v", err)
+	}
+	supportID, ok := cp.resolveAlias("call-1")
+	if !ok {
+		t.Fatal("resolveAlias(call-1) failed")
+	}
+	nonSupportID, ok := cp.resolveAlias("mail-other")
+	if !ok {
+		t.Fatal("resolveAlias(mail-other) failed")
+	}
+	baseRes := CaseResult{
+		RawAnswer:    "5천만원",
+		FinishReason: "stop",
+		Sources:      []sourceItem{{ID: supportID}},
+	}
+	prompt := "...근거span..."
+
+	t.Run("cites a support doc: passes", func(t *testing.T) {
+		res := baseRes
+		res.Verification = &verificationPayload{CitationStatus: "valid", CitedIDs: []string{supportID}}
+		m := computeMetrics(f, cp, res, prompt)
+		if !boolVal(m.CitationWithinSupport) {
+			t.Errorf("want citation_within_support=true, got %v", boolVal(m.CitationWithinSupport))
+		}
+		if !m.Pass {
+			t.Errorf("want Pass=true when the citation resolves into Gold.SupportDocs")
+		}
+	})
+
+	t.Run("cites a real but non-support doc: fails", func(t *testing.T) {
+		res := baseRes
+		res.Verification = &verificationPayload{CitationStatus: "valid", CitedIDs: []string{nonSupportID}}
+		m := computeMetrics(f, cp, res, prompt)
+		if boolVal(m.CitationWithinSupport) {
+			t.Errorf("want citation_within_support=false, got %v", boolVal(m.CitationWithinSupport))
+		}
+		if m.Pass {
+			t.Errorf("want Pass=false when the citation resolves to a real document OUTSIDE Gold.SupportDocs — this is the exact gap issue #273 closes")
+		}
+	})
+}
+
+func TestBuildReport_AbstentionStats(t *testing.T) {
+	results := []CaseResult{
+		// Real pipeline, correctly abstained on an unanswerable question:
+		// true positive.
+		{
+			Fixture:      Fixture{ID: "real-tp", Gold: Gold{Answerable: false}},
+			FinishReason: "no_evidence",
+			Metrics:      CaseMetrics{Pass: true, AbstainedCorrectly: true},
+		},
+		// Real pipeline, wrongly abstained on an ANSWERABLE question: false
+		// positive (issue #266's "normal-answer loss").
+		{
+			Fixture:      Fixture{ID: "real-fp", Gold: Gold{Answerable: true}},
+			FinishReason: "no_evidence",
+			Metrics:      CaseMetrics{Pass: false, FalseAbstention: true},
+		},
+		// Real pipeline, answered instead of abstaining on an unanswerable
+		// question: false negative.
+		{
+			Fixture:      Fixture{ID: "real-fn", Gold: Gold{Answerable: false}},
+			FinishReason: "stop",
+			Metrics:      CaseMetrics{Pass: false, CitationStatus: "valid"},
+		},
+		// A ScriptedAnswer fixture that ALSO happens to look like a
+		// natural abstention shape — must be excluded from the stat
+		// entirely (its finish_reason was forced, not produced by the
+		// real decision path).
+		{
+			Fixture:      Fixture{ID: "scripted-excluded", Gold: Gold{Answerable: false}, ScriptedAnswer: "제공된 정보로는 답변할 수 없습니다."},
+			FinishReason: "no_evidence",
+			Metrics:      CaseMetrics{Pass: true, AbstainedCorrectly: true},
+		},
+		// A harness-error case — measured nothing, must also be excluded.
+		{
+			Fixture: Fixture{ID: "harness-error", Gold: Gold{Answerable: false}},
+			Err:     errFixtureHarness,
+		},
+	}
+	rep := BuildReport(results, Provenance{})
+	want := AbstentionStats{
+		Considered: 3, Predicted: 2, Actual: 2,
+		TruePositive: 1, FalsePositive: 1, FalseNegative: 1,
+		Precision: 0.5, Recall: 0.5,
+	}
+	if rep.Abstention != want {
+		t.Errorf("Abstention = %+v, want %+v", rep.Abstention, want)
+	}
+}
+
+// errFixtureHarness is a fixed sentinel error for
+// TestBuildReport_AbstentionStats — its message is never inspected, only
+// its non-nilness.
+var errFixtureHarness = errors.New("askeval: synthetic harness error for a test")
 
 // boolVal returns the value of p, or false when p is nil (a CaseMetrics
 // *bool field that does not apply to the fixture's shape — see
