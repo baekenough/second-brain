@@ -118,7 +118,8 @@ const (
 	LaneDocumentStore = "document_store" // internal/store 의 5-lane 가중 RRF 결과
 	LaneChunkVector   = "chunk_vector"
 	LaneOpenSearch    = "opensearch"
-	LaneChunkFTS      = "chunk_fts" // 1차 경로가 비었을 때만 도는 폴백
+	LaneChunkFTS      = "chunk_fts"       // 1차 경로가 비었을 때만 도는 폴백
+	LaneChunkFTSFused = "chunk_fts_fused" // SEARCH_CHUNK_SPARSE=fuse: 결과 유무와 무관하게 RRF 융합(#270)
 )
 
 // SearchTrace 는 Search 한 번에 대한 진단 기록이다. "왜 이 문서가 상위에
@@ -859,11 +860,24 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 		}
 	}
 
-	// When the primary path (full-document FTS / hybrid) + chunk vector
-	// returned no results, fall back to chunk FTS. Under a window its hits are
-	// verified like the vector lane's; unverifiable hits are dropped, so an
-	// empty answer stays empty rather than silently widening the window.
-	if len(results) == 0 && s.chunkStore != nil && chunkLanesEnabled {
+	// SEARCH_CHUNK_SPARSE=fuse (#270 phase A): promote the chunk FTS/bigm
+	// lane into the same RRF fusion the chunk vector / OpenSearch lanes use
+	// above, instead of running it only as a zero-results fallback. Default
+	// ("fallback") takes the unchanged branch below — see
+	// fuseChunkSparse's doc comment (chunk_sparse_lane.go) for why this has
+	// to exist before migration 040's derived sparse context is worth
+	// building at all.
+	if tune.ChunkSparse == model.ChunkSparseFuse && s.chunkStore != nil && chunkLanesEnabled {
+		if fused, ok := s.fuseChunkSparse(ctx, q, results, laneLimit, tune, trace); ok {
+			results = fused
+			chunkFused = true
+		}
+	} else if len(results) == 0 && s.chunkStore != nil && chunkLanesEnabled {
+		// When the primary path (full-document FTS / hybrid) + chunk vector
+		// returned no results, fall back to chunk FTS. Under a window its hits
+		// are verified like the vector lane's; unverifiable hits are dropped,
+		// so an empty answer stays empty rather than silently widening the
+		// window.
 		chunkResults, cerr := s.searchChunksFTS(ctx, q.Query, laneLimit, q)
 		if cerr != nil {
 			// Non-fatal: log and return the empty primary result set.

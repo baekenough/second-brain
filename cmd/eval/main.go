@@ -183,6 +183,9 @@ func run() error {
 		"최신성 감쇠 반감기(일). 0(기본)이면 감쇠하지 않는다. 시간창이 없는 질의에만 적용된다")
 	recencyAlpha := flag.Float64("recency-alpha", model.DefaultRecencyAlpha,
 		"최신성 감쇠의 최대 강도. 승수는 (1-alpha)+alpha*exp(-ln2*age/halflife) 다")
+	chunkSparse := flag.String("chunk-sparse", model.ChunkSparseFallback,
+		"청크 FTS/bigm 레인 융합 방식(#270). fallback(기본)은 1차 경로가 결과를 "+
+			"하나도 못 찾았을 때만 폴백으로 돌고, fuse 는 결과 유무와 무관하게 RRF 융합에 참여시킨다")
 	flag.Parse()
 	if *pairLimit < 0 || (*split != "all" && *split != "train" && *split != "holdout") {
 		return errors.New("invalid eval --split or --limit")
@@ -209,6 +212,7 @@ func run() error {
 		RerankInput:         *rerankInput,
 		RecencyHalfLifeDays: *recencyHalflife,
 		RecencyAlpha:        *recencyAlpha,
+		ChunkSparse:         *chunkSparse,
 	}
 	if err := validateTuningFlags(tuning); err != nil {
 		return err

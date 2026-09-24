@@ -42,16 +42,18 @@ func TestSearchTuningNormalized(t *testing.T) {
 			want: model.SearchTuning{
 				MergeMode: model.MergeAsymmetric, RerankBlend: model.RerankBlendReplace,
 				RerankBlendWeight: 1.0, RerankInput: model.RerankInputHead, RecencyAlpha: 0.3,
+				ChunkSparse: model.ChunkSparseFallback,
 			},
 		},
 		{
 			name: "알 수 없는 문자열은 기본값으로 되돌린다",
 			in: model.SearchTuning{
-				MergeMode: "SYMMETRIC-오타", RerankBlend: "blend", RerankInput: "chunk",
+				MergeMode: "SYMMETRIC-오타", RerankBlend: "blend", RerankInput: "chunk", ChunkSparse: "fuze-오타",
 			},
 			want: model.SearchTuning{
 				MergeMode: model.MergeAsymmetric, RerankBlend: model.RerankBlendReplace,
 				RerankBlendWeight: 1.0, RerankInput: model.RerankInputHead, RecencyAlpha: 0.3,
+				ChunkSparse: model.ChunkSparseFallback,
 			},
 		},
 		{
@@ -60,11 +62,13 @@ func TestSearchTuningNormalized(t *testing.T) {
 				RerankOverfetch: 50, MergeMode: model.MergeSymmetric,
 				RerankBlend: model.RerankBlendRRF, RerankBlendWeight: 0.5,
 				RerankInput: model.RerankInputBestChunk, RecencyHalfLifeDays: 30, RecencyAlpha: 0.7,
+				ChunkSparse: model.ChunkSparseFuse,
 			},
 			want: model.SearchTuning{
 				RerankOverfetch: 50, MergeMode: model.MergeSymmetric,
 				RerankBlend: model.RerankBlendRRF, RerankBlendWeight: 0.5,
 				RerankInput: model.RerankInputBestChunk, RecencyHalfLifeDays: 30, RecencyAlpha: 0.7,
+				ChunkSparse: model.ChunkSparseFuse,
 			},
 		},
 		{
@@ -75,6 +79,7 @@ func TestSearchTuningNormalized(t *testing.T) {
 			want: model.SearchTuning{
 				MergeMode: model.MergeAsymmetric, RerankBlend: model.RerankBlendReplace,
 				RerankBlendWeight: 1.0, RerankInput: model.RerankInputHead, RecencyAlpha: 1,
+				ChunkSparse: model.ChunkSparseFallback,
 			},
 		},
 	}

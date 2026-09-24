@@ -39,6 +39,15 @@ const (
 	// 본문을 보낸다. 통화 전사·긴 메일처럼 근거가 앞부분에 없는 문서를
 	// 겨냥한다.
 	RerankInputBestChunk = "best_chunk"
+
+	// ChunkSparseFallback 은 현행 동작이다(#270). 청크 FTS/bigm 레인은
+	// 1차 경로(문서 하이브리드 + 청크 벡터 + OpenSearch)가 결과를 하나도
+	// 못 찾았을 때만 폴백으로 돈다.
+	ChunkSparseFallback = "fallback"
+	// ChunkSparseFuse 는 청크 FTS/bigm 레인을 1차 경로 결과 유무와 무관하게
+	// 항상 RRF 융합에 참여시킨다(실험용). 스키마 변경 없음 — chunks.content
+	// 만 매칭·반환한다(#270 phase A).
+	ChunkSparseFuse = "fuse"
 )
 
 // 노브 기본값. 제로값이 곧 "현행 동작" 이 되도록 잡았다 — 새 필드가 생겼다는
@@ -93,6 +102,11 @@ type SearchTuning struct {
 	// 승수는 (1-alpha) + alpha*exp(-ln2*age/halflife) 이므로 alpha=1 이면
 	// 반감기마다 점수가 절반이 되고, alpha=0 이면 감쇠가 없다.
 	RecencyAlpha float64
+
+	// ChunkSparse 는 ChunkSparseFallback(기본) 또는 ChunkSparseFuse.
+	// fuse 는 청크 FTS/bigm 레인을 1차 경로 결과 유무와 무관하게 RRF 융합에
+	// 참여시킨다(#270 phase A).
+	ChunkSparse string
 }
 
 // IsZero 는 노브가 하나도 설정되지 않았는지 — 즉 "현행 동작" 인지 — 알린다.
@@ -128,6 +142,9 @@ func (t SearchTuning) Normalized() SearchTuning {
 	if t.RecencyAlpha > 1 {
 		t.RecencyAlpha = 1
 	}
+	if t.ChunkSparse != ChunkSparseFuse {
+		t.ChunkSparse = ChunkSparseFallback
+	}
 	return t
 }
 
@@ -149,6 +166,7 @@ func EnvSearchTuning() SearchTuning {
 		RerankInput:         envTuningChoice("SEARCH_RERANK_INPUT", RerankInputHead, RerankInputBestChunk),
 		RecencyHalfLifeDays: envTuningFloat("SEARCH_RECENCY_HALFLIFE_DAYS"),
 		RecencyAlpha:        envTuningFloat("SEARCH_RECENCY_ALPHA"),
+		ChunkSparse:         envTuningChoice("SEARCH_CHUNK_SPARSE", ChunkSparseFallback, ChunkSparseFuse),
 	}.Normalized()
 }
 

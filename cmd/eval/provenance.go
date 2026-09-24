@@ -135,6 +135,10 @@ func validateTuningFlags(t model.SearchTuning) error {
 	if t.RecencyAlpha <= 0 || t.RecencyAlpha > 1 || math.IsNaN(t.RecencyAlpha) {
 		return fmt.Errorf("eval: --recency-alpha must be in (0, 1], got %v", t.RecencyAlpha)
 	}
+	if t.ChunkSparse != model.ChunkSparseFallback && t.ChunkSparse != model.ChunkSparseFuse {
+		return fmt.Errorf("eval: invalid --chunk-sparse %q (want %q or %q)",
+			t.ChunkSparse, model.ChunkSparseFallback, model.ChunkSparseFuse)
+	}
 	return nil
 }
 
@@ -166,6 +170,9 @@ func applyTuningProfile(profile map[string]any, t model.SearchTuning) {
 		// alpha 도 마찬가지 — 반감기가 0 이면 alpha 는 아무 효과가 없다.
 		profile["recency_halflife_days"] = t.RecencyHalfLifeDays
 		profile["recency_alpha"] = t.RecencyAlpha
+	}
+	if t.ChunkSparse == model.ChunkSparseFuse {
+		profile["chunk_sparse"] = t.ChunkSparse
 	}
 }
 
