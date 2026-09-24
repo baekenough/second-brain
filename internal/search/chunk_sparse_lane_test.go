@@ -124,3 +124,120 @@ func TestSearch_ChunkSparse_Fuse_AppliesFiltersAndInsightGuard(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// SEARCH_CHUNK_SPARSE=fuse_ctx (#270 phase B) — chunk_sparse_lane.go's
+// fuseChunkSparseCtx / SparseContextSearcher.
+// ---------------------------------------------------------------------------
+
+// mockSparseContextSearcher adds SearchSparseContextFiltered on top of
+// mockChunkSearcher, so a single fake can be asserted to SparseContextSearcher
+// (fuse_ctx) while a plain *mockChunkSearcher (used by every other test in
+// this file) never satisfies that interface — proving the type assertion in
+// fuseChunkSparseCtx actually gates on capability, not on tuning alone.
+type mockSparseContextSearcher struct {
+	mockChunkSearcher
+	ctxResults []store.ChunkSearchResult
+	ctxErr     error
+	gotVersion string
+}
+
+func (m *mockSparseContextSearcher) SearchSparseContextFiltered(_ context.Context, _ model.SearchQuery, _ int, version string) ([]store.ChunkSearchResult, error) {
+	m.gotVersion = version
+	return m.ctxResults, m.ctxErr
+}
+
+// TestSearch_ChunkSparseCtx_UnsupportedStore_NoOp proves fuse_ctx degrades
+// gracefully (no panic, no results dropped) when the wired chunk store does
+// not implement SparseContextSearcher — the state every non-*store.ChunkStore
+// adapter and the askeval fake corpus are in today.
+func TestSearch_ChunkSparseCtx_UnsupportedStore_NoOp(t *testing.T) {
+	t.Parallel()
+
+	primaryID := uuid.New()
+	docs := &mockDocSearcher{results: []*model.SearchResult{
+		makeSearchResult(primaryID, "primary hit", 0.9),
+	}}
+	chunks := &mockChunkSearcher{} // does NOT implement SparseContextSearcher
+
+	svc := NewService(docs, disabledEmbedder{}).WithChunkStore(chunks).
+		WithTuning(model.SearchTuning{ChunkSparse: model.ChunkSparseFuseCtx, ChunkSparseCtxVersion: model.ChunkSparseCtxV1TP})
+	results, err := svc.Search(context.Background(), model.SearchQuery{Query: "budget"})
+	if err != nil {
+		t.Fatalf("Search returned error: %v", err)
+	}
+	if len(results) != 1 || results[0].ID != primaryID {
+		t.Fatalf("results = %+v, want the primary hit preserved (unsupported store must not error or panic)", results)
+	}
+}
+
+// TestSearch_ChunkSparseCtx_AddsCandidates_AndPassesVersion proves the
+// fuse_ctx lane fuses a context-only hit into a non-empty primary result set
+// (same promotion as phase A's fuse) AND passes the configured
+// ChunkSparseCtxVersion through to the store call unchanged.
+func TestSearch_ChunkSparseCtx_AddsCandidates_AndPassesVersion(t *testing.T) {
+	t.Parallel()
+
+	primaryID := uuid.New()
+	ctxOnlyID := uuid.New()
+
+	docs := &mockDocSearcher{results: []*model.SearchResult{
+		makeSearchResult(primaryID, "primary hit", 0.9),
+	}}
+	chunks := &mockSparseContextSearcher{
+		ctxResults: []store.ChunkSearchResult{makeChunkResult(ctxOnlyID, 0, 0.4, "context-only hit")},
+	}
+
+	svc := NewService(docs, disabledEmbedder{}).WithChunkStore(chunks).
+		WithTuning(model.SearchTuning{ChunkSparse: model.ChunkSparseFuseCtx, ChunkSparseCtxVersion: model.ChunkSparseCtxV1Full})
+	results, err := svc.Search(context.Background(), model.SearchQuery{Query: "budget", Limit: 10})
+	if err != nil {
+		t.Fatalf("Search returned error: %v", err)
+	}
+
+	if chunks.gotVersion != model.ChunkSparseCtxV1Full {
+		t.Errorf("store received context_version = %q, want %q", chunks.gotVersion, model.ChunkSparseCtxV1Full)
+	}
+
+	var sawPrimary, sawCtx bool
+	for _, r := range results {
+		if r.ID == primaryID {
+			sawPrimary = true
+		}
+		if r.ID == ctxOnlyID {
+			sawCtx = true
+		}
+	}
+	if !sawPrimary {
+		t.Errorf("results = %+v, want the primary hit preserved", results)
+	}
+	if !sawCtx {
+		t.Errorf("results = %+v, want the context-only hit fused in", results)
+	}
+}
+
+// TestSearch_ChunkSparseCtx_ReturnsRawContent proves the lane returns
+// c.content (the search result Content field), never sparse_text — a
+// contract SearchSparseContextFiltered's SQL already enforces, but wrong
+// wiring at this layer (e.g. building the SearchResult from a different
+// field) would defeat it just as effectively.
+func TestSearch_ChunkSparseCtx_ReturnsRawContent(t *testing.T) {
+	t.Parallel()
+
+	docs := &mockDocSearcher{}
+	ctxOnlyID := uuid.New()
+	rawHit := makeChunkResult(ctxOnlyID, 0, 0.6, "raw content title")
+	// makeChunkResult sets Chunk.Content to "chunk content <title>" — assert
+	// exactly that value comes back, proving nothing substituted sparse_text.
+	chunks := &mockSparseContextSearcher{ctxResults: []store.ChunkSearchResult{rawHit}}
+
+	svc := NewService(docs, disabledEmbedder{}).WithChunkStore(chunks).
+		WithTuning(model.SearchTuning{ChunkSparse: model.ChunkSparseFuseCtx, ChunkSparseCtxVersion: model.ChunkSparseCtxV1TP})
+	results, err := svc.Search(context.Background(), model.SearchQuery{Query: "budget", Limit: 10})
+	if err != nil {
+		t.Fatalf("Search returned error: %v", err)
+	}
+	if len(results) != 1 || results[0].Content != rawHit.Chunk.Content {
+		t.Fatalf("results = %+v, want a single result with Content = %q", results, rawHit.Chunk.Content)
+	}
+}

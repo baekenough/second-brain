@@ -45,6 +45,17 @@ func TestValidateTuningFlags(t *testing.T) {
 		{"--recency-halflife-days 음수", func(t *model.SearchTuning) { t.RecencyHalfLifeDays = -1 }, true},
 		{"--recency-alpha 범위 밖", func(t *model.SearchTuning) { t.RecencyAlpha = 1.5 }, true},
 		{"--chunk-sparse 오타", func(t *model.SearchTuning) { t.ChunkSparse = "fuze" }, true},
+		{"--chunk-sparse=fuse_ctx + 유효한 버전", func(t *model.SearchTuning) {
+			t.ChunkSparse = model.ChunkSparseFuseCtx
+			t.ChunkSparseCtxVersion = model.ChunkSparseCtxV1TP
+		}, false},
+		{"--chunk-sparse=fuse_ctx 인데 버전 없음", func(t *model.SearchTuning) {
+			t.ChunkSparse = model.ChunkSparseFuseCtx
+		}, true},
+		{"--chunk-sparse=fuse_ctx 인데 버전 오타", func(t *model.SearchTuning) {
+			t.ChunkSparse = model.ChunkSparseFuseCtx
+			t.ChunkSparseCtxVersion = "v2"
+		}, true},
 	}
 
 	for _, tc := range tests {
@@ -100,6 +111,14 @@ func TestApplyTuningProfile_NonDefaultSplitsBaseline(t *testing.T) {
 			wantKeys: []string{"recency_halflife_days", "recency_alpha"},
 		},
 		{"청크 희소 레인 융합", func(t *model.SearchTuning) { t.ChunkSparse = model.ChunkSparseFuse }, []string{"chunk_sparse"}},
+		{
+			name: "청크 희소 문맥 레인은 버전까지 함께 남긴다",
+			mutate: func(t *model.SearchTuning) {
+				t.ChunkSparse = model.ChunkSparseFuseCtx
+				t.ChunkSparseCtxVersion = model.ChunkSparseCtxV1Full
+			},
+			wantKeys: []string{"chunk_sparse", "chunk_sparse_ctx_version"},
+		},
 	}
 
 	for _, tc := range tests {

@@ -185,7 +185,10 @@ func run() error {
 		"최신성 감쇠의 최대 강도. 승수는 (1-alpha)+alpha*exp(-ln2*age/halflife) 다")
 	chunkSparse := flag.String("chunk-sparse", model.ChunkSparseFallback,
 		"청크 FTS/bigm 레인 융합 방식(#270). fallback(기본)은 1차 경로가 결과를 "+
-			"하나도 못 찾았을 때만 폴백으로 돌고, fuse 는 결과 유무와 무관하게 RRF 융합에 참여시킨다")
+			"하나도 못 찾았을 때만 폴백으로 돌고, fuse 는 결과 유무와 무관하게 RRF 융합에 참여시키며, "+
+			"fuse_ctx 는 migrations/040 의 파생 sparse context 를 우선 매칭한다(--chunk-sparse-ctx-version 필요)")
+	chunkSparseCtxVersion := flag.String("chunk-sparse-ctx-version", "",
+		"--chunk-sparse=fuse_ctx 에서만 쓰인다. v1-tp(제목+참여자) 또는 v1-full(임베딩과 동일한 헤더)")
 	flag.Parse()
 	if *pairLimit < 0 || (*split != "all" && *split != "train" && *split != "holdout") {
 		return errors.New("invalid eval --split or --limit")
@@ -205,14 +208,15 @@ func run() error {
 	// "실제로는 기본값으로 돈 실행" 이 갈라지면, 그 결과로 내린 판단이 전부
 	// 근거 없는 것이 된다 — --as-of 를 거부하는 위 분기와 같은 이유다.
 	tuning := model.SearchTuning{
-		RerankOverfetch:     *rerankOverfetch,
-		MergeMode:           *mergeMode,
-		RerankBlend:         *rerankBlend,
-		RerankBlendWeight:   *rerankBlendWeight,
-		RerankInput:         *rerankInput,
-		RecencyHalfLifeDays: *recencyHalflife,
-		RecencyAlpha:        *recencyAlpha,
-		ChunkSparse:         *chunkSparse,
+		RerankOverfetch:       *rerankOverfetch,
+		MergeMode:             *mergeMode,
+		RerankBlend:           *rerankBlend,
+		RerankBlendWeight:     *rerankBlendWeight,
+		RerankInput:           *rerankInput,
+		RecencyHalfLifeDays:   *recencyHalflife,
+		RecencyAlpha:          *recencyAlpha,
+		ChunkSparse:           *chunkSparse,
+		ChunkSparseCtxVersion: *chunkSparseCtxVersion,
 	}
 	if err := validateTuningFlags(tuning); err != nil {
 		return err

@@ -135,9 +135,14 @@ func validateTuningFlags(t model.SearchTuning) error {
 	if t.RecencyAlpha <= 0 || t.RecencyAlpha > 1 || math.IsNaN(t.RecencyAlpha) {
 		return fmt.Errorf("eval: --recency-alpha must be in (0, 1], got %v", t.RecencyAlpha)
 	}
-	if t.ChunkSparse != model.ChunkSparseFallback && t.ChunkSparse != model.ChunkSparseFuse {
-		return fmt.Errorf("eval: invalid --chunk-sparse %q (want %q or %q)",
-			t.ChunkSparse, model.ChunkSparseFallback, model.ChunkSparseFuse)
+	if t.ChunkSparse != model.ChunkSparseFallback && t.ChunkSparse != model.ChunkSparseFuse && t.ChunkSparse != model.ChunkSparseFuseCtx {
+		return fmt.Errorf("eval: invalid --chunk-sparse %q (want %q, %q or %q)",
+			t.ChunkSparse, model.ChunkSparseFallback, model.ChunkSparseFuse, model.ChunkSparseFuseCtx)
+	}
+	if t.ChunkSparse == model.ChunkSparseFuseCtx &&
+		t.ChunkSparseCtxVersion != model.ChunkSparseCtxV1TP && t.ChunkSparseCtxVersion != model.ChunkSparseCtxV1Full {
+		return fmt.Errorf("eval: --chunk-sparse=%s requires --chunk-sparse-ctx-version=%q or %q, got %q",
+			model.ChunkSparseFuseCtx, model.ChunkSparseCtxV1TP, model.ChunkSparseCtxV1Full, t.ChunkSparseCtxVersion)
 	}
 	return nil
 }
@@ -171,8 +176,14 @@ func applyTuningProfile(profile map[string]any, t model.SearchTuning) {
 		profile["recency_halflife_days"] = t.RecencyHalfLifeDays
 		profile["recency_alpha"] = t.RecencyAlpha
 	}
-	if t.ChunkSparse == model.ChunkSparseFuse {
+	if t.ChunkSparse != model.ChunkSparseFallback {
 		profile["chunk_sparse"] = t.ChunkSparse
+		if t.ChunkSparse == model.ChunkSparseFuseCtx {
+			// 버전은 fuse_ctx 일 때만 의미가 있다 — fuse(raw)에는 존재하지
+			// 않는 개념이라 그 실행 프로필에 넣으면 쓰이지도 않는 값이
+			// baseline 을 가른다.
+			profile["chunk_sparse_ctx_version"] = t.ChunkSparseCtxVersion
+		}
 	}
 }
 

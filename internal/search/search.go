@@ -115,11 +115,12 @@ type Service struct {
 // 후보를 올려보낸 레인의 이름. 진단 출력에만 쓰이며, 값이 그대로 JSON 에
 // 실리므로 영어 식별자로 고정한다.
 const (
-	LaneDocumentStore = "document_store" // internal/store 의 5-lane 가중 RRF 결과
-	LaneChunkVector   = "chunk_vector"
-	LaneOpenSearch    = "opensearch"
-	LaneChunkFTS      = "chunk_fts"       // 1차 경로가 비었을 때만 도는 폴백
-	LaneChunkFTSFused = "chunk_fts_fused" // SEARCH_CHUNK_SPARSE=fuse: 결과 유무와 무관하게 RRF 융합(#270)
+	LaneDocumentStore    = "document_store" // internal/store 의 5-lane 가중 RRF 결과
+	LaneChunkVector      = "chunk_vector"
+	LaneOpenSearch       = "opensearch"
+	LaneChunkFTS         = "chunk_fts"           // 1차 경로가 비었을 때만 도는 폴백
+	LaneChunkFTSFused    = "chunk_fts_fused"     // SEARCH_CHUNK_SPARSE=fuse: 결과 유무와 무관하게 RRF 융합(#270)
+	LaneChunkFTSFusedCtx = "chunk_fts_fused_ctx" // SEARCH_CHUNK_SPARSE=fuse_ctx: 파생 문맥(migration 040) 우선 매칭(#270 phase B)
 )
 
 // SearchTrace 는 Search 한 번에 대한 진단 기록이다. "왜 이 문서가 상위에
@@ -869,6 +870,11 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 	// building at all.
 	if tune.ChunkSparse == model.ChunkSparseFuse && s.chunkStore != nil && chunkLanesEnabled {
 		if fused, ok := s.fuseChunkSparse(ctx, q, results, laneLimit, tune, trace); ok {
+			results = fused
+			chunkFused = true
+		}
+	} else if tune.ChunkSparse == model.ChunkSparseFuseCtx && s.chunkStore != nil && chunkLanesEnabled {
+		if fused, ok := s.fuseChunkSparseCtx(ctx, q, results, laneLimit, tune, trace); ok {
 			results = fused
 			chunkFused = true
 		}
