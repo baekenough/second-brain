@@ -13,6 +13,7 @@ import (
 	"github.com/baekenough/second-brain/internal/intent"
 	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/timeutil"
 	"github.com/google/uuid"
 )
@@ -24,6 +25,12 @@ type AskRequest struct {
 	Question       string `json:"question"`
 	ConversationID string `json:"conversation_id,omitempty"`
 }
+
+// askRequestMaxBytes 는 POST /api/v1/ask 요청 본문 상한이다(#282). 질문
+// 예산(askQuestionBytes, 4KB)이 JSON 이스케이프로 최대 6배(24KB)까지 커질 수
+// 있고 conversation_id 가 붙으므로 32KB 로 둔다. 디코딩 전 메모리 상한이
+// 목적이며, 초과하면 413 이다.
+const askRequestMaxBytes = 32 << 10
 
 // AskSourceItem mirrors web/src/lib/types.ts:132-138 EXACTLY — field names
 // and JSON types are a wire contract with the already-shipped frontend, not
@@ -281,8 +288,8 @@ func writeSSEEvent(w http.ResponseWriter, flusher http.Flusher, event string, pa
 // (의도분석 → RAG검색 → 종합·배출), streamed to the client via SSE.
 func (s *Server) askHandler(w http.ResponseWriter, r *http.Request) {
 	var req AskRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if err := decodeBoundedJSON(w, r, askRequestMaxBytes, &req); err != nil {
+		writeBoundedJSONError(w, err, askRequestMaxBytes, "invalid request body")
 		return
 	}
 	if strings.TrimSpace(req.Question) == "" {
@@ -290,8 +297,16 @@ func (s *Server) askHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(req.Question) > askQuestionBytes {
-		writeError(w, http.StatusBadRequest, "question exceeds input budget")
+	// 질문은 그대로 검색 질의가 되므로 검색 진입점과 같은 공통 검증을 거친다
+	// (#282). 길이 예산만 /ask 자기 것(askQuestionBytes)을 쓴다. SSE 헤더를
+	// 쓰기 전이라 400 JSON 으로 돌려줄 수 있다. 타임아웃은 아래 askTimeout 이
+	// 검색까지 포함해 이미 요청 전체를 묶고 있어 따로 두지 않는다.
+	if err := search.ValidateInputText("question", req.Question, askQuestionBytes); err != nil {
+		if errors.Is(err, search.ErrInputTooLong) {
+			writeError(w, http.StatusBadRequest, "question exceeds input budget")
+			return
+		}
+		writeError(w, http.StatusBadRequest, searchInputMessage(err))
 		return
 	}
 

@@ -710,6 +710,48 @@ func TestLoad_HTTPWriteTimeoutSeconds(t *testing.T) {
 	}
 }
 
+// TestLoad_SearchRequestTimeoutSeconds 는 SEARCH_REQUEST_TIMEOUT_SECONDS 파싱을
+// 고정한다(#282). 0·음수가 "즉시 만료"나 "무제한"으로 새지 않고 기본값으로
+// 떨어지는지, cfg 필드와 공개 헬퍼가 같은 값을 내는지를 본다.
+func TestLoad_SearchRequestTimeoutSeconds(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		envVal string
+		unset  bool
+		want   time.Duration
+	}{
+		{name: "default_when_unset", unset: true, want: 60 * time.Second},
+		{name: "explicit_10", envVal: "10", want: 10 * time.Second},
+		{name: "invalid_string_uses_default", envVal: "5s", want: 60 * time.Second},
+		{name: "zero_uses_default", envVal: "0", want: 60 * time.Second},
+		{name: "negative_uses_default", envVal: "-3", want: 60 * time.Second},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unset {
+				unsetenv(t, "SEARCH_REQUEST_TIMEOUT_SECONDS")
+			} else {
+				setenv(t, "SEARCH_REQUEST_TIMEOUT_SECONDS", tc.envVal)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.SearchRequestTimeout != tc.want {
+				t.Errorf("SearchRequestTimeout = %v, want %v", cfg.SearchRequestTimeout, tc.want)
+			}
+			if got := SearchRequestTimeout(); got != tc.want {
+				t.Errorf("SearchRequestTimeout() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestLoad_FeedbackEvidenceEnabled verifies FEEDBACK_EVIDENCE_ENABLED parsing.
 // The accepted truthy set deliberately mirrors the api handler's own gate
 // (1/true/yes/on, case-insensitive) so that wiring and handler cannot

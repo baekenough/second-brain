@@ -122,7 +122,7 @@ func run() error {
 	)
 
 	// Register tools.
-	registerSearchTool(s, searchSvc, cfg.RerankDefault)
+	registerSearchTool(s, searchSvc, cfg.RerankDefault, cfg.SearchRequestTimeout)
 	registerGetDocumentTool(s, docStore)
 	registerStatsTool(s, docStore)
 	registerAddNoteTool(s, docStore, chunkStore, embedClient, cfg.APIKey)
@@ -153,7 +153,7 @@ func run() error {
 	// Wire the handler after httpSrv is constructed; the library uses
 	// customHTTPSrv.Handler as-is when httpServer is pre-set via
 	// WithStreamableHTTPServer (it skips the internal mux setup).
-	customHTTPSrv.Handler = httpSrv
+	customHTTPSrv.Handler = newMCPHTTPHandler(httpSrv)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -179,6 +179,33 @@ func run() error {
 
 	slog.Info("MCP server shutdown complete")
 	return nil
+}
+
+// mcpRequestMaxBytes 는 MCP HTTP 요청 본문 상한이다(#282 보안 리뷰 후속).
+//
+// mcp-go 의 StreamableHTTPServer 는 JSON-RPC 본문을 io.ReadAll 로 끝까지 읽은
+// 뒤에야 도구를 고르고, Bearer 인증 결과는 도구 핸들러 안에서만 확인된다.
+// 그래서 상한이 없으면 인증 없는 요청 하나로 서버 메모리를 원하는 만큼 쓰게 할
+// 수 있다.
+//
+// 값을 1MB 같은 작은 수로 두지 않은 이유: 가장 큰 정상 요청은 add_note 이고
+// 그 본문 상한 note.MaxContentBytes 가 10MB 다. 게다가 JSON 직렬화는 비 ASCII
+// 문자를 \uXXXX 로 이스케이프할 수 있어(Python json.dumps 기본값
+// ensure_ascii=True — hermes 클라이언트가 Python 이다) 한글 3바이트가 6바이트,
+// 서로게이트 쌍으로 가는 4바이트 문자는 12바이트가 된다. 최악 3배에 JSON-RPC
+// 봉투 여유 1MB 를 더했다. 이보다 낮추려면 MCP 경로의 add_note 본문 상한을
+// 먼저 낮춰야 한다.
+const mcpRequestMaxBytes = 3*note.MaxContentBytes + 1<<20
+
+// newMCPHTTPHandler 는 MCP HTTP 핸들러 앞에 본문 상한을 건다. main 과 테스트가
+// 같은 함수를 써서, 배선에서 상한이 빠지면 테스트가 잡는다.
+func newMCPHTTPHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, mcpRequestMaxBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -287,7 +314,13 @@ func metadataString(m map[string]any, key string) *string {
 	return &s
 }
 
-func registerSearchTool(s *server.MCPServer, svc *search.Service, rerankDefault bool) {
+// registerSearchTool 은 MCP search 도구를 등록한다. timeout 은 검색 서비스
+// 호출 하나에 거는 상한(SEARCH_REQUEST_TIMEOUT_SECONDS, #282)이며, 0 이하이면
+// config.DefaultSearchRequestTimeout 을 쓴다.
+func registerSearchTool(s *server.MCPServer, svc *search.Service, rerankDefault bool, timeout time.Duration) {
+	if timeout <= 0 {
+		timeout = config.DefaultSearchRequestTimeout
+	}
 	tool := mcp.NewTool(
 		"search",
 		mcp.WithDescription(
@@ -372,6 +405,11 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service, rerankDefault 
 		if err != nil || strings.TrimSpace(query) == "" {
 			return mcp.NewToolResultError("query parameter is required and must be non-empty"), nil
 		}
+		// REST 검색과 같은 공통 검증(#282). 오류 문구는 필드 이름과 고정 사유만
+		// 담아 질의 원문을 되돌려 주지 않는다.
+		if err := search.ValidateInputText("query", query, search.MaxQueryBytes); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 
 		limit := req.GetInt("limit", 10)
 		if limit <= 0 {
@@ -455,9 +493,23 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service, rerankDefault 
 			sq.UseRerank = false
 		}
 
-		results, err := svc.Search(ctx, sq)
+		// 검색 경로에만 거는 타임아웃(#282). 판정은 오류 체인이 아니라 searchCtx
+		// 상태로 한다 — 검색 서비스가 레인 오류를 감싸는 방식에 따라 체인에
+		// context.DeadlineExceeded 가 남지 않을 수 있다(internal/api 의
+		// searchWithTimeout 과 같은 규칙).
+		searchCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		results, err := svc.Search(searchCtx, sq)
 		if err != nil {
-			slog.Error("mcp search: query failed", "error", err, "query", query)
+			// 질의 원문은 로그에 남기지 않는다(개인정보, #282).
+			if errors.Is(searchCtx.Err(), context.DeadlineExceeded) {
+				slog.Warn("mcp search: timed out", "timeout", timeout.String(), "error", err)
+				return mcp.NewToolResultError("search timed out"), nil
+			}
+			if errors.Is(err, search.ErrInvalidInput) {
+				return mcp.NewToolResultError("invalid search input"), nil
+			}
+			slog.Error("mcp search: query failed", "error", err)
 			return mcp.NewToolResultError("internal error searching documents"), nil
 		}
 

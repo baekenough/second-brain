@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -9,6 +8,7 @@ import (
 
 	"github.com/baekenough/second-brain/internal/curation"
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/baekenough/second-brain/internal/search"
 )
 
 // The insight-exclusion default (spec §3.2 echo-chamber guard 4, §6.5) used to
@@ -65,8 +65,8 @@ func stripEvidenceForREST(results []*model.SearchResult) []*model.SearchResult {
 // searchHandler handles POST /api/v1/search.
 func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 	var req searchRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if err := decodeBoundedJSON(w, r, searchRequestMaxBytes, &req); err != nil {
+		writeBoundedJSONError(w, err, searchRequestMaxBytes, "invalid JSON body")
 		return
 	}
 	if req.Query == "" {
@@ -85,15 +85,22 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 		UseRerank:          req.UseRerank,
 		IncludeRetention:   req.IncludeRetention,
 	}
-
-	start := time.Now()
-	results, err := s.search.Search(r.Context(), q)
-	if err != nil {
-		slog.Error("search: query failed", "error", err)
-		writeError(w, http.StatusInternalServerError, "internal server error")
+	// DB 에 가기 전에 모든 문자열 입력(질의·소스 필터·정렬)을 검사한다(#282).
+	if err := search.ValidateQueryInput(q, search.MaxQueryBytes); err != nil {
+		writeError(w, http.StatusBadRequest, searchInputMessage(err))
 		return
 	}
 
+	start := time.Now()
+	results, err := s.searchWithTimeout(r.Context(), q)
+	if err != nil {
+		s.writeSearchFailure(w, "search", err)
+		return
+	}
+
+	// 큐레이션은 LLM 호출이라 검색 타임아웃(searchTimeout) 밖에 둔다 — LLM 은
+	// 자기 HTTP 타임아웃(LLM_TIMEOUT_SECONDS)이 따로 있고, 검색 상한을 LLM 지연에
+	// 맞춰 늘리면 검색 경로 보호가 무의미해진다.
 	if req.Curated {
 		curator := curation.New(s.llmClient)
 		curatedResults, err := curator.Curate(r.Context(), req.Query, results)
@@ -155,15 +162,23 @@ func (s *Server) searchGetHandler(w http.ResponseWriter, r *http.Request) {
 		UseRerank:        useRerank,
 		IncludeRetention: includeRetention,
 	}
-
-	start := time.Now()
-	results, err := s.search.Search(r.Context(), q)
-	if err != nil {
-		slog.Error("search: query failed", "error", err)
-		writeError(w, http.StatusInternalServerError, "internal server error")
+	// 쿼리스트링은 퍼센트 디코딩 결과가 그대로 문자열이 되므로(%FF, %00)
+	// 잘못된 UTF-8 과 NUL 이 실제로 들어오는 경로다. DB 전에 거부한다(#282).
+	if err := search.ValidateQueryInput(q, search.MaxQueryBytes); err != nil {
+		writeError(w, http.StatusBadRequest, searchInputMessage(err))
 		return
 	}
 
+	start := time.Now()
+	results, err := s.searchWithTimeout(r.Context(), q)
+	if err != nil {
+		s.writeSearchFailure(w, "search", err)
+		return
+	}
+
+	// 큐레이션은 LLM 호출이라 검색 타임아웃(searchTimeout) 밖에 둔다 — LLM 은
+	// 자기 HTTP 타임아웃(LLM_TIMEOUT_SECONDS)이 따로 있고, 검색 상한을 LLM 지연에
+	// 맞춰 늘리면 검색 경로 보호가 무의미해진다.
 	if curated {
 		curator := curation.New(s.llmClient)
 		curatedResults, err := curator.Curate(r.Context(), query, results)

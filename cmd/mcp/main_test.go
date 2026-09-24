@@ -401,7 +401,7 @@ func (disabledEmbeddingEngine) Dimension() int { return 0 }
 func newOccurredTestServer(docs *fakeOccurredDocSearcher, rerankDefault bool) *mcpserver.MCPServer {
 	svc := search.NewService(docs, disabledEmbeddingEngine{})
 	s := mcpserver.NewMCPServer("test", "0.0.0", mcpserver.WithToolCapabilities(false))
-	registerSearchTool(s, svc, rerankDefault)
+	registerSearchTool(s, svc, rerankDefault, 0)
 	return s
 }
 
@@ -822,7 +822,7 @@ func TestSearchTool_NewSourceTypes_Accepted(t *testing.T) {
 	// Build a search server with a fake search service that returns no results.
 	svc := &fakeSearchSvc{}
 	s := mcpserver.NewMCPServer("test", "0.0.0", mcpserver.WithToolCapabilities(false))
-	registerSearchTool(s, nil, false) // nil *search.Service — handler short-circuits at source validation
+	registerSearchTool(s, nil, false, 0) // nil *search.Service — handler short-circuits at source validation
 
 	// We need a real *search.Service for registerSearchTool. Use the inline
 	// stub approach: register a custom handler that exercises allowedSourceTypes

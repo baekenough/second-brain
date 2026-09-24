@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/baekenough/second-brain/internal/graph"
+	"github.com/baekenough/second-brain/internal/search"
 )
 
 // Graph read API (Part B). Four GET routes over a fixed query catalogue.
@@ -137,8 +138,16 @@ func (s *Server) graphEntitiesHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "q is required")
 		return
 	}
+	// 엔티티 이름 검색도 검색 진입점이라 같은 공통 검증을 거친다(#282).
+	if err := search.ValidateInputText("q", prefix, search.MaxQueryBytes); err != nil {
+		writeError(w, http.StatusBadRequest, searchInputMessage(err))
+		return
+	}
 
-	hits, err := s.graph.SearchEntities(r.Context(), prefix,
+	// 검색 진입점과 같은 요청 타임아웃을 건다(#282).
+	ctx, cancel := context.WithTimeout(r.Context(), s.searchTimeout)
+	defer cancel()
+	hits, err := s.graph.SearchEntities(ctx, prefix,
 		graph.ClampSearchLimit(parseIntDefault(q.Get("limit"), 0)))
 	if err != nil {
 		graphUnavailable(w, "entities", err)

@@ -705,6 +705,16 @@ func (s *Service) SearchTraced(ctx context.Context, q model.SearchQuery) ([]*mod
 }
 
 func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *SearchTrace) ([]*model.SearchResult, error) {
+	// 입력 내용 방어선(#282). 외부 진입점은 각자 길이 상한까지 포함해 먼저
+	// 검사하지만, 진입점을 거치지 않는 호출자(Discord 게이트웨이, /ask 의
+	// LLM 재작성 질의, eval·tune)도 있어서 여기서 한 번 더 막는다. 잘못된
+	// UTF-8·NUL 이 SQL 파라미터로 바인딩되면 SQLSTATE 22021 로 검색 전체가
+	// 실패하므로, DB 왕복 전에 ErrInvalidInput 으로 돌려준다. 길이는 진입점마다
+	// 예산이 달라(/ask 는 4KB) 여기서는 검사하지 않는다(maxBytes=0).
+	if err := ValidateQueryInput(q, 0); err != nil {
+		return nil, fmt.Errorf("search: %w", err)
+	}
+
 	if q.Limit <= 0 {
 		q.Limit = 20
 	}
