@@ -94,6 +94,18 @@ jobs:
           if grep -q -- '--- SKIP' api-realdb.log; then echo "::error::api real-DB test skipped"; exit 1; fi
           ran=$(grep -c -- '^--- PASS: Test.*_RealDB ' api-realdb.log || true)
           if [ "$ran" -lt 2 ]; then echo "::error::expected >=2 api real-DB tests, ran $ran"; exit 1; fi
+      - name: Scheduler on the real database (Skip is a failure)
+        # internal/scheduler 의 *_RealDB 테스트가 CI 에서 SKIP 되던 공백이
+        # 있었다(#292) — TEST_DATABASE_URL 은 이 job env 에서 상속되므로
+        # 정상적으로는 절대 SKIP 이 나오면 안 된다. SKIP 이 보이면 실DB
+        # 검증이 실제로는 실행되지 않았다는 뜻이므로 조용히 넘어가지 않고
+        # 실패시킨다.
+        run: |
+          set -o pipefail
+          go test -race -count=1 -v -run 'RealDB$' ./internal/scheduler/... | tee scheduler-realdb.log
+          if grep -q -- '--- SKIP' scheduler-realdb.log; then echo "::error::scheduler real-DB test skipped"; exit 1; fi
+          ran=$(grep -c -- '^--- PASS: Test.*_RealDB ' scheduler-realdb.log || true)
+          if [ "$ran" -lt 2 ]; then echo "::error::expected >=2 scheduler real-DB tests, ran $ran"; exit 1; fi
       - name: Database logs
         if: failure()
         run: docker logs store-test-db
