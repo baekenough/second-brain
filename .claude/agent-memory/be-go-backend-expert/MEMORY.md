@@ -24,3 +24,4 @@
 - [project_hyde_wiring_defect.md](project_hyde_wiring_defect.md) — HyDE 영구 no-op(llmClient가 searchSvc 조립보다 뒤에 생성돼 WithLLM 주입 불가); WithOccurredRangeChecker/WithWeights는 미배선이 의도된 것임을 코드로 확인
 - [project_feedback_input_limits_286.md](project_feedback_input_limits_286.md) — #286 PR-A: feedback input limits, non-POST mutation 405, PG rejects urn UUIDs (pass id.String()), flaky conn-reuse test fix, api RealDB tests Skip in CI
 - [project_search_timeout_input_validation.md](project_search_timeout_input_validation.md) — #282 검색 타임아웃·입력검증: pgx 기본값이 이미 서버측 취소(asyncClose CancelRequest), ctx.Err() 판정, json이 잘못된 UTF-8을 U+FFFD로 바꿈
+- [project_search_concurrency_gate_286.md](project_search_concurrency_gate_286.md) — #286-3 검색 게이트: 검색호출 단위 슬롯(중첩 금지), /ask는 TryAcquire 폴링으로 REST에 양보(FIFO 공유 시 기아), SMS PII 마스킹이 테스트 표식 깨뜨림
