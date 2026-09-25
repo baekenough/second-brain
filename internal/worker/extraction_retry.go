@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/baekenough/second-brain/internal/logsafe"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/store"
 )
@@ -175,7 +176,7 @@ func (w *ExtractionRetryWorker) processRemote(ctx context.Context, f store.Extra
 	if w.refetcher == nil {
 		slog.Debug("extraction retry: skipping non-local path (no refetcher configured)",
 			"source_type", f.SourceType,
-			"source_id", f.SourceID,
+			"source_id", logsafe.SafeSourceID(f.SourceID),
 		)
 		return
 	}
@@ -185,7 +186,7 @@ func (w *ExtractionRetryWorker) processRemote(ctx context.Context, f store.Extra
 		if errors.Is(err, ErrRefetchNotSupported) {
 			slog.Debug("extraction retry: skipping non-local path (refetch not supported)",
 				"source_type", f.SourceType,
-				"source_id", f.SourceID,
+				"source_id", logsafe.SafeSourceID(f.SourceID),
 			)
 			return
 		}
@@ -193,7 +194,7 @@ func (w *ExtractionRetryWorker) processRemote(ctx context.Context, f store.Extra
 		w.recordFailure(ctx, f, err)
 		slog.Warn("extraction retry: refetch failed",
 			"source_type", f.SourceType,
-			"source_id", f.SourceID,
+			"source_id", logsafe.SafeSourceID(f.SourceID),
 			"attempt", f.Attempts+1,
 			"err", err,
 		)
@@ -222,7 +223,7 @@ func (w *ExtractionRetryWorker) extractAndResolve(
 		w.recordFailure(ctx, f, err)
 		slog.Warn("extraction retry: extraction failed",
 			"source_type", f.SourceType,
-			"source_id", f.SourceID,
+			"source_id", logsafe.SafeSourceID(f.SourceID),
 			"attempt", f.Attempts+1,
 		)
 		return
@@ -238,7 +239,7 @@ func (w *ExtractionRetryWorker) extractAndResolve(
 	if err := w.docStore.Upsert(ctx, doc); err != nil {
 		slog.Warn("extraction retry: upsert failed",
 			"source_type", f.SourceType,
-			"source_id", f.SourceID,
+			"source_id", logsafe.SafeSourceID(f.SourceID),
 			"err", err,
 		)
 		return
@@ -247,7 +248,7 @@ func (w *ExtractionRetryWorker) extractAndResolve(
 	if err := w.failureStore.Resolve(ctx, f.SourceType, f.SourceID); err != nil {
 		slog.Warn("extraction retry: resolve failed",
 			"source_type", f.SourceType,
-			"source_id", f.SourceID,
+			"source_id", logsafe.SafeSourceID(f.SourceID),
 			"err", err,
 		)
 		return
@@ -255,7 +256,7 @@ func (w *ExtractionRetryWorker) extractAndResolve(
 
 	slog.Info("extraction retry: resolved",
 		"source_type", f.SourceType,
-		"source_id", f.SourceID,
+		"source_id", logsafe.SafeSourceID(f.SourceID),
 	)
 }
 
@@ -277,7 +278,7 @@ func (w *ExtractionRetryWorker) recordFailure(ctx context.Context, f store.Extra
 	if recordErr != nil {
 		slog.Warn("extraction retry: failed to record attempt",
 			"source_type", f.SourceType,
-			"source_id", f.SourceID,
+			"source_id", logsafe.SafeSourceID(f.SourceID),
 			"err", recordErr,
 		)
 	}

@@ -18,6 +18,7 @@ import (
 	"github.com/baekenough/second-brain/internal/config"
 	"github.com/baekenough/second-brain/internal/graph"
 	"github.com/baekenough/second-brain/internal/llm"
+	"github.com/baekenough/second-brain/internal/logsafe"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
 	"github.com/baekenough/second-brain/internal/telemetry"
@@ -51,6 +52,15 @@ func run() error {
 	// Overload() forces .env values to win over pre-existing env vars, preventing
 	// stale/empty values (e.g. empty ANTHROPIC_API_KEY) from causing 401 failures.
 	_ = godotenv.Overload()
+
+	// 로그용 파일 참조(file_ref) 키(#297). LOG_REF_KEY 가 없으면 프로세스마다
+	// 무작위 키를 쓴다. 키 값은 절대 로그에 남기지 않는다 — 출처(env/ephemeral)만
+	// 남긴다. 너무 짧은 키는 시작을 멈춘다(오류 문구에 키 값은 없다).
+	logRefKeySource, err := logsafe.ConfigureFromEnv()
+	if err != nil {
+		return err
+	}
+	slog.Info("log ref key configured", "log_ref_key", string(logRefKeySource))
 
 	cfg, err := config.Load()
 	if err != nil {

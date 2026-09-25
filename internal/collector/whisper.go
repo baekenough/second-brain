@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +29,7 @@ import (
 	"github.com/baekenough/second-brain/internal/audiovalidate"
 	"github.com/baekenough/second-brain/internal/collector/smsmap"
 	"github.com/baekenough/second-brain/internal/config"
+	"github.com/baekenough/second-brain/internal/logsafe"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/telemetry"
 	"github.com/google/uuid"
@@ -543,16 +546,20 @@ func isPlausibleRecordingTime(t time.Time) bool {
 // The filename is attacker/device-controlled input from the phone, not
 // trusted data — the future check exists because a malformed or spoofed
 // filename must never silently produce a bogus OccurredAt.
-func callRecordingOccurredAt(filename string, mtime, now time.Time) time.Time {
+//
+// logger·fileAttrs(#297): 파일 이름은 로그에 남기지 않는다 — 기본 설정에서
+// 전화번호가 들어 있다. 파일은 fileAttrs(whisperFileAttrs)의 키 있는 file_ref
+// 로 가리킨다. 파싱한 통화 시각은 남긴다 — 시각은 번호가 아니다.
+func callRecordingOccurredAt(logger *slog.Logger, fileAttrs []any, filename string, mtime, now time.Time) time.Time {
 	t, ok := parseTPhoneFilenameUTC(filename)
 	if !ok {
-		slog.Debug("whisper: filename has no usable embedded call timestamp — using mtime for occurred_at",
-			"filename", filename, "mtime", mtime)
+		logger.Debug("whisper: filename has no usable embedded call timestamp — using mtime for occurred_at",
+			append(fileAttrs, "mtime", mtime)...)
 		return mtime
 	}
 	if t.After(now) {
-		slog.Warn("whisper: filename timestamp is in the future — using mtime for occurred_at",
-			"filename", filename, "parsed", t, "now", now, "mtime", mtime)
+		logger.Warn("whisper: filename timestamp is in the future — using mtime for occurred_at",
+			append(fileAttrs, "parsed", t, "now", now, "mtime", mtime)...)
 		return mtime
 	}
 
@@ -643,6 +650,55 @@ type WhisperCollector struct {
 	// design). Initialised in NewWhisperCollector.
 	nameRedactor     *NameRedactor
 	failedQuarantine map[string]struct{}
+
+	// logger 는 이 수집기의 모든 로그 줄을 받는다(#297). nil 이면
+	// slog.Default(). 테스트는 이것을 주입해, 전역 로거를 바꾸지 않고도 병렬
+	// 테스트가 각자의 로그를 잡는다.
+	logger *slog.Logger
+}
+
+// WithLogger 는 이 수집기의 모든 로그 줄에 쓸 로거를 주입한다.
+// nil 이면 slog.Default() 로 돌아간다.
+func (c *WhisperCollector) WithLogger(l *slog.Logger) *WhisperCollector {
+	c.logger = l
+	return c
+}
+
+// log 는 주입한 로거를, 없으면 slog.Default() 를 돌려준다.
+func (c *WhisperCollector) log() *slog.Logger {
+	if c.logger != nil {
+		return c.logger
+	}
+	return slog.Default()
+}
+
+// whisperFileKind 는 이름을 드러내지 않고 이름 모양으로 오디오 파일을
+// 분류한다: "voice-memo"(ingest 의 voice-memo_ 접두사, 또는 삼성 음성 녹음의
+// _YYMMDD_HHMMSS 꼬리), "call"(TPhoneCallRecords 의 _YYYYMMDDHHMMSS 꼬리),
+// 그 밖에는 "other".
+func whisperFileKind(path string) string {
+	base := filepath.Base(path)
+	switch {
+	case strings.HasPrefix(base, "voice-memo_"):
+		return "voice-memo"
+	case reTPhone.MatchString(base):
+		return "call"
+	case reVoiceRecorder.MatchString(base):
+		return "voice-memo"
+	default:
+		return "other"
+	}
+}
+
+// whisperFileAttrs 는 오디오 파일을 가리키는 로그 속성이다(#297):
+// file_ref(audioDir 기준 상대 경로의 키 있는 해시 — SafeSourceID 가
+// "transcript:ref=…" 에 넣는 값과 같다), ext, kind. 경로·파일 이름은 남기지
+// 않는다: 통화 녹음 파일 이름은 기본 설정에서 "{전화번호}_{YYYYMMDDHHMMSS}.m4a" 다.
+//
+// 결과는 len == cap 으로 잘라 둔다. 그래야 호출자마다 append(attrs, …) 가
+// 공유 배열에 덮어쓰지 않고 새로 복사한다.
+func whisperFileAttrs(audioDir, path string) []any {
+	return slices.Clip(append(logsafe.FileAttrs(audioDir, path), "kind", whisperFileKind(path)))
 }
 
 // NewWhisperCollector returns a WhisperCollector configured from cfg.
@@ -967,11 +1023,11 @@ func (c *WhisperCollector) CollectStream(ctx context.Context, since time.Time, o
 	isLocal := isLocalWhisperEndpoint(c.baseURL)
 	if !isLocal {
 		if c.cfg.WhisperCloudAllowed {
-			slog.Info("whisper: call audio is intentionally sent to a cloud transcription endpoint (issue #100 policy exception acknowledged)",
+			c.log().Info("whisper: call audio is intentionally sent to a cloud transcription endpoint (issue #100 policy exception acknowledged)",
 				"endpoint", c.baseURL,
 			)
 		} else {
-			slog.Warn("whisper: endpoint does not appear to be local — call transcription data may be sent to a cloud API; set WHISPER_CLOUD_ALLOWED=true to acknowledge this is intentional, or WHISPER_API_URL to a localhost/private-network address",
+			c.log().Warn("whisper: endpoint does not appear to be local — call transcription data may be sent to a cloud API; set WHISPER_CLOUD_ALLOWED=true to acknowledge this is intentional, or WHISPER_API_URL to a localhost/private-network address",
 				"endpoint", c.baseURL,
 			)
 		}
@@ -990,7 +1046,8 @@ func (c *WhisperCollector) CollectStream(ctx context.Context, since time.Time, o
 
 	err := filepath.WalkDir(c.cfg.WhisperAudioDir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			slog.Warn("whisper: walk error", "path", path, "error", walkErr)
+			c.log().Warn("whisper: walk error",
+				append(whisperFileAttrs(c.cfg.WhisperAudioDir, path), logsafe.ErrAttrs(walkErr)...)...)
 			return nil // continue walk
 		}
 
@@ -1017,7 +1074,8 @@ func (c *WhisperCollector) CollectStream(ctx context.Context, since time.Time, o
 
 		info, err := d.Info()
 		if err != nil {
-			slog.Warn("whisper: stat failed", "path", path, "error", err)
+			c.log().Warn("whisper: stat failed",
+				append(whisperFileAttrs(c.cfg.WhisperAudioDir, path), logsafe.ErrAttrs(err)...)...)
 			return nil
 		}
 
@@ -1102,22 +1160,22 @@ func (c *WhisperCollector) CollectStream(ctx context.Context, since time.Time, o
 		// single log line per cycle, not a repeated expensive network/CPU
 		// operation.
 		if !isLocal && info.Size() > whisperCloudMaxFileBytes {
-			slog.Warn("whisper: skipping file over cloud API 25 MiB limit",
-				"path", path,
-				"size_bytes", info.Size(),
-				"limit_bytes", whisperCloudMaxFileBytes,
-			)
+			c.log().Warn("whisper: skipping file over cloud API 25 MiB limit",
+				append(whisperFileAttrs(c.cfg.WhisperAudioDir, path),
+					"size_bytes", info.Size(),
+					"limit_bytes", whisperCloudMaxFileBytes,
+				)...)
 			return nil
 		}
 
 		// Per-file size cap: skip files that exceed the configured limit.
 		// When maxFileBytes <= 0 the cap is disabled (unlimited).
 		if c.maxFileBytes > 0 && info.Size() > c.maxFileBytes {
-			slog.Warn("whisper: skipping oversized file",
-				"path", path,
-				"size_bytes", info.Size(),
-				"limit_bytes", c.maxFileBytes,
-			)
+			c.log().Warn("whisper: skipping oversized file",
+				append(whisperFileAttrs(c.cfg.WhisperAudioDir, path),
+					"size_bytes", info.Size(),
+					"limit_bytes", c.maxFileBytes,
+				)...)
 			return nil
 		}
 
@@ -1150,7 +1208,7 @@ func (c *WhisperCollector) CollectStream(ctx context.Context, since time.Time, o
 		}
 
 		if err := checkAudioFileHeader(path, ext); err != nil {
-			if !quarantineCorruptAudio(path, c.cfg.WhisperAudioDir, info.Size(), err) {
+			if !quarantineCorruptAudio(c.log(), path, c.cfg.WhisperAudioDir, info.Size(), err) {
 				// Physical quarantine failed (e.g. read-only mount). Record the
 				// path in the in-memory skip-set so this file is not re-visited
 				// on subsequent collection cycles within this process (#158).
@@ -1190,7 +1248,7 @@ func (c *WhisperCollector) CollectStream(ctx context.Context, since time.Time, o
 	// lookup per file.
 	emitted, streamErr := c.streamPending(ctx, pending, now, isLocal, onBatch)
 
-	slog.Info("whisper: collected transcripts", "count", emitted, "audio_dir", c.cfg.WhisperAudioDir)
+	c.log().Info("whisper: collected transcripts", "count", emitted, "audio_dir", c.cfg.WhisperAudioDir)
 	return streamErr
 }
 
@@ -1360,9 +1418,13 @@ func (c *WhisperCollector) streamPending(ctx context.Context, pending []pendingT
 // pool can call it concurrently. transcribeFile / diarizeAudio internals are
 // untouched.
 func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTranscription, now time.Time, isLocal bool) (model.Document, bool) {
+	// fileAttrs 는 아래 모든 로그 줄에서 경로·이름 없이 파일을 가리킨다(#297).
+	fileAttrs := whisperFileAttrs(c.cfg.WhisperAudioDir, item.path)
+
 	txResult, err := c.transcribeFile(ctx, item.path, isLocal)
 	if err != nil {
-		slog.Warn("whisper: transcription failed", "path", item.path, "error", err)
+		c.log().Warn("whisper: transcription failed",
+			append(fileAttrs, logsafe.ErrAttrs(err)...)...)
 		return model.Document{}, false // partial success — skip
 	}
 
@@ -1370,7 +1432,7 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 	// occurredAt is the actual call time, parsed from the filename when
 	// possible — NOT mtime (save time). See callRecordingOccurredAt doc
 	// comment for why mtime is unreliable here.
-	occurredAt := callRecordingOccurredAt(filepath.Base(item.path), mtime, now)
+	occurredAt := callRecordingOccurredAt(c.log(), fileAttrs, filepath.Base(item.path), mtime, now)
 	meta := map[string]any{
 		"relative_path": item.relPath,
 		"language":      c.cfg.WhisperLanguage,
@@ -1446,8 +1508,8 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 				meta["speaker_count"] = nSpeakers
 				meta["diarization"] = "native"
 			} else {
-				slog.Warn("whisper: renderSpeakerBlocks produced empty output for native diarization — using plain transcript",
-					"path", item.path)
+				c.log().Warn("whisper: renderSpeakerBlocks produced empty output for native diarization — using plain transcript",
+					fileAttrs...)
 			}
 		}
 		// len(txResult.diarized) == 0: transcribeFile already warned and
@@ -1456,14 +1518,14 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 	case c.cfg.DiarizationEnabled && c.cfg.DiarizationAPIURL != "" && len(txResult.segments) > 0:
 		audioBytes, readErr := os.ReadFile(item.path)
 		if readErr != nil {
-			slog.Warn("whisper: diarization skipped — cannot re-read audio file",
-				"path", item.path, "error", readErr)
+			c.log().Warn("whisper: diarization skipped — cannot re-read audio file",
+				append(fileAttrs, logsafe.ErrAttrs(readErr)...)...)
 		} else {
 			isCall := isTPhoneCallPath(item.path)
 			diarSegs, diarErr := c.diarizeAudio(ctx, item.path, audioBytes, isCall)
 			if diarErr != nil {
-				slog.Warn("whisper: diarization failed — using plain transcript",
-					"path", item.path, "error", diarErr)
+				c.log().Warn("whisper: diarization failed — using plain transcript",
+					append(fileAttrs, logsafe.ErrAttrs(diarErr)...)...)
 			} else {
 				labelled, nSpeakers := labelTranscript(txResult.segments, diarSegs)
 				if labelled != "" {
@@ -1471,8 +1533,8 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 					meta["speaker_count"] = nSpeakers
 					meta["diarization"] = "pyannote"
 				} else {
-					slog.Warn("whisper: labelTranscript produced empty output — using plain transcript",
-						"path", item.path)
+					c.log().Warn("whisper: labelTranscript produced empty output — using plain transcript",
+						fileAttrs...)
 				}
 			}
 		}
@@ -1535,7 +1597,7 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 	}
 	if c.cfg.PIINameRedactionEnabled {
 		if err := c.nameRedactor.Redact(ctx, &doc); err != nil {
-			slog.Warn("whisper: name redaction failed; document withheld for retry", "source_id_bytes", len(doc.SourceID))
+			c.log().Warn("whisper: name redaction failed; document withheld for retry", "source_id_bytes", len(doc.SourceID))
 			return model.Document{}, false
 		}
 	}
@@ -1679,7 +1741,9 @@ func checkAudioFileHeader(path, ext string) error {
 	const headerSize = 8
 	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("open: %w", err)
+		// StripPath: 이 오류는 격리 로그까지 간다. *fs.PathError 문구에는
+		// 경로(기본 설정에서 전화번호)가 들어 있다(#297).
+		return whisperStep("open audio header", logsafe.StripPath(err))
 	}
 	defer f.Close() //nolint:errcheck // read-only, close error is irrelevant
 
@@ -1771,7 +1835,9 @@ type transcribeFileResult struct {
 func (c *WhisperCollector) transcribeFile(ctx context.Context, path string, isLocal bool) (_ transcribeFileResult, err error) {
 	audioBytes, err := os.ReadFile(path)
 	if err != nil {
-		return transcribeFileResult{}, fmt.Errorf("read audio file: %w", err)
+		// StripPath(#297): buildDocument 가 이 오류를 로그로 남긴다. 원래
+		// *fs.PathError 문구에는 경로(= 전화번호)가 들어 있다.
+		return transcribeFileResult{}, whisperStep("read audio file", logsafe.StripPath(err))
 	}
 
 	ctx, span := whisperTracer().Start(ctx, "transcription", oteltrace.WithAttributes(
@@ -1782,8 +1848,12 @@ func (c *WhisperCollector) transcribeFile(ctx context.Context, path string, isLo
 	defer span.End()
 	defer func() {
 		if err != nil {
+			// err 에는 경로도 외부 본문도 없다(#297): 경로는 os 호출
+			// 자리에서 빼고, 비-200 본문은 status + 검증한 error.type/code 로
+			// 줄인다(whisperStatusError). span 상태 문구는 고정 문구다 —
+			// OTel 이 OTLP 엔드포인트로 내보내므로 자유 문구를 넣지 않는다.
 			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
+			span.SetStatus(codes.Error, "transcription failed")
 		}
 	}()
 
@@ -1795,8 +1865,10 @@ func (c *WhisperCollector) transcribeFile(ctx context.Context, path string, isLo
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 
-	// file field
-	fw, err := mw.CreateFormFile("file", filepath.Base(path))
+	// file 필드. 멀티파트 파일 이름은 고정 "audio"+확장자다(#297 D3): 실제
+	// 이름에는 기본 설정에서 전화번호가 들어 있고, 이 요청은 클라우드
+	// API(OpenAI)로 갈 수 있다. 엔드포인트는 컨테이너 형식을 확장자로만 판별한다.
+	fw, err := mw.CreateFormFile("file", whisperUploadFilename(path))
 	if err != nil {
 		return transcribeFileResult{}, fmt.Errorf("create form file: %w", err)
 	}
@@ -1857,17 +1929,19 @@ func (c *WhisperCollector) transcribeFile(ctx context.Context, path string, isLo
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return transcribeFileResult{}, fmt.Errorf("http request: %w", err)
+		return transcribeFileResult{}, whisperStep("http request", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return transcribeFileResult{}, fmt.Errorf("read response body: %w", err)
+	// 비-200: 외부 본문을 오류에 넣지 않는다(#297) — 본문은 요청 데이터를
+	// 되돌려 줄 수 있고, 이 오류는 로그와 span 이벤트로 나간다.
+	if resp.StatusCode != http.StatusOK {
+		return transcribeFileResult{}, readWhisperStatusError("whisper", resp)
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return transcribeFileResult{}, fmt.Errorf("whisper API returned %d: %s", resp.StatusCode, body)
+	body, err := readBoundedBody(resp.Body, whisperMaxResponseBytes)
+	if err != nil {
+		return transcribeFileResult{}, whisperStep("read response body", err)
 	}
 
 	// Parse response according to the request shape actually sent above.
@@ -1875,7 +1949,7 @@ func (c *WhisperCollector) transcribeFile(ctx context.Context, path string, isLo
 	case nativeDiarize:
 		var result diarizedResponse
 		if err := json.Unmarshal(body, &result); err != nil {
-			return transcribeFileResult{}, fmt.Errorf("decode response JSON: %w", err)
+			return transcribeFileResult{}, whisperStep("decode response JSON", err)
 		}
 		if len(result.Segments) == 0 {
 			// Observed when chunking_strategy is missing/misconfigured, or for
@@ -1883,8 +1957,8 @@ func (c *WhisperCollector) transcribeFile(ctx context.Context, path string, isLo
 			// the flat text rather than erroring — buildDocument still
 			// produces a (non-diarized) document rather than dropping the
 			// file entirely.
-			slog.Warn("whisper: diarized_json response had zero segments — falling back to flat text",
-				"path", path, "model", c.cfg.WhisperModel)
+			c.log().Warn("whisper: diarized_json response had zero segments — falling back to flat text",
+				append(whisperFileAttrs(c.cfg.WhisperAudioDir, path), "model", c.cfg.WhisperModel)...)
 			return transcribeFileResult{text: result.Text}, nil
 		}
 		return transcribeFileResult{text: result.Text, diarized: result.Segments}, nil
@@ -1893,7 +1967,7 @@ func (c *WhisperCollector) transcribeFile(ctx context.Context, path string, isLo
 		// Plain {"text":"..."} — identical to the original pre-#111 path.
 		var result whisperTranscribeResponse
 		if err := json.Unmarshal(body, &result); err != nil {
-			return transcribeFileResult{}, fmt.Errorf("decode response JSON: %w", err)
+			return transcribeFileResult{}, whisperStep("decode response JSON", err)
 		}
 		return transcribeFileResult{text: result.Text}, nil
 
@@ -1901,7 +1975,7 @@ func (c *WhisperCollector) transcribeFile(ctx context.Context, path string, isLo
 		// verbose_json {"text":"...","segments":[...]} for pyannote alignment.
 		var result whisperVerboseResponse
 		if err := json.Unmarshal(body, &result); err != nil {
-			return transcribeFileResult{}, fmt.Errorf("decode response JSON: %w", err)
+			return transcribeFileResult{}, whisperStep("decode response JSON", err)
 		}
 		return transcribeFileResult{
 			text:     result.Text,
@@ -1975,7 +2049,7 @@ func isTPhoneCallPath(path string) bool {
 // per-call-site guard.
 func (c *WhisperCollector) diarizeAudio(ctx context.Context, path string, audioBytes []byte, isTPhoneCall bool) ([]diarSegment, error) {
 	if !isLocalWhisperEndpoint(c.cfg.DiarizationAPIURL) {
-		slog.Warn("whisper: diarization endpoint does not appear to be local — refusing to send call audio for diarization; falling back to plain transcript",
+		c.log().Warn("whisper: diarization endpoint does not appear to be local — refusing to send call audio for diarization; falling back to plain transcript",
 			"endpoint", c.cfg.DiarizationAPIURL,
 		)
 		return nil, fmt.Errorf("diarization endpoint %q is not local; refusing to send audio (#165)", c.cfg.DiarizationAPIURL)
@@ -1984,7 +2058,9 @@ func (c *WhisperCollector) diarizeAudio(ctx context.Context, path string, audioB
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 
-	fw, err := mw.CreateFormFile("file", filepath.Base(path))
+	// transcribeFile 과 같은 고정 업로드 이름 "audio"+확장자(#297 D3). 이
+	// 엔드포인트는 로컬 전용(#165/#169)이라 유출 수정이 아니라 일관성 때문이다.
+	fw, err := mw.CreateFormFile("file", whisperUploadFilename(path))
 	if err != nil {
 		return nil, fmt.Errorf("create form file: %w", err)
 	}
@@ -2013,22 +2089,22 @@ func (c *WhisperCollector) diarizeAudio(ctx context.Context, path string, audioB
 	// enforces dial-time locality verification — see verifiedDialContext.
 	resp, err := c.diarizeHTTPClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("diarization http request: %w", err)
+		return nil, whisperStep("diarization http request", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read diarization response body: %w", err)
+	if resp.StatusCode != http.StatusOK {
+		return nil, readWhisperStatusError("diarization", resp)
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("diarization API returned %d: %s", resp.StatusCode, body)
+	body, err := readBoundedBody(resp.Body, diarizationMaxResponseBytes)
+	if err != nil {
+		return nil, whisperStep("read diarization response body", err)
 	}
 
 	var result diarizeResponse
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("decode diarization response JSON: %w", err)
+		return nil, whisperStep("decode diarization response JSON", err)
 	}
 
 	if len(result.Segments) == 0 {
@@ -2143,51 +2219,201 @@ const whisperQuarantineDir = ".quarantine"
 //
 // Sidecar files (<path>.meta.json) are moved alongside the audio file when
 // present, so that provenance information is preserved for manual inspection.
-func quarantineCorruptAudio(path, audioDir string, sizeBytes int64, reason error) bool {
+//
+// 로그(#297): 경로는 남기지 않는다 — 오디오 경로도, 목적지도, 사이드카도.
+// 오류 문구도 남기지 않는다(*fs.PathError·*os.LinkError 문구에 두 경로가 모두
+// 들어 있다). 파일은 whisperFileAttrs 로 가리키고, reason 은 고정 분류
+// (quarantineReasonAttrs), mkdir·이동 오류는 모양만(logsafe.PrefixedErrAttrs)
+// 남긴다. quarantine_dir 은 남긴다 — 설정한 오디오 디렉터리 + 상수라서
+// 파일마다 다른 값이 아니다.
+func quarantineCorruptAudio(logger *slog.Logger, path, audioDir string, sizeBytes int64, reason error) bool {
+	fileAttrs := whisperFileAttrs(audioDir, path)
+	reasonAttrs := quarantineReasonAttrs(reason)
+
 	qDir := filepath.Join(audioDir, whisperQuarantineDir)
 	if err := os.MkdirAll(qDir, 0o755); err != nil {
-		slog.Warn("whisper: cannot create quarantine dir — corrupt file added to in-memory skip-set (#158)",
-			"path", path,
-			"quarantine_dir", qDir,
-			"size_bytes", sizeBytes,
-			"reason", reason,
-			"mkdir_error", err,
-		)
+		attrs := append(append(fileAttrs, "quarantine_dir", qDir, "size_bytes", sizeBytes), reasonAttrs...)
+		logger.Warn("whisper: cannot create quarantine dir — corrupt file added to in-memory skip-set (#158)",
+			append(attrs, logsafe.PrefixedErrAttrs("mkdir_", err)...)...)
 		return false
 	}
 
 	dest := filepath.Join(qDir, filepath.Base(path))
 	if err := os.Rename(path, dest); err != nil {
-		slog.Warn("whisper: quarantine move failed — corrupt file added to in-memory skip-set (#158)",
-			"path", path,
-			"dest", dest,
-			"size_bytes", sizeBytes,
-			"reason", reason,
-			"move_error", err,
-		)
+		attrs := append(append(fileAttrs, "size_bytes", sizeBytes), reasonAttrs...)
+		logger.Warn("whisper: quarantine move failed — corrupt file added to in-memory skip-set (#158)",
+			append(attrs, logsafe.PrefixedErrAttrs("move_", err)...)...)
 		return false
 	}
 
-	slog.Warn("whisper: corrupt audio file quarantined — will not be retried",
-		"path", path,
-		"quarantine", dest,
-		"size_bytes", sizeBytes,
-		"reason", reason,
-	)
+	logger.Warn("whisper: corrupt audio file quarantined — will not be retried",
+		append(append(fileAttrs, "size_bytes", sizeBytes), reasonAttrs...)...)
 
 	// Move sidecar alongside the audio file (best-effort: no error on absence).
 	sidecar := path + ".meta.json"
 	if _, err := os.Stat(sidecar); err == nil {
 		sidecarDest := dest + ".meta.json"
 		if err := os.Rename(sidecar, sidecarDest); err != nil {
-			slog.Warn("whisper: could not move sidecar to quarantine",
-				"sidecar", sidecar,
-				"dest", sidecarDest,
-				"error", err,
-			)
+			// fileAttrs 는 오디오 파일의 ref 다. 사이드카는 "<오디오>.meta.json"
+			// 이라 오디오 ref 로 이미 가리킬 수 있다.
+			logger.Warn("whisper: could not move sidecar to quarantine",
+				append(fileAttrs, logsafe.ErrAttrs(err)...)...)
 		}
 	}
 	return true
+}
+
+// quarantineReasonAttrs 는 checkAudioFileHeader 오류를 로그에 남겨도 되는
+// 속성으로 줄인다: "reason" 은 고정 분류("too_short", "not_m4a",
+// "unreadable")이고, 읽지 못한 파일이면 오류 모양(op/errno)을 붙인다.
+func quarantineReasonAttrs(reason error) []any {
+	switch {
+	case reason == nil:
+		return []any{"reason", "unknown"}
+	case errors.Is(reason, audiovalidate.ErrTooShort):
+		return []any{"reason", "too_short"}
+	case errors.Is(reason, audiovalidate.ErrNotM4A):
+		return []any{"reason", "not_m4a"}
+	default:
+		return append([]any{"reason", "unreadable"}, logsafe.PrefixedErrAttrs("reason_", reason)...)
+	}
+}
+
+// whisperUploadFilename 은 오디오와 함께 보내는 멀티파트 파일 이름이다
+// (#297 D3): "audio" + 소문자 확장자. 실제 파일 이름에는 기본 설정에서
+// 전화번호가 들어 있어 기계 밖으로 내보내면 안 된다. 엔드포인트는 컨테이너
+// 형식을 확장자로만 판별한다.
+func whisperUploadFilename(path string) string {
+	return "audio" + strings.ToLower(filepath.Ext(path))
+}
+
+// 외부 오디오 API 응답 크기 상한(#297).
+const (
+	// whisperMaxResponseBytes 는 200 전사 본문 상한이다. 25 MiB 오디오의
+	// diarized_json 도 넉넉히 들어간다.
+	whisperMaxResponseBytes = 32 << 20
+	// diarizationMaxResponseBytes 는 200 화자 분리 본문(세그먼트 목록) 상한이다.
+	diarizationMaxResponseBytes = 16 << 20
+	// whisperMaxErrorBodyBytes 는 error.type / error.code 를 찾으려고 읽는
+	// 비-200 본문의 최대 길이다.
+	whisperMaxErrorBodyBytes = 64 << 10
+	// whisperMaxDrainBytes 는 연결을 재사용하려고 추가로 읽어 버리는 비-200
+	// 본문 길이다. 이보다 크면 연결을 그냥 닫는다.
+	whisperMaxDrainBytes = 1 << 20
+)
+
+// errWhisperBodyTooLarge 는 200 본문이 상한을 넘을 때 readBoundedBody 가
+// 돌려준다.
+var errWhisperBodyTooLarge = errors.New("response body exceeds size cap")
+
+// readBoundedBody 는 r 을 max 바이트까지 읽는다. 더 긴 본문은 조용히 자르지
+// 않고 오류로 돌려준다(잘린 JSON 은 나중에 덜 분명한 디코드 오류로만 드러난다).
+func readBoundedBody(r io.Reader, max int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > max {
+		return nil, errWhisperBodyTooLarge
+	}
+	return b, nil
+}
+
+// whisperStepError 는 전사·화자 분리 요청의 어느 단계가 실패했는지 기록한다.
+// step 은 늘 고정 문구라 로그에 남겨도 된다(LogAttrs). Error() 문구는 #297
+// 이전의 "단계: 원인" 모양 그대로다.
+type whisperStepError struct {
+	step string
+	err  error
+}
+
+func whisperStep(step string, err error) error { return &whisperStepError{step: step, err: err} }
+
+func (e *whisperStepError) Error() string   { return e.step + ": " + e.err.Error() }
+func (e *whisperStepError) Unwrap() error   { return e.err }
+func (e *whisperStepError) LogAttrs() []any { return []any{"step", e.step} }
+
+// whisperStatusError 는 전사·화자 분리 엔드포인트의 비-200 응답이다. 응답
+// 본문은 일부러 담지 않는다(#297): 외부 오류 본문은 요청 데이터(파일 이름,
+// 전사 본문)를 되돌려 줄 수 있다. 상태 코드와 검증한 error.type / error.code
+// 만 남는다.
+type whisperStatusError struct {
+	service    string // "whisper" or "diarization" — fixed literal
+	statusCode int
+	errType    string // "" unless it matched reUpstreamErrorToken
+	errCode    string // "" unless it matched reUpstreamErrorToken
+}
+
+// Error 는 #297 이전 접두사("whisper API returned 500")를 유지해 기존 로그
+// 검색이 계속 맞는다. 뒤에 붙던 본문만 없어졌다.
+func (e *whisperStatusError) Error() string {
+	msg := fmt.Sprintf("%s API returned %d", e.service, e.statusCode)
+	var parts []string
+	if e.errType != "" {
+		parts = append(parts, "error.type="+e.errType)
+	}
+	if e.errCode != "" {
+		parts = append(parts, "code="+e.errCode)
+	}
+	if len(parts) > 0 {
+		msg += " (" + strings.Join(parts, ", ") + ")"
+	}
+	return msg
+}
+
+// LogAttrs 는 logsafe.LogAttrer 구현이다.
+func (e *whisperStatusError) LogAttrs() []any {
+	attrs := []any{"status", e.statusCode}
+	if e.errType != "" {
+		attrs = append(attrs, "upstream_error_type", e.errType)
+	}
+	if e.errCode != "" {
+		attrs = append(attrs, "upstream_error_code", e.errCode)
+	}
+	return attrs
+}
+
+// reUpstreamErrorToken 은 외부 본문에서 옮겨 오는 error.type / error.code 의
+// 유일한 허용 모양이다: 짧은 소문자 토큰(예: "invalid_request_error",
+// "rate_limit_exceeded"). 그 밖의 값(자유 문구, 사용자 데이터)은 버린다.
+// 첫 글자는 영문 소문자여야 한다 — 숫자로 시작하는 값(예: "01000009999")은
+// 전화번호일 수 있다.
+var reUpstreamErrorToken = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,63}$`)
+
+// readWhisperStatusError 는 비-200 응답으로 whisperStatusError 를 만든다:
+// OpenAI 오류 모양 {"error":{"type":…,"code":…}} 을 찾으려고 최대
+// whisperMaxErrorBodyBytes 를 읽고, keep-alive 연결을 재사용하려고
+// whisperMaxDrainBytes 까지 더 읽어 버린다. 본문 문구 자체는 남기지 않는다.
+func readWhisperStatusError(service string, resp *http.Response) *whisperStatusError {
+	se := &whisperStatusError{service: service, statusCode: resp.StatusCode}
+	head, _ := io.ReadAll(io.LimitReader(resp.Body, whisperMaxErrorBodyBytes))
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, whisperMaxDrainBytes))
+
+	var parsed struct {
+		Error struct {
+			Type json.RawMessage `json:"type"`
+			Code json.RawMessage `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(head, &parsed) != nil {
+		return se
+	}
+	se.errType = upstreamErrorToken(parsed.Error.Type)
+	se.errCode = upstreamErrorToken(parsed.Error.Code)
+	return se
+}
+
+// upstreamErrorToken 은 raw 가 reUpstreamErrorToken 에 맞는 JSON 문자열일
+// 때만 그 문자열을, 아니면 "" 를 돌려준다.
+func upstreamErrorToken(raw json.RawMessage) string {
+	var v string
+	if len(raw) == 0 || json.Unmarshal(raw, &v) != nil {
+		return ""
+	}
+	if !reUpstreamErrorToken.MatchString(v) {
+		return ""
+	}
+	return v
 }
 
 // WithNameRedactor injects the approved remote protection step.

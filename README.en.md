@@ -381,6 +381,7 @@ Key environment variables based on `internal/config/config.go`.
 | `WHISPER_API_KEY` | — | OpenAI API key. Required — empty disables transcription |
 | `WHISPER_MODEL` | `gpt-4o-transcribe-diarize` | Combined transcription + speaker diarization model |
 | `WHISPER_CHUNKING_STRATEGY` | `auto` | Required to receive speaker diarization segments |
+| `LOG_REF_KEY` | — (random per-process key) | Key for the `file_ref` (first 8 bytes of HMAC-SHA256) that identifies files and source_ids in logs (#297). Call-recording file names embed the phone number by default, so logs carry only this reference, never the path. **A `file_ref` only matches refs made with the same key** — when empty, each process gets its own key, so refs match only within one process (and change on restart). To correlate server and collector logs, or to compute a ref locally and match it, **inject the same `LOG_REF_KEY` into both server and collector**. Must be at least 16 bytes (shorter aborts startup). The key is never printed — the startup log `log_ref_key` shows only its source (`env`/`ephemeral`) |
 | `ENTITY_EXTRACTION_ENABLED` | `false` | Enable entity extraction |
 
 > When both `EMBEDDING_API_KEY` and `CLIPROXY_AUTH_FILE` are set, `CLIPROXY_AUTH_FILE` takes precedence.

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/baekenough/second-brain/internal/llm"
+	"github.com/baekenough/second-brain/internal/logsafe"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/google/uuid"
 )
@@ -281,7 +282,7 @@ docLoop:
 			if err := w.summarizeOne(docCtx, doc); err != nil {
 				slog.Warn("summarizer: summarize failed",
 					"doc_id", doc.ID,
-					"source_id", doc.SourceID,
+					"source_id", logsafe.SafeSourceID(doc.SourceID),
 					"error", err)
 				return
 			}

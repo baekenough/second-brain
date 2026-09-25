@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -279,8 +280,10 @@ func TestWhisperCollector_Collect_BasicTranscription(t *testing.T) {
 	if captured.fields["language"] != "ko" {
 		t.Errorf("multipart language = %q, want %q", captured.fields["language"], "ko")
 	}
-	if captured.filename != "call-2024.m4a" {
-		t.Errorf("uploaded filename = %q, want %q", captured.filename, "call-2024.m4a")
+	// #297 D3: 업로드 이름은 고정 "audio"+확장자다. 실제 파일 이름(기본
+	// 설정에서 전화번호가 들어 있음)은 보내지 않는다.
+	if captured.filename != "audio.m4a" {
+		t.Errorf("uploaded filename = %q, want %q", captured.filename, "audio.m4a")
 	}
 	if captured.fileSize == 0 {
 		t.Error("uploaded file has zero bytes")
@@ -1241,7 +1244,7 @@ func testQuarantineSkipSetDirectly(t *testing.T, corruptPath string) {
 	nonExistentAudioDir := filepath.Join(t.TempDir(), "does-not-exist", "subdir")
 
 	// quarantineCorruptAudio must return false when mkdir fails.
-	ok := quarantineCorruptAudio(corruptPath, nonExistentAudioDir, 4096, fmt.Errorf("no ftyp box"))
+	ok := quarantineCorruptAudio(slog.Default(), corruptPath, nonExistentAudioDir, 4096, fmt.Errorf("no ftyp box"))
 	if ok {
 		t.Errorf("quarantineCorruptAudio returned true for non-existent audioDir, want false")
 	}

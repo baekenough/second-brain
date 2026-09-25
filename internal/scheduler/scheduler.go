@@ -14,6 +14,7 @@ import (
 	"github.com/baekenough/second-brain/internal/chunker"
 	"github.com/baekenough/second-brain/internal/collector"
 	"github.com/baekenough/second-brain/internal/llm"
+	"github.com/baekenough/second-brain/internal/logsafe"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
@@ -625,12 +626,12 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 				if errors.Is(upsertErr, store.ErrDuplicateTranscript) {
 					slog.Debug("scheduler: skipped duplicate call content",
 						"collector", col.Name(),
-						"source_id", batch[i].SourceID)
+						"source_id", logsafe.SafeSourceID(batch[i].SourceID))
 					continue
 				}
 				slog.Warn("scheduler: upsert failed",
 					"collector", col.Name(),
-					"source_id", batch[i].SourceID,
+					"source_id", logsafe.SafeSourceID(batch[i].SourceID),
 					"error", upsertErr)
 				continue
 			}
@@ -1054,7 +1055,7 @@ func (s *Scheduler) persistChunks(ctx context.Context, doc *model.Document) {
 		slog.Error("scheduler: chunk persist failed",
 			"err", err,
 			"doc_id", doc.ID,
-			"source_id", doc.SourceID,
+			"source_id", logsafe.SafeSourceID(doc.SourceID),
 			"chunk_count", len(chunks),
 		)
 		return // no point embedding if we could not store chunks
@@ -1162,7 +1163,7 @@ func (s *Scheduler) extractEntities(ctx context.Context, doc *model.Document) {
 	entities, err := worker.ExtractEntities(ctx, s.llmClient, doc)
 	if err != nil {
 		slog.Warn("scheduler: entity extraction failed (non-fatal)",
-			"doc_id", doc.ID, "source_id", doc.SourceID, "error", err)
+			"doc_id", doc.ID, "source_id", logsafe.SafeSourceID(doc.SourceID), "error", err)
 		return
 	}
 	if len(entities) == 0 {
@@ -1261,12 +1262,12 @@ func (s *Scheduler) ForceCollectSlackChannel(ctx context.Context, channelID, cha
 		if err := s.store.Upsert(ctx, &docs[i]); err != nil {
 			if errors.Is(err, store.ErrDuplicateTranscript) {
 				slog.Debug("scheduler: skipped duplicate call-transcript",
-					"source_id", docs[i].SourceID)
+					"source_id", logsafe.SafeSourceID(docs[i].SourceID))
 				continue
 			}
 			slog.Warn("scheduler: force-collect upsert failed",
 				"channel_id", channelID,
-				"source_id", docs[i].SourceID,
+				"source_id", logsafe.SafeSourceID(docs[i].SourceID),
 				"error", err)
 			continue
 		}

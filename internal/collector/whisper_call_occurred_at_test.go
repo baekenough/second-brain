@@ -16,6 +16,7 @@ package collector
 
 import (
 	"context"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -33,7 +34,7 @@ func TestCallRecordingOccurredAt_NormalFilename(t *testing.T) {
 	now := time.Date(2026, 8, 26, 6, 0, 0, 0, time.UTC)
 	filename := "01025777190_20260826054434.m4a"
 
-	got := callRecordingOccurredAt(filename, mtime, now)
+	got := callRecordingOccurredAt(slog.Default(), nil, filename, mtime, now)
 
 	want := time.Date(2026, 8, 26, 5, 44, 34, 0, time.UTC)
 	if !got.Equal(want) {
@@ -58,7 +59,7 @@ func TestCallRecordingOccurredAt_MtimeDriftRegression(t *testing.T) {
 	mtime := time.Date(2026, 8, 26, 22, 16, 0, 0, time.UTC)
 	now := time.Date(2026, 8, 27, 0, 0, 0, 0, time.UTC)
 
-	got := callRecordingOccurredAt(filename, mtime, now)
+	got := callRecordingOccurredAt(slog.Default(), nil, filename, mtime, now)
 
 	wantCallTime := time.Date(2026, 8, 26, 5, 44, 34, 0, time.UTC)
 	if !got.Equal(wantCallTime) {
@@ -95,7 +96,7 @@ func TestCallRecordingOccurredAt_UnparseableFilename_FallsBackToMtime(t *testing
 		filename := filename
 		t.Run("fallback:"+filename, func(t *testing.T) {
 			t.Parallel()
-			got := callRecordingOccurredAt(filename, mtime, now)
+			got := callRecordingOccurredAt(slog.Default(), nil, filename, mtime, now)
 			if !got.Equal(mtime) {
 				t.Errorf("filename %q: got %v, want mtime fallback %v", filename, got, mtime)
 			}
@@ -116,7 +117,7 @@ func TestCallRecordingOccurredAt_FutureTimestamp_FallsBackToMtime(t *testing.T) 
 	// Filename claims a call one day in the future relative to now.
 	filename := "01025777190_20260827120000.m4a"
 
-	got := callRecordingOccurredAt(filename, mtime, now)
+	got := callRecordingOccurredAt(slog.Default(), nil, filename, mtime, now)
 	if !got.Equal(mtime) {
 		t.Errorf("callRecordingOccurredAt() = %v, want mtime fallback %v (future timestamp must be rejected)", got, mtime)
 	}
@@ -133,7 +134,7 @@ func TestCallRecordingOccurredAt_TooOldTimestamp_FallsBackToMtime(t *testing.T) 
 	// Year 1999 — before the isPlausibleRecordingTime floor of 2000.
 	filename := "01025777190_19991231235959.m4a"
 
-	got := callRecordingOccurredAt(filename, mtime, now)
+	got := callRecordingOccurredAt(slog.Default(), nil, filename, mtime, now)
 	if !got.Equal(mtime) {
 		t.Errorf("callRecordingOccurredAt() = %v, want mtime fallback %v (year < 2000 must be rejected)", got, mtime)
 	}
@@ -152,7 +153,7 @@ func TestCallRecordingOccurredAt_RejectsKSTMisparse(t *testing.T) {
 	mtime := time.Date(2026, 8, 26, 6, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 8, 27, 0, 0, 0, 0, time.UTC)
 
-	got := callRecordingOccurredAt(filename, mtime, now)
+	got := callRecordingOccurredAt(slog.Default(), nil, filename, mtime, now)
 
 	correctUTC := time.Date(2026, 8, 26, 5, 44, 34, 0, time.UTC)
 	if !got.Equal(correctUTC) {
