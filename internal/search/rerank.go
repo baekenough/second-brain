@@ -5,9 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"time"
+
+	"github.com/baekenough/second-brain/internal/httperr"
 )
 
 // Reranker scores query-document pairs and returns results sorted by relevance.
@@ -47,6 +48,16 @@ func NewHTTPReranker(apiURL, apiKey, model string, _ int) *HTTPReranker {
 // Enabled reports whether a rerank API endpoint is configured.
 func (r *HTTPReranker) Enabled() bool { return r.apiURL != "" }
 
+// rerankResponseBytesPerDoc 는 결과 항목 하나({"index":…,"relevance_score":…})
+// 의 바이트 상한 추정치다. return_documents 를 쓰지 않으므로 문서 본문은
+// 응답에 없다.
+const rerankResponseBytesPerDoc = 256
+
+// rerankResponseLimit 은 문서 n 개를 리랭크한 성공 응답 본문의 상한이다.
+func rerankResponseLimit(n int) int64 {
+	return 1<<20 + int64(n)*rerankResponseBytesPerDoc
+}
+
 // Rerank scores each document against the query and returns results ordered by
 // descending relevance score. When the reranker is disabled (empty apiURL) it
 // returns the original order with synthetic scores so callers need not branch.
@@ -68,6 +79,10 @@ func (r *HTTPReranker) Rerank(ctx context.Context, query string, docs []string) 
 		Query     string   `json:"query"`
 		Documents []string `json:"documents"`
 		TopN      int      `json:"top_n"`
+		// ReturnDocuments 를 false 로 명시한다. 기본값이 true 인 공급자가 있어
+		// 생략하면 응답에 문서 본문이 되돌아온다 — 응답 상한
+		// (rerankResponseLimit)은 본문이 없다는 전제로 잡았다.
+		ReturnDocuments bool `json:"return_documents"`
 	}
 
 	payload := rerankRequest{
@@ -75,6 +90,8 @@ func (r *HTTPReranker) Rerank(ctx context.Context, query string, docs []string) 
 		Query:     query,
 		Documents: docs,
 		TopN:      len(docs),
+		// 문서 본문은 응답에 필요 없다(index·score 만 쓴다).
+		ReturnDocuments: false,
 	}
 
 	body, err := json.Marshal(payload)
@@ -98,12 +115,16 @@ func (r *HTTPReranker) Rerank(ctx context.Context, query string, docs []string) 
 	}
 	defer resp.Body.Close()
 
-	b, err := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		// 오류 문구는 상태 코드만 담는다("rerank API status %d" 유지). 리랭커
+		// 오류 본문은 문서 조각을 되돌려 줄 수 있어 읽지 않고 상한 안에서
+		// 버리기만 한다(연결 재사용).
+		httperr.Drain(resp.Body)
+		return nil, &httperr.StatusError{Prefix: "rerank API status", StatusCode: resp.StatusCode}
+	}
+	b, err := httperr.ReadBody(resp.Body, rerankResponseLimit(len(docs)))
 	if err != nil {
 		return nil, fmt.Errorf("rerank read response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("rerank API status %d", resp.StatusCode)
 	}
 
 	var apiResp struct {

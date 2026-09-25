@@ -720,11 +720,11 @@ func parseEnrichmentResponse(raw string) (*NoteEnrichmentResult, error) {
 
 	var resp enrichmentResponse
 	if err := json.Unmarshal([]byte(trimmed), &resp); err != nil {
-		truncated := raw
-		if len(truncated) > 200 {
-			truncated = truncated[:200] + "...[truncated]"
-		}
-		slog.Warn("note enrichment: failed to parse LLM JSON", "error", err, "response", truncated)
+		// 응답 조각은 로그에 남기지 않는다(#288 D4). LLM 응답은 사용자 노트를
+		// 풀어 쓴 내용이라 앞부분만 잘라도 개인정보가 섞이고, 바이트 단위로
+		// 자르면 UTF-8 문자가 중간에서 끊긴다. 길이만 남긴다. err 는
+		// encoding/json 오류라 오프셋·문자 하나·스키마 필드 이름만 담는다.
+		slog.Warn("note enrichment: failed to parse LLM JSON", "error", err, "response_len", len(raw))
 		return nil, fmt.Errorf("parse note enrichment response: %w", err)
 	}
 
