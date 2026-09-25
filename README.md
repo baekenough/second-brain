@@ -349,6 +349,27 @@ Android second-brain-push 앱이 SMS·통화 기록을 JSON 배치로 전송합�
 
 레코드 필드 상한: SMS `body` 64 KiB, `address`·`number`·`contact_name` 1 KiB. 넘는 레코드만 건너뜁니다. 문서 upsert 와 청크 교체는 한 트랜잭션이라, 청크 단계에서 실패하면 문서 행도 되돌아가고 재전송 때 다시 만들어집니다. 임베딩은 요청 중에 만들지 않습니다 — 새 청크는 collector 의 임베딩 백필이 다음 수집 주기(`COLLECT_INTERVAL`, 기본 10분)에 채우므로 벡터 검색 반영은 그만큼 늦고, 전문·bigm 검색은 바로 반영됩니다. 로그에는 본문·주소·번호를 남기지 않고 개수·인덱스·SQLSTATE 만 남깁니다.
 
+**통화 전사 보호(#292).** 통화 로그·녹음·전사는 source_id 하나(`call-log:{dateMs}:{numHash}:{durHash}`)를 같이 씁니다. 전사가 붙은 통화 문서(`metadata.transcription` 이 `none`·`pending` 이 아님)에 같은 통화 로그나 녹음이 다시 와도(앱 재설치·커서 초기화로 전량 재전송, XML 백업 재수집, 녹음 재업로드) 전사 본문·임베딩·청크·전사 metadata 는 그대로 둡니다. 통화 로그를 다시 수집한 경우(`transcription=none`)에는 통화 로그가 권위를 갖는 `contact_name`·`direction`·`duration_seconds`·`number` 와 제목을 갱신합니다. 녹음 재업로드(`pending`)는 아무것도 덧씌우지 않습니다 — 녹음 쪽은 방향을 `incoming` 으로 고정해 보내고 연락처가 비어 올 수 있기 때문입니다. 어느 쪽이든 "내용 변경 없음" 으로 처리되어, ingest/messages 와 collector 스케줄러 모두 청크·청크 임베딩·엔티티 추출을 다시 하지 않습니다(스케줄러는 저장된 내용이 바뀐 문서만 다시 청크합니다).
+
+### POST /api/v1/ingest/recording
+
+Android 앱이 통화 녹음·음성메모를 multipart(`file`, `kind`, `number`, `date_ms`, `duration_sec`, `contact_name`)로 올립니다. 오디오와 사이드카(`{오디오}.meta.json`)를 `INGEST_RECORDING_DIR` 에 쓰고, 전사 대기(`transcription=pending`) 통화 문서를 만듭니다. WhisperCollector 가 나중에 전사해 같은 문서에 병합합니다.
+
+**응답 계약(#292).** 앱(`Uploader.handleRecordingResponse`)은 2xx(`accepted` 또는 `skipped` 가 참)와 401·403 이 아닌 4xx 에서 그 파일을 **전송 완료로 표시하고 다시 보내지 않습니다.** 5xx·네트워크 오류에서는 표시하지 않고, 이번 실행의 녹음 루프를 멈춘 뒤 다음 실행(주기 20분)에 같은 파일부터 다시 보냅니다. 그래서 일시 오류에 4xx 를 주면 그 녹음은 영구히 유실되고, 영구 오류에 5xx 를 주면 그 파일에서 녹음 루프가 매번 멈춰 뒤의 녹음이 전부 막힙니다.
+
+| 상태 | 뜻 | 앱 동작 |
+|------|----|---------|
+| `201` `{accepted:true, document_id}` | 오디오·사이드카·대기 문서를 저장했습니다 | 전송 완료 |
+| `200` `{accepted:true, skipped:true, reason:"duplicate_content"}` | 오디오·사이드카는 저장했고, 다른 source_id 의 활성 통화 문서와 요약 내용이 같아 대기 문서만 만들지 않았습니다. 다시 보내도 결과가 같고, 전사는 WhisperCollector 가 합니다 | 전송 완료 |
+| `200` `{accepted:false, skipped:true, reason:"cutover"}` | `COLLECTOR_CUTOVER` 이전 녹음이라 아무것도 저장하지 않았습니다 | 전송 완료 |
+| `400` | 형식 오류: multipart 가 아님·경계 없음·본문은 온전히 받았는데 multipart 가 끝나지 않음, 필수 필드(`file`·`date_ms`, 통화는 `number`) 누락, `kind` 가 잘못됨, 손상된 오디오(m4a 에 `ftyp` 없음·8바이트 미만) | 전송 완료(영구) |
+| `413` | 파일이 `INGEST_MAX_FILE_BYTES`(기본 100 MiB)를 넘었습니다 | 전송 완료(영구) |
+| `422` | DB 가 입력 때문에 문서를 거부했습니다(SQLSTATE 22·54, 23502·23514). 오디오는 저장돼 있습니다 | 전송 완료(영구) |
+| `503` + `Retry-After: 30` | **일시 오류**: 업로드가 도중에 끊김·읽기 시간 초과·연결 끊김, 디스크 오류(저장 디렉터리·사이드카·오디오·32 MiB 초과 파트의 임시 파일), DB 장애·분류되지 않은 DB 오류 | 다음 실행에 재전송 |
+| `401` | API 키가 없거나 틀렸습니다 | 동기화 중단 |
+
+오디오와 사이드카는 임시 파일(`.partial`)에 쓴 뒤 이름을 바꾸므로 잘린 파일이 보이지 않고, 사이드카를 먼저 씁니다 — 오디오가 보이면 사이드카도 이미 있어 WhisperCollector 가 통화 문서에 병합할 수 있습니다. 서버 전체 `ReadTimeout`(15초)은 이 경로에서만 200초로 늘립니다(앱 호출 제한 180초보다 길게) — 모바일 망의 큰 업로드가 서버 기한에 매번 끊겨 같은 파일에서 재시도가 반복되지 않게 하려는 것입니다. 단 `API_KEY` 가 비어 인증이 꺼져 있으면 늘리지 않고 시작 시 경고합니다. 저장 파일 이름은 파일 시스템 한도를 넘지 않게 줄입니다(음성메모 이름 줄기 100바이트, 넘으면 잘라서 원래 이름의 해시를 붙임 · 확장자는 WhisperCollector 가 전사하는 목록만 쓰고 나머지는 `.audio` · 너무 긴 번호는 해시로) — 이름이 길어 쓰기가 실패하면 같은 파일이 매번 503 이 되기 때문입니다. 시작 시 1시간보다 오래된 임시 파일(`.partial`)을 지웁니다. 로그에는 파일 이름·저장 경로·번호·연락처를 남기지 않습니다(통화 녹음 파일 이름에 번호가 들어 있습니다). 오류 종류·errno·SQLSTATE 만 남깁니다.
+
 ---
 
 ## 환경 변수

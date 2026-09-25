@@ -24,7 +24,15 @@ import (
 
 // DocumentUpserter is the subset of the document store used by the scheduler.
 type DocumentUpserter interface {
+	// Upsert 는 내용이 바뀌었는지 알려 주지 않는 upsert 다. 사용자가 명시적으로
+	// 요청한 전량 재수집(ForceCollectSlackChannel)만 쓴다 — 거기서는 청크를
+	// 무조건 다시 만드는 것이 의도다.
 	Upsert(ctx context.Context, doc *model.Document) error
+	// UpsertTracked 는 정기 수집(processBatch)의 비병합 경로가 쓴다. 저장된
+	// content 가 바뀌었는지 돌려주고, 스케줄러는 바뀌지 않았으면 청크·청크
+	// 임베딩·엔티티 추출을 건너뛴다(#292). 통화 전사 보호로 들어온 요약 대신
+	// 기존 전사가 남은 경우도 "바뀌지 않음" 이다 — store.callTranscriptKeptSQL.
+	UpsertTracked(ctx context.Context, doc *model.Document) (contentChanged bool, err error)
 	LastCollectedAt(ctx context.Context, instanceID string, src model.SourceType, fallback time.Time) time.Time
 	UpdateCollectorState(ctx context.Context, instanceID string, src model.SourceType, lastCollectedAt time.Time) error
 	RecordCollectionLog(ctx context.Context, src model.SourceType, started time.Time, count int, err error) error
@@ -604,11 +612,14 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 			// store.AttachTranscript's doc comment for exactly what that
 			// preserves (call-log-only metadata, title, authoritative
 			// occurred_at).
-			var upsertErr error
+			var (
+				contentChanged bool
+				upsertErr      error
+			)
 			if _, merging := batch[i].Metadata["transcript_source_id"]; merging {
-				_, upsertErr = s.store.AttachTranscript(ctx, &batch[i])
+				contentChanged, upsertErr = s.store.AttachTranscript(ctx, &batch[i])
 			} else {
-				upsertErr = s.store.Upsert(ctx, &batch[i])
+				contentChanged, upsertErr = s.store.UpsertTracked(ctx, &batch[i])
 			}
 			if upsertErr != nil {
 				if errors.Is(upsertErr, store.ErrDuplicateTranscript) {
@@ -624,6 +635,25 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 				continue
 			}
 			count++
+
+			// 저장된 content 가 그대로면(같은 내용 재수집, 또는 통화 전사 보호로
+			// 들어온 요약 대신 기존 전사가 남음) 뒤따르는 작업을 모두 건너뛴다
+			// (#292). batch[i].Content 는 들어온 값이라 저장된 값과 다를 수 있다 —
+			// 그것으로 청크를 다시 만들면 문서 행은 전사, 청크·청크 임베딩은 통화
+			// 요약인 불일치가 된다(리뷰 재현: SMS XML 수집기가 전사된 통화를 재수집).
+			//   - 청크·청크 임베딩: 내용이 같으면 이미 그 내용의 청크가 있다.
+			//     재임베딩 비용(API 호출)도 아낀다.
+			//   - 엔티티 추출(LLM): 추출은 문서 content 에서 한다. 내용이 같으면
+			//     처음 저장할 때 이미 했고, 실패했거나 꺼져 있던 문서는
+			//     entities_processed_at 기준의 EntityWorker 백필이 채운다. 보호된
+			//     통화에서는 요약으로 추출하면 전사와 무관한 연결만 늘어난다.
+			// 잃는 것: 예전에는 같은 내용을 다시 수집할 때마다 청크를 다시 만들어,
+			// 앞선 청크 저장 실패가 우연히 복구됐다. 정기 수집은 워터마크 뒤의
+			// 새·변경 문서만 가져오므로 이 복구는 실제로는 거의 일어나지 않았고,
+			// 수동 전량 재수집(ForceCollectSlackChannel)은 여전히 무조건 다시 만든다.
+			if !contentChanged {
+				continue
+			}
 
 			// Persist text chunks for FTS indexing (issue #9).
 			// This replaces the previous 8 KB hard truncation (issue #3):

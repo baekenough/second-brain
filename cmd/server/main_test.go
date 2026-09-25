@@ -367,3 +367,21 @@ func TestWarnIngestMessagesLimits(t *testing.T) {
 		}
 	}
 }
+
+// TestWarnRecordingWithoutAPIKey: 녹음 수집이 켜져 있고 API_KEY 가 비었을 때만
+// 경고한다(#292).
+func TestWarnRecordingWithoutAPIKey(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		dir, key string
+		want     bool
+	}{
+		{"/rec", "", true},
+		{"/rec", "k", false},
+		{"", "", false},
+	} {
+		if got := warnRecordingWithoutAPIKey(tc.dir, tc.key); got != tc.want {
+			t.Errorf("warnRecordingWithoutAPIKey(%q, %q) = %v, want %v", tc.dir, tc.key, got, tc.want)
+		}
+	}
+}
