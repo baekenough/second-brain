@@ -12,6 +12,7 @@ import (
 
 	"github.com/baekenough/second-brain/internal/intent"
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
 	"github.com/baekenough/second-brain/internal/timeutil"
 	"github.com/go-chi/chi/v5"
@@ -511,14 +512,17 @@ func goldenMergeStreams(relevance, recent []*model.SearchResult, judged map[uuid
 // POST /api/v1/golden/feedback (judge="llm") instead.
 func (s *Server) goldenJudgmentsHandler(w http.ResponseWriter, r *http.Request) {
 	var req goldenJudgmentsRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if err := decodeBoundedJSON(w, r, goldenRequestMaxBytes, &req); err != nil {
+		writeBoundedJSONError(w, err, goldenRequestMaxBytes, "invalid request body")
 		return
 	}
 
 	queryID, err := uuid.Parse(req.QueryID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "query_id must be a UUID")
+		return
+	}
+	if !checkGoldenJudgmentCount(w, len(req.Judgments)) {
 		return
 	}
 
@@ -535,6 +539,11 @@ func (s *Server) goldenJudgmentsHandler(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusBadRequest, "judgment must be relevant, irrelevant, or noise")
 			return
 		}
+		if j.Rank < 0 || j.Rank > goldenRankMax {
+			writeError(w, http.StatusBadRequest,
+				"rank must be between 0 and "+strconv.Itoa(goldenRankMax))
+			return
+		}
 		inputs = append(inputs, store.GoldenJudgmentInput{
 			DocumentID: docID,
 			Judgment:   j.Judgment,
@@ -545,6 +554,12 @@ func (s *Server) goldenJudgmentsHandler(w http.ResponseWriter, r *http.Request) 
 
 	saved, feedbackApplied, err := s.golden.UpsertJudgments(r.Context(), queryID, inputs, req.FinishQuery)
 	if err != nil {
+		// 없는 query_id·document_id 는 FK 위반(23503)이다. 입력 문제이므로 400 이고,
+		// UpsertJudgments 는 한 트랜잭션이라 앞서 쓴 판정까지 모두 롤백된다.
+		if isForeignKeyViolation(err) {
+			writeError(w, http.StatusBadRequest, "query_id or document_id not found")
+			return
+		}
 		slog.Error("golden: upsert judgments failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal server error")
 		return
@@ -592,14 +607,30 @@ type goldenFeedbackResponse struct {
 // GoldenStore.UpsertJudgments — so a hermes auto-judgment cannot silently
 // contaminate the same tag a human judgment would use as ground truth.
 func (s *Server) goldenFeedbackHandler(w http.ResponseWriter, r *http.Request) {
+	// 본문 상한(#286)은 note 같은 저장하지 않는 필드까지 함께 묶는다. 원 바이트
+	// UTF-8 검사도 여기서 새로 생겨, 잘못된 UTF-8 본문은 U+FFFD 로 바뀌어 통과하던
+	// 것이 400 이 된다(의도된 변화).
 	var req goldenFeedbackRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if err := decodeBoundedJSON(w, r, goldenRequestMaxBytes, &req); err != nil {
+		writeBoundedJSONError(w, err, goldenRequestMaxBytes, "invalid request body")
 		return
 	}
 
 	if strings.TrimSpace(req.QueryText) == "" {
 		writeError(w, http.StatusBadRequest, "query_text is required")
+		return
+	}
+	// query_text 는 DB 로 보내지 않고 Go 쪽에서 비교하지만(FindQueryByText),
+	// 다른 진입점과 같은 입력 규칙을 적용해 길이·내용을 묶는다.
+	if err := search.ValidateInputText("query_text", req.QueryText, goldenQueryTextMaxBytes); err != nil {
+		writeError(w, http.StatusBadRequest, searchInputMessage(err))
+		return
+	}
+	if err := search.ValidateInputText("asked_at", req.AskedAt, goldenAskedAtMaxBytes); err != nil {
+		writeError(w, http.StatusBadRequest, searchInputMessage(err))
+		return
+	}
+	if !checkGoldenJudgmentCount(w, len(req.Judgments)) {
 		return
 	}
 	if !goldenAllowedSources[req.Source] {
@@ -632,6 +663,11 @@ func (s *Server) goldenFeedbackHandler(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "judgment must be relevant, irrelevant, or noise")
 			return
 		}
+		if j.Rank < 0 || j.Rank > goldenRankMax {
+			writeError(w, http.StatusBadRequest,
+				"rank must be between 0 and "+strconv.Itoa(goldenRankMax))
+			return
+		}
 		inputs = append(inputs, store.GoldenJudgmentInput{
 			DocumentID: docID,
 			Judgment:   j.Judgment,
@@ -654,6 +690,11 @@ func (s *Server) goldenFeedbackHandler(w http.ResponseWriter, r *http.Request) {
 
 	saved, feedbackApplied, err := s.golden.UpsertJudgments(r.Context(), queryID, inputs, false)
 	if err != nil {
+		// 없는 document_id 는 FK 위반(23503) → 400. 트랜잭션 전체가 롤백된다.
+		if isForeignKeyViolation(err) {
+			writeError(w, http.StatusBadRequest, "document_id not found")
+			return
+		}
 		slog.Error("golden: feedback upsert judgments failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal server error")
 		return
@@ -727,6 +768,18 @@ func (s *Server) goldenExportHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- helpers ---
+
+// checkGoldenJudgmentCount 는 요청 하나의 판정 수 상한(goldenJudgmentsMax)을
+// 검사하고, 넘으면 400 을 쓰고 false 를 돌려준다. 판정 하나가 한 트랜잭션 안의
+// SQL 1~3문장이라 개수 상한이 요청당 DB 작업량 상한이다(#286).
+func checkGoldenJudgmentCount(w http.ResponseWriter, n int) bool {
+	if n > goldenJudgmentsMax {
+		writeError(w, http.StatusBadRequest,
+			"judgments exceeds maximum of "+strconv.Itoa(goldenJudgmentsMax)+" items")
+		return false
+	}
+	return true
+}
 
 func goldenRetentionTag(doc model.Document) string {
 	tag, ok := doc.RetentionTag()

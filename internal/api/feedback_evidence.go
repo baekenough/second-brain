@@ -2,16 +2,15 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"os"
 	"strings"
 
 	"github.com/baekenough/second-brain/internal/dataset"
+	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
 	"github.com/baekenough/second-brain/internal/telemetry"
-	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	oteltrace "go.opentelemetry.io/otel/trace"
@@ -95,9 +94,10 @@ func (s *Server) evidenceFeedbackHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// 본문 상한(#286)은 플래그 검사 뒤에 건다 — 꺼진 엔드포인트는 본문을 읽지 않는다.
 	var req EvidenceFeedbackRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if err := decodeBoundedJSON(w, r, feedbackRequestMaxBytes, &req); err != nil {
+		writeBoundedJSONError(w, err, feedbackRequestMaxBytes, "invalid request body")
 		return
 	}
 
@@ -122,8 +122,27 @@ func (s *Server) evidenceFeedbackHandler(w http.ResponseWriter, r *http.Request)
 	}
 	// Parsed here rather than left to the database so that a malformed
 	// identifier is a 400 instead of a foreign-key violation dressed up as 500.
-	if _, err := uuid.Parse(req.DocumentID); err != nil {
+	// 정규형으로 바꿔 둔다: uuid.Parse 가 받는 urn 형식은 PostgreSQL 이 22P02 로
+	// 거부하므로, 원문을 넘기면 검증을 통과하고도 500 이 된다(canonicalUUID 참고).
+	docID, ok := canonicalUUID(req.DocumentID)
+	if !ok {
 		writeError(w, http.StatusBadRequest, "document_id must be a UUID")
+		return
+	}
+	req.DocumentID = docID
+	// 길이·UTF-8·NUL 검사(#286). query 상한은 /ask 질문 상한과 같은 상수라
+	// 답을 받은 질문에는 항상 투표할 수 있다. conversation_id 는 기존 행의 형식을
+	// 운영 DB 없이 확인할 수 없어 UUID 로 강제하지 않고 길이·내용만 본다.
+	if err := search.ValidateInputText("conversation_id", req.ConversationID, feedbackIDMaxBytes); err != nil {
+		writeError(w, http.StatusBadRequest, searchInputMessage(err))
+		return
+	}
+	if err := search.ValidateInputText("query", req.Query, feedbackQueryMaxBytes); err != nil {
+		writeError(w, http.StatusBadRequest, searchInputMessage(err))
+		return
+	}
+	if !evidenceLayers[req.Layer] {
+		writeError(w, http.StatusBadRequest, "layer must be empty, note, observed, or insight")
 		return
 	}
 
@@ -142,6 +161,11 @@ func (s *Server) evidenceFeedbackHandler(w http.ResponseWriter, r *http.Request)
 		Metadata: map[string]any{"rank": req.Rank, "layer": req.Layer},
 	})
 	if err != nil {
+		// 존재하지 않는 document_id 는 FK 위반(23503)이다. 입력 문제이므로 400.
+		if isForeignKeyViolation(err) {
+			writeError(w, http.StatusBadRequest, "document_id not found")
+			return
+		}
 		slog.Error("feedback evidence: upsert failed", "error", err, "query_hash", queryHash)
 		writeError(w, http.StatusInternalServerError, "internal server error")
 		return

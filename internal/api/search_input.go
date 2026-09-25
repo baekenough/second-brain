@@ -40,15 +40,23 @@ var (
 	errBodyInvalidJSON = errors.New("invalid JSON body")
 )
 
-// decodeBoundedJSON 은 검색 경로의 POST 본문(/api/v1/search, /api/v1/ask)을
-// 상한 안에서 읽어 dst 로 디코딩한다.
+// decodeBoundedJSON 은 POST 본문(/api/v1/search, /api/v1/ask, feedback 류
+// #286)을 상한 안에서 읽어 dst 로 디코딩한다.
 //
 // json.Decoder 로 바로 읽지 않고 먼저 바이트로 읽는 이유: encoding/json 은
 // 문자열 안의 잘못된 UTF-8 바이트를 U+FFFD 로 조용히 바꿔 버린다. 그러면
 // 사용자가 보낸 것과 다른 질의로 검색하게 되므로, 디코딩 전에 본문 전체의
 // UTF-8 유효성을 확인해 400 으로 거부한다(JSON 명세 RFC 8259 도 UTF-8 을
 // 요구한다). "\u0000" 같은 이스케이프는 여기서 걸리지 않고 디코딩 뒤
-// search.ValidateQueryInput 의 NUL 검사가 잡는다.
+// search.ValidateInputText 의 NUL 검사가 잡는다.
+//
+// 이 검사가 막는 것은 "원 바이트"가 잘못된 UTF-8 인 경우뿐이다. 짝 없는
+// 서로게이트 이스케이프("\ud800")는 본문 자체가 유효한 UTF-8 이라 통과하고,
+// encoding/json 이 디코딩하면서 U+FFFD 로 바꾼다(#286 항목 4a). 이것은 거부하지
+// 않는다: 디코딩 뒤에는 사용자가 실제로 보낸 U+FFFD 와 구분할 수 없어 U+FFFD
+// 를 거부하면 복사해 온 깨진 문자 같은 정상 입력까지 막게 되고, U+FFFD 는
+// PostgreSQL text·jsonb 에 안전해 보안 영향이 없다. 원문 이스케이프를 직접
+// 훑어 정확히 잡는 방법은 복잡도에 비해 얻는 것이 없다.
 func decodeBoundedJSON(w http.ResponseWriter, r *http.Request, maxBytes int64, dst any) error {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBytes))
 	if err != nil {
@@ -127,11 +135,16 @@ func (s *Server) writeSearchFailure(w http.ResponseWriter, label string, err err
 }
 
 // searchInputMessage 는 검증 오류에서 클라이언트에 보여 줄 문구를 꺼낸다.
-// search.InputError 의 문구는 필드 이름과 고정 사유만 담으므로 그대로 쓴다.
+// search.InputError 와 feedbackInputError(#286)의 문구는 필드 이름과 고정
+// 사유만 담으므로 그대로 쓴다.
 func searchInputMessage(err error) string {
 	var ie *search.InputError
 	if errors.As(err, &ie) {
 		return ie.Error()
+	}
+	var fe *feedbackInputError
+	if errors.As(err, &fe) {
+		return fe.Error()
 	}
 	return "invalid search input"
 }

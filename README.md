@@ -364,6 +364,8 @@ Android second-brain-push 앱이 SMS·통화 기록을 JSON 배치로 전송합�
 
 검색 입력 검증(#282): 검색 질의(`q`, `query`)와 소스 필터·정렬 값은 DB 에 가기 전에 검사한다. 잘못된 UTF-8·NUL(`\x00`) 포함·질의 1024바이트 초과는 400 이고, `POST /api/v1/search` 본문은 16KB(초과 시 413), `/api/v1/ask` 본문은 32KB, `/api/v1/graphql` 본문·쿼리스트링은 각각 64KB(초과 시 413/414)로 제한한다. GraphQL 은 요청당 `search` 필드 5개(별칭·fragment 전개 포함), `curated:true` 검색 1개까지만 실행하고(초과 시 400), 순환 fragment 는 400 으로 거부하며, 요청 전체에 `SEARCH_REQUEST_TIMEOUT_SECONDS` 를 한 번 건다. MCP HTTP 본문은 31MB(add_note 10MB 의 비 ASCII 이스케이프 최악 3배 + 1MB)로 제한한다. `/api/v1/ask` 질문은 같은 검증을 거치되 길이 상한만 4KB 다. 오류 응답과 로그에는 질의 원문을 남기지 않는다.
 
+피드백 입력 검증(#286): 피드백을 저장하는 경로(`POST /api/v1/feedback`, `POST /api/v1/feedback/evidence`, GraphQL `createFeedback`, `POST /api/v1/golden/judgments`, `POST /api/v1/golden/feedback`)도 DB 에 가기 전에 같은 규칙(잘못된 UTF-8·NUL 거부)으로 검사한다. 본문은 feedback·evidence 32KB, golden 64KB(초과 시 413)이고, 잘못된 UTF-8 원 바이트가 든 본문은 400 이다(이전에는 네 REST 경로 모두 U+FFFD 로 바꿔 통과시켰다). 필드 상한은 `query`·`query_text` 4KB(`/ask` 질문 상한과 같은 상수라 답을 받은 질문에는 항상 투표할 수 있다), `comment` 4KB, `source` 64바이트, `session_id`·`user_id`·`conversation_id` 128바이트, `metadata` 직렬화 4KB·중첩 깊이 16(키와 문자열 값 모두 NUL·UTF-8 검사)이며, 판정 배열은 요청당 100개까지이고 판정의 `rank` 는 0~10000 이다. `document_id` 는 UUID 여야 하며 `urn:uuid:`·중괄호·하이픈 없는 32자·대문자 형식은 정규형(소문자 36자)으로 바꿔 저장한다(PostgreSQL 은 urn 형식을 받지 않는다). 존재하지 않는 `document_id`·`chunk_id`·`query_id` 는 500 이 아니라 400 이다(golden 판정은 한 트랜잭션이라 요청 전체가 롤백된다). evidence 의 `layer` 는 `""`·`note`·`observed`·`insight` 만 받는다. GraphQL 은 요청당 `createFeedback` 1개(별칭·fragment 전개 포함)까지만 실행하고, POST 가 아닌 요청(GET 링크 등)이 mutation 을 실행하려 하면 405(`Allow: POST`)로 거부한다 — query 연산의 GET 은 그대로 된다. OpenSearch 레인이 실패하면 오류·로그에는 상태 코드와 `error.type` 만 남기고 응답 본문(질의 조각이 든 `reason`)은 버린다.
+
 ### Collector
 
 | 키 | 기본값 | 설명 |
