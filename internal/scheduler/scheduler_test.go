@@ -54,8 +54,12 @@ func (c *countingCollector) callCount() int {
 type mockStore struct {
 	mu       sync.Mutex
 	upserts  int
-	attaches int      // AttachTranscript call count
-	recorded []string // source_ids passed to RecordTranscribed
+	attaches int // AttachTranscript call count
+	tracked  int // UpsertTracked call count
+	// unchanged 가 참이면 UpsertTracked·AttachTranscript 가 contentChanged=false
+	// 를 돌려준다.
+	unchanged bool
+	recorded  []string // source_ids passed to RecordTranscribed
 }
 
 func (m *mockStore) Upsert(_ context.Context, _ *model.Document) error {
@@ -63,6 +67,21 @@ func (m *mockStore) Upsert(_ context.Context, _ *model.Document) error {
 	m.upserts++
 	m.mu.Unlock()
 	return nil
+}
+
+// UpsertTracked 는 정기 수집의 비병합 경로(processBatch)다. upserts 를 함께
+// 세고(호출 수 단언은 경로와 무관하게 "저장 시도 수"다), unchanged 가 참이면
+// "내용 변경 없음" 을 돌려준다.
+func (m *mockStore) UpsertTracked(_ context.Context, doc *model.Document) (bool, error) {
+	m.mu.Lock()
+	m.upserts++
+	m.tracked++
+	unchanged := m.unchanged
+	m.mu.Unlock()
+	if doc.ID == uuid.Nil {
+		doc.ID = uuid.New()
+	}
+	return !unchanged, nil
 }
 
 func (m *mockStore) LastCollectedAt(_ context.Context, _ string, _ model.SourceType, fallback time.Time) time.Time {
@@ -140,7 +159,7 @@ func (m *mockStore) AttachTranscript(_ context.Context, doc *model.Document) (bo
 	if doc.ID == uuid.Nil {
 		doc.ID = uuid.New()
 	}
-	return true, nil
+	return !m.unchanged, nil
 }
 
 // attachCount returns the number of AttachTranscript calls observed so far.

@@ -113,11 +113,121 @@ const classificationProtectedMetadataKeys = `'segment', 'retention', 'classifier
 // label, a corrected sender) stuck at its stale value forever — only the
 // finite classification-owned key set above needs protecting, not the whole
 // object.
+//
+// 기존 metadata 는 existingMetadataObjectSQL 로 정규화해서 읽는다(#292 리뷰).
+// SQL NULL·jsonb null·배열·스칼라에 jsonb_each 를 부르면 "cannot call
+// jsonb_each on a non-object" 로 upsert 전체가 실패한다.
 const upsertMetadataMergeSQL = `EXCLUDED.metadata || COALESCE((
 			SELECT jsonb_object_agg(kv.key, kv.value)
-			FROM jsonb_each(documents.metadata) AS kv(key, value)
+			FROM jsonb_each(` + existingMetadataObjectSQL + `) AS kv(key, value)
 			WHERE kv.key = ANY (ARRAY[` + classificationProtectedMetadataKeys + `])
 		), '{}'::jsonb)`
+
+// existingMetadataObjectSQL 은 기존 행의 metadata 를 객체로 정규화한다. 객체가
+// 아니면(SQL NULL·jsonb null·배열·스칼라) 빈 객체로 본다. 열 기본값은 '{}'
+// 이지만 NOT NULL 제약이 없고, Go 쪽 nil map 은 json.Marshal 로 jsonb null 이
+// 되므로 실제로 생길 수 있는 값이다. COALESCE(NULLIF(…, 'null'), '{}') 보다
+// 넓게 잡은 것은 배열·스칼라도 jsonb_each·|| 에서 같은 문제를 내기 때문이다.
+const existingMetadataObjectSQL = `CASE WHEN jsonb_typeof(documents.metadata) = 'object' THEN documents.metadata ELSE '{}'::jsonb END`
+
+// 통화 전사 보호(#292) — Upsert·UpsertTracked 의 ON CONFLICT 가 함께 쓴다.
+//
+// 통화 로그(smsmap.MapCall, transcription="none")·녹음 업로드(ingest/recording,
+// "pending")·전사(WhisperCollector → AttachTranscript, "done")는 source_id
+// 하나(call-log:{dateMs}:{numHash}:{durHash})를 같이 쓴다(마이그레이션 033,
+// model.SourceCall 주석). 전사가 붙은 뒤 같은 통화 로그나 녹음이 다시 오면
+// (앱 재설치·커서 초기화로 전량 재전송, XML SMS 백업 재수집, 녹음 재업로드)
+// 예전 ON CONFLICT 는 content 를 4줄 요약으로, metadata 를 요약의 스냅숏으로
+// 통째로 바꿨다. 전사 원장(transcription_ledger)이 같은 오디오의 재전사를
+// 막으므로 그 전사는 영구히 사라졌다.
+//
+// 보호 조건(callTranscriptKeptSQL) — 넷 다 참이어야 한다:
+//   - 기존 행이 source_type='call' 이다. 다른 소스는 전혀 건드리지 않는다.
+//   - 기존 metadata 가 객체다. SQL NULL·jsonb null·배열이면 전사 상태를 알 수
+//     없고(마이그레이션 033 이 모든 통화 문서에 transcription 키를 채웠으므로
+//     정상 행에서는 생기지 않는다), 예전처럼 보호했다가는 metadata 가 NULL 로
+//     남거나 null||{} 가 배열이 된다. 보통 upsert 로 처리해 객체로 되돌린다.
+//   - 기존 행의 transcription 이 none·pending 이 아니다. 값의 실제 집합은
+//     none·pending·done 셋이고(model.SourceCall 주석, smsmap.MapCall,
+//     ingest_recording.go, whisper.go), 키가 없는 행은 033 이전의 레거시
+//     전사 문서뿐이다 — classify.evaluateCall 도 키 없음을 done 과 같이 본다.
+//     그래서 "none·pending 이 아니면 전사가 있다" 로 판정한다. 모르는 새 값이
+//     생겨도 보호 쪽으로 기운다(덮어서 잃는 것보다 안전하다).
+//   - 들어오는 행의 transcription 이 none 또는 pending 이다. 즉 통화 로그나
+//     녹음 업로드가 보낸 요약이다. WhisperCollector 의 단독 전사 문서
+//     (transcript:{relPath}, 키 없음)끼리의 upsert 는 전사가 전사를 고치는
+//     것이므로 보호하지 않는다.
+//
+// 보호할 때:
+//   - content·embedding·embedding_version 은 기존 값을 둔다. 들어온 요약의
+//     임베딩이 전사의 임베딩을 덮으면 벡터 검색이 전사를 못 찾는다.
+//   - metadata 는 기존 행 전체를 두고, 들어온 것이 통화 로그 재수집
+//     (transcription="none")일 때만 통화 로그가 권위를 갖는 키
+//     (callLogRefreshableMetadataKeys)를 들어온 값으로 덧씌운다. 녹음 재업로드
+//     ("pending")는 아무것도 덧씌우지 않는다 — 녹음 핸들러는 direction 을
+//     incoming 으로 박고(앱이 방향을 보내지 않는다) contact_name 이 비어 올 수
+//     있어서, 덧씌우면 전사된 발신 통화가 수신으로 바뀌고 연락처가 사라진다(#292
+//     리뷰). 녹음 쪽은 통화 로그 키의 권위가 아니다. 기존 행 전체를
+//     두는 이유: 전사 쪽 키는 whisper.go 버전·사이드카·033 병합(옛 전사 문서의
+//     metadata 를 통째로 합침)에 따라 달라서 목록으로 다 적을 수 없다. 목록에
+//     없는 키 하나를 잃는 것보다 통화 로그 키 몇 개만 갱신하는 편이 안전하다.
+//     분류 키(classificationProtectedMetadataKeys)도 기존 행에 있으므로 그대로
+//     남는다.
+//   - title 은 metadata 와 같은 원칙이다: 통화 로그 재수집("none")이면 들어온
+//     제목(통화 로그가 권위, AttachTranscript 도 통화 로그 쪽 제목을 남긴다),
+//     녹음 재업로드("pending")면 기존 제목을 둔다(녹음 쪽 제목은 늘 "incoming
+//     통화 …" 이다).
+//   - occurred_at·collected_at 은 예전과 같다. occurred_at 은 통화 로그의
+//     dateMs 가 권위이고, 같은 source_id 면 dateMs 도 같다.
+//   - content_changed 는 false 가 된다(upsertTrackedRow 의 RETURNING 이 갱신
+//     후 content 와 비교한다). 그래서 청크 교체·재임베딩이 일어나지 않는다.
+const callTranscriptKeptSQL = `(documents.source_type = 'call'
+			AND jsonb_typeof(documents.metadata) = 'object'
+			AND COALESCE(documents.metadata->>'transcription', '') NOT IN ('none', 'pending')
+			AND COALESCE(EXCLUDED.metadata->>'transcription', '') IN ('none', 'pending'))`
+
+// callLogRefreshableMetadataKeys 는 전사가 붙은 통화 문서에서도 통화 로그 재수집이
+// 갱신해도 되는 metadata 키다. 모두 smsmap.MapCall 이 통화 로그에서 만드는
+// 키이고, 마이그레이션 033 도 병합 뒤 이 넷을 통화 로그 쪽 값으로 다시 박았다
+// ("통화 로그가 이 키들의 권위"). 연락처를 나중에 저장하면 contact_name 이
+// 바뀌고, PII 플래그를 켜면 contact_name·number 가 가림 토큰으로 바뀐다 —
+// 둘 다 반영돼야 한다. duration_seconds 는 source_id(durHash)에 들어 있어
+// 같은 문서라면 값이 같다.
+//
+// 넣지 않은 키와 이유:
+//   - transcription·audio_file·recording_type: 전사·녹음 상태다. 통화 로그의
+//     "none" 이나 재업로드의 새 파일 이름으로 바꾸면 전사가 없는 문서처럼
+//     보이거나 전사한 오디오와 연결이 끊긴다.
+//   - pii_name_redacted: content 가 가려졌는지를 나타낸다. 보호 중에는
+//     content(전사)를 바꾸지 않으므로 통화 로그 쪽 값을 옮기면 사실과 달라진다.
+const callLogRefreshableMetadataKeys = `'contact_name', 'direction', 'duration_seconds', 'number'`
+
+// callFromCallLogSQL 은 들어온 행이 통화 로그 재수집(transcription="none")인지
+// 본다. 보호 조건 안에서만 쓰므로 들어온 값은 none 아니면 pending 이다.
+const callFromCallLogSQL = `EXCLUDED.metadata->>'transcription' = 'none'`
+
+// callTranscriptUpsertSetSQL 은 Upsert·UpsertTracked 의 ON CONFLICT DO UPDATE
+// SET 가운데 보호 대상 열(title·content·metadata·embedding·embedding_version)
+// 이다. 보호 조건이 거짓이면 예전 식과 똑같다(metadata 만 기존 행 정규화가
+// 더해졌다 — existingMetadataObjectSQL).
+const callTranscriptUpsertSetSQL = `
+			title        = CASE WHEN ` + callTranscriptKeptSQL + ` AND NOT (` + callFromCallLogSQL + `)
+			               THEN documents.title ELSE EXCLUDED.title END,
+			content      = CASE WHEN ` + callTranscriptKeptSQL + `
+			               THEN documents.content ELSE EXCLUDED.content END,
+			metadata     = CASE WHEN ` + callTranscriptKeptSQL + `
+			               THEN documents.metadata || CASE WHEN ` + callFromCallLogSQL + ` THEN COALESCE((
+			                   SELECT jsonb_object_agg(kv.key, kv.value)
+			                   FROM jsonb_each(EXCLUDED.metadata) AS kv(key, value)
+			                   WHERE kv.key = ANY (ARRAY[` + callLogRefreshableMetadataKeys + `])
+			               ), '{}'::jsonb) ELSE '{}'::jsonb END
+			               ELSE ` + upsertMetadataMergeSQL + ` END,
+			embedding    = CASE WHEN ` + callTranscriptKeptSQL + `
+			               THEN documents.embedding
+			               ELSE COALESCE(EXCLUDED.embedding, documents.embedding) END,
+			embedding_version = CASE WHEN ` + callTranscriptKeptSQL + ` THEN documents.embedding_version
+			                    WHEN EXCLUDED.embedding IS NOT NULL THEN EXCLUDED.embedding_version
+			                    ELSE documents.embedding_version END,`
 
 // UpsertTracked is identical to Upsert but additionally returns a bool that
 // indicates whether the document's content actually changed. Callers that
@@ -138,6 +248,10 @@ const upsertMetadataMergeSQL = `EXCLUDED.metadata || COALESCE((
 // comment for why a bare `metadata = EXCLUDED.metadata` used to silently
 // erase a golden-set "user" retention judgment on the document's next
 // re-collection.
+//
+// 통화 전사 보호(#292): 전사가 붙은 통화 문서에 같은 source_id 의 통화 로그·
+// 녹음 요약이 다시 오면 content·전사 metadata·임베딩을 남기고
+// contentChanged=false 를 돌려준다 — callTranscriptKeptSQL 주석 참고.
 //
 // *DocumentStore satisfies the api.IngestMessagesUpserter interface via this method.
 func (s *DocumentStore) UpsertTracked(ctx context.Context, doc *model.Document) (contentChanged bool, err error) {
@@ -287,11 +401,20 @@ func upsertTrackedRow(ctx context.Context, db rowQuerier, doc *model.Document) (
 	// (PostgreSQL CTE semantics: all CTEs and the main DML share one MVCC
 	// snapshot), capturing the pre-update content before the INSERT/UPDATE
 	// fires. On INSERT the `prev` row is empty → COALESCE(old_content, '') →
-	// compared against incoming $4, which will differ → content_changed=true.
+	// compared against the stored content(저장된 값), which will differ → content_changed=true.
 	// On UPDATE with identical content: old=new → content_changed=false.
 	// On UPDATE with changed content: old≠new → content_changed=true.
 	// xmax::text::bigint=0 signals a fresh INSERT (belt-and-suspenders: a new
 	// row cannot have unchanged content anyway).
+	//
+	// 비교 대상은 들어온 값($4)이 아니라 RETURNING 의 documents.content, 곧
+	// **갱신 후 실제로 저장된 값**이다(#292). 위 2번 함정(RETURNING 은 갱신 후
+	// 값을 본다)을 여기서는 일부러 이용한다. 통화 전사 보호
+	// (callTranscriptKeptSQL)가 기존 전사를 남기면 저장된 content 는 이전과 같고,
+	// 그래서 content_changed=false 가 되어 호출자가 청크를 요약으로 바꾸거나
+	// 재임베딩하지 않는다. $4 와 비교하면 들어온 요약과 옛 전사가 다르므로
+	// true 가 되어, 문서 행은 지켜 놓고 청크만 요약으로 바꾸는 반쪽 덮어쓰기가
+	// 된다. 보호가 없는 경우에는 저장된 값이 곧 $4 라 예전과 결과가 같다.
 	const q = `
 		WITH prev AS (
 			SELECT content AS old_content
@@ -302,13 +425,7 @@ func upsertTrackedRow(ctx context.Context, db rowQuerier, doc *model.Document) (
 			(source_type, source_id, title, content, metadata, embedding, occurred_at, collected_at, embedding_version)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (source_type, source_id) DO UPDATE SET
-			title        = EXCLUDED.title,
-			content      = EXCLUDED.content,
-			metadata     = ` + upsertMetadataMergeSQL + `,
-			embedding    = COALESCE(EXCLUDED.embedding, documents.embedding),
-			embedding_version = CASE WHEN EXCLUDED.embedding IS NOT NULL
-			                    THEN EXCLUDED.embedding_version
-			                    ELSE documents.embedding_version END,
+			` + callTranscriptUpsertSetSQL + `
 			occurred_at  = COALESCE(EXCLUDED.occurred_at, documents.occurred_at),
 			collected_at = EXCLUDED.collected_at,
 			status       = 'active',
@@ -316,7 +433,7 @@ func upsertTrackedRow(ctx context.Context, db rowQuerier, doc *model.Document) (
 			updated_at   = now()
 		RETURNING id, created_at, updated_at,
 		          (xmax::text::bigint = 0) AS was_insert,
-		          COALESCE((SELECT old_content FROM prev), '') IS DISTINCT FROM $4 AS content_changed`
+		          COALESCE((SELECT old_content FROM prev), '') IS DISTINCT FROM documents.content AS content_changed`
 
 	var wasInsert bool
 	row := db.QueryRow(ctx, q,
@@ -356,6 +473,9 @@ func upsertTrackedRow(ctx context.Context, db rowQuerier, doc *model.Document) (
 // overlaid back from the existing row (see upsertMetadataMergeSQL's doc
 // comment) — every other metadata key is replaced wholesale by the incoming
 // collector snapshot, same as before this protection was added.
+//
+// 통화 전사 보호(#292)도 UpsertTracked 와 똑같이 적용된다(녹음 재업로드가
+// 이 경로다) — callTranscriptKeptSQL 주석 참고.
 func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
 	// Recurrence guards (migration 027 background): warn on a container or
 	// deprecated source_type, and warn on a possible cross-source duplicate
@@ -420,13 +540,7 @@ func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
 			(source_type, source_id, title, content, metadata, embedding, occurred_at, collected_at, embedding_version)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (source_type, source_id) DO UPDATE SET
-			title        = EXCLUDED.title,
-			content      = EXCLUDED.content,
-			metadata     = ` + upsertMetadataMergeSQL + `,
-			embedding    = COALESCE(EXCLUDED.embedding, documents.embedding),
-			embedding_version = CASE WHEN EXCLUDED.embedding IS NOT NULL
-			                    THEN EXCLUDED.embedding_version
-			                    ELSE documents.embedding_version END,
+			` + callTranscriptUpsertSetSQL + `
 			occurred_at  = COALESCE(EXCLUDED.occurred_at, documents.occurred_at),
 			collected_at = EXCLUDED.collected_at,
 			status       = 'active',

@@ -27,6 +27,11 @@ func (m *dupRejectStore) Upsert(_ context.Context, _ *model.Document) error {
 	return store.ErrDuplicateTranscript
 }
 
+// UpsertTracked 는 정기 수집 경로(processBatch)가 쓴다 — 같은 중복 거부.
+func (m *dupRejectStore) UpsertTracked(_ context.Context, _ *model.Document) (bool, error) {
+	return false, store.ErrDuplicateTranscript
+}
+
 // singleTranscriptCollector returns exactly one call-transcript document per
 // Collect, so the scheduler's processBatch ledgers its source_id.
 type singleTranscriptCollector struct {

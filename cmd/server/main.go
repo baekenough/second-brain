@@ -254,6 +254,8 @@ func run() error {
 
 	warnSearchWriteTimeout(cfg.SearchRequestTimeout, cfg.HTTPWriteTimeout)
 	warnIngestMessagesWriteTimeout(cfg.HTTPWriteTimeout)
+	warnRecordingWithoutAPIKey(cfg.IngestRecordingDir, cfg.APIKey)
+	cleanupRecordingPartials(cfg.IngestRecordingDir, time.Now())
 	warnIngestMessagesLimits(cfg.IngestMaxBatchMessages, cfg.IngestMessagesMaxBodyBytes)
 
 	httpServer := &http.Server{
@@ -376,6 +378,34 @@ func warnIngestMessagesWriteTimeout(writeTimeout time.Duration) bool {
 		"http_write_timeout", writeTimeout.String(),
 	)
 	return true
+}
+
+// warnRecordingWithoutAPIKey 는 녹음 수집이 켜져 있는데 API_KEY 가 비어 있으면
+// 경고하고 true 를 돌려준다(#292). 인증이 꺼져 있으면 /api/v1/ingest/recording
+// 이 누구에게나 열리고, 그 경로만 늘리는 읽기 기한(200초)은 아예 적용하지 않는다
+// (api.ingestRecordingHandler) — 인증 없는 느린 업로드가 연결을 붙잡지 못하게
+// 하려는 것이다. 그 대신 모바일 망의 큰 업로드는 서버 ReadTimeout(15초)에 끊길
+// 수 있다. 시작을 막지는 않는다.
+func warnRecordingWithoutAPIKey(recordingDir, apiKey string) bool {
+	if recordingDir == "" || apiKey != "" {
+		return false
+	}
+	slog.Warn("API_KEY is empty while recording ingest is enabled — /api/v1/ingest/recording accepts unauthenticated uploads and its extended read deadline is disabled")
+	return true
+}
+
+// cleanupRecordingPartials 는 녹음 저장 디렉터리에 남은 오래된 임시 파일
+// (.partial)을 시작 시 지운다(#292). 로그에는 개수와 오류 종류만 남긴다 — 오류
+// 문구에 들어 있는 경로는 전화번호가 든 파일 이름이다.
+func cleanupRecordingPartials(recordingDir string, now time.Time) {
+	removed, err := api.CleanupStaleRecordingPartials(recordingDir, api.RecordingPartialMaxAge, now)
+	switch {
+	case err != nil:
+		slog.Warn("recording ingest: stale temporary file cleanup incomplete",
+			"removed", removed, "err_type", fmt.Sprintf("%T", err))
+	case removed > 0:
+		slog.Info("recording ingest: removed stale temporary files", "removed", removed)
+	}
 }
 
 // 폰 앱(mobile/second-brain-push Uploader.kt)의 배치 크기와, 그 배치를
