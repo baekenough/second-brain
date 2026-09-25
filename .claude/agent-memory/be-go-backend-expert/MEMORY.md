@@ -22,4 +22,5 @@
 - [project_active_weights_serving.md](project_active_weights_serving.md) — #214 승격 가중치 서빙: 캐시 없이 요청마다 읽는 이유(tune=별도 프로세스), 우선순위 3단, SEARCH_ACTIVE_WEIGHTS_ENABLED 기본 off
 - [project_ask_occurred_at_contract.md](project_ask_occurred_at_contract.md) — PR #219: AskSourceItem.OccurredAt 의도적 no-omitempty(키부재 vs null 구분), JSONB라 마이그레이션 불필요, sort는 planner가 날짜창 확정 시에만 적용
 - [project_hyde_wiring_defect.md](project_hyde_wiring_defect.md) — HyDE 영구 no-op(llmClient가 searchSvc 조립보다 뒤에 생성돼 WithLLM 주입 불가); WithOccurredRangeChecker/WithWeights는 미배선이 의도된 것임을 코드로 확인
+- [project_feedback_input_limits_286.md](project_feedback_input_limits_286.md) — #286 PR-A: feedback input limits, non-POST mutation 405, PG rejects urn UUIDs (pass id.String()), flaky conn-reuse test fix, api RealDB tests Skip in CI
 - [project_search_timeout_input_validation.md](project_search_timeout_input_validation.md) — #282 검색 타임아웃·입력검증: pgx 기본값이 이미 서버측 취소(asyncClose CancelRequest), ctx.Err() 판정, json이 잘못된 UTF-8을 U+FFFD로 바꿈
