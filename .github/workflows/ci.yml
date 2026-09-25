@@ -5,7 +5,21 @@ on:
     branches: [main]
     tags: ['v*']
   pull_request:
-    branches: [main]
+    # 'feature/**' 는 스택 PR(#280 류: base 가 main 이 아니라 다른 feature
+    # 브랜치)에도 CI 를 태우기 위함이다(#285). push 트리거는 그대로 main 만
+    # 유지한다 — 스택 PR 은 머지되며 pull_request(synchronize) 이벤트만
+    # 발생시키고, feature 브랜치로의 직접 push 는 없기 때문에 실행 빈도가
+    # 늘지 않는다.
+    branches: [main, 'feature/**']
+
+# 동시성 그룹 (#285 보완). PR/브랜치 단위로 묶어, 같은 PR 에 커밋을 빠르게
+# 여러 번 push 하면 옛 실행을 취소하고 최신 커밋만 돌린다 — feature/**
+# 를 pull_request 대상에 추가(위)하면서 스택 PR 도 CI 대상이 되어 중복
+# 실행 가능성이 늘었기 때문에 필요해졌다. main push 는 취소하지 않는다
+# (배포·태그와 연결된 실행을 도중에 끊으면 안 된다).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -68,6 +82,18 @@ jobs:
         run: go test -race -count=1 ./internal/store/...
       - name: Verify repeatability and order independence
         run: go test -race -shuffle=on -count=2 ./internal/store/...
+      - name: API handlers on the real database (Skip is a failure)
+        # internal/api 의 *_RealDB 테스트는 TEST_DATABASE_URL 이 비어 있으면
+        # t.Skip 으로 조용히 건너뛴다 — 이 job env(TEST_DATABASE_URL, 위)가
+        # 이 단계에도 그대로 상속되므로 정상적으로는 절대 SKIP 이 나오면 안
+        # 된다. SKIP 이 보이면 실DB 검증이 실제로는 실행되지 않았다는
+        # 뜻이므로 조용히 넘어가지 않고 실패시킨다.
+        run: |
+          set -o pipefail
+          go test -race -count=1 -v -run 'RealDB$' ./internal/api/... | tee api-realdb.log
+          if grep -q -- '--- SKIP' api-realdb.log; then echo "::error::api real-DB test skipped"; exit 1; fi
+          ran=$(grep -c -- '^--- PASS: Test.*_RealDB ' api-realdb.log || true)
+          if [ "$ran" -lt 2 ]; then echo "::error::expected >=2 api real-DB tests, ran $ran"; exit 1; fi
       - name: Database logs
         if: failure()
         run: docker logs store-test-db
@@ -76,7 +102,7 @@ jobs:
         run: docker rm -f store-test-db
 
   yaml-lint:
-    name: k8s YAML + hygiene gates [1-6/6] (single source-of-truth)
+    name: k8s YAML + hygiene gates [1-7/7] (single source-of-truth)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -102,7 +128,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Bare absolute host path guard (ci-checks.sh [6/6])
+      - name: Bare absolute host path guard (ci-checks.sh [6/7])
         run: bash scripts/ci-checks.sh
       - name: docker compose config validation
         run: |

@@ -538,8 +538,18 @@ func (s *Server) buildSchema() (graphql.Schema, error) {
 					Metadata:   meta,
 				}
 
+				// REST /api/v1/feedback 와 같은 검증(#286). GraphQL 경로는 본문
+				// UTF-8 검사가 없어 이것이 유일한 방어선이다. 오류 문구는 필드
+				// 이름과 고정 사유만 담아 errors[].message 에 그대로 실어도 된다.
+				if err := validateFeedback(&f); err != nil {
+					return nil, errors.New(searchInputMessage(err))
+				}
+
 				id, err := s.feedback.Record(p.Context, f)
 				if err != nil {
+					if isForeignKeyViolation(err) {
+						return nil, errors.New(errFeedbackReferenceNotFound)
+					}
 					slog.Error("graphql: record feedback failed", "error", err)
 					return nil, fmt.Errorf("internal server error")
 				}

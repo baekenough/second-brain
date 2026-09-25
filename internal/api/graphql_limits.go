@@ -31,31 +31,51 @@ const (
 	// 큐레이션은 호출마다 LLM 을 부르고 검색 타임아웃 밖에서 돈다(LLM 자기
 	// 타임아웃만 적용)이라, 여러 개를 허용하면 LLM 비용과 지연이 그대로 곱해진다.
 	graphqlMaxCuratedSearches = 1
+
+	// graphqlMaxFeedbackMutations 는 요청 하나에서 허용하는 createFeedback
+	// 필드 수다(#286). 별칭이 변수 하나를 재사용하면 본문 상한이 저장량을 묶지
+	// 못한다: 64KB 본문(별칭 1,000개 + 20KB comment 변수)이 INSERT 1,000회,
+	// comment 약 20MB 로 재현됐다. 입력 필드 상한만으로는 4KB × 1,000 = 4MB 가
+	// 남으므로 개수를 따로 묶는다. GraphQL 피드백 클라이언트는 없고 배치도
+	// 필요 없어 1 이다.
+	graphqlMaxFeedbackMutations = 1
 )
 
 // errGraphQLTooManySearches / errGraphQLTooManyCurated / errGraphQLFragmentCycle
-// 은 AST 사전 검사의 거부 사유다. 문구는 고정이며 요청 내용을 담지 않는다.
+// / errGraphQLTooManyFeedbacks / errGraphQLMutationNeedsPOST 는 AST 사전 검사의
+// 거부 사유다. 문구는 고정이며 요청 내용을 담지 않는다.
 var (
-	errGraphQLFragmentCycle   = errors.New("fragment cycle detected")
-	errGraphQLTooManySearches = fmt.Errorf("too many search fields in one request (max %d)", graphqlMaxSearchFields)
-	errGraphQLTooManyCurated  = fmt.Errorf("too many curated searches in one request (max %d)", graphqlMaxCuratedSearches)
+	errGraphQLFragmentCycle     = errors.New("fragment cycle detected")
+	errGraphQLTooManySearches   = fmt.Errorf("too many search fields in one request (max %d)", graphqlMaxSearchFields)
+	errGraphQLTooManyCurated    = fmt.Errorf("too many curated searches in one request (max %d)", graphqlMaxCuratedSearches)
+	errGraphQLTooManyFeedbacks  = fmt.Errorf("too many createFeedback fields in one request (max %d)", graphqlMaxFeedbackMutations)
+	errGraphQLMutationNeedsPOST = errors.New("mutations require POST")
 )
 
-// graphqlSearchCost 는 연산 하나가 실행할 search 필드 수와 그중 curated 수다.
-type graphqlSearchCost struct {
-	searches int
-	curated  int
+// graphqlCost 는 연산 하나가 실행할 비용 필드 수다: search 필드 수와 그중
+// curated 수, createFeedback 필드 수(#286).
+type graphqlCost struct {
+	searches  int
+	curated   int
+	feedbacks int
 }
 
-// countGraphQLSearches 는 문서의 각 연산이 실행할 search 필드 수를 세고,
+// exceeds 는 어느 한 항목이라도 상한을 넘었는지 본다.
+func (c graphqlCost) exceeds() bool {
+	return c.searches > graphqlMaxSearchFields ||
+		c.curated > graphqlMaxCuratedSearches ||
+		c.feedbacks > graphqlMaxFeedbackMutations
+}
+
+// countGraphQLCost 는 문서의 각 연산이 실행할 비용 필드 수를 세고, 항목별로
 // 가장 비싼 연산의 값을 돌려준다. 한 요청에서는 연산 하나만 실행되므로 합이
 // 아니라 최댓값이 실제 비용이다(operationName 해석을 따로 하지 않아도 된다).
 //
 // 셈에는 별칭, fragment spread, inline fragment 를 모두 전개해 넣는다.
 // @skip/@include 지시어는 무시하고 센다 — 과대 계산은 거부 쪽으로만 틀리므로
-// 안전하다. search 는 Query 루트에만 있는 필드라 필드의 하위 선택은 내려가지
-// 않는다.
-func countGraphQLSearches(doc *ast.Document, variables map[string]interface{}) graphqlSearchCost {
+// 안전하다. search 는 Query 루트, createFeedback 은 Mutation 루트에만 있는
+// 필드라 필드의 하위 선택은 내려가지 않는다.
+func countGraphQLCost(doc *ast.Document, variables map[string]interface{}) graphqlCost {
 	fragments := map[string]*ast.FragmentDefinition{}
 	for _, def := range doc.Definitions {
 		if fd, ok := def.(*ast.FragmentDefinition); ok && fd.Name != nil {
@@ -63,7 +83,7 @@ func countGraphQLSearches(doc *ast.Document, variables map[string]interface{}) g
 		}
 	}
 
-	var worst graphqlSearchCost
+	var worst graphqlCost
 	for _, def := range doc.Definitions {
 		op, ok := def.(*ast.OperationDefinition)
 		if !ok {
@@ -73,7 +93,7 @@ func countGraphQLSearches(doc *ast.Document, variables map[string]interface{}) g
 			fragments: fragments,
 			variables: variables,
 			defaults:  variableDefaults(op),
-			memo:      map[string]graphqlSearchCost{},
+			memo:      map[string]graphqlCost{},
 			visiting:  map[string]bool{},
 		}
 		cost := c.selectionSet(op.SelectionSet)
@@ -82,6 +102,9 @@ func countGraphQLSearches(doc *ast.Document, variables map[string]interface{}) g
 		}
 		if cost.curated > worst.curated {
 			worst.curated = cost.curated
+		}
+		if cost.feedbacks > worst.feedbacks {
+			worst.feedbacks = cost.feedbacks
 		}
 	}
 	return worst
@@ -97,24 +120,28 @@ type graphqlCostCounter struct {
 	fragments map[string]*ast.FragmentDefinition
 	variables map[string]interface{}
 	defaults  map[string]ast.Value
-	memo      map[string]graphqlSearchCost
+	memo      map[string]graphqlCost
 	visiting  map[string]bool
 }
 
-func (c *graphqlCostCounter) selectionSet(set *ast.SelectionSet) graphqlSearchCost {
-	var total graphqlSearchCost
+func (c *graphqlCostCounter) selectionSet(set *ast.SelectionSet) graphqlCost {
+	var total graphqlCost
 	if set == nil {
 		return total
 	}
 	for _, sel := range set.Selections {
-		var part graphqlSearchCost
+		var part graphqlCost
 		switch s := sel.(type) {
 		case *ast.Field:
-			if s.Name != nil && s.Name.Value == "search" {
+			switch {
+			case s.Name == nil:
+			case s.Name.Value == "search":
 				part.searches = 1
 				if c.isCurated(s) {
 					part.curated = 1
 				}
+			case s.Name.Value == "createFeedback":
+				part.feedbacks = 1
 			}
 		case *ast.InlineFragment:
 			part = c.selectionSet(s.SelectionSet)
@@ -125,21 +152,22 @@ func (c *graphqlCostCounter) selectionSet(set *ast.SelectionSet) graphqlSearchCo
 		}
 		total.searches += part.searches
 		total.curated += part.curated
+		total.feedbacks += part.feedbacks
 		// 상한을 넘은 뒤로는 더 셀 이유가 없다. 거대한 문서에서 셈을 일찍 끊는다.
-		if total.searches > graphqlMaxSearchFields || total.curated > graphqlMaxCuratedSearches {
+		if total.exceeds() {
 			return total
 		}
 	}
 	return total
 }
 
-func (c *graphqlCostCounter) fragment(name string) graphqlSearchCost {
+func (c *graphqlCostCounter) fragment(name string) graphqlCost {
 	if cost, ok := c.memo[name]; ok {
 		return cost
 	}
 	fd, ok := c.fragments[name]
 	if !ok || c.visiting[name] {
-		return graphqlSearchCost{}
+		return graphqlCost{}
 	}
 	c.visiting[name] = true
 	cost := c.selectionSet(fd.SelectionSet)
@@ -254,6 +282,40 @@ func variableDefaults(op *ast.OperationDefinition) map[string]ast.Value {
 	return out
 }
 
+// graphqlSelectsMutation 은 이 요청이 실행할 연산이 mutation 인지 본다(#286).
+//
+// graphql-go 실행기와 같은 규칙으로 연산을 고른다: operationName 이 비어 있으면
+// 문서의 유일한 연산, 있으면 이름이 같은 연산. 실행기가 연산을 고를 수 없는
+// 문서(연산이 여럿인데 이름이 없거나, 없는 이름)는 실행되지 않지만, 해석 차이로
+// 우회될 여지를 남기지 않으려고 문서 안에 mutation 이 하나라도 있으면 true 로
+// 친다(안전 쪽).
+func graphqlSelectsMutation(doc *ast.Document, operationName string) bool {
+	var ops []*ast.OperationDefinition
+	for _, def := range doc.Definitions {
+		if op, ok := def.(*ast.OperationDefinition); ok {
+			ops = append(ops, op)
+		}
+	}
+	anyMutation := false
+	for _, op := range ops {
+		if op.Operation == ast.OperationTypeMutation {
+			anyMutation = true
+		}
+	}
+	if operationName == "" {
+		if len(ops) == 1 {
+			return ops[0].Operation == ast.OperationTypeMutation
+		}
+		return anyMutation
+	}
+	for _, op := range ops {
+		if op.Name != nil && op.Name.Value == operationName {
+			return op.Operation == ast.OperationTypeMutation
+		}
+	}
+	return anyMutation
+}
+
 // writeGraphQLError 는 GraphQL 클라이언트가 읽는 {"errors":[{"message":…}]}
 // 모양으로 오류를 쓴다. msg 는 고정 문구만 넘긴다.
 func writeGraphQLError(w http.ResponseWriter, status int, msg string) {
@@ -274,13 +336,27 @@ func writeGraphQLError(w http.ResponseWriter, status int, msg string) {
 //     AST 검사가 쿼리스트링 경로에도 똑같이 적용되므로 막을 필요가 없다.
 //  2. 본문 길이: graphqlRequestMaxBytes 를 넘으면 413.
 //  3. AST 사전 검사: fragment 순환(graphql-go 검증기를 스택 오버플로로 죽임),
-//     search 필드 수·curated 수 초과는 실행하지 않고 400. 구문 오류는 그대로
-//     graphql-go 에 넘겨 기존 오류 응답을 유지한다.
+//     search 필드 수·curated 수·createFeedback 수(#286) 초과는 실행하지 않고
+//  400. 구문 오류는 그대로 graphql-go 에 넘겨 기존 오류 응답을 유지한다 —
+//     실행되지 않으므로 증폭도 없다.
+//     3a. POST 가 아닌 요청이 mutation 을 실행하려 하면 405(Allow: POST, #286).
+//     graphql-go 핸들러는 메서드와 무관하게 쿼리스트링의 문서를 실행하므로,
+//     막지 않으면 링크 하나(GET)로 쓰기가 일어난다. GraphQL-over-HTTP 도
+//     GET 을 query 전용으로 둔다. query 연산의 GET 은 그대로 허용한다.
 //  4. 요청 전체 타임아웃: searchTimeout 을 요청 ctx 에 건다. 필드별
 //     searchWithTimeout 은 이 ctx 의 자식이라, 필드가 몇 개든 요청 전체의
 //     벽시계 시간이 timeout 하나로 묶인다. REST 와 달리 curated 검색의 LLM
 //     큐레이션도 이 시간 안에 끝나야 한다 — 요청 단위 상한이 목적이므로
 //     예외를 두지 않았고, curated 는 요청당 1회로 이미 제한된다.
+//
+// 오류 메시지 반사(#286 항목 4b)는 그대로 둔다. graphql-go 는 구문 오류(원문
+// 줄)와 변수 강제 변환 오류(변수 값 전체), 인자 리터럴 오류를 errors[].message
+// 에 되돌린다. FormatErrorFn 으로 고정 문구화하지 않은 이유: 반사 대상은 같은
+// 인증된 요청자 자신의 입력이고 응답은 JSON 이라 XSS 가 성립하지 않으며,
+// 서버 로그에는 남지 않는다(ResultCallbackFn 미사용, requestLogger 는
+// method·path·status·bytes 만 기록 — TestGraphQLErrorReflection_NotLogged 가
+// 고정). 고정 문구화는 GraphiQL 디버깅을 크게 해친다. 반사 크기(최대 64KB)가
+// 문제가 되면 FormatErrorFn 에서 메시지를 256바이트로 자르는 것이 후속 선택지다.
 func (s *Server) guardGraphQL(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if len(r.URL.RawQuery) > graphqlRequestMaxBytes {
@@ -317,13 +393,22 @@ func (s *Server) guardGraphQL(next http.Handler) http.Handler {
 				writeGraphQLError(w, http.StatusBadRequest, errGraphQLFragmentCycle.Error())
 				return
 			}
-			cost := countGraphQLSearches(doc, opts.Variables)
+			if r.Method != http.MethodPost && graphqlSelectsMutation(doc, opts.OperationName) {
+				w.Header().Set("Allow", http.MethodPost)
+				writeGraphQLError(w, http.StatusMethodNotAllowed, errGraphQLMutationNeedsPOST.Error())
+				return
+			}
+			cost := countGraphQLCost(doc, opts.Variables)
 			if cost.searches > graphqlMaxSearchFields {
 				writeGraphQLError(w, http.StatusBadRequest, errGraphQLTooManySearches.Error())
 				return
 			}
 			if cost.curated > graphqlMaxCuratedSearches {
 				writeGraphQLError(w, http.StatusBadRequest, errGraphQLTooManyCurated.Error())
+				return
+			}
+			if cost.feedbacks > graphqlMaxFeedbackMutations {
+				writeGraphQLError(w, http.StatusBadRequest, errGraphQLTooManyFeedbacks.Error())
 				return
 			}
 		}

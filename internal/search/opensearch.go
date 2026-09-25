@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -92,6 +93,58 @@ type osSearchResponse struct {
 	} `json:"hits"`
 }
 
+// OpenSearch 응답 본문 상한(#286 항목 2).
+//
+// 오류 본문은 64KB 까지만 읽는다. 필요한 것은 error.type 하나뿐이고, 그 필드는
+// 본문 앞쪽에 오지 않을 수도 있지만 잘려서 해석에 실패하면 "unknown" 으로
+// 떨어질 뿐이라 안전하다. 성공 본문은 limit×3 개 청크라 정상이면 수백 KB 이므로
+// 16MB 는 고장 난(또는 가로챈) 응답이 메모리를 끝없이 쓰지 못하게 하는 상한이다.
+const (
+	opensearchMaxErrorBodyBytes = 64 << 10
+	opensearchMaxResponseBytes  = 16 << 20
+
+	// opensearchMaxErrorDrainBytes 는 오류 본문 64KB 를 읽고 남은 부분을 버리며
+	// 읽는 상한이다. net/http 는 본문을 끝까지 읽고 닫아야 keep-alive 연결을
+	// 다시 쓴다. 다만 끝없이 읽으면 고장 난 서버의 거대한 본문에 시간을 쓰므로
+	// 상한을 두고, 넘으면 그 연결만 버린다(다음 요청은 새 연결).
+	opensearchMaxErrorDrainBytes = 1 << 20
+)
+
+// opensearchErrorTypeRe 는 오류 문자열에 넣어도 되는 error.type 모양이다.
+// OpenSearch 의 예외 이름(query_shard_exception, parse_exception 등)은 소문자와
+// 밑줄뿐이다. 이 모양이 아니면 따옴표·개행 같은 주입 문자나 질의 조각일 수
+// 있으므로 쓰지 않는다.
+var opensearchErrorTypeRe = regexp.MustCompile(`^[a-z_]{1,64}$`)
+
+// opensearchStatusError 는 비-200 응답을 오류로 바꾼다.
+//
+// 본문을 그대로 오류에 담지 않는 이유: query_shard_exception·parse_exception
+// 의 reason·root_cause 에는 질의 조각이 들어가고, 이 오류는 search.Service 가
+// slog.Warn 으로 남긴다. 질의는 개인정보가 섞일 수 있는 사용자 입력이므로
+// 상태 코드와 정제된 error.type 만 남긴다. 운영 진단에는 이 둘로 충분하고,
+// 자세한 사유는 OpenSearch 자체 로그에 있다.
+func opensearchStatusError(resp *http.Response) error {
+	typ := "unknown"
+	b, err := io.ReadAll(io.LimitReader(resp.Body, opensearchMaxErrorBodyBytes))
+	// 남은 본문을 상한 안에서 버려 연결 재사용을 지킨다. 내용은 쓰지 않는다.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, opensearchMaxErrorDrainBytes))
+	if err == nil {
+		var parsed struct {
+			Error json.RawMessage `json:"error"`
+		}
+		if json.Unmarshal(b, &parsed) == nil && len(parsed.Error) > 0 {
+			var obj struct {
+				Type string `json:"type"`
+			}
+			// error 가 문자열인 옛 형식은 해석에 실패해 unknown 이 된다.
+			if json.Unmarshal(parsed.Error, &obj) == nil && opensearchErrorTypeRe.MatchString(obj.Type) {
+				typ = obj.Type
+			}
+		}
+	}
+	return fmt.Errorf("opensearch: status %d (error.type=%s)", resp.StatusCode, typ)
+}
+
 // Search runs a BM25 multi_match query (content + title, title weighted 2x)
 // against the OpenSearch index, applying the SAME include/exclude source-type
 // and occurred_at-window semantics every other lane honours — see
@@ -138,12 +191,15 @@ func (c *OpenSearchClient) Search(ctx context.Context, q model.SearchQuery, limi
 	}
 	defer resp.Body.Close()
 
-	b, err := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, opensearchStatusError(resp)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, opensearchMaxResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("opensearch: read response: %w", err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("opensearch: status %d: %s", resp.StatusCode, b)
+	if len(b) > opensearchMaxResponseBytes {
+		return nil, fmt.Errorf("opensearch: response exceeds %d bytes", opensearchMaxResponseBytes)
 	}
 
 	var parsed osSearchResponse

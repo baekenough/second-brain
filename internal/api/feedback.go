@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 
@@ -28,6 +27,11 @@ type FeedbackRequest struct {
 	Metadata   map[string]any `json:"metadata,omitempty"`
 }
 
+// errFeedbackReferenceNotFound 는 document_id·chunk_id 가 가리키는 행이 없을 때
+// (FK 위반 23503)의 응답 문구다. 어느 ID 인지는 제약 이름으로만 알 수 있어
+// 둘을 묶어 말한다.
+const errFeedbackReferenceNotFound = "document_id or chunk_id not found"
+
 // FeedbackResponse is returned on successful feedback creation.
 type FeedbackResponse struct {
 	ID int64 `json:"id"`
@@ -36,10 +40,13 @@ type FeedbackResponse struct {
 // feedbackHandler handles POST /api/v1/feedback.
 // Validates the request body and delegates persistence to FeedbackRecorder.
 // Returns 201 Created with {"id": <id>} on success.
+//
+// 본문 상한·필드 검증(#286)은 DB 에 가기 전에 한다. 거부 응답과 로그에는
+// 입력값을 넣지 않는다(필드 이름과 고정 사유만).
 func (s *Server) feedbackHandler(w http.ResponseWriter, r *http.Request) {
 	var req FeedbackRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if err := decodeBoundedJSON(w, r, feedbackRequestMaxBytes, &req); err != nil {
+		writeBoundedJSONError(w, err, feedbackRequestMaxBytes, "invalid request body")
 		return
 	}
 
@@ -66,9 +73,17 @@ func (s *Server) feedbackHandler(w http.ResponseWriter, r *http.Request) {
 	if f.Metadata == nil {
 		f.Metadata = map[string]any{}
 	}
+	if err := validateFeedback(&f); err != nil {
+		writeError(w, http.StatusBadRequest, searchInputMessage(err))
+		return
+	}
 
 	id, err := s.feedback.Record(r.Context(), f)
 	if err != nil {
+		if isForeignKeyViolation(err) {
+			writeError(w, http.StatusBadRequest, errFeedbackReferenceNotFound)
+			return
+		}
 		slog.Error("feedback: record failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal server error")
 		return

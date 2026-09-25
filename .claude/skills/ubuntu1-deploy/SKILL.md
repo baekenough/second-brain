@@ -103,16 +103,48 @@ EOF
 - [ ] `~/bin/verify-mounts.sh; echo exit=$?` → exit=0
 - [ ] server 로그에 `migration applied` / `server listening`
 - [ ] 워커·수집기 로그에 첫 tick 확인
-- [ ] API 스모크 테스트 (응답 본문은 화면에 출력하지 말고 건수만 확인)
+- [ ] API 스모크 테스트 (응답 본문은 화면에 출력하지 말고 상태 코드·결과 건수만 확인)
+
+`q` 없는 `/api/v1/search`는 `search.ValidateQueryInput`이 400으로 거부해 스모크로 쓸 수 없다(#285). 무해한 단어를 넣어 200과 결과 건수만 본다.
 
 ```bash
 ssh ubuntu1 'bash -l -s' <<'EOF'
 cd ~/second-brain-app
-curl -s -o /dev/null -w '%{http_code}\n' \
-  -H "Authorization: Bearer $(grep '^API_KEY=' .env.local | cut -d= -f2-)" \
-  'http://127.0.0.1:8081/api/v1/search?source_type=call&limit=1'
+AUTH="Authorization: Bearer $(grep '^API_KEY=' .env.local | cut -d= -f2-)"
+curl -s -H "$AUTH" \
+  'http://127.0.0.1:8081/api/v1/search?q=%ED%9A%8C%EC%9D%98&limit=1' \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("count:", d.get("count"))'
 EOF
 ```
+
+- [ ] (선택) v0.25.1 입력 검증 확인 — NUL 바이트가 400인지 (`search.ValidateQueryInput`, #282)
+
+```bash
+ssh ubuntu1 'bash -l -s' <<'EOF'
+cd ~/second-brain-app
+AUTH="Authorization: Bearer $(grep '^API_KEY=' .env.local | cut -d= -f2-)"
+curl -s -o /dev/null -w '%{http_code}\n' -H "$AUTH" \
+  'http://127.0.0.1:8081/api/v1/search?q=a%00b&limit=1'
+EOF
+```
+
+기대값: `400`. 다른 값이면 v0.25.1 입력 검증이 배포 이미지에 없다는 뜻이다.
+
+- [ ] (선택, **이미지 ID 대조가 MATCH일 때만 실행**) GraphQL 순환 fragment 400 확인 (#282)
+
+> **경고**: 이 요청은 `graphql-go` 검증기의 무한 재귀 버그(순환 fragment에서 스택 오버플로 → 복구 불가 → 프로세스 종료)를 건드린다. v0.25.1 이전 이미지(AST 가드 미적용)에 보내면 **서버 프로세스가 죽는다**. 위 "1순위 — 이미지 ID 대조"가 MATCH임을 먼저 확인한 뒤에만 실행할 것.
+
+```bash
+ssh ubuntu1 'bash -l -s' <<'EOF'
+cd ~/second-brain-app
+AUTH="Authorization: Bearer $(grep '^API_KEY=' .env.local | cut -d= -f2-)"
+curl -s -o /dev/null -w '%{http_code}\n' -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"query":"query { ...A } fragment A on Query { ...B } fragment B on Query { ...A }"}' \
+  'http://127.0.0.1:8081/api/v1/graphql'
+EOF
+```
+
+기대값: `400`(AST 가드가 실행 전에 거부). 요청이 멈추거나 응답이 없으면 즉시 컨테이너 상태(`docker ps`)를 확인할 것 — 프로세스가 죽었을 수 있다.
 
 - [ ] (백업했다면) 배포 후 집계가 사전 집계와 기대한 방향으로만 달라졌는지 대조
 
