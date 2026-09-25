@@ -28,6 +28,12 @@ import (
 //
 // 슬롯 대기는 풀 연결을 잡지 않는다. 기다리는 동안 DB 에는 아무 부하도 없다.
 //
+// 각주(#290 이후): 위의 "ingest 는 r.Context() 만 들고 무기한 기다린다" 는
+// ingest/messages 에서는 해소됐다 — 그 경로는 자체 요청 예산(45초,
+// IngestMessagesBudget)과 동시 1건 게이트(ingest_messages.go)를 가져, 풀이
+// 비면 예산 안에서 503 으로 끝난다. ingest/recording·ingest/file 경로는 아직
+// 요청 ctx 만 쓰므로 이 설명이 그대로 해당한다(recording 은 #290 PR-B 범위).
+//
 // # 대기 우선순위: REST·GraphQL·golden 먼저, /ask 는 양보
 //
 // REST·GraphQL·golden 은 세마포어의 FIFO 대기열에 서서 최대 searchGateWait(1초)

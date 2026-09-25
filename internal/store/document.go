@@ -141,6 +141,76 @@ const upsertMetadataMergeSQL = `EXCLUDED.metadata || COALESCE((
 //
 // *DocumentStore satisfies the api.IngestMessagesUpserter interface via this method.
 func (s *DocumentStore) UpsertTracked(ctx context.Context, doc *model.Document) (contentChanged bool, err error) {
+	if err := s.preUpsertTrackedChecks(ctx, doc); err != nil {
+		return false, err
+	}
+	return upsertTrackedRow(ctx, s.pg.pool, doc)
+}
+
+// UpsertTrackedWithChunks 는 UpsertTracked 와 같은 upsert 를 하되, 내용이
+// 바뀌었으면(contentChanged) 그 문서의 청크 교체까지 **한 트랜잭션**에서 한다
+// (#290). buildChunks 는 upsert 가 doc.ID 를 채운 뒤, 내용이 바뀐 경우에만
+// 호출된다. 돌려받은 청크의 DocumentID 는 무시하고 doc.ID 를 쓴다.
+//
+// 왜 한 트랜잭션인가: upsert(autocommit)와 청크 교체(별도 트랜잭션)를 따로
+// 하면, 청크 교체만 실패했을 때 문서 행은 새 내용으로 이미 커밋돼 있다. 호출자가
+// 일시 오류로 보고 같은 레코드를 다시 보내면 upsert 는 "내용이 같다"
+// (contentChanged=false)를 돌려주고 청크 교체를 건너뛴다 — 그 문서는 청크 없이
+// (또는 옛 내용의 청크로) 영구히 남는다. 청크 백필은 embedding IS NULL 인 청크만
+// 채우고, 청크가 아예 없는 문서는 되살리지 않는다. 한 트랜잭션으로 묶으면 "문서
+// 행이 새 내용이다" 이면 "청크도 새 내용이다" 가 항상 성립하므로, 실패 뒤
+// 재전송은 언제나 처음부터 다시 한다.
+//
+// 내용이 바뀌었는데 buildChunks 가 빈 슬라이스를 돌려주면(빈 본문) 옛 청크를
+// 지우기만 한다 — 옛 내용의 청크가 새 내용의 문서에 매달려 있으면 안 된다.
+//
+// 동시성: upsert 가 문서 행에 FOR NO KEY UPDATE 잠금을 잡은 뒤에 청크를
+// 교체하고, ChunkStore.ReplaceDocument 는 청크를 지우기 전에 같은 행을
+// FOR UPDATE 로 잠근다. 그래서 같은 문서의 청크 교체 둘이 겹치지 않는다
+// (겹치면 늦은 쪽이 chunk_index 유일 제약 23505 로 실패했다). 잠금 순서는
+// 양쪽 모두 "문서 행 → 청크 행" 이다(ReplaceDocument 주석의 교착 분석).
+//
+// 사전 점검(checkDuplicateArrival, 통화 중복 전사 확인)은 읽기 전용이라
+// 트랜잭션 밖에서 풀로 한다. ErrDuplicateTranscript 는 UpsertTracked 처럼
+// 감싸지 않고 돌려준다. 그 밖의 오류는 %w 로 감싸므로 *pgconn.PgError·context
+// 오류를 errors.As/Is 로 꺼낼 수 있다.
+func (s *DocumentStore) UpsertTrackedWithChunks(
+	ctx context.Context,
+	doc *model.Document,
+	buildChunks func(*model.Document) []Chunk,
+) (contentChanged bool, err error) {
+	if err := s.preUpsertTrackedChecks(ctx, doc); err != nil {
+		return false, err
+	}
+
+	tx, err := s.pg.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("upsert with chunks: begin tx: %w", err)
+	}
+	defer func() {
+		// 커밋한 뒤에는 아무 일도 하지 않는다. 오류 경로에서는 문서 행도 되돌린다.
+		_ = tx.Rollback(ctx)
+	}()
+
+	contentChanged, err = upsertTrackedRow(ctx, tx, doc)
+	if err != nil {
+		return false, fmt.Errorf("upsert with chunks: upsert: %w", err)
+	}
+	if contentChanged && buildChunks != nil {
+		if err := replaceChunksTx(ctx, tx, doc.ID, buildChunks(doc)); err != nil {
+			return false, fmt.Errorf("upsert with chunks: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("upsert with chunks: commit: %w", err)
+	}
+	return contentChanged, nil
+}
+
+// preUpsertTrackedChecks 는 UpsertTracked·UpsertTrackedWithChunks 가 쓰기 전에
+// 하는 점검이다. 경고 두 개는 쓰기를 막지 않고, 통화 중복 전사면
+// ErrDuplicateTranscript 를 돌려준다.
+func (s *DocumentStore) preUpsertTrackedChecks(ctx context.Context, doc *model.Document) error {
 	// Recurrence guards (migration 027 background): warn on a container or
 	// deprecated source_type, and warn on a possible cross-source duplicate
 	// arrival. Both are non-blocking — see document_source_guard.go package
@@ -165,14 +235,27 @@ func (s *DocumentStore) UpsertTracked(ctx context.Context, doc *model.Document) 
 				"source_id", doc.SourceID,
 				"content_len", len(doc.Content),
 			)
-			return false, ErrDuplicateTranscript
+			return ErrDuplicateTranscript
 		case isNoRows(qErr):
 			// No duplicate — proceed with the normal upsert.
 		default:
-			return false, fmt.Errorf("call dup check: %w", qErr)
+			return fmt.Errorf("call dup check: %w", qErr)
 		}
 	}
+	return nil
+}
 
+// rowQuerier 는 *pgxpool.Pool 과 pgx.Tx 가 함께 만족하는 QueryRow 다.
+// upsertTrackedRow 가 autocommit(풀)과 트랜잭션(UpsertTrackedWithChunks)에서
+// 같은 문장 코드를 쓰게 하려는 것이다.
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// upsertTrackedRow 는 UpsertTracked 의 INSERT … ON CONFLICT 문장을 db 위에서
+// 실행하고 contentChanged 를 돌려준다. 변경 감지 방식은 UpsertTracked 문서
+// 주석과 아래 주석을 본다.
+func upsertTrackedRow(ctx context.Context, db rowQuerier, doc *model.Document) (contentChanged bool, err error) {
 	meta, err := json.Marshal(doc.Metadata)
 	if err != nil {
 		return false, fmt.Errorf("marshal metadata: %w", err)
@@ -236,7 +319,7 @@ func (s *DocumentStore) UpsertTracked(ctx context.Context, doc *model.Document) 
 		          COALESCE((SELECT old_content FROM prev), '') IS DISTINCT FROM $4 AS content_changed`
 
 	var wasInsert bool
-	row := s.pg.pool.QueryRow(ctx, q,
+	row := db.QueryRow(ctx, q,
 		doc.SourceType,
 		doc.SourceID,
 		doc.Title,

@@ -337,6 +337,18 @@ curl http://localhost:8081/api/v1/collect/status
 
 Android second-brain-push 앱이 SMS·통화 기록을 JSON 배치로 전송합니다. source_id 형식: `sms:{dateMs}:{addrHash}:{direction}`.
 
+**응답 계약(#290).** 앱은 2xx 를 받으면 `errors[]` 를 보지 않고 커서를 배치 끝까지 전진하고, 5xx 를 받으면 커서를 멈추고 같은 배치를 다시 보냅니다. 401/403 이 아닌 4xx 도 다시 보냅니다. 그래서 상태 코드가 곧 "이 배치를 다시 받아야 하는가" 입니다.
+
+| 상태 | 뜻 | 앱 동작 |
+|------|----|---------|
+| `201` `{accepted, skipped, sanitized, errors[]}` | 배치를 끝까지 처리했습니다. `errors[]` 는 다시 보내도 결과가 같은 **영구 오류**로 건너뛴 레코드입니다(필수 필드 누락, 필드 상한 초과, `date_ms` 가 2000-01-01~서버 시각+7일 밖, 원소 타입 오류, DB SQLSTATE 22·54 클래스와 23502·23514 — 23505 같은 나머지 23 은 동시 쓰기 경합이라 503). 문구는 `sms[3]: body exceeds 65536 bytes` 처럼 배열 이름·인덱스·고정 사유만 담고 입력 값은 담지 않습니다. `skipped` 는 컷오버 이전 레코드와 통화 중복 전사, `sanitized` 는 NUL(U+0000)을 지우고 **저장에 성공한** 레코드 수입니다(거부된 레코드는 errors[] 에만 잡힘). 건너뛴 사유는 서버 로그에 사유 코드별 개수(`error_reasons`·`skip_reasons`, 예: `missing_date_ms`, `db_sqlstate_23514`, `before_cutover`)로 남고, 저장된 레코드 없이 모두 거부되면 앱·서버 필드 계약이 어긋났을 가능성이 커 ERROR 로 남깁니다 | 커서 전진 |
+| `503` + `Retry-After: 30` | **일시 오류**입니다. DB 연결 끊김·풀 고갈·요청 예산(45초) 초과·클라이언트 이탈·분류되지 않은 오류, 잘린 업로드, 또는 다른 ingest 요청이 처리 중(동시 1건 게이트, 최대 2초 대기)일 때입니다. 첫 일시 오류에서 멈추고 나머지 레코드는 처리하지 않습니다. 앞서 저장된 레코드는 재전송 때 "변경 없음" 으로 빠르게 지나갑니다 | 같은 배치 재전송 |
+| `413` | 본문이 `INGEST_MESSAGES_MAX_BODY_BYTES`(기본 32 MiB)를 넘거나 레코드 수가 `INGEST_MAX_BATCH_MESSAGES`(기본 5000)를 넘었습니다. 정상 앱(300건/배치)은 닿지 않는 크기이며 서버가 `slog.Error` 로 남깁니다 | 재전송(예외로 둔 경우) |
+| `401` | API 키가 없거나 틀렸습니다 | 재시도 중단 |
+| `400` | JSON 문법 오류·최상위 구조 오류·빈 본문(앱 버그). 레코드 하나의 문제(잘못된 UTF-8·NUL·필드 과대·원소 타입 오류)로는 400 을 주지 않습니다 — 잘못된 UTF-8 은 U+FFFD 로 바뀌어 저장됩니다 | 재전송(예외로 둔 경우) |
+
+레코드 필드 상한: SMS `body` 64 KiB, `address`·`number`·`contact_name` 1 KiB. 넘는 레코드만 건너뜁니다. 문서 upsert 와 청크 교체는 한 트랜잭션이라, 청크 단계에서 실패하면 문서 행도 되돌아가고 재전송 때 다시 만들어집니다. 임베딩은 요청 중에 만들지 않습니다 — 새 청크는 collector 의 임베딩 백필이 다음 수집 주기(`COLLECT_INTERVAL`, 기본 10분)에 채우므로 벡터 검색 반영은 그만큼 늦고, 전문·bigm 검색은 바로 반영됩니다. 로그에는 본문·주소·번호를 남기지 않고 개수·인덱스·SQLSTATE 만 남깁니다.
+
 ---
 
 ## 환경 변수
@@ -362,6 +374,8 @@ Android second-brain-push 앱이 SMS·통화 기록을 JSON 배치로 전송합�
 | `ENTITY_EXTRACTION_ENABLED` | `false` | 엔티티 추출 + 검색 레인 활성화 |
 | `SEARCH_REQUEST_TIMEOUT_SECONDS` | `60` | 검색 요청 하나(임베딩·DB·리랭크)의 제한 시간(초). REST `/api/v1/search`·GraphQL `search`·MCP `search` 에 적용, 초과 시 REST 는 504. DB 전역 `statement_timeout` 이 아니라 요청 context 타임아웃이다(ctx 가 끝나면 pgx 가 서버 측 문장도 취소). `/api/v1/ask` 는 `ASK_TIMEOUT_SECONDS` 가 따로 묶는다. 0·음수·잘못된 값은 기본값 |
 | `SEARCH_MAX_CONCURRENCY` | 자동 | 서버 프로세스의 동시 검색 수 상한(#286). 비우면 DB 풀 크기의 절반 `max(1, MaxConns/2)`, 양수면 그 값을 쓰되 `MaxConns-1` 로 잘린다(ingest 같은 비검색 경로에 연결을 남기려는 것). REST `/api/v1/search`·`/api/v1/golden/next` 는 빈 슬롯을 최대 1초 기다린 뒤 503 `search capacity exceeded` + `Retry-After: 2`, GraphQL `search` 는 같은 문구의 필드 오류, `/api/v1/ask` 는 503 없이 기다린다(아래). MCP·collector 는 별도 프로세스·별도 풀이라 적용하지 않는다. 시작 로그 `search: concurrency limit` 에 실제 `max_conns`·`max_concurrency` 가 남는다. 0·음수·잘못된 값은 자동값(제한을 끄는 설정은 없다). 예외: 풀 최대 연결이 1 이하(`pool_max_conns=1`)면 K 도 1 이라 검색 1건이 연결을 전부 쓰므로 ingest 보호가 성립하지 않는다(시작 시 경고) — 그때는 `pool_max_conns` 를 올린다. `/api/v1/ask` 는 검색 호출마다 최대 10초 기다리고 REST 대기자에게 양보하며, 넘으면 `retrieval failed` 로 끝난다 |
+| `INGEST_MESSAGES_MAX_BODY_BYTES` | `33554432` (32 MiB) | `POST /api/v1/ingest/messages` 요청 본문 상한(바이트, #288). 넘으면 413. 0·음수·잘못된 값은 기본값(상한을 끄는 설정은 없다). 4 MiB 미만이거나 `INGEST_MAX_BATCH_MESSAGES` 가 폰 앱 배치 크기(300) 미만이면 시작 시 경고한다 — 앱은 413 을 끝없이 재시도하므로 동기화가 멈춘다 |
+
 
 검색 입력 검증(#282): 검색 질의(`q`, `query`)와 소스 필터·정렬 값은 DB 에 가기 전에 검사한다. 잘못된 UTF-8·NUL(`\x00`) 포함·질의 1024바이트 초과는 400 이고, `POST /api/v1/search` 본문은 16KB(초과 시 413), `/api/v1/ask` 본문은 32KB, `/api/v1/graphql` 본문·쿼리스트링은 각각 64KB(초과 시 413/414)로 제한한다. GraphQL 은 요청당 `search` 필드 5개(별칭·fragment 전개 포함), `curated:true` 검색 1개까지만 실행하고(초과 시 400), 순환 fragment 는 400 으로 거부하며, 요청 전체에 `SEARCH_REQUEST_TIMEOUT_SECONDS` 를 한 번 건다. MCP HTTP 본문은 31MB(add_note 10MB 의 비 ASCII 이스케이프 최악 3배 + 1MB)로 제한한다. `/api/v1/ask` 질문은 같은 검증을 거치되 길이 상한만 4KB 다. 오류 응답과 로그에는 질의 원문을 남기지 않는다.
 

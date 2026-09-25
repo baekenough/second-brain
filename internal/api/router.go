@@ -20,6 +20,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
+	"golang.org/x/sync/semaphore"
 )
 
 // Ask pipeline defaults (spec §5.2/§6, plan Task 5). Used whenever
@@ -80,15 +81,20 @@ type Server struct {
 	ingestEmbedder     IngestFileEmbedder
 	ingestMaxFileBytes int64
 
-	// messagesUpserter, messagesChunks, messagesEmbedder, messagesMaxBatch, and
-	// messagesCutover are optional. When messagesUpserter is non-nil the
-	// POST /api/v1/ingest/messages route is registered.
-	// Set via WithIngestMessages before calling Handler().
+	// messagesUpserter·messagesMaxBatch·messagesCutover 는 선택이다.
+	// messagesUpserter 가 nil 이 아니면 POST /api/v1/ingest/messages 경로를
+	// 등록한다. Handler() 전에 WithIngestMessages 로 건다.
+	//
+	// messagesMaxBody(본문 상한), messagesBudget(요청 예산), messagesGate·
+	// messagesGateWait(동시 1건 게이트)는 WithIngestMessages 가 기본값으로
+	// 채운다(#290, ingest_messages.go). 테스트만 budget·gateWait 를 줄인다.
 	messagesUpserter IngestMessagesUpserter
-	messagesChunks   IngestFileChunkWriter
-	messagesEmbedder IngestFileEmbedder
 	messagesMaxBatch int
 	messagesCutover  time.Time
+	messagesMaxBody  int64
+	messagesBudget   time.Duration
+	messagesGate     *semaphore.Weighted
+	messagesGateWait time.Duration
 
 	// recordingUpserter, recordingDir, recordingMaxFileBytes, and
 	// recordingCutover are optional. When recordingUpserter is non-nil and
