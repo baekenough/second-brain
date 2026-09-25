@@ -96,6 +96,46 @@ func (s *ChunkStore) ReplaceDocument(ctx context.Context, documentID uuid.UUID, 
 		_ = tx.Rollback(ctx)
 	}()
 
+	// 문서 행을 먼저 잠근다(#290 후속). 같은 문서의 청크를 바꾸는 쓰기는
+	// 두 곳이다: 이 함수(scheduler.persistChunks·ingest/file·notes)와
+	// DocumentStore.UpsertTrackedWithChunks(ingest/messages). 뒤쪽은
+	// INSERT … ON CONFLICT DO UPDATE 로 문서 행에 FOR NO KEY UPDATE 잠금을
+	// 먼저 잡는다. 이 함수가 문서 행을 잠그지 않으면 두 트랜잭션이 동시에
+	// "청크 전부 삭제 → chunk_index 0 부터 삽입" 을 하게 되고, 늦게 삽입한
+	// 쪽이 먼저 삽입한 쪽의 커밋 뒤 chunks_document_id_chunk_index_key 23505
+	// 로 실패한다(리뷰 실DB 재현). ingest/messages 는 그 23505 를 받으면 폰의
+	// 새 내용을 잃거나(영구 분류 시) 재전송해야 한다.
+	//
+	// FOR UPDATE 는 FOR NO KEY UPDATE 와 충돌하므로 두 경로가 문서 행에서
+	// 줄을 선다. 교착 없음 근거: 두 경로 모두 "문서 행 → 청크 행" 순서로만
+	// 잠근다. 청크만 건드리는 다른 쓰기(임베딩 백필 UpdateChunkEmbeddings)는
+	// 문서 행을 잠그지 않고(키 열을 바꾸지 않아 FK 의 KEY SHARE 도 없다),
+	// 청크를 쥔 채 문서 행을 기다리는 경로가 없으므로 대기 순환이 생기지 않는다.
+	// 문서가 없으면(삭제됨) 잠글 행이 없을 뿐이고, 이어지는 삽입은 기존처럼 FK
+	// 위반으로 실패한다.
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM documents WHERE id = $1 FOR UPDATE`, documentID); err != nil {
+		return fmt.Errorf("chunks replace lock document %s: %w", documentID, err)
+	}
+
+	if err := replaceChunksTx(ctx, tx, documentID, chunks); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("chunks replace commit for document %s: %w", documentID, err)
+	}
+	return nil
+}
+
+// replaceChunksTx 는 호출자가 연 트랜잭션 tx 안에서 documentID 의 청크를 모두
+// 지우고 chunks 를 넣는다. 커밋·롤백은 호출자 몫이다. ReplaceDocument 와
+// DocumentStore.UpsertTrackedWithChunks(#290, 문서 upsert 와 같은 트랜잭션)가
+// 함께 쓴다. chunks 의 DocumentID 필드는 보지 않고 documentID 를 쓴다.
+//
+// 호출자는 이 함수를 부르기 전에 같은 트랜잭션에서 문서 행을 잠가야 한다
+// (ReplaceDocument 는 SELECT … FOR UPDATE, UpsertTrackedWithChunks 는 upsert
+// 자체의 행 잠금). 그래야 같은 문서의 청크 교체가 직렬화된다.
+func replaceChunksTx(ctx context.Context, tx pgx.Tx, documentID uuid.UUID, chunks []Chunk) error {
 	// Delete existing chunks for this document.
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM chunks WHERE document_id = $1`, documentID,
@@ -104,7 +144,7 @@ func (s *ChunkStore) ReplaceDocument(ctx context.Context, documentID uuid.UUID, 
 	}
 
 	if len(chunks) == 0 {
-		return tx.Commit(ctx)
+		return nil
 	}
 
 	// Batch insert using pgx CopyFrom for efficiency.
@@ -118,18 +158,13 @@ func (s *ChunkStore) ReplaceDocument(ctx context.Context, documentID uuid.UUID, 
 		})
 	}
 
-	_, err = tx.CopyFrom(
+	if _, err := tx.CopyFrom(
 		ctx,
 		pgx.Identifier{"chunks"},
 		[]string{"document_id", "chunk_index", "content", "byte_size"},
 		pgx.CopyFromRows(rows),
-	)
-	if err != nil {
+	); err != nil {
 		return fmt.Errorf("chunks replace insert for document %s: %w", documentID, err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("chunks replace commit for document %s: %w", documentID, err)
 	}
 	return nil
 }

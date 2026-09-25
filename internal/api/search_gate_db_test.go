@@ -31,7 +31,9 @@ import (
 //
 //   - 대조군(게이트 없음 = 이 변경 전 동작): 검색이 연결 4개를 모두 쥐어 ingest 는
 //     연결을 못 얻고 게이트웨이 대용 데드라인(ingestGatewayDeadline)까지 막힌 뒤
-//     저장에 실패한다 — 결함 재현.
+//     저장에 실패한다 — 결함 재현. #290 이후 ingest 는 이 실패를 일시 오류로
+//     분류해 503 + Retry-After 로 돌려준다(이전에는 201 + accepted 0 이라 폰이
+//     커서를 전진해 레코드를 잃었다). 그래서 대조군의 기대 상태는 503 이다.
 //   - 실험군(K=2, 자동값 max(1, 4/2)): 검색은 연결 2개까지만 쓰고 나머지 4건은
 //     1초 뒤 503, ingest 는 1초 안에 저장된다.
 //
@@ -77,6 +79,8 @@ func withPoolMaxConns(t *testing.T, dsn string, n int) string {
 }
 
 type gateScenarioResult struct {
+	ingestStatus   int
+	ingestRetry    string
 	ingestLatency  time.Duration
 	ingestAccepted int
 	ingestErrors   int
@@ -136,10 +140,10 @@ func TestSearchGate_IngestProtection_RealDB(t *testing.T) {
 	control := runGateScenario(t, pg, monitor, marker+"-control", 0)
 	gated := runGateScenario(t, pg, monitor, marker+"-gated", k)
 
-	t.Logf("control (no gate): ingest %v accepted=%d errors=%d, max concurrent search backends=%d, search statuses=%v",
-		control.ingestLatency.Round(time.Millisecond), control.ingestAccepted, control.ingestErrors, control.maxSleeping, control.searchCodes)
-	t.Logf("gated (K=%d):      ingest %v accepted=%d errors=%d, max concurrent search backends=%d, search statuses=%v",
-		k, gated.ingestLatency.Round(time.Millisecond), gated.ingestAccepted, gated.ingestErrors, gated.maxSleeping, gated.searchCodes)
+	t.Logf("control (no gate): ingest %d in %v accepted=%d errors=%d, max concurrent search backends=%d, search statuses=%v",
+		control.ingestStatus, control.ingestLatency.Round(time.Millisecond), control.ingestAccepted, control.ingestErrors, control.maxSleeping, control.searchCodes)
+	t.Logf("gated (K=%d):      ingest %d in %v accepted=%d errors=%d, max concurrent search backends=%d, search statuses=%v",
+		k, gated.ingestStatus, gated.ingestLatency.Round(time.Millisecond), gated.ingestAccepted, gated.ingestErrors, gated.maxSleeping, gated.searchCodes)
 
 	// 대조군: 결함이 재현돼야 이 실험이 의미가 있다.
 	if control.maxSleeping != gateDBPoolMaxConns {
@@ -149,10 +153,19 @@ func TestSearchGate_IngestProtection_RealDB(t *testing.T) {
 		t.Errorf("control: ingest accepted=%d after %v; want it starved until the %v deadline (defect not reproduced)",
 			control.ingestAccepted, control.ingestLatency, ingestGatewayDeadline)
 	}
+	// #290: 저장에 실패한 배치는 201 이 아니라 503 + Retry-After 여야 폰이
+	// 커서를 멈추고 다시 보낸다.
+	if control.ingestStatus != http.StatusServiceUnavailable || control.ingestRetry == "" {
+		t.Errorf("control: ingest status=%d Retry-After=%q, want 503 with Retry-After (a failed batch must not be 201)",
+			control.ingestStatus, control.ingestRetry)
+	}
 
 	// 실험군: 검색은 K 개 연결까지만, ingest 는 제시간에 저장.
 	if gated.maxSleeping > k {
 		t.Errorf("gated: %d search backends held connections, want <= K=%d", gated.maxSleeping, k)
+	}
+	if gated.ingestStatus != http.StatusCreated {
+		t.Errorf("gated: ingest status=%d, want 201", gated.ingestStatus)
 	}
 	if gated.ingestAccepted != 1 || gated.ingestErrors != 0 {
 		t.Errorf("gated: ingest accepted=%d errors=%d, want 1 and 0", gated.ingestAccepted, gated.ingestErrors)
@@ -172,7 +185,7 @@ func runGateScenario(t *testing.T, pg *store.Postgres, monitor *pgx.Conn, marker
 
 	docStore := store.NewDocumentStore(pg)
 	srv := NewServer(nil, search.NewService(sleepingSearcher{pool: pg.Pool()}, askDisabledEmbedder{}), nil, nil, nil, "", "").
-		WithIngestMessages(docStore, store.NewChunkStore(pg), nil, 0, time.Time{})
+		WithIngestMessages(docStore, 0, time.Time{})
 	if k > 0 {
 		srv = srv.WithSearchConcurrency(k)
 	}
@@ -230,13 +243,12 @@ func runGateScenario(t *testing.T, pg *store.Postgres, monitor *pgx.Conn, marker
 	h.ServeHTTP(w, req)
 	latency := time.Since(start)
 
+	// 상태 코드 판정은 호출자가 한다(대조군 503, 실험군 201).
 	var resp IngestMessagesResponse
 	if w.Code == http.StatusCreated {
 		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 			t.Fatalf("ingest response: %v", err)
 		}
-	} else {
-		t.Errorf("ingest status = %d, want 201; body = %s", w.Code, w.Body.String())
 	}
 	maxSleeping = max(maxSleeping, countSleeping(t, monitor))
 
@@ -244,6 +256,8 @@ func runGateScenario(t *testing.T, pg *store.Postgres, monitor *pgx.Conn, marker
 	// 세려고 잠깐 기다렸다가 나머지(pg_sleep 중)를 취소한다. 취소하면 pgx 가
 	// 서버 측 문장도 멈춘다.
 	result := gateScenarioResult{
+		ingestStatus:   w.Code,
+		ingestRetry:    w.Header().Get("Retry-After"),
 		ingestLatency:  latency,
 		ingestAccepted: resp.Accepted,
 		ingestErrors:   len(resp.Errors),

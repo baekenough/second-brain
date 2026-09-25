@@ -357,6 +357,13 @@ type Config struct {
 	// Invalid values use the default.
 	IngestMaxBatchMessages int
 
+	// IngestMessagesMaxBodyBytes 는 POST /api/v1/ingest/messages 요청 본문
+	// 상한(바이트)이다(#288 1항). INGEST_MESSAGES_MAX_BODY_BYTES, 기본 32 MiB.
+	// 넘으면 413 이다. 정상 최대치(300건 × SMS 본문 상한 64 KiB ≈ 19.8 MB)의
+	// 1.6배라 정상 앱은 닿지 않는다. 0·음수·잘못된 값은 기본값을 쓴다 — 상한을
+	// 끄는 설정은 두지 않는다.
+	IngestMessagesMaxBodyBytes int64
+
 	// Summarizer
 	// SummarizerBackfillEnabled controls whether the SummarizerWorker scans for
 	// pre-existing unsummarized documents (WHERE title_summary IS NULL).
@@ -951,6 +958,8 @@ func Load() (*Config, error) {
 		IngestRecordingDir:     resolveIngestRecordingDir(),
 		IngestMaxBatchMessages: ingestMaxBatchMessages(),
 
+		IngestMessagesMaxBodyBytes: ingestMessagesMaxBodyBytes(),
+
 		SummarizerBackfillEnabled: summarizerBackfill,
 		SummarizerBatchSize:       summarizerBatchSize(),
 		SummarizerInterval:        summarizerInterval(),
@@ -1357,6 +1366,29 @@ func ingestMaxBatchMessages() int {
 			"error", err,
 		)
 		return defaultCap
+	}
+	return n
+}
+
+// DefaultIngestMessagesMaxBodyBytes 는 INGEST_MESSAGES_MAX_BODY_BYTES 의
+// 기본값(32 MiB)이다. api.DefaultIngestMessagesMaxBodyBytes 와 같은 값이다
+// (config 는 api 를 import 하지 않으므로 따로 둔다).
+const DefaultIngestMessagesMaxBodyBytes int64 = 32 << 20
+
+// ingestMessagesMaxBodyBytes 는 INGEST_MESSAGES_MAX_BODY_BYTES 를 읽는다.
+// 비었거나 0 이하·잘못된 값이면 기본값이다.
+func ingestMessagesMaxBodyBytes() int64 {
+	v := os.Getenv("INGEST_MESSAGES_MAX_BODY_BYTES")
+	if v == "" {
+		return DefaultIngestMessagesMaxBodyBytes
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 {
+		slog.Warn("config: INGEST_MESSAGES_MAX_BODY_BYTES is invalid; using default 32 MiB",
+			"value", v,
+			"error", err,
+		)
+		return DefaultIngestMessagesMaxBodyBytes
 	}
 	return n
 }

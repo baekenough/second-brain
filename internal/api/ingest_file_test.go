@@ -11,9 +11,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/google/uuid"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/store"
+	"github.com/google/uuid"
 )
 
 // --- stubs ---
@@ -21,12 +21,13 @@ import (
 type stubIngestUpserter struct {
 	upserted []*model.Document
 	err      error
-	// contentChangedSequence controls the contentChanged value returned by
-	// UpsertTracked for each successive call. When the slice is exhausted every
-	// further call returns true (new document). Use this to simulate a duplicate
-	// batch where some records are unchanged.
+	// contentChangedSequence 는 UpsertTrackedWithChunks 가 호출 순번마다
+	// 돌려줄 contentChanged 값이다. 슬라이스가 끝나면 그 뒤는 모두 true(새
+	// 문서)다. 일부 레코드가 바뀌지 않은 재전송 배치를 흉내 낼 때 쓴다.
 	contentChangedSequence []bool
 	callCount              int
+	// chunkBuilds 는 buildChunks 호출 수다(내용이 바뀐 문서에서만 부른다).
+	chunkBuilds int
 }
 
 func (s *stubIngestUpserter) Upsert(_ context.Context, doc *model.Document) error {
@@ -41,11 +42,11 @@ func (s *stubIngestUpserter) Upsert(_ context.Context, doc *model.Document) erro
 	return nil
 }
 
-// UpsertTracked satisfies IngestMessagesUpserter. It behaves identically to
-// Upsert for document persistence. The contentChanged return value is driven by
-// contentChangedSequence: if the slice has an entry for this call index it is
-// used; otherwise true is returned (default: treat as new/changed document).
-func (s *stubIngestUpserter) UpsertTracked(_ context.Context, doc *model.Document) (contentChanged bool, err error) {
+// UpsertTrackedWithChunks 는 IngestMessagesUpserter 를 만족시킨다. 문서
+// 저장은 Upsert 와 같다. contentChanged 는 contentChangedSequence 의 호출
+// 순번 값이고, 없으면 true(새 문서·바뀐 문서)다. buildChunks 는 저장소와
+// 똑같이 내용이 바뀐 문서에서만 부른다.
+func (s *stubIngestUpserter) UpsertTrackedWithChunks(_ context.Context, doc *model.Document, buildChunks func(*model.Document) []store.Chunk) (contentChanged bool, err error) {
 	if s.err != nil {
 		return false, s.err
 	}
@@ -56,10 +57,15 @@ func (s *stubIngestUpserter) UpsertTracked(_ context.Context, doc *model.Documen
 
 	idx := s.callCount
 	s.callCount++
+	changed := true // default: content is new/changed
 	if idx < len(s.contentChangedSequence) {
-		return s.contentChangedSequence[idx], nil
+		changed = s.contentChangedSequence[idx]
 	}
-	return true, nil // default: content is new/changed
+	if changed && buildChunks != nil {
+		buildChunks(doc)
+		s.chunkBuilds++
+	}
+	return changed, nil
 }
 
 type stubIngestChunkWriter struct {

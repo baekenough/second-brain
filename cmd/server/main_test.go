@@ -324,3 +324,46 @@ func TestWarnSearchWriteTimeout(t *testing.T) {
 		}
 	}
 }
+
+// TestWarnIngestMessagesWriteTimeout 은 ingest/messages 의 게이트 대기 + 예산
+// (2초 + 45초)이 WriteTimeout 에 닿을 때만 경고하는지 고정한다(#290).
+func TestWarnIngestMessagesWriteTimeout(t *testing.T) {
+	cases := []struct {
+		name  string
+		write time.Duration
+		want  bool
+	}{
+		{name: "default_90s_ok", write: 90 * time.Second, want: false},
+		{name: "just_above", write: 48 * time.Second, want: false},
+		{name: "equal", write: 47 * time.Second, want: true},
+		{name: "below", write: 30 * time.Second, want: true},
+	}
+	for _, tc := range cases {
+		if got := warnIngestMessagesWriteTimeout(tc.write); got != tc.want {
+			t.Errorf("%s: warnIngestMessagesWriteTimeout(%v) = %v, want %v", tc.name, tc.write, got, tc.want)
+		}
+	}
+}
+
+// TestWarnIngestMessagesLimits 는 ingest/messages 상한이 폰 앱 배치(300건)나
+// 본문 4 MiB 보다 작을 때만 경고하는지 고정한다(#290 후속). 기본값(5000건,
+// 32 MiB)은 경고 없음.
+func TestWarnIngestMessagesLimits(t *testing.T) {
+	cases := []struct {
+		name     string
+		maxBatch int
+		maxBody  int64
+		want     bool
+	}{
+		{name: "defaults_ok", maxBatch: 5000, maxBody: 32 << 20, want: false},
+		{name: "exactly_app_batch_and_4mib", maxBatch: 300, maxBody: 4 << 20, want: false},
+		{name: "batch_below_app", maxBatch: 299, maxBody: 32 << 20, want: true},
+		{name: "body_below_4mib", maxBatch: 5000, maxBody: 4<<20 - 1, want: true},
+		{name: "both_below", maxBatch: 100, maxBody: 1 << 20, want: true},
+	}
+	for _, tc := range cases {
+		if got := warnIngestMessagesLimits(tc.maxBatch, tc.maxBody); got != tc.want {
+			t.Errorf("%s: warnIngestMessagesLimits(%d, %d) = %v, want %v", tc.name, tc.maxBatch, tc.maxBody, got, tc.want)
+		}
+	}
+}

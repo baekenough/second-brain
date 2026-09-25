@@ -196,7 +196,8 @@ func run() error {
 		WithIngestFile(docStore, chunkStore, embedClient, cfg.IngestMaxFileBytes).
 		WithPIINumberHashing(cfg.PIINumberHashingEnabled).
 		WithPIINameRedaction(cfg.PIINameRedactionEnabled).
-		WithIngestMessages(docStore, chunkStore, embedClient, cfg.IngestMaxBatchMessages, cfg.CollectorCutover).
+		WithIngestMessages(docStore, cfg.IngestMaxBatchMessages, cfg.CollectorCutover).
+		WithIngestMessagesMaxBody(cfg.IngestMessagesMaxBodyBytes).
 		WithIngestRecording(docStore, cfg.IngestRecordingDir, cfg.IngestMaxFileBytes, cfg.CollectorCutover).
 		WithNotes(docStore, chunkStore, embedClient).
 		WithAskConfig(time.Duration(cfg.AskTimeoutSeconds)*time.Second, cfg.AskContextTopK, cfg.AskContextInsightM).
@@ -252,6 +253,8 @@ func run() error {
 	}
 
 	warnSearchWriteTimeout(cfg.SearchRequestTimeout, cfg.HTTPWriteTimeout)
+	warnIngestMessagesWriteTimeout(cfg.HTTPWriteTimeout)
+	warnIngestMessagesLimits(cfg.IngestMaxBatchMessages, cfg.IngestMessagesMaxBodyBytes)
 
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.Port,
@@ -356,6 +359,57 @@ func warnSearchWriteTimeout(searchTimeout, writeTimeout time.Duration) bool {
 		"http_write_timeout", writeTimeout.String(),
 	)
 	return true
+}
+
+// warnIngestMessagesWriteTimeout 은 ingest/messages 의 최장 경로(게이트 대기
+// api.IngestMessagesGateWait + 요청 예산 api.IngestMessagesBudget)가 HTTP
+// WriteTimeout 이상이면 경고하고 true 를 돌려준다(#290). 그러면 예산이 끝나
+// 503 을 쓰기 전에 연결이 잘리고, 게이트웨이는 502 를 준다 — 서버가 아직
+// 처리 중인데 폰이 재전송하는 2026-06-21 사고의 모양이다. 시작을 막지는 않는다.
+func warnIngestMessagesWriteTimeout(writeTimeout time.Duration) bool {
+	if api.IngestMessagesGateWait+api.IngestMessagesBudget < writeTimeout {
+		return false
+	}
+	slog.Warn("HTTP_WRITE_TIMEOUT_SECONDS is not above the ingest/messages gate wait plus request budget — a slow ingest may be cut before its 503 is written",
+		"ingest_gate_wait", api.IngestMessagesGateWait.String(),
+		"ingest_budget", api.IngestMessagesBudget.String(),
+		"http_write_timeout", writeTimeout.String(),
+	)
+	return true
+}
+
+// 폰 앱(mobile/second-brain-push Uploader.kt)의 배치 크기와, 그 배치를
+// 받으려면 필요한 최소 본문 상한이다. 앱 BATCH_SIZE 는 300 이고, 운영 실측
+// SMS 본문 p99 2 KB·최대 7.4 KB(2026-09-25)로 보면 300건 요청은 수백 KB 다.
+// 4 MiB 는 300건이 평균 약 14 KB 여도 들어가는 하한이다.
+const (
+	phoneAppBatchSize          = 300
+	minIngestMessagesBodyBytes = 4 << 20
+)
+
+// warnIngestMessagesLimits 는 ingest/messages 상한이 폰 앱의 정상 배치보다
+// 작으면 경고하고 true 를 돌려준다(#290 후속). INGEST_MAX_BATCH_MESSAGES 가
+// 300 미만이거나 INGEST_MESSAGES_MAX_BODY_BYTES 가 4 MiB 미만이면 앱의 배치가
+// 413 을 받는데, 앱은 401/403 이 아닌 4xx 를 끝없이 재시도하므로 SMS·통화
+// 동기화가 통째로 멈춘다. 설정 실수를 시작 로그에서 바로 보이게 한다.
+// 시작을 막지는 않는다.
+func warnIngestMessagesLimits(maxBatch int, maxBody int64) bool {
+	warned := false
+	if maxBatch < phoneAppBatchSize {
+		slog.Warn("INGEST_MAX_BATCH_MESSAGES is below the phone app batch size — every phone batch will get 413 and be retried forever",
+			"ingest_max_batch_messages", maxBatch,
+			"phone_app_batch_size", phoneAppBatchSize,
+		)
+		warned = true
+	}
+	if maxBody < minIngestMessagesBodyBytes {
+		slog.Warn("INGEST_MESSAGES_MAX_BODY_BYTES is below 4 MiB — a normal phone batch may get 413 and be retried forever",
+			"ingest_messages_max_body_bytes", maxBody,
+			"recommended_min_bytes", minIngestMessagesBodyBytes,
+		)
+		warned = true
+	}
+	return warned
 }
 
 // wireActionsAndBriefing conditionally registers the /api/v1/actions and

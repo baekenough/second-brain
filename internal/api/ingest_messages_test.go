@@ -2,7 +2,6 @@ package api
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -20,13 +19,11 @@ import (
 // maxBatch 0 uses the package default.
 func newMessagesTestServer(
 	upserter IngestMessagesUpserter,
-	chunks IngestFileChunkWriter,
-	embed IngestFileEmbedder,
 	maxBatch int,
 	cutover time.Time,
 ) *Server {
 	srv := NewServer(nil, nil, nil, nil, nil, "", "test-key")
-	srv.WithIngestMessages(upserter, chunks, embed, maxBatch, cutover)
+	srv.WithIngestMessages(upserter, maxBatch, cutover)
 	return srv
 }
 
@@ -58,7 +55,7 @@ func TestIngestMessages_AuthRequired(t *testing.T) {
 	t.Parallel()
 
 	upserter := &stubIngestUpserter{}
-	srv := newMessagesTestServer(upserter, &stubIngestChunkWriter{}, &stubIngestEmbedder{}, 0, time.Time{})
+	srv := newMessagesTestServer(upserter, 0, time.Time{})
 
 	body := map[string]any{
 		"sms":   []any{},
@@ -77,7 +74,7 @@ func TestIngestMessages_EmptyBatch(t *testing.T) {
 	t.Parallel()
 
 	upserter := &stubIngestUpserter{}
-	srv := newMessagesTestServer(upserter, &stubIngestChunkWriter{}, &stubIngestEmbedder{}, 0, time.Time{})
+	srv := newMessagesTestServer(upserter, 0, time.Time{})
 
 	body := map[string]any{
 		"sms":   []any{},
@@ -106,7 +103,7 @@ func TestIngestMessages_SMSMapsCorrectly(t *testing.T) {
 	t.Parallel()
 
 	upserter := &stubIngestUpserter{}
-	srv := newMessagesTestServer(upserter, &stubIngestChunkWriter{}, &stubIngestEmbedder{}, 0, time.Time{})
+	srv := newMessagesTestServer(upserter, 0, time.Time{})
 
 	addr := "010-1111-2222"
 	body := "안녕하세요"
@@ -170,7 +167,7 @@ func TestIngestMessages_CallMapsCorrectly(t *testing.T) {
 	t.Parallel()
 
 	upserter := &stubIngestUpserter{}
-	srv := newMessagesTestServer(upserter, &stubIngestChunkWriter{}, &stubIngestEmbedder{}, 0, time.Time{})
+	srv := newMessagesTestServer(upserter, 0, time.Time{})
 
 	number := "010-5555-6666"
 	dateMs := time.Now().Add(-2 * time.Hour).UnixMilli()
@@ -242,9 +239,9 @@ func TestIngestMessages_CutoverSkipsOldRecords(t *testing.T) {
 	cutover := time.Now().Add(-30 * time.Minute)
 
 	upserter := &stubIngestUpserter{}
-	srv := newMessagesTestServer(upserter, &stubIngestChunkWriter{}, &stubIngestEmbedder{}, 0, cutover)
+	srv := newMessagesTestServer(upserter, 0, cutover)
 
-	oldMs := time.Now().Add(-2 * time.Hour).UnixMilli() // before cutover
+	oldMs := time.Now().Add(-2 * time.Hour).UnixMilli()    // before cutover
 	newMs := time.Now().Add(-10 * time.Minute).UnixMilli() // after cutover
 
 	payload := map[string]any{
@@ -290,7 +287,7 @@ func TestIngestMessages_Idempotent(t *testing.T) {
 	t.Parallel()
 
 	upserter := &stubIngestUpserter{}
-	srv := newMessagesTestServer(upserter, &stubIngestChunkWriter{}, &stubIngestEmbedder{}, 0, time.Time{})
+	srv := newMessagesTestServer(upserter, 0, time.Time{})
 
 	addr := "010-7777-8888"
 	body := "test message"
@@ -334,7 +331,7 @@ func TestIngestMessages_OversizedBatch(t *testing.T) {
 	t.Parallel()
 
 	// Limit to 2 records.
-	srv := newMessagesTestServer(&stubIngestUpserter{}, &stubIngestChunkWriter{}, &stubIngestEmbedder{}, 2, time.Time{})
+	srv := newMessagesTestServer(&stubIngestUpserter{}, 2, time.Time{})
 
 	// 3 SMS records — exceeds the cap.
 	var smsRecords []any
@@ -358,7 +355,7 @@ func TestIngestMessages_OversizedBatch(t *testing.T) {
 func TestIngestMessages_InvalidBody(t *testing.T) {
 	t.Parallel()
 
-	srv := newMessagesTestServer(&stubIngestUpserter{}, &stubIngestChunkWriter{}, &stubIngestEmbedder{}, 0, time.Time{})
+	srv := newMessagesTestServer(&stubIngestUpserter{}, 0, time.Time{})
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/ingest/messages",
 		bytes.NewBufferString("not valid json"))
@@ -378,7 +375,7 @@ func TestIngestMessages_MissingAddress(t *testing.T) {
 	t.Parallel()
 
 	upserter := &stubIngestUpserter{}
-	srv := newMessagesTestServer(upserter, &stubIngestChunkWriter{}, &stubIngestEmbedder{}, 0, time.Time{})
+	srv := newMessagesTestServer(upserter, 0, time.Time{})
 
 	payload := map[string]any{
 		"sms": []any{
@@ -408,38 +405,19 @@ func TestIngestMessages_MissingAddress(t *testing.T) {
 	}
 }
 
-// TestIngestMessages_DuplicateBatchSkipsEmbed verifies the core performance fix:
-// when a batch of records is re-sent and none of them have changed content,
-// chunk replacement and embedding are skipped for every unchanged record.
-//
-// This mirrors the prod scenario: 224 records retried, 216 unchanged → only
-// the 8 new/changed records should trigger embed work. Here we test the skip
-// with a tracking embedder so we can assert embed call count.
-func TestIngestMessages_DuplicateBatchSkipsEmbed(t *testing.T) {
+// TestIngestMessages_DuplicateBatchSkipsChunkBuild 는 성능 수정(2026-06-21,
+// 224건 재전송)을 고정한다: 재전송 배치에서 바뀌지 않은 레코드는 청크를 만들지
+// 않고, 새 레코드·바뀐 레코드만 만든다. 임베딩은 이제 요청 경로에서 아예 하지
+// 않는다(결정 D2, #290) — collector 백필이 embedding IS NULL 청크를 채운다.
+func TestIngestMessages_DuplicateBatchSkipsChunkBuild(t *testing.T) {
 	t.Parallel()
-
-	// funcEmbedder counts EmbedBatch invocations so we can assert that
-	// unchanged records never trigger an embed call.
-	var embedCallCount int
-	embedder := &funcEmbedder{
-		enabled: true,
-		embedBatch: func(_ context.Context, texts []string) ([][]float32, error) {
-			embedCallCount++
-			vecs := make([][]float32, len(texts))
-			for i := range vecs {
-				vecs[i] = []float32{0.1, 0.2, 0.3}
-			}
-			return vecs, nil
-		},
-	}
 
 	// Sequence: first two records return contentChanged=false (duplicates),
 	// third record returns contentChanged=true (new).
 	upserter := &stubIngestUpserter{
 		contentChangedSequence: []bool{false, false, true},
 	}
-
-	srv := newMessagesTestServer(upserter, &stubIngestChunkWriter{}, embedder, 0, time.Time{})
+	srv := newMessagesTestServer(upserter, 0, time.Time{})
 
 	payload := map[string]any{
 		"sms": []any{
@@ -460,24 +438,10 @@ func TestIngestMessages_DuplicateBatchSkipsEmbed(t *testing.T) {
 	if resp.Accepted != 3 {
 		t.Errorf("accepted=%d, want 3", resp.Accepted)
 	}
-
-	// EmbedBatch must be called exactly once: only for the 1 changed record.
-	// The 2 duplicate records must not trigger any embed call.
-	if embedCallCount != 1 {
-		t.Errorf("EmbedBatch called %d times, want 1 (only new/changed records should embed)", embedCallCount)
+	// 청크는 정확히 한 번, 바뀐 레코드 1건에서만 만들어야 한다.
+	if upserter.chunkBuilds != 1 {
+		t.Errorf("buildChunks called %d times, want 1 (only new/changed records)", upserter.chunkBuilds)
 	}
-}
-
-// funcEmbedder is an IngestFileEmbedder that delegates to a function, allowing
-// tests to count or control EmbedBatch invocations without a full mock library.
-type funcEmbedder struct {
-	enabled    bool
-	embedBatch func(ctx context.Context, texts []string) ([][]float32, error)
-}
-
-func (f *funcEmbedder) Enabled() bool { return f.enabled }
-func (f *funcEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
-	return f.embedBatch(ctx, texts)
 }
 
 // TestIngestMessages_AuthLikeRedacted verifies that OTP digits in auth-like
@@ -486,7 +450,7 @@ func TestIngestMessages_AuthLikeRedacted(t *testing.T) {
 	t.Parallel()
 
 	upserter := &stubIngestUpserter{}
-	srv := newMessagesTestServer(upserter, &stubIngestChunkWriter{}, &stubIngestEmbedder{}, 0, time.Time{})
+	srv := newMessagesTestServer(upserter, 0, time.Time{})
 
 	payload := map[string]any{
 		"sms": []any{

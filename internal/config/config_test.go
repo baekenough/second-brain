@@ -982,3 +982,37 @@ func TestNameRedactionDefaultOffAndRequiresAPI(t *testing.T) {
 		t.Fatal("enabled without authenticated API must fail")
 	}
 }
+
+// TestLoad_IngestMessagesMaxBodyBytes 는 INGEST_MESSAGES_MAX_BODY_BYTES 파싱을
+// 고정한다(#288 1항). 0·음수·잘못된 값은 기본 32 MiB 로 떨어진다 — 상한을 끄는
+// 설정은 없다. t.Setenv 를 쓰므로 병렬로 돌리지 않는다.
+func TestLoad_IngestMessagesMaxBodyBytes(t *testing.T) {
+	cases := []struct {
+		name   string
+		envVal string
+		unset  bool
+		want   int64
+	}{
+		{name: "unset_is_default", unset: true, want: 32 << 20},
+		{name: "explicit_1mib", envVal: "1048576", want: 1 << 20},
+		{name: "zero_is_default", envVal: "0", want: 32 << 20},
+		{name: "negative_is_default", envVal: "-1", want: 32 << 20},
+		{name: "not_a_number_is_default", envVal: "32MiB", want: 32 << 20},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unset {
+				unsetenv(t, "INGEST_MESSAGES_MAX_BODY_BYTES")
+			} else {
+				t.Setenv("INGEST_MESSAGES_MAX_BODY_BYTES", tc.envVal)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.IngestMessagesMaxBodyBytes != tc.want {
+				t.Errorf("IngestMessagesMaxBodyBytes = %d, want %d", cfg.IngestMessagesMaxBodyBytes, tc.want)
+			}
+		})
+	}
+}
