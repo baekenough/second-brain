@@ -1,7 +1,7 @@
 ---
 title: ubuntu1-deploy
 type: skill
-updated: 2026-09-20
+updated: 2026-09-25
 sources:
   - .claude/skills/ubuntu1-deploy/SKILL.md
 related:
@@ -34,7 +34,7 @@ Deploy or redeploy the second-brain stack to the `ubuntu1` host: build images on
 3. Build images on `ubuntu1` (`docker build --target <svc>` per service — Compose has no `build:` section)
 4. Pre-deploy backup (only when the deploy includes a data-mutating migration; `pg_dump` of affected tables)
 5. Roll out (`docker compose --env-file .env.local -f docker-compose.ubuntu1.yml up -d`)
-6. Verify — image ID diff between running and built images takes priority over any HTTP/health check, since a health check passes even when `up -d` silently restarted the old image
+6. Verify — image ID diff between running and built images takes priority over any HTTP/health check, since a health check passes even when `up -d` silently restarted the old image. The API smoke test now sends `q=회의` and checks only status code + result count (#285: `/api/v1/search` without `q` is rejected with 400 by `search.ValidateQueryInput`, so an empty query can no longer be used as a smoke test). Two optional post-deploy checks were added: a NUL-byte query expecting 400 (#282, confirms v0.25.1 input validation reached the image) and a GraphQL circular-fragment payload expecting 400 (#282, confirms the AST guard against `graphql-go`'s infinite-recursion validator bug) — the circular-fragment check must only run after the image-ID diff confirms MATCH, since sending it to a pre-v0.25.1 image crashes the server process (unrecoverable stack overflow).
 
 ## Incidents It Guards Against
 
