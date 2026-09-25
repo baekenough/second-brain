@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"mime"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/store"
 	"github.com/go-chi/chi/v5"
 )
@@ -200,6 +200,17 @@ func (s *Server) listActionsHandler(w http.ResponseWriter, r *http.Request) {
 // user's earlier decision about it (spec §5.5).
 var actionIdentityKeyRE = regexp.MustCompile(`^action:[0-9a-f]{16}$`)
 
+// actionStateRequestMaxBytes 는 POST /api/v1/actions/{key}/status 본문의
+// 상한이다(#288 2항).
+//
+// 정상 요청 중 가장 큰 것은 note 500룬이다. 웹 UI 는 note 를 보내지 않아
+// 본문이 약 20~30B 지만, 파이썬 json.dumps 기본값(ensure_ascii)처럼 \u
+// 이스케이프를 쓰는 클라이언트는 4바이트 문자 하나를 서로게이트 쌍
+// 12B 로 적는다. 500룬이면 최대 6,000B 이므로 4 KiB 로는 정상 요청을 413
+// 으로 거부할 수 있어 8 KiB 로 잡았다. 500룬을 넘는 note 를 자르는 동작은
+// 그대로다 — 8 KiB 를 넘는 본문만 413 이 된다.
+const actionStateRequestMaxBytes = 8 << 10
+
 // actionNoteMaxLen bounds the free-text note. It is user-visible data, never
 // logged, and exists only to be shown back to the same user.
 const actionNoteMaxLen = 500
@@ -227,10 +238,11 @@ func (s *Server) setActionStateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req setActionStateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		// The decoder error can quote the request body, which may contain a
-		// note; only the fixed message goes out and nothing is logged.
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if err := decodeBoundedJSON(w, r, actionStateRequestMaxBytes, &req); err != nil {
+		// 디코드 오류는 본문(note 포함)을 인용할 수 있으므로 고정 문구만
+		// 돌려주고 로그에 남기지 않는다. 상한 초과는 413, 잘못된 UTF-8 은
+		// 필드 이름과 사유만 담은 400 이다.
+		writeBoundedJSONError(w, err, actionStateRequestMaxBytes, "invalid request body")
 		return
 	}
 
@@ -239,6 +251,14 @@ func (s *Server) setActionStateHandler(w http.ResponseWriter, r *http.Request) {
 	case model.StateOpen, model.StateDone, model.StateIgnored:
 	default:
 		writeError(w, http.StatusBadRequest, "invalid state")
+		return
+	}
+
+	// NUL(\u0000)은 JSON 으로는 합법이지만 PostgreSQL text 에 넣으면 22021
+	// 로 실패해 500 이 된다. 자르기 전에 거부한다(#288 2항). 응답에는 필드
+	// 이름과 고정 사유만 담긴다(search.InputError).
+	if err := search.ValidateInputText("note", req.Note, 0); err != nil {
+		writeError(w, http.StatusBadRequest, searchInputMessage(err))
 		return
 	}
 

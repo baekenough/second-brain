@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -22,6 +21,7 @@ import (
 	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/baekenough/second-brain/internal/auth"
+	"github.com/baekenough/second-brain/internal/httperr"
 	"github.com/baekenough/second-brain/internal/telemetry"
 )
 
@@ -347,13 +347,16 @@ func (c *Client) CompleteWithMessages(ctx context.Context, system string, messag
 			}
 			return result, nil
 		}
-		if isClientError(err) || errors.Is(err, ErrTruncated) {
+		if isClientError(err) || errors.Is(err, ErrTruncated) || errors.Is(err, httperr.ErrBodyTooLarge) {
 			// 4xx — do not retry.
 			//
 			// Truncation is not retried either: the same prompt against the
 			// same budget deterministically exhausts it again, so retrying
 			// only bills three full max_tokens generations for one failure.
 			// The error tells the operator which knob to turn instead.
+			//
+			// 응답 본문 상한 초과(httperr.ErrBodyTooLarge)도 같은 이유로
+			// 재시도하지 않는다.
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
 			return "", err
@@ -470,6 +473,9 @@ func (c *Client) StreamWithMessages(ctx context.Context, system string, messages
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
+		// 본문은 읽지 않고 상한 안에서 버리기만 한다 — 닫기만 하면 keep-alive
+		// 연결을 다시 쓰지 못한다(#288 3항).
+		httperr.Drain(resp.Body)
 		return &clientError{statusCode: resp.StatusCode}
 	}
 
@@ -560,6 +566,12 @@ func (c *Client) StreamWithMessages(ctx context.Context, system string, messages
 	return nil
 }
 
+// llmMaxResponseBytes 는 비스트리밍 chat completion 성공 응답 본문의 상한이다.
+// 답변 길이는 max_tokens 로 제한되므로 정상 응답은 수십 KB 다. reasoning
+// 필드를 싣는 공급자를 감안해 넉넉히 잡았고, 고장 난(또는 가로챈) 응답이
+// 메모리를 끝없이 쓰지 못하게 하는 방어선이다.
+const llmMaxResponseBytes = 16 << 20
+
 // safeFailure keeps upstream URLs, response fragments, and credential-provider
 // details out of logs and tracing. Preserve standard cancellation semantics.
 func safeFailure(stage string, err error) error {
@@ -621,16 +633,25 @@ func (c *Client) doRequest(ctx context.Context, reqBody chatRequest) (string, *t
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", nil, safeFailure("read response body", err)
+	// 오류 응답의 본문은 쓰지 않으므로 읽지 않고 상한 안에서 버린다(연결
+	// 재사용). 재시도 판정은 전과 같이 상태 코드로 한다: 4xx 는 clientError
+	// (재시도 안 함), 5xx 는 재시도.
+	if resp.StatusCode >= 400 {
+		httperr.Drain(resp.Body)
+		if resp.StatusCode < 500 {
+			return "", nil, &clientError{statusCode: resp.StatusCode}
+		}
+		return "", nil, fmt.Errorf("llm: server error %d", resp.StatusCode)
 	}
 
-	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-		return "", nil, &clientError{statusCode: resp.StatusCode}
-	}
-	if resp.StatusCode >= 500 {
-		return "", nil, fmt.Errorf("llm: server error %d", resp.StatusCode)
+	body, err := httperr.ReadBody(resp.Body, llmMaxResponseBytes)
+	if err != nil {
+		if errors.Is(err, httperr.ErrBodyTooLarge) {
+			// 상한 초과는 같은 요청을 다시 보내도 같다 — 호출자가 재시도하지
+			// 않도록 ErrBodyTooLarge 를 체인에 남긴다. 오류에 본문은 없다.
+			return "", nil, fmt.Errorf("llm: read response body: %w", err)
+		}
+		return "", nil, safeFailure("read response body", err)
 	}
 
 	var chatResp chatResponse

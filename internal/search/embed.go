@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -21,6 +21,7 @@ import (
 	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/baekenough/second-brain/internal/auth"
+	"github.com/baekenough/second-brain/internal/httperr"
 	"github.com/baekenough/second-brain/internal/telemetry"
 )
 
@@ -322,44 +323,29 @@ func (c *EmbedClient) Embed(ctx context.Context, text string) (vec []float32, er
 			continue
 		}
 
-		b, readErr := io.ReadAll(res.Body)
-		res.Body.Close()
-		if readErr != nil {
-			lastErr = fmt.Errorf("embed read response: %w", readErr)
+		if res.StatusCode != http.StatusOK {
+			// 비-200 본문은 오류에 싣지 않는다(#288 3항): 상태 코드와 정제한
+			// error.type/code 만 남긴다. 재시도 판정은 classifyStatus 가 상태
+			// 코드로만 한다.
+			statusErr := httperr.ReadStatusError("embed API status", res)
+			res.Body.Close()
+			if retry, err := c.classifyStatus(ctx, "embed", attempt, res, statusErr); !retry {
+				return nil, err
+			}
+			lastErr = statusErr
 			continue
 		}
 
-		switch {
-		case res.StatusCode == http.StatusTooManyRequests:
-			// 429 — honour Retry-After if present, else use backoff schedule.
-			retryAfter := parseRetryAfter(res.Header.Get("Retry-After"))
-			if attempt < embedMaxRetries {
-				delay := embedRetryDelays[attempt]
-				if retryAfter > delay {
-					delay = retryAfter
-				}
-				slog.Warn("embed: rate limited (429), backing off",
-					"attempt", attempt,
-					"delay", delay,
-					"retry_after_header", res.Header.Get("Retry-After"),
-				)
-				select {
-				case <-ctx.Done():
-					return nil, fmt.Errorf("embed: context cancelled during 429 backoff: %w", ctx.Err())
-				case <-time.After(delay):
-				}
+		b, readErr := httperr.ReadBody(res.Body, c.responseLimit(1))
+		res.Body.Close()
+		if readErr != nil {
+			if errors.Is(readErr, httperr.ErrBodyTooLarge) {
+				// 상한 초과는 다시 보내도 같다 — 재시도하지 않는다.
+				c.logBodyTooLarge("embed", 1)
+				return nil, fmt.Errorf("embed read response: %w", readErr)
 			}
-			lastErr = fmt.Errorf("embed API status 429: %s", b)
+			lastErr = fmt.Errorf("embed read response: %w", readErr)
 			continue
-
-		case res.StatusCode >= 500:
-			// 5xx server error — retryable.
-			lastErr = fmt.Errorf("embed API status %d: %s", res.StatusCode, b)
-			continue
-
-		case res.StatusCode != http.StatusOK:
-			// 4xx (non-429) — not retryable.
-			return nil, fmt.Errorf("embed API status %d: %s", res.StatusCode, b)
 		}
 
 		var resp struct {
@@ -534,42 +520,25 @@ func (c *EmbedClient) embedBatchOnce(ctx context.Context, texts []string) (_ [][
 			continue
 		}
 
-		b, readErr := io.ReadAll(res.Body)
-		res.Body.Close()
-		if readErr != nil {
-			lastErr = fmt.Errorf("embed batch read response: %w", readErr)
+		if res.StatusCode != http.StatusOK {
+			statusErr := httperr.ReadStatusError("embed batch API status", res)
+			res.Body.Close()
+			if retry, err := c.classifyStatus(ctx, "embed batch", attempt, res, statusErr); !retry {
+				return nil, err
+			}
+			lastErr = statusErr
 			continue
 		}
 
-		switch {
-		case res.StatusCode == http.StatusTooManyRequests:
-			retryAfter := parseRetryAfter(res.Header.Get("Retry-After"))
-			if attempt < embedMaxRetries {
-				delay := embedRetryDelays[attempt]
-				if retryAfter > delay {
-					delay = retryAfter
-				}
-				slog.Warn("embed batch: rate limited (429), backing off",
-					"attempt", attempt,
-					"delay", delay,
-					"retry_after_header", res.Header.Get("Retry-After"),
-				)
-				select {
-				case <-ctx.Done():
-					return nil, fmt.Errorf("embed batch: context cancelled during 429 backoff: %w", ctx.Err())
-				case <-time.After(delay):
-				}
+		b, readErr := httperr.ReadBody(res.Body, c.responseLimit(len(texts)))
+		res.Body.Close()
+		if readErr != nil {
+			if errors.Is(readErr, httperr.ErrBodyTooLarge) {
+				c.logBodyTooLarge("embed batch", len(texts))
+				return nil, fmt.Errorf("embed batch read response: %w", readErr)
 			}
-			lastErr = fmt.Errorf("embed batch API status 429: %s", b)
+			lastErr = fmt.Errorf("embed batch read response: %w", readErr)
 			continue
-
-		case res.StatusCode >= 500:
-			lastErr = fmt.Errorf("embed batch API status %d: %s", res.StatusCode, b)
-			continue
-
-		case res.StatusCode != http.StatusOK:
-			// 4xx (non-429) — not retryable.
-			return nil, fmt.Errorf("embed batch API status %d: %s", res.StatusCode, b)
 		}
 
 		var resp struct {
@@ -592,6 +561,100 @@ func (c *EmbedClient) embedBatchOnce(ctx context.Context, texts []string) (_ [][
 	}
 
 	return nil, fmt.Errorf("embed batch: all retries exhausted: %w", lastErr)
+}
+
+// classifyStatus 는 비-200 응답의 재시도 여부를 상태 코드로만 정한다. 단건과
+// 배치가 같은 규칙을 쓴다(오류 문자열에 기대지 않는다).
+//
+//   - 429: Retry-After 헤더(없으면 백오프 표)만큼 기다린 뒤 재시도한다.
+//     마지막 시도였으면 기다리지 않고 재시도 루프가 끝나게 둔다.
+//   - 5xx: 재시도한다.
+//   - 그 밖(429 가 아닌 4xx 등): 재시도하지 않고 statusErr 를 돌려준다.
+//
+// retry=false 이면 호출자는 err 를 그대로 반환한다. 429 대기 중 ctx 가
+// 끝나면 retry=false 와 취소 오류를 돌려준다. label 은 기존 로그·오류 문구
+// ("embed", "embed batch")를 유지하려고 받는다. 헤더는 본문을 드레인한
+// 뒤에도 그대로 읽을 수 있다.
+func (c *EmbedClient) classifyStatus(ctx context.Context, label string, attempt int, res *http.Response, statusErr error) (retry bool, err error) {
+	switch {
+	case res.StatusCode == http.StatusTooManyRequests:
+		retryAfter := parseRetryAfter(res.Header.Get("Retry-After"))
+		if attempt < embedMaxRetries {
+			delay := embedRetryDelays[attempt]
+			if retryAfter > delay {
+				delay = retryAfter
+			}
+			slog.Warn(label+": rate limited (429), backing off",
+				"attempt", attempt,
+				"delay", delay,
+				"retry_after_header", res.Header.Get("Retry-After"),
+			)
+			select {
+			case <-ctx.Done():
+				return false, fmt.Errorf("%s: context cancelled during 429 backoff: %w", label, ctx.Err())
+			case <-time.After(delay):
+			}
+		}
+		return true, nil
+	case res.StatusCode >= 500:
+		return true, nil
+	default:
+		return false, statusErr
+	}
+}
+
+// embedResponseDefaultDims 는 차원을 모를 때 응답 상한 계산에 쓰는 값이다.
+// 이 저장소가 쓰는 가장 큰 모델(text-embedding-3-large)의 기본 차원이다.
+const embedResponseDefaultDims = 3072
+
+// embedResponseBytesPerFloat 는 JSON 으로 적힌 float 하나의 바이트 상한 추정치다.
+//
+// OpenAI 응답은 들여쓰기한 JSON 이고 float 하나를 한 줄에 적는다. float32
+// 값을 float64 최단 표기로 적으면 약 20자(예: -0.018034566193819046)이고,
+// 여기에 들여쓰기·쉼표·개행이 붙는다. 실측(정규화한 3072차원, 2칸
+// 들여쓰기)은 약 30.4B/float 였다. 32 로 두면 정상 응답이 상한의 94%(CRLF
+// 97%)이고 4칸 들여쓰기면 넘는다. 상한 초과는 재시도하지 않으므로 백필이
+// 매 틱 실패한다. 그래서 4칸 들여쓰기 + CRLF(약 40B)까지 덮도록 48 로 잡았다.
+const embedResponseBytesPerFloat = 48
+
+// embedResponseOverhead 는 벡터 외의 응답 부분(object·model·usage 와 항목별
+// index 키)을 덮는 여유분이다.
+const embedResponseOverhead = 1 << 20
+
+// responseLimit 은 입력 n 개에 대한 성공 응답 본문의 바이트 상한이다.
+//
+// 배치는 문자 수(maxBatchChars)로만 나누므로 입력 개수에 고정 상한이 없다.
+// OpenAI 최대 입력 2048개 × 1536차원이면 응답이 약 63MB 가 된다. 고정
+// 상한은 너무 크거나(방어 효과 없음) 너무 작아(정상 배치 거부) 입력 개수와
+// 차원으로 계산한다. 차원은 요청에 싣는 dimensions → 설정된 dim →
+// embedResponseDefaultDims 순으로 쓴다.
+func (c *EmbedClient) responseLimit(n int) int64 {
+	if n < 1 {
+		n = 1
+	}
+	return int64(n)*int64(c.responseDims())*embedResponseBytesPerFloat + embedResponseOverhead
+}
+
+// responseDims 는 응답 상한 계산에 쓰는 차원이다.
+func (c *EmbedClient) responseDims() int {
+	if c.requestDimensions > 0 {
+		return c.requestDimensions
+	}
+	if c.dim > 0 {
+		return c.dim
+	}
+	return embedResponseDefaultDims
+}
+
+// logBodyTooLarge 는 성공 응답이 상한을 넘었을 때 상한 계산의 입력(limit·n·
+// dims)만 남긴다. 본문은 남기지 않는다. 운영자가 상한이 정상 응답을 자른
+// 것인지(상수 조정 필요) 고장 난 응답인지 가를 수 있게 한다.
+func (c *EmbedClient) logBodyTooLarge(label string, n int) {
+	slog.Warn(label+": response body exceeds limit",
+		"limit", c.responseLimit(n),
+		"n", n,
+		"dims", c.responseDims(),
+	)
 }
 
 // setAuth attaches the Authorization header when a token source is configured.

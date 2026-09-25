@@ -27,3 +27,4 @@
 - [project_search_concurrency_gate_286.md](project_search_concurrency_gate_286.md) — #286-3 검색 게이트: 검색호출 단위 슬롯(중첩 금지), /ask는 TryAcquire 폴링으로 REST에 양보(FIFO 공유 시 기아), SMS PII 마스킹이 테스트 표식 깨뜨림
 - [project_ingest_messages_contract_290.md](project_ingest_messages_contract_290.md) — #290 ingest/messages 응답 계약(201=커서전진/503=재전송), 오류분류, upsert+청크 한 tx, 실DB 결함주입(pg_sleep 트리거+terminate), ci [7/7] 한글
 - [project_call_transcript_protect_292.md](project_call_transcript_protect_292.md) — #292 PR-B: 통화 전사 보호 CASE(메타 패치 방식·content_changed 갱신후 비교), 녹음 응답 계약·ReadTimeout poison 함정, 소프트삭제 부활 전수
+- [project_upstream_error_body_288.md](project_upstream_error_body_288.md) — #288 2·3항: internal/httperr(upstream 대신, #297 병렬 회피), type/code 정규식 숫자 제외, embed classifyStatus, actions 8KiB

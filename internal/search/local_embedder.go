@@ -5,9 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"time"
+
+	"github.com/baekenough/second-brain/internal/httperr"
 )
 
 // localEmbedTimeout is the HTTP timeout for a single Ollama embedding request.
@@ -85,6 +86,10 @@ func (e *LocalEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]flo
 	return out, nil
 }
 
+// localEmbedMaxResponseBytes 는 Ollama /api/embeddings 성공 응답 본문의
+// 상한이다. 벡터 하나(8192차원 × 약 22B ≈ 180KB)를 넉넉히 덮는다.
+const localEmbedMaxResponseBytes = 1 << 20
+
 // embed sends a single POST /api/embeddings request to the Ollama server.
 func (e *LocalEmbedder) embed(ctx context.Context, text string) ([]float32, error) {
 	payload := struct {
@@ -112,12 +117,14 @@ func (e *LocalEmbedder) embed(ctx context.Context, text string) ([]float32, erro
 	}
 	defer res.Body.Close()
 
-	b, err := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusOK {
+		// 본문(Ollama 는 {"error":"…"} 에 요청 조각을 담을 수 있다)은 오류에
+		// 싣지 않는다(#288 3항).
+		return nil, httperr.ReadStatusError("local embed API status", res)
+	}
+	b, err := httperr.ReadBody(res.Body, localEmbedMaxResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("local embed read response: %w", err)
-	}
-	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("local embed API status %d: %s", res.StatusCode, b)
 	}
 
 	var resp struct {
