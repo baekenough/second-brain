@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/baekenough/second-brain/internal/logsafe"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -346,7 +347,7 @@ func (s *DocumentStore) preUpsertTrackedChecks(ctx context.Context, doc *model.D
 		switch {
 		case qErr == nil:
 			slog.Info("store: skipping duplicate call content",
-				"source_id", doc.SourceID,
+				"source_id", logsafe.SafeSourceID(doc.SourceID),
 				"content_len", len(doc.Content),
 			)
 			return ErrDuplicateTranscript
@@ -500,7 +501,7 @@ func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
 		case err == nil:
 			// A duplicate row was found — skip the insert.
 			slog.Info("store: skipping duplicate call content",
-				"source_id", doc.SourceID,
+				"source_id", logsafe.SafeSourceID(doc.SourceID),
 				"content_len", len(doc.Content),
 			)
 			return ErrDuplicateTranscript
@@ -636,7 +637,7 @@ func (s *DocumentStore) AttachTranscript(ctx context.Context, doc *model.Documen
 	switch {
 	case qErr == nil:
 		slog.Info("store: skipping duplicate call content (attach-transcript)",
-			"source_id", doc.SourceID,
+			"source_id", logsafe.SafeSourceID(doc.SourceID),
 			"content_len", len(doc.Content),
 		)
 		return false, ErrDuplicateTranscript

@@ -9,7 +9,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"mime/multipart"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -20,6 +19,7 @@ import (
 
 	"github.com/baekenough/second-brain/internal/audiovalidate"
 	"github.com/baekenough/second-brain/internal/collector/smsmap"
+	"github.com/baekenough/second-brain/internal/logsafe"
 	"github.com/baekenough/second-brain/internal/model"
 )
 
@@ -895,31 +895,10 @@ func isDiskErr(err error) bool {
 // 속성이다. 오류 문구는 남기지 않는다 — *fs.PathError·*os.LinkError 의 문구에는
 // 저장 경로가 들어 있고, 통화 녹음의 저장 파일 이름은 기본 설정에서 전화번호다.
 // 연산 이름(open·write·rename …)과 errno 문구(예: "no space left on device"),
-// 시간 초과 여부만 남긴다.
+// 시간 초과 여부만 남긴다. 구현은 logsafe.ErrAttrs 로 옮겼다(#297) — 속성 이름
+// (err_type·op·errno·timeout·truncated)은 그대로다.
 func recordingErrAttrs(err error) []any {
-	attrs := []any{"err_type", fmt.Sprintf("%T", err)}
-	var (
-		pathErr *fs.PathError
-		linkErr *os.LinkError
-		errno   syscall.Errno
-		netErr  net.Error
-	)
-	switch {
-	case errors.As(err, &pathErr):
-		attrs = append(attrs, "op", pathErr.Op)
-	case errors.As(err, &linkErr):
-		attrs = append(attrs, "op", linkErr.Op)
-	}
-	if errors.As(err, &errno) {
-		attrs = append(attrs, "errno", errno.Error())
-	}
-	if errors.As(err, &netErr) {
-		attrs = append(attrs, "timeout", netErr.Timeout())
-	}
-	if errors.Is(err, io.ErrUnexpectedEOF) {
-		attrs = append(attrs, "truncated", true)
-	}
-	return attrs
+	return logsafe.ErrAttrs(err)
 }
 
 // firstErr 는 nil 이 아닌 첫 오류다.

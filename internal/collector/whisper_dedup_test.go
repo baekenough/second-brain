@@ -13,8 +13,10 @@ package collector
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -155,15 +157,18 @@ func TestWhisperCollector_NilIndex_FallsBackToMtime(t *testing.T) {
 
 // TestWhisperCollector_Concurrency verifies that with WhisperConcurrency=4 and
 // several unknown files, every file is transcribed exactly once — no duplicate
-// submission, no loss — guarding the worker-pool against races. Each filename is
-// recorded in a sync.Map keyed by filename with an atomic per-file counter; any
-// filename hit more than once fails the test.
+// submission, no loss — guarding the worker-pool against races. 업로드마다
+// 올라온 오디오 바이트를 키로 sync.Map 에 파일별 원자 카운터를 둔다. 두 번
+// 이상 전사된 파일이 있으면 실패한다.
+//
+// 멀티파트 파일 이름이 아니라 내용으로 구분한다: #297(D3) 이후 업로드 이름은
+// 모두 "audio"+확장자라서, 파일마다 고유한 바이트 꼬리를 붙인다.
 func TestWhisperCollector_Concurrency(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
 
-	// hits maps uploaded filename → *int64 atomic counter.
+	// hits 는 올라온 오디오 바이트 → *int64 원자 카운터다.
 	var hits sync.Map
 	var totalHits int64
 
@@ -176,7 +181,11 @@ func TestWhisperCollector_Concurrency(t *testing.T) {
 		var fname string
 		if r.MultipartForm != nil {
 			if fhs, ok := r.MultipartForm.File["file"]; ok && len(fhs) > 0 {
-				fname = fhs[0].Filename
+				if f, err := fhs[0].Open(); err == nil {
+					b, _ := io.ReadAll(f)
+					_ = f.Close()
+					fname = string(b)
+				}
 			}
 		}
 		ctr, _ := hits.LoadOrStore(fname, new(int64))
@@ -191,7 +200,19 @@ func TestWhisperCollector_Concurrency(t *testing.T) {
 	now := time.Now().UTC()
 	for i := 0; i < fileCount; i++ {
 		name := filepath.Base(filepath.Join(dir, namef(i)))
-		writeDummyAudio(t, dir, name, now.Add(-time.Duration(i)*time.Minute).Truncate(time.Second))
+		p := writeDummyAudio(t, dir, name, now.Add(-time.Duration(i)*time.Minute).Truncate(time.Second))
+		// 파일마다 고유한 꼬리 바이트(헤더 검사는 앞 8바이트만 읽으므로
+		// 파일은 여전히 유효하다).
+		f, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatalf("open %s: %v", name, err)
+		}
+		if _, err := f.WriteString(name); err != nil {
+			t.Fatalf("append %s: %v", name, err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("close %s: %v", name, err)
+		}
 	}
 
 	cfg := &config.Config{

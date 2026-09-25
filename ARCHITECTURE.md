@@ -908,6 +908,7 @@ const API_KEY = process.env.API_KEY ?? "";  // 서버사이드만 사용 (클라
 | `WHISPER_CLOUD_ALLOWED` | `false` | 오디오가 OpenAI로 전송됨을 인지했다는 플래그. 동작을 막지 않고 로그 레벨만 변경 |
 | `DIARIZATION_API_URL` | — | (레거시 로컬 전용) pyannote 화자 분리 서버 URL — 기본 클라우드 전사 경로(gpt-4o-transcribe-diarize)는 이 값을 사용하지 않음 |
 | `DIARIZATION_ENABLED` | `false` | (레거시 로컬 전용) 로컬 pyannote 화자 분리 셀렉터 — 클라우드 화자 분리는 항상 내장되어 있어 이 값과 무관 |
+| `LOG_REF_KEY` | — (프로세스별 무작위 키) | 로그에서 파일·source_id 를 가리키는 `file_ref`(HMAC-SHA256 앞 8바이트) 계산 키(#297). 통화 녹음 파일 이름에는 기본 설정에서 전화번호가 들어가므로 로그에는 경로 대신 이 참조값만 남긴다. **`file_ref` 는 같은 키로 만든 값끼리만 맞춰 볼 수 있다** — 비워 두면 프로세스마다 키가 달라 같은 프로세스 안에서만 대조된다(재시작하면 ref 도 바뀐다). server·collector 로그를 교차 추적하거나 로컬에서 ref 를 계산해 대조하려면 **server·collector 에 같은 `LOG_REF_KEY` 를 주입**한다. 16바이트 이상이어야 하며(짧으면 시작 실패) 키 값은 어디에도 출력하지 않는다. 시작 로그 `log_ref_key` 에는 출처(`env`/`ephemeral`)만 남는다 |
 
 ### cliproxy 통합
 

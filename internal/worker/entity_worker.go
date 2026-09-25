@@ -5,9 +5,10 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/baekenough/second-brain/internal/llm"
+	"github.com/baekenough/second-brain/internal/logsafe"
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/google/uuid"
 )
 
 // EntityDocumentLister is the read/write side of the document store required
@@ -141,7 +142,7 @@ func (w *EntityWorker) tick(ctx context.Context) {
 			// LLM failure is considered transient; leave entities_processed_at
 			// NULL so the document is retried on the next tick.
 			slog.Warn("entity worker: extraction failed",
-				"doc_id", doc.ID, "source_id", doc.SourceID, "error", err)
+				"doc_id", doc.ID, "source_id", logsafe.SafeSourceID(doc.SourceID), "error", err)
 			continue
 		}
 

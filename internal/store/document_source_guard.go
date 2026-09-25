@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/baekenough/second-brain/internal/logsafe"
 	"github.com/baekenough/second-brain/internal/model"
 )
 
@@ -115,7 +116,7 @@ func checkSourceTypeGuard(doc *model.Document) {
 		// Include identifying (non-content) fields so a reintroduced write
 		// path — e.g. a re-enabled collector or a tool that reverts to this
 		// source_type — is traceable from the log line alone.
-		attrs := []any{"source_type", st, "source_id", doc.SourceID}
+		attrs := []any{"source_type", st, "source_id", logsafe.SafeSourceID(doc.SourceID)}
 		for _, k := range deprecatedGuardMetadataKeys {
 			if v := metadataStringField(doc.Metadata, k); v != "" {
 				attrs = append(attrs, "metadata_"+k, v)
