@@ -10,9 +10,13 @@ package scheduler
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/baekenough/second-brain/internal/llm"
 	"github.com/baekenough/second-brain/internal/model"
 )
 
@@ -73,12 +77,12 @@ func TestScheduler_MergeDocument_UsesAttachTranscript(t *testing.T) {
 	}
 }
 
-// TestScheduler_StandaloneDocument_UsesUpsert verifies that a document with
-// NO metadata["transcript_source_id"] (a standalone transcript, or any other
-// collector's document) still goes through the ordinary store.Upsert path,
-// and the ledger records the document's own SourceID (there is no separate
-// raw identity to prefer).
-func TestScheduler_StandaloneDocument_UsesUpsert(t *testing.T) {
+// TestScheduler_StandaloneDocument_UsesUpsertTracked 는
+// metadata["transcript_source_id"] 가 없는 문서(단독 전사나 다른 수집기의
+// 문서)가 비병합 upsert 경로로 가는지 본다. #292 부터 그 경로는
+// store.UpsertTracked 라서 스케줄러가 저장된 내용이 바뀌었는지 안다. 원장에는
+// 문서 자신의 SourceID 가 남는다(따로 우선할 원래 오디오 식별자가 없다).
+func TestScheduler_StandaloneDocument_UsesUpsertTracked(t *testing.T) {
 	t.Parallel()
 
 	const sourceID = "transcript:legacy/orphan.m4a"
@@ -95,8 +99,8 @@ func TestScheduler_StandaloneDocument_UsesUpsert(t *testing.T) {
 
 	sched.run(context.Background(), col)
 
-	if st.upserts != 1 {
-		t.Errorf("Upsert called %d times, want 1", st.upserts)
+	if st.tracked != 1 || st.upserts != 1 {
+		t.Errorf("UpsertTracked called %d times (upserts %d), want 1", st.tracked, st.upserts)
 	}
 	if got := st.attachCount(); got != 0 {
 		t.Errorf("AttachTranscript called %d times, want 0 (standalone document must never merge)", got)
@@ -105,5 +109,66 @@ func TestScheduler_StandaloneDocument_UsesUpsert(t *testing.T) {
 	recorded := st.recordedIDs()
 	if len(recorded) != 1 || recorded[0] != sourceID {
 		t.Errorf("recorded ledger ids = %v, want [%q]", recorded, sourceID)
+	}
+}
+
+// countingCompleter 는 엔티티 추출 LLM 호출 수를 센다.
+type countingCompleter struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *countingCompleter) Enabled() bool { return true }
+func (c *countingCompleter) CompleteWithMessages(_ context.Context, _ string, _ []llm.Message) (string, error) {
+	c.mu.Lock()
+	c.calls++
+	c.mu.Unlock()
+	return `{"entities":[]}`, nil
+}
+
+func (c *countingCompleter) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+type nopEntityLinker struct{}
+
+func (nopEntityLinker) UpsertAndLinkEntities(context.Context, uuid.UUID, []model.Entity) error {
+	return nil
+}
+
+// TestScheduler_UnchangedContentSkipsFollowUpWork (#292): 저장된 content 가
+// 그대로면(같은 내용 재수집·통화 전사 보호) 엔티티 추출(LLM)을 부르지 않는다.
+// 바뀌었으면 예전처럼 부른다. 비병합(UpsertTracked)·병합(AttachTranscript)
+// 경로 모두 같다. 청크 쪽은 실DB 테스트
+// (TestScheduler_RecollectRechunksOnlyWhenChanged_RealDB)가 본다.
+func TestScheduler_UnchangedContentSkipsFollowUpWork(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		meta      map[string]any
+		unchanged bool
+		wantCalls int
+	}{
+		{"standalone changed", map[string]any{}, false, 1},
+		{"standalone unchanged", map[string]any{}, true, 0},
+		{"merge changed", map[string]any{"transcript_source_id": "transcript:a.m4a"}, false, 1},
+		{"merge unchanged", map[string]any{"transcript_source_id": "transcript:a.m4a"}, true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			col := &singleDocCollector{doc: model.Document{
+				SourceType: model.SourceCall, SourceID: "call-log:1:a:b", Title: "t",
+				Content: "본문", Metadata: tc.meta,
+			}}
+			st := &mockStore{unchanged: tc.unchanged}
+			llmc := &countingCompleter{}
+			sched := New(st, disabledEmbed(), col).WithEntityExtraction(nopEntityLinker{}, llmc)
+			sched.run(context.Background(), col)
+			if got := llmc.count(); got != tc.wantCalls {
+				t.Errorf("entity extraction LLM calls = %d, want %d", got, tc.wantCalls)
+			}
+		})
 	}
 }
