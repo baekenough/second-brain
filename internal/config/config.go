@@ -639,6 +639,14 @@ type Config struct {
 	// 실패하게 되고, 무제한 설정은 의도적으로 두지 않는다.
 	SearchRequestTimeout time.Duration
 
+	// SearchMaxConcurrency 는 동시 검색 수 상한 SEARCH_MAX_CONCURRENCY 다
+	// (#286 항목 3). 0 은 "자동" — cmd/server 가 DB 풀 크기로 max(1, MaxConns/2)
+	// 를 쓴다. 양수는 그 값을 쓰되 MaxConns−1 로 잘린다(비검색 경로에 연결 1개는
+	// 반드시 남긴다). 풀 크기를 모르는 여기서는 상한을 자르지 않는다 — 계산은
+	// api.SearchConcurrency 한 곳에 있다. 0·음수·잘못된 값은 경고 후 자동이다.
+	// 제한을 끄는 설정은 의도적으로 두지 않는다.
+	SearchMaxConcurrency int
+
 	// FeedbackEvidenceEnabled gates POST /api/v1/feedback/evidence (Part D).
 	// FEEDBACK_EVIDENCE_ENABLED env var, default false.
 	//
@@ -988,6 +996,9 @@ func Load() (*Config, error) {
 		// #282 검색 요청 타임아웃 — 기본값 근거는 필드 doc comment 참고.
 		SearchRequestTimeout: SearchRequestTimeout(),
 
+		// #286 동시 검색 상한 — 0 은 자동(풀 크기 기반), 필드 doc comment 참고.
+		SearchMaxConcurrency: searchMaxConcurrency(),
+
 		// Part D feedback collection — default false (see doc comment above).
 		FeedbackEvidenceEnabled: envFlag("FEEDBACK_EVIDENCE_ENABLED"),
 
@@ -1035,6 +1046,26 @@ const DefaultSearchRequestTimeout = 60 * time.Second
 // 이 함수를 불러서 cfg.SearchRequestTimeout 과 값이 어긋날 수 없다.
 func SearchRequestTimeout() time.Duration {
 	return timeoutSeconds("SEARCH_REQUEST_TIMEOUT_SECONDS", DefaultSearchRequestTimeout)
+}
+
+// searchMaxConcurrency 는 SEARCH_MAX_CONCURRENCY 를 읽는다. 비어 있으면 0(자동),
+// 양의 정수가 아니면 경고를 남기고 0(자동)이다.
+func searchMaxConcurrency() int {
+	const key = "SEARCH_MAX_CONCURRENCY"
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		slog.Warn("config: search concurrency is invalid; using automatic value",
+			"key", key,
+			"value", v,
+			"error", err,
+		)
+		return 0
+	}
+	return n
 }
 
 // timeoutSeconds parses an integer-seconds env var into a duration, logging

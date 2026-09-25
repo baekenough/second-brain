@@ -388,7 +388,11 @@ func (s *Server) askHandler(w http.ResponseWriter, r *http.Request) {
 	)
 
 	// Stage 2: retrieval assembly (원문/정리 vs 추론 layers, spec §5.3).
-	result, err := assembleRetrieval(ctx, s.search, params, plan, s.askTopK, s.askInsightM, s.askRerankDefault)
+	// 검색 호출마다 검색 슬롯을 최대 askSearchWaitMax(ask ctx 안에서) 기다리고
+	// REST 대기자에게 양보한다(#286 항목 3, gatedSearcher). /ask 는
+	// searchWithTimeout 을 거치지 않으므로 여기서 감싼다.
+	searcher := gatedSearcher{inner: s.search, gate: s.searchGate}
+	result, err := assembleRetrieval(ctx, searcher, params, plan, s.askTopK, s.askInsightM, s.askRerankDefault)
 	if err != nil {
 		slog.Error("ask: retrieval failed", "error", err)
 		_ = writeSSEEvent(w, flusher, "error", askErrorPayload{Message: "retrieval failed"})

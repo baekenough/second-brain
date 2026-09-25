@@ -303,3 +303,24 @@ func TestHTTPServerWriteTimeout_CoversAskAndSearch(t *testing.T) {
 		t.Fatalf("HTTPWriteTimeout %v must exceed the ask timeout %ds", cfg.HTTPWriteTimeout, cfg.AskTimeoutSeconds)
 	}
 }
+
+// TestWarnSearchWriteTimeout 은 슬롯 대기 + 검색 타임아웃이 WriteTimeout 에
+// 닿을 때만 경고하는지 고정한다(#286). 기본값(60초 + 1초 < 90초)은 경고 없음.
+func TestWarnSearchWriteTimeout(t *testing.T) {
+	cases := []struct {
+		name          string
+		search, write time.Duration
+		want          bool
+	}{
+		{name: "defaults_ok", search: 60 * time.Second, write: 90 * time.Second, want: false},
+		{name: "just_below", search: 88 * time.Second, write: 90 * time.Second, want: false},
+		{name: "wait_reaches_write_timeout", search: 89 * time.Second, write: 90 * time.Second, want: true},
+		{name: "search_equals_write_timeout", search: 90 * time.Second, write: 90 * time.Second, want: true},
+		{name: "search_above_write_timeout", search: 120 * time.Second, write: 90 * time.Second, want: true},
+	}
+	for _, tc := range cases {
+		if got := warnSearchWriteTimeout(tc.search, tc.write); got != tc.want {
+			t.Errorf("%s: warnSearchWriteTimeout(%v, %v) = %v, want %v", tc.name, tc.search, tc.write, got, tc.want)
+		}
+	}
+}

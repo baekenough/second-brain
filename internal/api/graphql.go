@@ -292,9 +292,18 @@ func (s *Server) buildSchema() (graphql.Schema, error) {
 				}
 
 				start := time.Now()
+				// 검색 슬롯은 이 필드의 검색 호출 동안만 쥔다(search_gate.go 의
+				// "슬롯 단위" 참고). 필드는 한 goroutine 에서 순차로 풀리므로 한
+				// 요청이 동시에 쥐는 슬롯은 최대 1개라 데드락이 없다.
 				results, err := s.searchWithTimeout(p.Context, q)
 				if err != nil {
 					switch {
+					case errors.Is(err, errSearchBusy):
+						// GraphQL 관례대로 HTTP 200 + errors[] — 다른 필드는 그대로 결과를 받는다.
+						slog.Warn("graphql: search capacity exceeded",
+							"max_concurrency", s.searchGate.capacity(),
+							"wait", searchGateWait.String())
+						return nil, errSearchBusy
 					case errors.Is(err, errSearchTimeout):
 						slog.Warn("graphql: search timed out", "timeout", s.searchTimeout.String(), "error", err)
 						return nil, errSearchTimeout

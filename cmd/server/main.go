@@ -202,6 +202,7 @@ func run() error {
 		WithAskConfig(time.Duration(cfg.AskTimeoutSeconds)*time.Second, cfg.AskContextTopK, cfg.AskContextInsightM).
 		WithAskRerankDefault(cfg.RerankDefault).
 		WithSearchTimeout(cfg.SearchRequestTimeout).
+		WithSearchConcurrency(searchConcurrency(pg.MaxConns(), cfg.SearchMaxConcurrency)).
 		WithAskSessions(askSessionStore).
 		WithGolden(store.NewGoldenStore(pg))
 
@@ -249,6 +250,8 @@ func run() error {
 			"ask_timeout_seconds", cfg.AskTimeoutSeconds,
 		)
 	}
+
+	warnSearchWriteTimeout(cfg.SearchRequestTimeout, cfg.HTTPWriteTimeout)
 
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.Port,
@@ -311,6 +314,48 @@ func buildSearchService(
 ) *search.Service {
 	return search.AssembleService(docStore, embedClient, chunkStore, reranker,
 		entityStore, osLane, llmClient, weightsHistoryStore, activeWeightsEnabled)
+}
+
+// searchConcurrency 는 동시 검색 상한 K 를 정하고 시작 로그에 실제 풀 크기와
+// 함께 남긴다(#286 항목 3). 풀 크기(max_conns)는 운영 DSN 에 pool_max_conns 가
+// 없어 pgx 기본값(max(4, CPU 수))이 쓰이므로, 배포 후 이 로그로 K 가 적절한지
+// 확인한다. DSN 은 출력하지 않는다.
+func searchConcurrency(maxConns int32, configured int) int {
+	k, clamped := api.SearchConcurrency(maxConns, configured)
+	slog.Info("search: concurrency limit",
+		"max_conns", maxConns,
+		"max_concurrency", k,
+		"configured", configured, // 0 = 자동(max(1, max_conns/2))
+	)
+	if clamped {
+		slog.Warn("SEARCH_MAX_CONCURRENCY exceeds the pool size minus one; clamped so non-search paths (ingest) keep a connection",
+			"configured", configured,
+			"max_conns", maxConns,
+			"max_concurrency", k,
+		)
+	}
+	if maxConns <= 1 {
+		slog.Warn("database pool has a single connection; search can still starve ingest — raise pool_max_conns",
+			"max_conns", maxConns,
+		)
+	}
+	return k
+}
+
+// warnSearchWriteTimeout 은 REST 검색의 최장 경로(슬롯 대기 api.SearchGateWait +
+// SEARCH_REQUEST_TIMEOUT_SECONDS)가 HTTP WriteTimeout 이상이면 경고하고 true 를
+// 돌려준다(#286). 그러면 504/503 JSON 을 쓰기 전에 연결이 잘려 클라이언트는 빈
+// 응답을 받는다. /ask 비교와 같은 방식으로 시작을 막지 않고 경고만 한다.
+func warnSearchWriteTimeout(searchTimeout, writeTimeout time.Duration) bool {
+	if searchTimeout+api.SearchGateWait < writeTimeout {
+		return false
+	}
+	slog.Warn("SEARCH_REQUEST_TIMEOUT_SECONDS plus the search slot wait is not below HTTP_WRITE_TIMEOUT_SECONDS — slow /search responses may be cut before the 504 is written",
+		"search_request_timeout", searchTimeout.String(),
+		"search_slot_wait", api.SearchGateWait.String(),
+		"http_write_timeout", writeTimeout.String(),
+	)
+	return true
 }
 
 // wireActionsAndBriefing conditionally registers the /api/v1/actions and
