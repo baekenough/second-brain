@@ -752,6 +752,47 @@ func TestLoad_SearchRequestTimeoutSeconds(t *testing.T) {
 	}
 }
 
+// TestLoad_SearchMaxConcurrency 는 SEARCH_MAX_CONCURRENCY 파싱을 고정한다
+// (#286 항목 3). 0·음수·잘못된 값은 "제한 없음"이 아니라 자동(0)으로 떨어져야
+// 한다 — 게이트를 끄는 설정은 없다. 과대값은 여기서 그대로 두고 풀 크기를 아는
+// api.SearchConcurrency 가 MaxConns-1 로 자른다(그쪽 테스트가 고정).
+// t.Setenv 를 쓰므로 병렬로 돌리지 않는다.
+func TestLoad_SearchMaxConcurrency(t *testing.T) {
+	cases := []struct {
+		name   string
+		envVal string
+		unset  bool
+		want   int
+	}{
+		{name: "unset_is_auto", unset: true, want: 0},
+		{name: "empty_is_auto", envVal: "", want: 0},
+		{name: "explicit_3", envVal: "3", want: 3},
+		{name: "surrounding_space", envVal: " 6 ", want: 6},
+		{name: "huge_kept_for_clamp_later", envVal: "100000", want: 100000},
+		{name: "zero_is_auto", envVal: "0", want: 0},
+		{name: "negative_is_auto", envVal: "-2", want: 0},
+		{name: "not_a_number_is_auto", envVal: "four", want: 0},
+		{name: "float_is_auto", envVal: "2.5", want: 0},
+		{name: "overflow_is_auto", envVal: "99999999999999999999", want: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unset {
+				unsetenv(t, "SEARCH_MAX_CONCURRENCY")
+			} else {
+				t.Setenv("SEARCH_MAX_CONCURRENCY", tc.envVal)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.SearchMaxConcurrency != tc.want {
+				t.Errorf("SearchMaxConcurrency = %d, want %d", cfg.SearchMaxConcurrency, tc.want)
+			}
+		})
+	}
+}
+
 // TestLoad_FeedbackEvidenceEnabled verifies FEEDBACK_EVIDENCE_ENABLED parsing.
 // The accepted truthy set deliberately mirrors the api handler's own gate
 // (1/true/yes/on, case-insensitive) so that wiring and handler cannot

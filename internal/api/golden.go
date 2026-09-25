@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"math"
 	"net/http"
@@ -299,10 +300,24 @@ func (s *Server) goldenGenerateHandler(w http.ResponseWriter, r *http.Request) {
 func (s *Server) goldenSearchStream(ctx context.Context, label string, q model.SearchQuery) ([]*model.SearchResult, error) {
 	results, err := s.searchWithTimeout(ctx, q)
 	if err != nil {
-		slog.Error("golden: "+label+" search failed", "error", err)
+		// 슬롯 부족은 writeGoldenSearchFailure 가 Warn 으로 한 번 남긴다.
+		if !errors.Is(err, errSearchBusy) {
+			slog.Error("golden: "+label+" search failed", "error", err)
+		}
 		return nil, err
 	}
 	return results, nil
+}
+
+// writeGoldenSearchFailure 는 golden/next 의 검색 실패를 응답으로 바꾼다.
+// 슬롯 부족(#286 항목 3)은 다른 검색 진입점과 같은 503 + Retry-After, 그 밖은
+// 기존대로 500 이다(타임아웃 504 분리는 이 변경의 범위가 아니다).
+func (s *Server) writeGoldenSearchFailure(w http.ResponseWriter, err error) {
+	if errors.Is(err, errSearchBusy) {
+		s.writeSearchBusy(w, "golden")
+		return
+	}
+	writeError(w, http.StatusInternalServerError, "internal server error")
 }
 
 func (s *Server) goldenNextHandler(w http.ResponseWriter, r *http.Request) {
@@ -373,7 +388,7 @@ func (s *Server) goldenNextHandler(w http.ResponseWriter, r *http.Request) {
 		OccurredTo:       relTo,
 	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal server error")
+		s.writeGoldenSearchFailure(w, err)
 		return
 	}
 
@@ -386,7 +401,7 @@ func (s *Server) goldenNextHandler(w http.ResponseWriter, r *http.Request) {
 		OccurredTo:       recTo,
 	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal server error")
+		s.writeGoldenSearchFailure(w, err)
 		return
 	}
 
@@ -404,7 +419,7 @@ func (s *Server) goldenNextHandler(w http.ResponseWriter, r *http.Request) {
 			IncludeRetention: true,
 		})
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "internal server error")
+			s.writeGoldenSearchFailure(w, err)
 			return
 		}
 
@@ -419,7 +434,7 @@ func (s *Server) goldenNextHandler(w http.ResponseWriter, r *http.Request) {
 			OccurredTo:       &fbRecentTo,
 		})
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "internal server error")
+			s.writeGoldenSearchFailure(w, err)
 			return
 		}
 

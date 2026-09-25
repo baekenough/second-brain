@@ -243,5 +243,10 @@ func (pg *Postgres) runMigrationWithEmbeddingDim(ctx context.Context, sql string
 // Pool returns the underlying pgx pool for use by store implementations.
 func (pg *Postgres) Pool() *pgxpool.Pool { return pg.pool }
 
+// MaxConns 는 풀의 최대 연결 수다. DSN 의 pool_max_conns 가 없으면 pgx 기본값
+// max(4, runtime.NumCPU()) 이다. 동시 검색 상한(SEARCH_MAX_CONCURRENCY, #286)을
+// 정하는 입력이고 시작 로그에 남긴다(DSN 자체는 로그에 남기지 않는다).
+func (pg *Postgres) MaxConns() int32 { return pg.pool.Stat().MaxConns() }
+
 // Close releases all pool connections.
 func (pg *Postgres) Close() { pg.pool.Close() }

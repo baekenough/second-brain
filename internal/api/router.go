@@ -135,6 +135,10 @@ type Server struct {
 	// 0 이 될 수 없다. WithSearchTimeout 으로 바꾼다.
 	searchTimeout time.Duration
 
+	// searchGate 는 동시 검색 수 상한이다(#286 항목 3, search_gate.go). nil 이면
+	// 제한이 없다. WithSearchConcurrency 로 건다.
+	searchGate *searchGate
+
 	// askRerankDefault mirrors cfg.RerankDefault (SEARCH_RERANK_DEFAULT):
 	// whether /api/v1/ask requests opt into cross-encoder reranking
 	// (model.SearchQuery.UseRerank) by default. Zero value (false) keeps a

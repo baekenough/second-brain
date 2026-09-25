@@ -100,7 +100,25 @@ func writeBoundedJSONError(w http.ResponseWriter, err error, maxBytes int64, inv
 // 검색 서비스는 레인마다 오류를 다르게 감싸고(문자열화, 57014 PgError 등)
 // 일부 레인 실패는 다른 오류로 이어지기도 해서, 오류 체인에 context 오류가
 // 남는다는 보장이 없다. 체인만 보면 타임아웃을 500 으로 오분류할 수 있다.
+//
+// 타임아웃 전에 검색 슬롯(search_gate.go, #286 항목 3)을 얻는다. 최대
+// searchGateWait 만 기다리고 못 얻으면 검색기를 부르지 않고 errSearchBusy 를
+// 돌려준다. 슬롯을 얻은 뒤에 타임아웃 ctx 를 만들어 REST·golden 에서는 대기
+// 시간이 검색 예산을 먹지 않게 한다. GraphQL 은 guardGraphQL 이 건 요청 단위
+// 기한(parent) 안에서 기다리므로, 대기 중 그 기한이 끝나면 슬롯 부족이 아니라
+// 타임아웃(errSearchTimeout)으로 분류한다 — 그러지 않으면 "context deadline
+// exceeded" 가 일반 오류 분기로 가 slog.Error 가 된다. REST GET/POST, GraphQL
+// search, golden/next 가 모두 이 함수를 거치므로 게이트도 여기 한 곳이다.
 func (s *Server) searchWithTimeout(parent context.Context, q model.SearchQuery) ([]*model.SearchResult, error) {
+	release, err := s.searchGate.acquire(parent, searchGateWait)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("%w: %w", errSearchTimeout, err)
+		}
+		return nil, err
+	}
+	defer release()
+
 	ctx, cancel := context.WithTimeout(parent, s.searchTimeout)
 	defer cancel()
 
@@ -117,12 +135,15 @@ func (s *Server) searchWithTimeout(parent context.Context, q model.SearchQuery) 
 //     아니고, 재시도하면 성공할 수 있다는 신호(콜드 스타트 #195 등)가 된다.
 //   - search.ErrInvalidInput → 400. 핸들러가 먼저 검사하므로 정상 경로에서는
 //     오지 않지만, 서비스 내부 방어선이 잡은 경우에도 500 으로 새지 않게 한다.
+//   - 검색 슬롯 부족(errSearchBusy) → 503 + Retry-After(#286 항목 3).
 //   - 그 밖 → 500.
 //
 // 응답 본문과 로그 어디에도 질의 원문을 넣지 않는다. 로그에는 오류와 설정된
 // 타임아웃만 남는다(pgx 오류는 바인딩 파라미터 값을 담지 않는다).
 func (s *Server) writeSearchFailure(w http.ResponseWriter, label string, err error) {
 	switch {
+	case errors.Is(err, errSearchBusy):
+		s.writeSearchBusy(w, label)
 	case errors.Is(err, errSearchTimeout):
 		slog.Warn(label+": timed out", "timeout", s.searchTimeout.String(), "error", err)
 		writeError(w, http.StatusGatewayTimeout, "search timed out")
@@ -132,6 +153,18 @@ func (s *Server) writeSearchFailure(w http.ResponseWriter, label string, err err
 		slog.Error(label+": query failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal server error")
 	}
+}
+
+// writeSearchBusy 는 검색 슬롯 부족을 503 으로 쓴다. 본문은 고정 문구,
+// Retry-After 로 재시도 시점을 알린다. 로그는 Warn — 부하 신호이지 서버
+// 결함이 아니다. 빈발하면 SEARCH_MAX_CONCURRENCY 나 풀 크기를 재평가한다.
+func (s *Server) writeSearchBusy(w http.ResponseWriter, label string) {
+	slog.Warn(label+": search capacity exceeded",
+		"max_concurrency", s.searchGate.capacity(),
+		"wait", searchGateWait.String(),
+	)
+	w.Header().Set("Retry-After", searchBusyRetryAfter)
+	writeError(w, http.StatusServiceUnavailable, errSearchBusy.Error())
 }
 
 // searchInputMessage 는 검증 오류에서 클라이언트에 보여 줄 문구를 꺼낸다.
