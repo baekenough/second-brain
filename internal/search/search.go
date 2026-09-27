@@ -722,7 +722,6 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 	// Applied before anything else so every downstream lane — the store's SQL
 	// filters, the chunk lanes' post-filter, and the reranker's input set —
 	// sees the same exclusion list.
-	q = q.WithRetrievalDefaults()
 	q = applyInsightExclusionDefault(q)
 	q = applyRetentionExclusionDefault(q)
 	warnOnSourceFilterConflict(q)
@@ -823,8 +822,6 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 	// (chunk vector/FTS, OpenSearch, below) shares the same enforcement
 	// point. The retention="low" score penalty is applied once, after every
 	// lane has been fused — see applyLowRetentionPenalty below.
-	// SQL 이 아닌 DocumentSearcher 구현에도 기본 제외 정책을 적용한다.
-	results = applySourceTypeFilters(model.SearchQuery{ExcludeSourceTypes: q.ExcludeSourceTypes}, results)
 	results = applyRetentionExclusion(q, results)
 	trace.recordLane(LaneDocumentStore, results)
 

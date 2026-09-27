@@ -275,10 +275,8 @@ func TestBuildOpenSearchRequest_MultiMatchFields(t *testing.T) {
 	if _, hasFilter := boolQuery["filter"]; hasFilter {
 		t.Error("filter clause present for a query with no window/source filters")
 	}
-	mustNot := boolQuery["must_not"].([]any)
-	values := mustNot[0].(map[string]any)["terms"].(map[string]any)["source_type"].([]any)
-	if len(values) != 1 || values[0] != "kakao" {
-		t.Errorf("default exclusion = %v, want [kakao]", values)
+	if _, hasMustNot := boolQuery["must_not"]; hasMustNot {
+		t.Error("must_not clause present for a query with no exclusions")
 	}
 }
 
@@ -331,8 +329,8 @@ func TestBuildOpenSearchRequest_SourceTypeIncludeAndExclude(t *testing.T) {
 		t.Fatalf("must_not clauses = %d, want 1 (exclude terms)", len(mustNot))
 	}
 	excludeValues := mustNot[0]["terms"].(map[string]any)["source_type"].([]string)
-	if len(excludeValues) != 2 || excludeValues[0] != "insight" || excludeValues[1] != "kakao" {
-		t.Errorf("exclude filter = %v, want [insight kakao]", excludeValues)
+	if len(excludeValues) != 1 || excludeValues[0] != "insight" {
+		t.Errorf("exclude filter = %v, want [insight]", excludeValues)
 	}
 }
 

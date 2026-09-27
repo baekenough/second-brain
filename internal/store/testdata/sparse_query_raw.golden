@@ -11,7 +11,7 @@
 			   OR tsv @@ plainto_tsquery('english', $1))
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
+			
 			
 			
 			LIMIT $3
@@ -23,7 +23,7 @@
 			WHERE embedding IS NOT NULL
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
+			
 			
 			
 			LIMIT $3
@@ -42,7 +42,7 @@
 			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
+			
 			
 			
 			LIMIT $3
@@ -54,7 +54,7 @@
 			WHERE summary_embedding IS NOT NULL
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
+			
 			
 			
 			LIMIT $3
@@ -65,10 +65,10 @@
 			FROM document_entities de
 			JOIN entities e ON e.id = de.entity_id
 			JOIN documents d ON d.id = de.document_id
-			WHERE e.normalized_name LIKE '%%' || $5 || '%%'
+			WHERE e.normalized_name LIKE '%%' || $4 || '%%'
 			AND d.status = 'active'
 			
-			AND d.source_type <> ALL($4)
+			
 			
 			
 			GROUP BY de.document_id
@@ -100,8 +100,7 @@
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
-$4 = []model.SourceType []model.SourceType{"kakao"}
-$5 = string "이번 주 회의 일정 알려줘"
+$4 = string "이번 주 회의 일정 알려줘"
 ==== hybrid/entity_off/base ====
 
 		WITH fts AS (
@@ -115,7 +114,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 			   OR tsv @@ plainto_tsquery('english', $1))
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
+			
 			
 			
 			LIMIT $3
@@ -127,7 +126,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 			WHERE embedding IS NOT NULL
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
+			
 			
 			
 			LIMIT $3
@@ -146,7 +145,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
+			
 			
 			
 			LIMIT $3
@@ -158,7 +157,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 			WHERE summary_embedding IS NOT NULL
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
+			
 			
 			
 			LIMIT $3
@@ -190,7 +189,6 @@ $5 = string "이번 주 회의 일정 알려줘"
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
-$4 = []model.SourceType []model.SourceType{"kakao"}
 ==== fulltext/base ====
 
 		SELECT id, source_type, source_id, title, content, metadata, embedding,
@@ -208,7 +206,7 @@ $4 = []model.SourceType []model.SourceType{"kakao"}
 		   OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
 		AND status = 'active'
 		
-		AND source_type <> ALL($3)
+		
 		
 		
 		ORDER BY score DESC
@@ -216,7 +214,6 @@ $4 = []model.SourceType []model.SourceType{"kakao"}
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 10
-$3 = []model.SourceType []model.SourceType{"kakao"}
 ==== chunk_fts/base ====
 
 		SELECT
@@ -240,13 +237,12 @@ $3 = []model.SourceType []model.SourceType{"kakao"}
 		JOIN documents d ON d.id = c.document_id
 		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
 		   OR c.content LIKE '%%' || $1 || '%%')
-		  AND d.status = 'active'  AND d.source_type <> ALL($3)
+		  AND d.status = 'active'   
 		ORDER BY rank DESC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
-$3 = []model.SourceType []model.SourceType{"kakao"}
 ==== sparse_ctx/base ====
 
 		WITH fresh AS (
@@ -268,7 +264,7 @@ $3 = []model.SourceType []model.SourceType{"kakao"}
 			WHERE sc.context_version = $3
 			  AND sc.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
 			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
-			  AND d.status = 'active'  AND d.source_type <> ALL($4)
+			  AND d.status = 'active'   
 			ORDER BY rank DESC
 			LIMIT $2
 		),
@@ -294,7 +290,7 @@ $3 = []model.SourceType []model.SourceType{"kakao"}
 				  AND sc2.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
 			)
 			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
-			AND d.status = 'active'  AND d.source_type <> ALL($4)
+			AND d.status = 'active'   
 			ORDER BY rank DESC
 			LIMIT $2
 		)
@@ -306,7 +302,6 @@ $3 = []model.SourceType []model.SourceType{"kakao"}
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
 $3 = string "v1-tp"
-$4 = []model.SourceType []model.SourceType{"kakao"}
 ==== hybrid/entity_on/source ====
 
 		WITH fts AS (
@@ -320,7 +315,7 @@ $4 = []model.SourceType []model.SourceType{"kakao"}
 			   OR tsv @@ plainto_tsquery('english', $1))
 			AND status = 'active'
 			AND source_type = ANY($4)
-			AND source_type <> ALL($5)
+			
 			
 			
 			LIMIT $3
@@ -332,7 +327,7 @@ $4 = []model.SourceType []model.SourceType{"kakao"}
 			WHERE embedding IS NOT NULL
 			AND status = 'active'
 			AND source_type = ANY($4)
-			AND source_type <> ALL($5)
+			
 			
 			
 			LIMIT $3
@@ -351,7 +346,7 @@ $4 = []model.SourceType []model.SourceType{"kakao"}
 			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
 			AND status = 'active'
 			AND source_type = ANY($4)
-			AND source_type <> ALL($5)
+			
 			
 			
 			LIMIT $3
@@ -363,7 +358,7 @@ $4 = []model.SourceType []model.SourceType{"kakao"}
 			WHERE summary_embedding IS NOT NULL
 			AND status = 'active'
 			AND source_type = ANY($4)
-			AND source_type <> ALL($5)
+			
 			
 			
 			LIMIT $3
@@ -374,10 +369,10 @@ $4 = []model.SourceType []model.SourceType{"kakao"}
 			FROM document_entities de
 			JOIN entities e ON e.id = de.entity_id
 			JOIN documents d ON d.id = de.document_id
-			WHERE e.normalized_name LIKE '%%' || $6 || '%%'
+			WHERE e.normalized_name LIKE '%%' || $5 || '%%'
 			AND d.status = 'active'
 			AND d.source_type = ANY($4)
-			AND d.source_type <> ALL($5)
+			
 			
 			
 			GROUP BY de.document_id
@@ -410,8 +405,7 @@ $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
 $4 = []model.SourceType []model.SourceType{"calendar"}
-$5 = []model.SourceType []model.SourceType{"kakao"}
-$6 = string "이번 주 회의 일정 알려줘"
+$5 = string "이번 주 회의 일정 알려줘"
 ==== hybrid/entity_off/source ====
 
 		WITH fts AS (
@@ -425,7 +419,7 @@ $6 = string "이번 주 회의 일정 알려줘"
 			   OR tsv @@ plainto_tsquery('english', $1))
 			AND status = 'active'
 			AND source_type = ANY($4)
-			AND source_type <> ALL($5)
+			
 			
 			
 			LIMIT $3
@@ -437,7 +431,7 @@ $6 = string "이번 주 회의 일정 알려줘"
 			WHERE embedding IS NOT NULL
 			AND status = 'active'
 			AND source_type = ANY($4)
-			AND source_type <> ALL($5)
+			
 			
 			
 			LIMIT $3
@@ -456,7 +450,7 @@ $6 = string "이번 주 회의 일정 알려줘"
 			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
 			AND status = 'active'
 			AND source_type = ANY($4)
-			AND source_type <> ALL($5)
+			
 			
 			
 			LIMIT $3
@@ -468,7 +462,7 @@ $6 = string "이번 주 회의 일정 알려줘"
 			WHERE summary_embedding IS NOT NULL
 			AND status = 'active'
 			AND source_type = ANY($4)
-			AND source_type <> ALL($5)
+			
 			
 			
 			LIMIT $3
@@ -501,7 +495,6 @@ $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
 $4 = []model.SourceType []model.SourceType{"calendar"}
-$5 = []model.SourceType []model.SourceType{"kakao"}
 ==== fulltext/source ====
 
 		SELECT id, source_type, source_id, title, content, metadata, embedding,
@@ -519,7 +512,7 @@ $5 = []model.SourceType []model.SourceType{"kakao"}
 		   OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
 		AND status = 'active'
 		AND source_type = ANY($3)
-		AND source_type <> ALL($4)
+		
 		
 		
 		ORDER BY score DESC
@@ -528,7 +521,6 @@ $5 = []model.SourceType []model.SourceType{"kakao"}
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 10
 $3 = []model.SourceType []model.SourceType{"calendar"}
-$4 = []model.SourceType []model.SourceType{"kakao"}
 ==== chunk_fts/source ====
 
 		SELECT
@@ -552,14 +544,13 @@ $4 = []model.SourceType []model.SourceType{"kakao"}
 		JOIN documents d ON d.id = c.document_id
 		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
 		   OR c.content LIKE '%%' || $1 || '%%')
-		  AND d.status = 'active'  AND d.source_type = ANY($3) AND d.source_type <> ALL($4)
+		  AND d.status = 'active'  AND d.source_type = ANY($3)  
 		ORDER BY rank DESC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
 $3 = []model.SourceType []model.SourceType{"calendar"}
-$4 = []model.SourceType []model.SourceType{"kakao"}
 ==== sparse_ctx/source ====
 
 		WITH fresh AS (
@@ -581,7 +572,7 @@ $4 = []model.SourceType []model.SourceType{"kakao"}
 			WHERE sc.context_version = $3
 			  AND sc.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
 			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
-			  AND d.status = 'active'  AND d.source_type = ANY($4) AND d.source_type <> ALL($5)
+			  AND d.status = 'active'  AND d.source_type = ANY($4)  
 			ORDER BY rank DESC
 			LIMIT $2
 		),
@@ -607,7 +598,7 @@ $4 = []model.SourceType []model.SourceType{"kakao"}
 				  AND sc2.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
 			)
 			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
-			AND d.status = 'active'  AND d.source_type = ANY($4) AND d.source_type <> ALL($5)
+			AND d.status = 'active'  AND d.source_type = ANY($4)  
 			ORDER BY rank DESC
 			LIMIT $2
 		)
@@ -620,7 +611,6 @@ $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
 $3 = string "v1-tp"
 $4 = []model.SourceType []model.SourceType{"calendar"}
-$5 = []model.SourceType []model.SourceType{"kakao"}
 ==== hybrid/entity_on/exclude ====
 
 		WITH fts AS (
@@ -723,7 +713,7 @@ $5 = []model.SourceType []model.SourceType{"kakao"}
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
-$4 = []model.SourceType []model.SourceType{"insight", "gmail", "kakao"}
+$4 = []model.SourceType []model.SourceType{"insight", "gmail"}
 $5 = string "이번 주 회의 일정 알려줘"
 ==== hybrid/entity_off/exclude ====
 
@@ -813,7 +803,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
-$4 = []model.SourceType []model.SourceType{"insight", "gmail", "kakao"}
+$4 = []model.SourceType []model.SourceType{"insight", "gmail"}
 ==== fulltext/exclude ====
 
 		SELECT id, source_type, source_id, title, content, metadata, embedding,
@@ -839,7 +829,7 @@ $4 = []model.SourceType []model.SourceType{"insight", "gmail", "kakao"}
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 10
-$3 = []model.SourceType []model.SourceType{"insight", "gmail", "kakao"}
+$3 = []model.SourceType []model.SourceType{"insight", "gmail"}
 ==== chunk_fts/exclude ====
 
 		SELECT
@@ -863,13 +853,13 @@ $3 = []model.SourceType []model.SourceType{"insight", "gmail", "kakao"}
 		JOIN documents d ON d.id = c.document_id
 		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
 		   OR c.content LIKE '%%' || $1 || '%%')
-		  AND d.status = 'active'  AND d.source_type <> ALL($3)
+		  AND d.status = 'active'  AND d.source_type <> ALL($3)  
 		ORDER BY rank DESC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
-$3 = []model.SourceType []model.SourceType{"insight", "gmail", "kakao"}
+$3 = []model.SourceType []model.SourceType{"insight", "gmail"}
 ==== sparse_ctx/exclude ====
 
 		WITH fresh AS (
@@ -891,7 +881,7 @@ $3 = []model.SourceType []model.SourceType{"insight", "gmail", "kakao"}
 			WHERE sc.context_version = $3
 			  AND sc.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
 			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
-			  AND d.status = 'active'  AND d.source_type <> ALL($4)
+			  AND d.status = 'active'  AND d.source_type <> ALL($4)  
 			ORDER BY rank DESC
 			LIMIT $2
 		),
@@ -917,7 +907,7 @@ $3 = []model.SourceType []model.SourceType{"insight", "gmail", "kakao"}
 				  AND sc2.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
 			)
 			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
-			AND d.status = 'active'  AND d.source_type <> ALL($4)
+			AND d.status = 'active'  AND d.source_type <> ALL($4)  
 			ORDER BY rank DESC
 			LIMIT $2
 		)
@@ -929,7 +919,7 @@ $3 = []model.SourceType []model.SourceType{"insight", "gmail", "kakao"}
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
 $3 = string "v1-tp"
-$4 = []model.SourceType []model.SourceType{"insight", "gmail", "kakao"}
+$4 = []model.SourceType []model.SourceType{"insight", "gmail"}
 ==== hybrid/entity_on/retention ====
 
 		WITH fts AS (
@@ -943,8 +933,8 @@ $4 = []model.SourceType []model.SourceType{"insight", "gmail", "kakao"}
 			   OR tsv @@ plainto_tsquery('english', $1))
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
-			AND COALESCE(metadata->>'retention', '') <> ALL($5)
+			
+			AND COALESCE(metadata->>'retention', '') <> ALL($4)
 			
 			LIMIT $3
 		),
@@ -955,8 +945,8 @@ $4 = []model.SourceType []model.SourceType{"insight", "gmail", "kakao"}
 			WHERE embedding IS NOT NULL
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
-			AND COALESCE(metadata->>'retention', '') <> ALL($5)
+			
+			AND COALESCE(metadata->>'retention', '') <> ALL($4)
 			
 			LIMIT $3
 		),
@@ -974,8 +964,8 @@ $4 = []model.SourceType []model.SourceType{"insight", "gmail", "kakao"}
 			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
-			AND COALESCE(metadata->>'retention', '') <> ALL($5)
+			
+			AND COALESCE(metadata->>'retention', '') <> ALL($4)
 			
 			LIMIT $3
 		),
@@ -986,8 +976,8 @@ $4 = []model.SourceType []model.SourceType{"insight", "gmail", "kakao"}
 			WHERE summary_embedding IS NOT NULL
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
-			AND COALESCE(metadata->>'retention', '') <> ALL($5)
+			
+			AND COALESCE(metadata->>'retention', '') <> ALL($4)
 			
 			LIMIT $3
 		),
@@ -997,11 +987,11 @@ $4 = []model.SourceType []model.SourceType{"insight", "gmail", "kakao"}
 			FROM document_entities de
 			JOIN entities e ON e.id = de.entity_id
 			JOIN documents d ON d.id = de.document_id
-			WHERE e.normalized_name LIKE '%%' || $6 || '%%'
+			WHERE e.normalized_name LIKE '%%' || $5 || '%%'
 			AND d.status = 'active'
 			
-			AND d.source_type <> ALL($4)
-			AND COALESCE(d.metadata->>'retention', '') <> ALL($5)
+			
+			AND COALESCE(d.metadata->>'retention', '') <> ALL($4)
 			
 			GROUP BY de.document_id
 			LIMIT $3
@@ -1032,9 +1022,8 @@ $4 = []model.SourceType []model.SourceType{"insight", "gmail", "kakao"}
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
-$4 = []model.SourceType []model.SourceType{"kakao"}
-$5 = []string []string{"disposable"}
-$6 = string "이번 주 회의 일정 알려줘"
+$4 = []string []string{"disposable"}
+$5 = string "이번 주 회의 일정 알려줘"
 ==== hybrid/entity_off/retention ====
 
 		WITH fts AS (
@@ -1048,8 +1037,8 @@ $6 = string "이번 주 회의 일정 알려줘"
 			   OR tsv @@ plainto_tsquery('english', $1))
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
-			AND COALESCE(metadata->>'retention', '') <> ALL($5)
+			
+			AND COALESCE(metadata->>'retention', '') <> ALL($4)
 			
 			LIMIT $3
 		),
@@ -1060,8 +1049,8 @@ $6 = string "이번 주 회의 일정 알려줘"
 			WHERE embedding IS NOT NULL
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
-			AND COALESCE(metadata->>'retention', '') <> ALL($5)
+			
+			AND COALESCE(metadata->>'retention', '') <> ALL($4)
 			
 			LIMIT $3
 		),
@@ -1079,8 +1068,8 @@ $6 = string "이번 주 회의 일정 알려줘"
 			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
-			AND COALESCE(metadata->>'retention', '') <> ALL($5)
+			
+			AND COALESCE(metadata->>'retention', '') <> ALL($4)
 			
 			LIMIT $3
 		),
@@ -1091,8 +1080,8 @@ $6 = string "이번 주 회의 일정 알려줘"
 			WHERE summary_embedding IS NOT NULL
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
-			AND COALESCE(metadata->>'retention', '') <> ALL($5)
+			
+			AND COALESCE(metadata->>'retention', '') <> ALL($4)
 			
 			LIMIT $3
 		),
@@ -1123,8 +1112,7 @@ $6 = string "이번 주 회의 일정 알려줘"
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
-$4 = []model.SourceType []model.SourceType{"kakao"}
-$5 = []string []string{"disposable"}
+$4 = []string []string{"disposable"}
 ==== fulltext/retention ====
 
 		SELECT id, source_type, source_id, title, content, metadata, embedding,
@@ -1142,16 +1130,15 @@ $5 = []string []string{"disposable"}
 		   OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
 		AND status = 'active'
 		
-		AND source_type <> ALL($3)
-		AND COALESCE(metadata->>'retention', '') <> ALL($4)
+		
+		AND COALESCE(metadata->>'retention', '') <> ALL($3)
 		
 		ORDER BY score DESC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 10
-$3 = []model.SourceType []model.SourceType{"kakao"}
-$4 = []string []string{"disposable"}
+$3 = []string []string{"disposable"}
 ==== chunk_fts/retention ====
 
 		SELECT
@@ -1175,14 +1162,13 @@ $4 = []string []string{"disposable"}
 		JOIN documents d ON d.id = c.document_id
 		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
 		   OR c.content LIKE '%%' || $1 || '%%')
-		  AND d.status = 'active'  AND d.source_type <> ALL($3)  AND COALESCE(d.metadata->>'retention', '') <> ALL($4)
+		  AND d.status = 'active'   AND COALESCE(d.metadata->>'retention', '') <> ALL($3)
 		ORDER BY rank DESC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
-$3 = []model.SourceType []model.SourceType{"kakao"}
-$4 = []string []string{"disposable"}
+$3 = []string []string{"disposable"}
 ==== sparse_ctx/retention ====
 
 		WITH fresh AS (
@@ -1204,7 +1190,7 @@ $4 = []string []string{"disposable"}
 			WHERE sc.context_version = $3
 			  AND sc.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
 			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
-			  AND d.status = 'active'  AND d.source_type <> ALL($4)  AND COALESCE(d.metadata->>'retention', '') <> ALL($5)
+			  AND d.status = 'active'   AND COALESCE(d.metadata->>'retention', '') <> ALL($4)
 			ORDER BY rank DESC
 			LIMIT $2
 		),
@@ -1230,7 +1216,7 @@ $4 = []string []string{"disposable"}
 				  AND sc2.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
 			)
 			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
-			AND d.status = 'active'  AND d.source_type <> ALL($4)  AND COALESCE(d.metadata->>'retention', '') <> ALL($5)
+			AND d.status = 'active'   AND COALESCE(d.metadata->>'retention', '') <> ALL($4)
 			ORDER BY rank DESC
 			LIMIT $2
 		)
@@ -1242,8 +1228,7 @@ $4 = []string []string{"disposable"}
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
 $3 = string "v1-tp"
-$4 = []model.SourceType []model.SourceType{"kakao"}
-$5 = []string []string{"disposable"}
+$4 = []string []string{"disposable"}
 ==== hybrid/entity_on/window ====
 
 		WITH fts AS (
@@ -1257,10 +1242,10 @@ $5 = []string []string{"disposable"}
 			   OR tsv @@ plainto_tsquery('english', $1))
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
 			
-			AND occurred_at >= $5
-			AND occurred_at < $6
+			
+			AND occurred_at >= $4
+			AND occurred_at < $5
 			LIMIT $3
 		),
 		vec AS (
@@ -1270,10 +1255,10 @@ $5 = []string []string{"disposable"}
 			WHERE embedding IS NOT NULL
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
 			
-			AND occurred_at >= $5
-			AND occurred_at < $6
+			
+			AND occurred_at >= $4
+			AND occurred_at < $5
 			LIMIT $3
 		),
 		bigm AS (
@@ -1290,10 +1275,10 @@ $5 = []string []string{"disposable"}
 			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
 			
-			AND occurred_at >= $5
-			AND occurred_at < $6
+			
+			AND occurred_at >= $4
+			AND occurred_at < $5
 			LIMIT $3
 		),
 		summvec AS (
@@ -1303,10 +1288,10 @@ $5 = []string []string{"disposable"}
 			WHERE summary_embedding IS NOT NULL
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
 			
-			AND occurred_at >= $5
-			AND occurred_at < $6
+			
+			AND occurred_at >= $4
+			AND occurred_at < $5
 			LIMIT $3
 		),
 		entity AS (
@@ -1315,13 +1300,13 @@ $5 = []string []string{"disposable"}
 			FROM document_entities de
 			JOIN entities e ON e.id = de.entity_id
 			JOIN documents d ON d.id = de.document_id
-			WHERE e.normalized_name LIKE '%%' || $7 || '%%'
+			WHERE e.normalized_name LIKE '%%' || $6 || '%%'
 			AND d.status = 'active'
 			
-			AND d.source_type <> ALL($4)
 			
-			AND d.occurred_at >= $5
-			AND d.occurred_at < $6
+			
+			AND d.occurred_at >= $4
+			AND d.occurred_at < $5
 			GROUP BY de.document_id
 			LIMIT $3
 		),
@@ -1351,10 +1336,9 @@ $5 = []string []string{"disposable"}
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
-$4 = []model.SourceType []model.SourceType{"kakao"}
-$5 = 2026-08-17T00:00:00Z
-$6 = 2026-08-24T00:00:00Z
-$7 = string "이번 주 회의 일정 알려줘"
+$4 = 2026-08-17T00:00:00Z
+$5 = 2026-08-24T00:00:00Z
+$6 = string "이번 주 회의 일정 알려줘"
 ==== hybrid/entity_off/window ====
 
 		WITH fts AS (
@@ -1368,10 +1352,10 @@ $7 = string "이번 주 회의 일정 알려줘"
 			   OR tsv @@ plainto_tsquery('english', $1))
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
 			
-			AND occurred_at >= $5
-			AND occurred_at < $6
+			
+			AND occurred_at >= $4
+			AND occurred_at < $5
 			LIMIT $3
 		),
 		vec AS (
@@ -1381,10 +1365,10 @@ $7 = string "이번 주 회의 일정 알려줘"
 			WHERE embedding IS NOT NULL
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
 			
-			AND occurred_at >= $5
-			AND occurred_at < $6
+			
+			AND occurred_at >= $4
+			AND occurred_at < $5
 			LIMIT $3
 		),
 		bigm AS (
@@ -1401,10 +1385,10 @@ $7 = string "이번 주 회의 일정 알려줘"
 			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
 			
-			AND occurred_at >= $5
-			AND occurred_at < $6
+			
+			AND occurred_at >= $4
+			AND occurred_at < $5
 			LIMIT $3
 		),
 		summvec AS (
@@ -1414,10 +1398,10 @@ $7 = string "이번 주 회의 일정 알려줘"
 			WHERE summary_embedding IS NOT NULL
 			AND status = 'active'
 			
-			AND source_type <> ALL($4)
 			
-			AND occurred_at >= $5
-			AND occurred_at < $6
+			
+			AND occurred_at >= $4
+			AND occurred_at < $5
 			LIMIT $3
 		),
 		entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false),
@@ -1447,9 +1431,8 @@ $7 = string "이번 주 회의 일정 알려줘"
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
-$4 = []model.SourceType []model.SourceType{"kakao"}
-$5 = 2026-08-17T00:00:00Z
-$6 = 2026-08-24T00:00:00Z
+$4 = 2026-08-17T00:00:00Z
+$5 = 2026-08-24T00:00:00Z
 ==== fulltext/window ====
 
 		SELECT id, source_type, source_id, title, content, metadata, embedding,
@@ -1467,18 +1450,17 @@ $6 = 2026-08-24T00:00:00Z
 		   OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
 		AND status = 'active'
 		
-		AND source_type <> ALL($3)
 		
-		AND occurred_at >= $4
-			AND occurred_at < $5
+		
+		AND occurred_at >= $3
+			AND occurred_at < $4
 		ORDER BY score DESC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 10
-$3 = []model.SourceType []model.SourceType{"kakao"}
-$4 = 2026-08-17T00:00:00Z
-$5 = 2026-08-24T00:00:00Z
+$3 = 2026-08-17T00:00:00Z
+$4 = 2026-08-24T00:00:00Z
 ==== chunk_fts/window ====
 
 		SELECT
@@ -1502,16 +1484,15 @@ $5 = 2026-08-24T00:00:00Z
 		JOIN documents d ON d.id = c.document_id
 		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
 		   OR c.content LIKE '%%' || $1 || '%%')
-		  AND d.status = 'active'  AND d.source_type <> ALL($3) AND d.occurred_at >= $4
-			AND d.occurred_at < $5
+		  AND d.status = 'active'  AND d.occurred_at >= $3
+			AND d.occurred_at < $4 
 		ORDER BY rank DESC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
-$3 = []model.SourceType []model.SourceType{"kakao"}
-$4 = 2026-08-17T00:00:00Z
-$5 = 2026-08-24T00:00:00Z
+$3 = 2026-08-17T00:00:00Z
+$4 = 2026-08-24T00:00:00Z
 ==== sparse_ctx/window ====
 
 		WITH fresh AS (
@@ -1533,8 +1514,8 @@ $5 = 2026-08-24T00:00:00Z
 			WHERE sc.context_version = $3
 			  AND sc.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
 			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
-			  AND d.status = 'active'  AND d.source_type <> ALL($4) AND d.occurred_at >= $5
-			AND d.occurred_at < $6
+			  AND d.status = 'active'  AND d.occurred_at >= $4
+			AND d.occurred_at < $5 
 			ORDER BY rank DESC
 			LIMIT $2
 		),
@@ -1560,8 +1541,8 @@ $5 = 2026-08-24T00:00:00Z
 				  AND sc2.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
 			)
 			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
-			AND d.status = 'active'  AND d.source_type <> ALL($4) AND d.occurred_at >= $5
-			AND d.occurred_at < $6
+			AND d.status = 'active'  AND d.occurred_at >= $4
+			AND d.occurred_at < $5 
 			ORDER BY rank DESC
 			LIMIT $2
 		)
@@ -1573,9 +1554,8 @@ $5 = 2026-08-24T00:00:00Z
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
 $3 = string "v1-tp"
-$4 = []model.SourceType []model.SourceType{"kakao"}
-$5 = 2026-08-17T00:00:00Z
-$6 = 2026-08-24T00:00:00Z
+$4 = 2026-08-17T00:00:00Z
+$5 = 2026-08-24T00:00:00Z
 ==== hybrid/entity_on/all ====
 
 		WITH fts AS (
@@ -1684,7 +1664,7 @@ $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
 $4 = []model.SourceType []model.SourceType{"calendar", "call"}
-$5 = []model.SourceType []model.SourceType{"insight", "kakao"}
+$5 = []model.SourceType []model.SourceType{"insight"}
 $6 = []string []string{"disposable"}
 $7 = 2026-08-17T00:00:00Z
 $8 = 2026-08-24T00:00:00Z
@@ -1782,7 +1762,7 @@ $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
 $4 = []model.SourceType []model.SourceType{"calendar", "call"}
-$5 = []model.SourceType []model.SourceType{"insight", "kakao"}
+$5 = []model.SourceType []model.SourceType{"insight"}
 $6 = []string []string{"disposable"}
 $7 = 2026-08-17T00:00:00Z
 $8 = 2026-08-24T00:00:00Z
@@ -1813,7 +1793,7 @@ $8 = 2026-08-24T00:00:00Z
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 10
 $3 = []model.SourceType []model.SourceType{"calendar", "call"}
-$4 = []model.SourceType []model.SourceType{"insight", "kakao"}
+$4 = []model.SourceType []model.SourceType{"insight"}
 $5 = []string []string{"disposable"}
 $6 = 2026-08-17T00:00:00Z
 $7 = 2026-08-24T00:00:00Z
@@ -1848,7 +1828,7 @@ $7 = 2026-08-24T00:00:00Z
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
 $3 = []model.SourceType []model.SourceType{"calendar", "call"}
-$4 = []model.SourceType []model.SourceType{"insight", "kakao"}
+$4 = []model.SourceType []model.SourceType{"insight"}
 $5 = 2026-08-17T00:00:00Z
 $6 = 2026-08-24T00:00:00Z
 $7 = []string []string{"disposable"}
@@ -1914,7 +1894,7 @@ $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
 $3 = string "v1-tp"
 $4 = []model.SourceType []model.SourceType{"calendar", "call"}
-$5 = []model.SourceType []model.SourceType{"insight", "kakao"}
+$5 = []model.SourceType []model.SourceType{"insight"}
 $6 = 2026-08-17T00:00:00Z
 $7 = 2026-08-24T00:00:00Z
 $8 = []string []string{"disposable"}
@@ -1931,7 +1911,7 @@ $8 = []string []string{"disposable"}
 			   OR tsv @@ plainto_tsquery('english', $1))
 			
 			
-			AND source_type <> ALL($4)
+			
 			
 			
 			LIMIT $3
@@ -1943,7 +1923,7 @@ $8 = []string []string{"disposable"}
 			WHERE embedding IS NOT NULL
 			
 			
-			AND source_type <> ALL($4)
+			
 			
 			
 			LIMIT $3
@@ -1962,7 +1942,7 @@ $8 = []string []string{"disposable"}
 			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
 			
 			
-			AND source_type <> ALL($4)
+			
 			
 			
 			LIMIT $3
@@ -1974,7 +1954,7 @@ $8 = []string []string{"disposable"}
 			WHERE summary_embedding IS NOT NULL
 			
 			
-			AND source_type <> ALL($4)
+			
 			
 			
 			LIMIT $3
@@ -1985,10 +1965,10 @@ $8 = []string []string{"disposable"}
 			FROM document_entities de
 			JOIN entities e ON e.id = de.entity_id
 			JOIN documents d ON d.id = de.document_id
-			WHERE e.normalized_name LIKE '%%' || $5 || '%%'
+			WHERE e.normalized_name LIKE '%%' || $4 || '%%'
 			
 			
-			AND d.source_type <> ALL($4)
+			
 			
 			
 			GROUP BY de.document_id
@@ -2020,8 +2000,7 @@ $8 = []string []string{"disposable"}
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
-$4 = []model.SourceType []model.SourceType{"kakao"}
-$5 = string "이번 주 회의 일정 알려줘"
+$4 = string "이번 주 회의 일정 알려줘"
 ==== hybrid/entity_off/include_deleted ====
 
 		WITH fts AS (
@@ -2035,7 +2014,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 			   OR tsv @@ plainto_tsquery('english', $1))
 			
 			
-			AND source_type <> ALL($4)
+			
 			
 			
 			LIMIT $3
@@ -2047,7 +2026,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 			WHERE embedding IS NOT NULL
 			
 			
-			AND source_type <> ALL($4)
+			
 			
 			
 			LIMIT $3
@@ -2066,7 +2045,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
 			
 			
-			AND source_type <> ALL($4)
+			
 			
 			
 			LIMIT $3
@@ -2078,7 +2057,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 			WHERE summary_embedding IS NOT NULL
 			
 			
-			AND source_type <> ALL($4)
+			
 			
 			
 			LIMIT $3
@@ -2110,7 +2089,6 @@ $5 = string "이번 주 회의 일정 알려줘"
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
-$4 = []model.SourceType []model.SourceType{"kakao"}
 ==== fulltext/include_deleted ====
 
 		SELECT id, source_type, source_id, title, content, metadata, embedding,
@@ -2128,7 +2106,7 @@ $4 = []model.SourceType []model.SourceType{"kakao"}
 		   OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))
 		
 		
-		AND source_type <> ALL($3)
+		
 		
 		
 		ORDER BY score DESC
@@ -2136,7 +2114,6 @@ $4 = []model.SourceType []model.SourceType{"kakao"}
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 10
-$3 = []model.SourceType []model.SourceType{"kakao"}
 ==== chunk_fts/include_deleted ====
 
 		SELECT
@@ -2160,13 +2137,12 @@ $3 = []model.SourceType []model.SourceType{"kakao"}
 		JOIN documents d ON d.id = c.document_id
 		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
 		   OR c.content LIKE '%%' || $1 || '%%')
-		  AND d.status = 'active'  AND d.source_type <> ALL($3)
+		  AND d.status = 'active'   
 		ORDER BY rank DESC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
-$3 = []model.SourceType []model.SourceType{"kakao"}
 ==== sparse_ctx/include_deleted ====
 
 		WITH fresh AS (
@@ -2188,7 +2164,7 @@ $3 = []model.SourceType []model.SourceType{"kakao"}
 			WHERE sc.context_version = $3
 			  AND sc.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
 			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
-			  AND d.status = 'active'  AND d.source_type <> ALL($4)
+			  AND d.status = 'active'   
 			ORDER BY rank DESC
 			LIMIT $2
 		),
@@ -2214,7 +2190,7 @@ $3 = []model.SourceType []model.SourceType{"kakao"}
 				  AND sc2.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
 			)
 			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
-			AND d.status = 'active'  AND d.source_type <> ALL($4)
+			AND d.status = 'active'   
 			ORDER BY rank DESC
 			LIMIT $2
 		)
@@ -2226,7 +2202,6 @@ $3 = []model.SourceType []model.SourceType{"kakao"}
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
 $3 = string "v1-tp"
-$4 = []model.SourceType []model.SourceType{"kakao"}
 ==== hybrid/entity_on/recent_past_window ====
 
 		WITH fts AS (
@@ -2335,7 +2310,7 @@ $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
 $4 = []model.SourceType []model.SourceType{"calendar", "call"}
-$5 = []model.SourceType []model.SourceType{"insight", "kakao"}
+$5 = []model.SourceType []model.SourceType{"insight"}
 $6 = []string []string{"disposable"}
 $7 = 2026-08-17T00:00:00Z
 $8 = 2026-08-24T00:00:00Z
@@ -2433,7 +2408,7 @@ $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
 $4 = []model.SourceType []model.SourceType{"calendar", "call"}
-$5 = []model.SourceType []model.SourceType{"insight", "kakao"}
+$5 = []model.SourceType []model.SourceType{"insight"}
 $6 = []string []string{"disposable"}
 $7 = 2026-08-17T00:00:00Z
 $8 = 2026-08-24T00:00:00Z
@@ -2464,7 +2439,7 @@ $8 = 2026-08-24T00:00:00Z
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 10
 $3 = []model.SourceType []model.SourceType{"calendar", "call"}
-$4 = []model.SourceType []model.SourceType{"insight", "kakao"}
+$4 = []model.SourceType []model.SourceType{"insight"}
 $5 = []string []string{"disposable"}
 $6 = 2026-08-17T00:00:00Z
 $7 = 2026-08-24T00:00:00Z
@@ -2499,7 +2474,7 @@ $7 = 2026-08-24T00:00:00Z
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
 $3 = []model.SourceType []model.SourceType{"calendar", "call"}
-$4 = []model.SourceType []model.SourceType{"insight", "kakao"}
+$4 = []model.SourceType []model.SourceType{"insight"}
 $5 = 2026-08-17T00:00:00Z
 $6 = 2026-08-24T00:00:00Z
 $7 = []string []string{"disposable"}
@@ -2565,7 +2540,7 @@ $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
 $3 = string "v1-tp"
 $4 = []model.SourceType []model.SourceType{"calendar", "call"}
-$5 = []model.SourceType []model.SourceType{"insight", "kakao"}
+$5 = []model.SourceType []model.SourceType{"insight"}
 $6 = 2026-08-17T00:00:00Z
 $7 = 2026-08-24T00:00:00Z
 $8 = []string []string{"disposable"}

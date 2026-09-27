@@ -22,7 +22,6 @@ export type SourceType =
   | "gmail"
   | "calendar"
   | "sms"
-  | "kakao"
   | "call"
   | "call-log"
   | "call-transcript"

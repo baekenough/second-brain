@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/baekenough/second-brain/internal/model"
@@ -455,8 +454,7 @@ func (s *ChunkStore) updateEmbeddingsBatch(ctx context.Context, embeddings []Chu
 			`UPDATE chunks
 			 SET embedding = $1,
 			     embedding_version = CASE WHEN $3 = '' THEN embedding_version ELSE $3 END
-			 WHERE id = $2
-			   AND document_id IN (SELECT id FROM documents WHERE `+backgroundSourceEligibilitySQL+`)`,
+			 WHERE id = $2`,
 			pgvector.NewVector(ce.Embedding),
 			ce.ChunkID,
 			ce.Version,
@@ -517,7 +515,6 @@ const listChunksNeedingEmbeddingQuery = `
 		FROM chunks c
 		JOIN documents d ON d.id = c.document_id
 		WHERE d.status = 'active'
-		  AND d.` + backgroundSourceEligibilitySQL + `
 		  AND (c.embedding IS NULL
 		       OR ($2 <> '' AND c.embedding_version IS DISTINCT FROM $2))
 		ORDER BY c.id ASC
@@ -582,7 +579,6 @@ func (s *ChunkStore) CountChunksNeedingEmbedding(ctx context.Context, currentVer
 		FROM chunks c
 		JOIN documents d ON d.id = c.document_id
 		WHERE d.status = 'active'
-		  AND d.`+backgroundSourceEligibilitySQL+`
 		  AND (c.embedding IS NULL
 		       OR ($1 <> '' AND c.embedding_version IS DISTINCT FROM $1))`,
 		currentVersion,
@@ -676,7 +672,6 @@ func (s *ChunkStore) SearchVectorFiltered(ctx context.Context, filter model.Sear
 
 // chunkEligibilitySQL shares the document lane's bound filter semantics.
 func chunkEligibilitySQL(args []interface{}, q model.SearchQuery) ([]interface{}, string) {
-	q = q.WithRetrievalDefaults()
 	filters := ""
 	if sources := q.IncludeSourceTypes(); len(sources) > 0 {
 		args = append(args, sources)
@@ -689,5 +684,5 @@ func chunkEligibilitySQL(args []interface{}, q model.SearchQuery) ([]interface{}
 	var occurred, retention string
 	args, _, occurred = appendOccurredRangeFilters(args, q.OccurredFrom, q.OccurredTo)
 	args, _, retention = appendRetentionFilter(args, q.ExcludeRetention)
-	return args, strings.TrimRight(filters+" "+occurred+" "+retention, " \t")
+	return args, filters + " " + occurred + " " + retention
 }
