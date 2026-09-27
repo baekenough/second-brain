@@ -571,6 +571,10 @@ func (s *Server) storeMessageRecord(
 		return true
 	}
 
+	if errors.Is(err, store.ErrDocumentDeleted) {
+		res.skip("document_deleted")
+		return true
+	}
 	class := classifyIngestErr(ctx, err)
 	attrs := append([]any{"kind", kind, "record_index", index, "class", class.String()}, ingestErrLogAttrs(err)...)
 	switch class {

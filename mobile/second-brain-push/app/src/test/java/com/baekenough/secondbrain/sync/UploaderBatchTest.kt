@@ -297,22 +297,43 @@ class UploaderBatchTest {
     }
 
     @Test
-    fun `uploadRecording returns PerFileClientError on 413 (payload too large)`() = runBlocking {
+    fun `uploadRecording leaves 408 413 and 429 queued for retry`() = runBlocking {
         val api = mockk<ApiService>()
         val cursorStore = mockk<CursorStore>(relaxed = true)
         val uploader = Uploader(api, cursorStore)
-
-        val file = tmpFolder.newFile("+821012345678_20260601143022.m4a")
-        file.writeBytes(ByteArray(100))
+        val file = tmpFolder.newFile("retry.m4a").apply { writeBytes(ByteArray(100)) }
         val recording = makeRecording(file)
+        for (code in listOf(408, 413, 429)) {
+            coEvery { api.postRecording(any(), any(), any(), any(), any(), any()) } returns okHttpRecordingError(code)
+            assertTrue(uploader.uploadRecording(recording) is UploadResult.TransientError)
+        }
+        coVerify(exactly = 0) { cursorStore.markRecordingSent(any()) }
+    }
 
-        coEvery { api.postRecording(any(), any(), any(), any(), any(), any()) } returns
-            okHttpRecordingError(413)
+    @Test
+    fun `recently modified recording is deferred before network or permanent marking`() = runBlocking {
+        val api = mockk<ApiService>()
+        val cursorStore = mockk<CursorStore>(relaxed = true)
+        val file = tmpFolder.newFile("active.m4a")
+        val recording = makeRecording(file)
+        file.setLastModified(System.currentTimeMillis())
+        assertTrue(Uploader(api, cursorStore).uploadRecording(recording) is UploadResult.TransientError)
+        coVerify(exactly = 0) { api.postRecording(any(), any(), any(), any(), any(), any()) }
+        coVerify(exactly = 0) { cursorStore.markRecordingSent(any()) }
+    }
 
-        val result = uploader.uploadRecording(recording)
-
-        assertTrue("expected PerFileClientError, got $result", result is UploadResult.PerFileClientError)
-        coVerify(exactly = 1) { cursorStore.markRecordingSent(file.name) }
+    @Test
+    fun `same timestamp records sort by id and retry after successful boundary`() = runBlocking {
+        val api = mockk<ApiService>()
+        val cursorStore = mockk<CursorStore>(relaxed = true)
+        val uploader = Uploader(api, cursorStore)
+        val records = (1..301).reversed().map { makeSingleSms(it.toLong(), 1000L) }
+        coEvery { api.postMessages(any()) } returnsMany listOf(
+            okHttpSuccessResponse(MessagesResponse(300, 0)), okHttpErrorResponse(503))
+        assertTrue(uploader.uploadMessages(records, emptyList()) is UploadResult.TransientError)
+        coVerify(exactly = 1) { cursorStore.advanceSms(300L, 1000L) }
+        val remaining = records.filter { it.dateMs > 1000L || (it.dateMs == 1000L && it.id > 300L) }
+        assertEquals(listOf(301L), remaining.map { it.id })
     }
 
     // ── uploadRecording integrity guard integration ───────────────────────
@@ -483,8 +504,9 @@ class UploaderBatchTest {
             """{"error":"test"}""".toResponseBody("application/json".toMediaType()),
         )
 
-    private fun makeRecording(file: File): ClassifiedRecording =
-        ClassifiedRecording(
+    private fun makeRecording(file: File): ClassifiedRecording {
+        file.setLastModified(System.currentTimeMillis() - 10 * 60_000L)
+        return ClassifiedRecording(
             filename = file.name,
             filePath = file.absolutePath,
             recordingTimeMs = 1780291822000L, // 2026-06-01T14:30:22 KST
@@ -492,4 +514,5 @@ class UploaderBatchTest {
             parsedContactName = null,
             linkedCall = null,
         )
+    }
 }

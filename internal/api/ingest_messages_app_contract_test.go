@@ -96,8 +96,8 @@ func TestIngestMessages_AppWireContract(t *testing.T) {
 		// 앱이 읽는 키는 모두 서버가 보내야 한다.
 		{kotlinClass: "MessagesResponse", server: IngestMessagesResponse{}, serverOnly: []string{"sanitized"}},
 		// 녹음 응답(#292): 앱은 accepted·skipped 로 전송 완료 여부를 정한다.
-		// reason 은 서버 로그·진단용이라 앱이 읽지 않는다.
-		{kotlinClass: "RecordingResponse", server: IngestRecordingResponse{}, serverOnly: []string{"reason"}},
+		// reason 은 앱에서 영구 제외 사유를 표시할 때 읽는다.
+		{kotlinClass: "RecordingResponse", server: IngestRecordingResponse{}},
 	}
 	for _, tc := range cases {
 		appKeys, ok := app[tc.kotlinClass]

@@ -9,6 +9,7 @@ import (
 
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/note"
+	"github.com/baekenough/second-brain/internal/store"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 )
@@ -119,6 +120,10 @@ func (s *Server) createNoteHandler(w http.ResponseWriter, r *http.Request) {
 		false, /* doEmbed — deferred to the chunk-embedding backfill; see above */
 		false /* requireTitle */)
 	if errMsg != "" {
+		if errMsg == store.ErrDocumentDeleted.Error() {
+			writeError(w, http.StatusConflict, "deleted note cannot be recreated")
+			return
+		}
 		// note.Save's remaining validation failures (empty content after
 		// trimming) are 400s; anything else is an internal error string.
 		if errMsg == "content is required and must be non-empty" {

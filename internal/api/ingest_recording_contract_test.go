@@ -72,6 +72,7 @@ func TestIngestRecording_UpsertErrorContract(t *testing.T) {
 		wantStatus int
 	}{
 		{"duplicate transcript", store.ErrDuplicateTranscript, http.StatusOK},
+		{"deleted document", store.ErrDocumentDeleted, http.StatusOK},
 		{"wrapped duplicate", fmt.Errorf("upsert: %w", store.ErrDuplicateTranscript), http.StatusOK},
 		{"connection failure", &pgconn.PgError{Code: "08006"}, http.StatusServiceUnavailable},
 		{"unknown error", errors.New("boom"), http.StatusServiceUnavailable},
@@ -98,6 +99,12 @@ func TestIngestRecording_UpsertErrorContract(t *testing.T) {
 				var resp IngestRecordingResponse
 				if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 					t.Fatal(err)
+				}
+				if errors.Is(tc.err, store.ErrDocumentDeleted) {
+					if resp.Accepted || !resp.Skipped || resp.Reason != "document_deleted" {
+						t.Fatalf("deleted response=%+v", resp)
+					}
+					return
 				}
 				// 앱은 accepted 또는 skipped 가 참이면 전송 완료로 표시한다.
 				if !resp.Accepted || !resp.Skipped || resp.Reason != recordingSkipReasonDuplicate || resp.DocumentID != "" {

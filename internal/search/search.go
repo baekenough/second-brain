@@ -739,6 +739,7 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 	// 검색 실험용 노브. 제로값이면 전부 현행 동작이므로, 아래 경로들은
 	// 노브를 켜지 않은 배포에서 이 줄이 생기기 전과 같은 결과를 낸다.
 	tune := s.resolveTuning(q)
+	q.Tuning = tune // 저장소 엔티티 레인에도 환경변수 노브를 전달한다.
 
 	// 희소 레인 질의 형태(SEARCH_SPARSE_QUERY, #276). SparseTerms 는 이
 	// 서비스만 채운다: 호출자가 넣은 값은 먼저 버리고, 노브가 켠 범위의

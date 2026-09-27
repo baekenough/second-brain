@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -63,6 +64,13 @@ const callDupCheckQuery = `
 	  AND content      = $1
 	  AND source_id   <> $2
 	LIMIT 1`
+
+// ErrDocumentDeleted 는 재수집으로 되살릴 수 없는 삭제 문서를 뜻한다.
+var ErrDocumentDeleted = errors.New("document was permanently soft-deleted")
+
+// 삭제 주체를 모르는 과거 행도 보수적으로 지킨다. 재등장이 허용된 수집기만
+// filesystem/system 주체를 명시한다.
+const reingestAllowedSQL = `(documents.status <> 'deleted' OR documents.deleted_by IN ('filesystem', 'system'))`
 
 // classificationProtectedMetadataKeys lists every documents.metadata key the
 // classification pipeline owns — internal/classify.Result.Metadata
@@ -148,7 +156,7 @@ const existingMetadataObjectSQL = `CASE WHEN jsonb_typeof(documents.metadata) = 
 //     없고(마이그레이션 033 이 모든 통화 문서에 transcription 키를 채웠으므로
 //     정상 행에서는 생기지 않는다), 예전처럼 보호했다가는 metadata 가 NULL 로
 //     남거나 null||{} 가 배열이 된다. 보통 upsert 로 처리해 객체로 되돌린다.
-//   - 기존 행의 transcription 이 none·pending 이 아니다. 값의 실제 집합은
+//   - pending 녹음에 none 로그가 재전송되거나, 기존 행의 transcription 이 none·pending 이 아니다. 값의 실제 집합은
 //     none·pending·done 셋이고(model.SourceCall 주석, smsmap.MapCall,
 //     ingest_recording.go, whisper.go), 키가 없는 행은 033 이전의 레거시
 //     전사 문서뿐이다 — classify.evaluateCall 도 키 없음을 done 과 같이 본다.
@@ -184,8 +192,10 @@ const existingMetadataObjectSQL = `CASE WHEN jsonb_typeof(documents.metadata) = 
 //     후 content 와 비교한다). 그래서 청크 교체·재임베딩이 일어나지 않는다.
 const callTranscriptKeptSQL = `(documents.source_type = 'call'
 			AND jsonb_typeof(documents.metadata) = 'object'
-			AND COALESCE(documents.metadata->>'transcription', '') NOT IN ('none', 'pending')
-			AND COALESCE(EXCLUDED.metadata->>'transcription', '') IN ('none', 'pending'))`
+			AND ((COALESCE(documents.metadata->>'transcription', '') NOT IN ('none', 'pending')
+			      AND COALESCE(EXCLUDED.metadata->>'transcription', '') IN ('none', 'pending'))
+			 OR (documents.metadata->>'transcription' = 'pending'
+			      AND EXCLUDED.metadata->>'transcription' = 'none')))`
 
 // callLogRefreshableMetadataKeys 는 전사가 붙은 통화 문서에서도 통화 로그 재수집이
 // 갱신해도 되는 metadata 키다. 모두 smsmap.MapCall 이 통화 로그에서 만드는
@@ -431,7 +441,9 @@ func upsertTrackedRow(ctx context.Context, db rowQuerier, doc *model.Document) (
 			collected_at = EXCLUDED.collected_at,
 			status       = 'active',
 			deleted_at   = NULL,
+			deleted_by   = NULL,
 			updated_at   = now()
+		WHERE ` + reingestAllowedSQL + `
 		RETURNING id, created_at, updated_at,
 		          (xmax::text::bigint = 0) AS was_insert,
 		          COALESCE((SELECT old_content FROM prev), '') IS DISTINCT FROM documents.content AS content_changed`
@@ -449,6 +461,9 @@ func upsertTrackedRow(ctx context.Context, db rowQuerier, doc *model.Document) (
 		embeddingVersionArg,
 	)
 	if err := row.Scan(&doc.ID, &doc.CreatedAt, &doc.UpdatedAt, &wasInsert, &contentChanged); err != nil {
+		if isNoRows(err) {
+			return false, ErrDocumentDeleted
+		}
 		return false, err
 	}
 	// Fresh INSERT: content is always new. The CTE comparison also yields true
@@ -461,7 +476,7 @@ func upsertTrackedRow(ctx context.Context, db rowQuerier, doc *model.Document) (
 }
 
 // Upsert inserts a document or updates it when (source_type, source_id) already exists.
-// On conflict the status is reset to 'active' (handles re-appearance of previously deleted files).
+// 충돌 시 filesystem/system 삭제만 재활성화한다. 사용자·정책·출처 불명 삭제는 유지한다.
 //
 // Duplicate call content guard: for source_type='call' only, a cheap
 // pre-insert existence check is performed. When an active document with
@@ -546,7 +561,9 @@ func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
 			collected_at = EXCLUDED.collected_at,
 			status       = 'active',
 			deleted_at   = NULL,
+			deleted_by   = NULL,
 			updated_at   = now()
+		WHERE ` + reingestAllowedSQL + `
 		RETURNING id, created_at, updated_at`
 
 	row := s.pg.pool.QueryRow(ctx, q,
@@ -560,7 +577,11 @@ func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
 		doc.CollectedAt,
 		embeddingVersionArg,
 	)
-	return row.Scan(&doc.ID, &doc.CreatedAt, &doc.UpdatedAt)
+	err = row.Scan(&doc.ID, &doc.CreatedAt, &doc.UpdatedAt)
+	if isNoRows(err) {
+		return ErrDocumentDeleted
+	}
+	return err
 }
 
 // ErrDuplicateTranscript is returned by Upsert when a call-transcript document
@@ -695,7 +716,9 @@ func (s *DocumentStore) AttachTranscript(ctx context.Context, doc *model.Documen
 			collected_at = EXCLUDED.collected_at,
 			status       = 'active',
 			deleted_at   = NULL,
+			deleted_by   = NULL,
 			updated_at   = now()
+		WHERE ` + reingestAllowedSQL + `
 		RETURNING id, created_at, updated_at,
 		          (xmax::text::bigint = 0) AS was_insert,
 		          (COALESCE((SELECT old_content FROM prev), '') IS DISTINCT FROM $4
@@ -714,6 +737,9 @@ func (s *DocumentStore) AttachTranscript(ctx context.Context, doc *model.Documen
 		embeddingVersionArg,
 	)
 	if err := row.Scan(&doc.ID, &doc.CreatedAt, &doc.UpdatedAt, &wasInsert, &contentChanged); err != nil {
+		if isNoRows(err) {
+			return false, ErrDocumentDeleted
+		}
 		return false, err
 	}
 	if wasInsert {
@@ -983,8 +1009,7 @@ func buildFulltextSearchQuery(query model.SearchQuery) (string, []interface{}) {
 		// 않는 파라미터는 PostgreSQL 이 타입을 정하지 못해 질의가 실패한다.
 		scoreExpr = fmt.Sprintf("GREATEST(\n\t\t           %s,\n\t\t           %s,\n\t\t           %s\n\t\t       )",
 			sp.tsRank("tsv", "simple"), sp.tsRank("tsv", "english"), sp.docSparseRank())
-		matchExpr = fmt.Sprintf("(%s\n\t\t   OR %s\n\t\t   OR %s)",
-			sp.tsMatch("tsv", "simple"), sp.tsMatch("tsv", "english"), sp.likeAny(true, "content", "title"))
+		matchExpr = sp.docMatch(true)
 	}
 
 	// The LIKE pattern uses SQL string concatenation ('%' || $1 || '%') so that
@@ -1337,6 +1362,11 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 	entityCTE := emptyEntityCTE
 	if w.EntityWeight > 0 {
 		entityCTE = buildEntityCTE(entityFilterParam, entityStatusFilter, entitySourceFilter, entityExcludeFilter, entityRetentionFilter, entityOccurredFilter)
+		if query.Tuning.EntityQueryContainsName {
+			legacy := "e.normalized_name LIKE '%%' || " + entityFilterParam + " || '%%'"
+			match := "char_length(e.normalized_name) >= 2 AND strpos(" + entityFilterParam + ", e.normalized_name) > 0"
+			entityCTE = strings.Replace(entityCTE, legacy, match, 1)
+		}
 	}
 
 	// 질의 형태(#276). 아래 네 조각의 기본값은 #276 이전 SQL 과 글자 하나까지
@@ -1349,7 +1379,12 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 			       )`
 	ftsMatch := `(tsv @@ plainto_tsquery('simple', $1)
 			   OR tsv @@ plainto_tsquery('english', $1))`
-	bigmOrderPrefix := ""
+	bigmOrder := `
+			           GREATEST(
+			               bigm_similarity(content, $1),
+			               bigm_similarity(title,   $1),
+			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
+			           ) DESC, id ASC`
 	bigmMatch := `(content LIKE '%%' || $1 || '%%'
 			    OR title   LIKE '%%' || $1 || '%%'
 			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))`
@@ -1360,11 +1395,11 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 			sp.tsRank("tsv", "simple"), sp.tsRank("tsv", "english"))
 		ftsMatch = fmt.Sprintf("(%s\n\t\t\t   OR %s)", sp.tsMatch("tsv", "simple"), sp.tsMatch("tsv", "english"))
 		// bigm 레인 순서: 맞은 키워드 수 → 질문 전체 일치 보너스(기존의 정밀
-		// 일치가 동점일 때 이기게) → 기존 bigm_similarity → id.
-		bigmOrderPrefix = fmt.Sprintf("\n\t\t\t           %s DESC,\n\t\t\t           %s DESC,",
+		// 일치가 동점일 때 이기게) → id. 원문 전체의 bigm_similarity 계산은 하지 않는다.
+		bigmOrder = fmt.Sprintf("\n\t\t\t           %s DESC,\n\t\t\t           %s DESC, id ASC",
 			sp.likeCount(true, "content", "title"),
-			"CASE WHEN content LIKE '%' || $1 || '%' OR title LIKE '%' || $1 || '%' THEN 1 ELSE 0 END")
-		bigmMatch = sp.likeAny(true, "content", "title")
+			"CASE WHEN content LIKE '%' || "+escapedRawLikeSQL+" || '%' OR title LIKE '%' || "+escapedRawLikeSQL+" || '%' THEN 1 ELSE 0 END")
+		bigmMatch = sp.docMatch(false)
 	}
 
 	q := fmt.Sprintf(`
@@ -1394,12 +1429,7 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 		),
 		bigm AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY%s
-			           GREATEST(
-			               bigm_similarity(content, $1),
-			               bigm_similarity(title,   $1),
-			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
-			           ) DESC, id ASC) AS rank
+			       row_number() OVER (ORDER BY%s) AS rank
 			FROM documents
 			WHERE %s
 			%s
@@ -1443,7 +1473,7 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 		ftsRank, ftsMatch, // fts: 질의 형태(#276)
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, // fts
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, // vec
-		bigmOrderPrefix, bigmMatch, // bigm: 질의 형태(#276)
+		bigmOrder, bigmMatch, // bigm: 질의 형태(#276)
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, // bigm
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, // summvec
 		entityCTE, // entity lane carries the same filters in d.-qualified form
@@ -1608,7 +1638,7 @@ func (s *DocumentStore) MarkDeleted(ctx context.Context, sourceType model.Source
 
 	tag, err := s.pg.pool.Exec(ctx, `
 		UPDATE documents
-		SET status = 'deleted', deleted_at = now()
+		SET status = 'deleted', deleted_at = now(), deleted_by = 'filesystem'
 		WHERE source_type = $1
 		  AND status = 'active'
 		  AND source_id != ALL($2)`,
@@ -1635,7 +1665,7 @@ func (s *DocumentStore) MarkDeleted(ctx context.Context, sourceType model.Source
 func (s *DocumentStore) SoftDeleteBySourceID(ctx context.Context, sourceType model.SourceType, sourceID string) (bool, error) {
 	const q = `
 		UPDATE documents
-		SET status = 'deleted', deleted_at = now()
+		SET status = 'deleted', deleted_at = now(), deleted_by = 'system'
 		WHERE source_type = $1 AND source_id = $2 AND status = 'active'`
 	tag, err := s.pg.pool.Exec(ctx, q, sourceType, sourceID)
 	if err != nil {
@@ -2315,7 +2345,7 @@ func (s *DocumentStore) ResetNoteEnrichment(ctx context.Context, documentID uuid
 func (s *DocumentStore) SoftDeleteByID(ctx context.Context, id uuid.UUID) error {
 	const q = `
 		UPDATE documents
-		SET status = 'deleted', deleted_at = now()
+		SET status = 'deleted', deleted_at = now(), deleted_by = 'user'
 		WHERE id = $1 AND source_type = 'note' AND status = 'active'`
 	if _, err := s.pg.pool.Exec(ctx, q, id); err != nil {
 		return fmt.Errorf("soft delete note %s: %w", id, err)
@@ -2332,7 +2362,7 @@ func (s *DocumentStore) SoftDeleteByID(ctx context.Context, id uuid.UUID) error 
 func (s *DocumentStore) SoftDeleteInsightsByNoteID(ctx context.Context, noteID uuid.UUID) (int, error) {
 	const q = `
 		UPDATE documents
-		SET status = 'deleted', deleted_at = now()
+		SET status = 'deleted', deleted_at = now(), deleted_by = 'policy'
 		WHERE source_type = 'insight'
 		  AND status = 'active'
 		  AND metadata->'provenance'->>'source_note_id' = $1

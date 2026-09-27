@@ -22,6 +22,12 @@ private val SLACK = CursorStore.FUTURE_SLACK_MS
  *   3. Sent-recording set update semantics (pure set logic, no DataStore).
  */
 class CursorStoreTest {
+    @Test fun `same date cursor cannot move to smaller id`() {
+        assertFalse(CursorStore.isMonotonicAdvance(1000, 2, 1000, 3))
+        assertTrue(CursorStore.isMonotonicAdvance(1000, 4, 1000, 3))
+        assertTrue(CursorStore.isMonotonicAdvance(1001, 1, 1000, 3))
+    }
+
 
     // ── Cutover constant ──────────────────────────────────────────────────
 

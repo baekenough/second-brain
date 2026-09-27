@@ -34,7 +34,8 @@ import (
 // 판 이력:
 //   - v1: 최초(#276).
 //   - v2: 불용어 "중에"·"이건"·"그건"·"저건" 추가(PR-B 리뷰 후속).
-const Version = "v2"
+//   - v3: -한으로 끝나는 세 글자 이름 보존, 명시한 검색 동사만 예외.
+const Version = "v3"
 
 // MaxTerms 는 키워드 수 상한이다. 저장소가 LIKE 키워드마다 플레이스홀더를
 // 하나씩 OR 로 펼치므로(pg_bigm GIN 은 LIKE ANY(array)를 인덱스로 못 쓴다)
@@ -227,13 +228,17 @@ func lexemeRuns(w string) []string {
 // 설계 문서의 원안은 "어미로 끝나면 토큰을 버린다" 였지만, 어간을 남기는
 // 쪽으로 바꿨다: "통화했어" → "통화", "회의인지" → "회의" 처럼 명사+어미가
 // 붙은 토큰이 흔하고, 과도하게 잘라도 TS 는 접두 매치·LIKE 는 부분 문자열
-// 매치라 손해가 작다("무제한" → "무제" 도 "무제한" 에 매치된다).
+// 매치를 한다. 다만 세 글자 -한 인명은 오탐을 줄이기 위해 보존한다.
 func stripPredicate(w string) (string, bool) {
 	n := utf8.RuneCountInString(w)
 	if n < 3 {
 		return w, true
 	}
 	for _, suf := range predicateSuffixes {
+		// 세 글자 인명은 보존하고, 명시한 검색 동사에만 한 어미를 뗀다.
+		if suf == "한" && n == 3 && !hanVerbs[w] {
+			continue
+		}
 		if !strings.HasSuffix(w, suf) {
 			continue
 		}
@@ -367,7 +372,7 @@ var timeExprRe = regexp.MustCompile(strings.Join([]string{
 
 // predicateSuffixes 는 서술어 어미다. 가장 긴 것부터 검사한다. "한" 만
 // 한 글자인데, "통화한 내용" 처럼 관형형 어미가 붙은 명사형 질문이 흔해서
-// 넣었다(3 rune 이상 토큰에만 적용된다).
+// 넣었다. 세 글자 토큰에는 hanVerbs 목록에 있는 동사만 적용한다.
 var predicateSuffixes = []string{
 	"했더라", "었더라", "였더라", "주세요",
 	"해줘", "어줘", "아줘", "려줘", "해봐", "줄래", "할래",
@@ -436,3 +441,5 @@ var stopwords = func() map[string]struct{} {
 	}
 	return m
 }()
+
+var hanVerbs = map[string]bool{"통화한": true, "회의한": true, "대화한": true, "공유한": true, "작성한": true, "연락한": true, "요청한": true, "확인한": true}

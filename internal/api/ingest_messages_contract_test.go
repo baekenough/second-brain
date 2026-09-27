@@ -708,3 +708,27 @@ func TestIngestMessages_SkipReasonsLoggedAndDriftAlarm(t *testing.T) {
 		}
 	})
 }
+
+func TestIngestMessages_DeletedDocumentIsSkipped(t *testing.T) {
+	t.Parallel()
+
+	u := &scriptedMessagesUpserter{fn: func(_ context.Context, call int, _ *model.Document) (bool, error) {
+		if call == 0 {
+			return false, store.ErrDocumentDeleted
+		}
+		return true, nil
+	}}
+	srv := newMessagesTestServer(u, 0, time.Time{})
+	payload := map[string]any{"calls": []any{
+		map[string]any{"number": "n1", "date_ms": recentMs(0), "duration_sec": 3, "type": 1},
+		map[string]any{"number": "n2", "date_ms": recentMs(1), "duration_sec": 4, "type": 2},
+	}}
+	rr := doMessagesPost(t, srv, payload, "Bearer test-key")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", rr.Code, rr.Body.String())
+	}
+	resp := decodeMessagesResp(t, rr)
+	if resp.Accepted != 1 || resp.Skipped != 1 || len(resp.Errors) != 0 {
+		t.Errorf("accepted=%d skipped=%d errors=%v, want 1/1/[]", resp.Accepted, resp.Skipped, resp.Errors)
+	}
+}

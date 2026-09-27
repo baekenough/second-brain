@@ -283,8 +283,8 @@ func TestDB_CallUpsertProtectionScope_RealDB(t *testing.T) {
 		}
 	})
 
-	t.Run("pending_to_none_follows_snapshot", func(t *testing.T) {
-		// 녹음 대기(pending) 문서는 보호 대상이 아니다 — 예전 동작 그대로다.
+	t.Run("pending_to_none_preserves_recording", func(t *testing.T) {
+		// 통화 로그 재전송은 녹음 대기 상태와 파일 연결을 지우면 안 된다.
 		sourceID := callProtectTestPrefix + uuid.NewString()
 		p := callLogDoc(sourceID, uniqContact("상대A"), "pending")
 		p.Metadata["audio_file"] = "zz.m4a"
@@ -297,7 +297,7 @@ func TestDB_CallUpsertProtectionScope_RealDB(t *testing.T) {
 			t.Fatal(err)
 		}
 		got := readCallRow(t, pg, sourceID)
-		if !changed || got.meta["contact_name"] != contactC {
+		if changed || got.meta["contact_name"] != contactC || got.meta["transcription"] != "pending" || got.meta["audio_file"] != "zz.m4a" {
 			t.Errorf("pending call not updated: changed=%v meta=%v", changed, got.meta)
 		}
 	})

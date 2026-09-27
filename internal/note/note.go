@@ -96,6 +96,9 @@ func Save(
 	}
 
 	if err := docs.Upsert(ctx, doc); err != nil {
+		if errors.Is(err, store.ErrDocumentDeleted) {
+			return nil, store.ErrDocumentDeleted.Error()
+		}
 		slog.Error("note: upsert failed", "source_id", sourceID, "error", err)
 		return nil, "internal error saving note"
 	}

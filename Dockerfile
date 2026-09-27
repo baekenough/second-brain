@@ -175,6 +175,7 @@ WORKDIR /app
 FROM runtime-base AS runtime-collector
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+      ffmpeg \
       ocrmypdf \
       poppler-utils \
       tesseract-ocr \

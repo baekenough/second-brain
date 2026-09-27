@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/baekenough/second-brain/internal/store"
 	"github.com/google/uuid"
 )
 
@@ -368,5 +369,14 @@ func TestCreateNote_EmbeddingBackendDown_StillPersists(t *testing.T) {
 	}
 	if doc.Metadata["enrichment_status"] != "pending" {
 		t.Errorf("enrichment_status = %v, want %q", doc.Metadata["enrichment_status"], "pending")
+	}
+}
+
+func TestCreateNote_Deleted_ReturnsConflict(t *testing.T) {
+	upserter := newFakeNotesUpserter()
+	upserter.upsertErr = store.ErrDocumentDeleted
+	rr := doNotesRequest(t, newNotesTestServer(upserter), http.MethodPost, "/api/v1/notes", map[string]string{"content": "deleted content"}, "Bearer test-key")
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"math"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -245,7 +246,11 @@ func (s *Service) buildRerankDocs(ctx context.Context, query string,
 	docs := make([]string, len(results))
 	if tune.RerankInput != model.RerankInputBestChunk {
 		for i, r := range results {
-			docs[i] = truncateRunes(r.Title+"\n"+r.Content, maxRerankDocRunes)
+			text := r.Title + "\n" + r.Content
+			if tune.RerankCallContext && r.SourceType == model.SourceCall {
+				text = callRerankContext(r) + "\n" + text
+			}
+			docs[i] = truncateRunes(text, maxRerankDocRunes)
 		}
 		return docs
 	}
@@ -262,7 +267,15 @@ func (s *Service) buildRerankDocs(ctx context.Context, query string,
 		if body == "" {
 			body = r.Content // head 폴백: 청크를 못 읽었거나 없는 문서
 		}
-		docs[i] = truncateRunes(rerankHeader(r)+"\n"+body, maxRerankDocRunes)
+		header := rerankHeader(r)
+		if tune.RerankCallContext && r.SourceType == model.SourceCall {
+			header += "\n" + callRerankContext(r)
+			// 통화 시작부와 선택된 근거가 서로 예산을 잠식하지 않도록 제한한다.
+			if !isChunkResult(r) && body != r.Content {
+				header += "\n" + truncateRunes(r.Content, 250)
+			}
+		}
+		docs[i] = truncateRunes(header+"\n"+body, maxRerankDocRunes)
 	}
 	return docs
 }
@@ -395,4 +408,14 @@ func truncateRunes(s string, max int) string {
 		return s
 	}
 	return string([]rune(s)[:max])
+}
+
+// callRerankContext는 이미 검색 결과에 있는 참여자만 전달한다.
+func callRerankContext(r *model.SearchResult) string {
+	name, _ := r.Metadata["contact_name"].(string)
+	if name == "" {
+		return ""
+	}
+	name = strings.Join(strings.Fields(name), " ")
+	return "참여자: " + truncateRunes(name, 120)
 }

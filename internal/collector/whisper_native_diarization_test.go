@@ -574,7 +574,7 @@ func makeCloudWhisperCollector(t *testing.T, cfg *config.Config, srv *httptest.S
 // .m4a file of exactly sizeBytes, so multi-megabyte test fixtures do not
 // consume real disk I/O time or space. A valid ISOBMFF "ftyp" box is written
 // at the start so the file would pass the audio integrity pre-check if it
-// were not skipped earlier by the cloud size cap.
+// 클라우드 업로드 준비를 마친 뒤 실제 업로드까지 도달한다.
 func writeSparseM4A(t *testing.T, dir, name string, sizeBytes int64, mtime time.Time) string {
 	t.Helper()
 	path := filepath.Join(dir, name)
@@ -605,12 +605,9 @@ func writeSparseM4A(t *testing.T, dir, name string, sizeBytes int64, mtime time.
 	return path
 }
 
-// TestWhisperCollector_CloudEndpoint_OversizeFileSkipped verifies that,
-// against a non-local (cloud) endpoint, a file over the 25 MiB hard API limit
-// is skipped (no HTTP call, no Document, no quarantine) while the walk
-// continues and a normal-size file in the same directory is still
-// transcribed.
-func TestWhisperCollector_CloudEndpoint_OversizeFileSkipped(t *testing.T) {
+// 크기만 큰 손상 파일은 변환 실패로 재시도를 늦추되 정상 파일 수집은 계속한다.
+// 유효한 대용량 음원 재인코딩은 whisper_cloud_audio_test.go에서 검증한다.
+func TestWhisperCollector_CloudEndpoint_InvalidOversizeFileDeferred(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -663,7 +660,7 @@ func TestWhisperCollector_CloudEndpoint_OversizeFileSkipped(t *testing.T) {
 		t.Errorf("Content = %q, want %q", docs[0].Content, wantTranscript)
 	}
 	if serverCalls != 1 {
-		t.Errorf("server called %d times, want 1 (oversized file must never reach the HTTP endpoint)", serverCalls)
+		t.Errorf("server called %d times, want 1 (invalid oversized file must not reach the HTTP endpoint)", serverCalls)
 	}
 }
 

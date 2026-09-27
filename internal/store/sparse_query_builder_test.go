@@ -218,3 +218,34 @@ func TestSparseQueryBuilders_HybridUntouchedLanes(t *testing.T) {
 		}
 	}
 }
+
+func TestSparseDocumentIndexBranches(t *testing.T) {
+	q := sparseSnapshotCases()[0].q
+	q.SparseTerms = model.SparseTerms{Like: []string{"foo_bar"}}
+	for _, b := range buildAllSparse(q) {
+		if b.name == "fulltext" || strings.HasPrefix(b.name, "hybrid/") {
+			if !strings.Contains(b.sql, "UNION SELECT id FROM documents WHERE source_type = 'call'") {
+				t.Fatalf("%s: 연락처 분기 누락", b.name)
+			}
+			if strings.Contains(b.sql, "bigm_similarity(") {
+				t.Fatalf("%s: 키워드 모드에 원문 유사도 계산이 남음", b.name)
+			}
+		}
+		if b.args[len(b.args)-1] != `foo\_bar` {
+			t.Errorf("%s: LIKE 인자 %v", b.name, b.args)
+		}
+	}
+}
+
+func TestEntityQueryContainsNameOptIn(t *testing.T) {
+	q := sparseSnapshotCases()[0].q
+	w := model.SearchWeights{}.Defaults()
+	w.EntityWeight = 1
+	baseline, _ := buildHybridSearchQuery(q, w)
+	q.Tuning.EntityQueryContainsName = true
+	candidate, args := buildHybridSearchQuery(q, w)
+	assertPlaceholdersDense(t, "entity opt-in", candidate, args)
+	if !strings.Contains(baseline, "e.normalized_name LIKE") || strings.Contains(candidate, "e.normalized_name LIKE") || !strings.Contains(candidate, "char_length(e.normalized_name) >= 2 AND strpos(") {
+		t.Fatal("엔티티 방향 노브가 적용되지 않음")
+	}
+}

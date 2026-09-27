@@ -478,3 +478,15 @@ func TestResolveTuning_RequestWinsOverService(t *testing.T) {
 		t.Errorf("요청 값이 서비스 기본값을 이겨야 한다: %+v", got)
 	}
 }
+
+func TestRerankCallContextOptIn(t *testing.T) {
+	s := &Service{}
+	call := &model.SearchResult{Document: model.Document{SourceType: model.SourceCall, Title: "가상 통화", Content: "안녕하세요", Metadata: map[string]interface{}{"contact_name": "가상참여자"}}}
+	for _, mode := range []string{model.RerankInputHead, model.RerankInputBestChunk} {
+		off := s.buildRerankDocs(context.Background(), "가상참여자 통화", []*model.SearchResult{call}, model.SearchTuning{RerankInput: mode})[0]
+		on := s.buildRerankDocs(context.Background(), "가상참여자 통화", []*model.SearchResult{call}, model.SearchTuning{RerankInput: mode, RerankCallContext: true})[0]
+		if strings.Contains(off, "참여자:") || !strings.Contains(on, "참여자: 가상참여자") {
+			t.Errorf("mode=%s off=%q on=%q", mode, off, on)
+		}
+	}
+}

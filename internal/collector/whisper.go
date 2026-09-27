@@ -651,6 +651,9 @@ type WhisperCollector struct {
 	nameRedactor     *NameRedactor
 	failedQuarantine map[string]struct{}
 
+	// 재시도 상태를 디스크에 쓸 수 없어도 같은 프로세스에서 경고를 반복하지 않는다.
+	cloudAudioRetries sync.Map
+
 	// logger 는 이 수집기의 모든 로그 줄을 받는다(#297). nil 이면
 	// slog.Default(). 테스트는 이것을 주입해, 전역 로거를 바꾸지 않고도 병렬
 	// 테스트가 각자의 로그를 잡는다.
@@ -961,12 +964,9 @@ const whisperStreamBatchSize = 5
 // exception was explicit rather than accidental misconfiguration. The guard
 // never blocks the request either way — it is observability, not enforcement.
 //
-// Cloud file-size guard: OpenAI's /v1/audio/transcriptions endpoint hard-caps
-// uploads at 25 MiB (whisperCloudMaxFileBytes, verified against the live
-// API). When the resolved endpoint is non-local, files over this limit are
-// skipped (not quarantined — they are valid audio, just too large for a
-// single request) and the walk continues; see CollectStream for the exact
-// placement and the transcription-ledger interaction.
+// 클라우드 업로드 한도를 넘는 파일은 원본을 보존한 채 임시 MP3로 재인코딩하고
+// 30분 단위로 분할한다. 한 구간이라도 실패하면 문서와 성공 원장을 만들지 않는다.
+// 실패는 별도 재시도 상태에 남겨 여섯 시간 뒤 다시 시도한다.
 //
 // Partial success: individual transcription failures are logged as warnings and
 // the walk continues. The final error is nil as long as the directory walk
@@ -991,7 +991,7 @@ func (c *WhisperCollector) Collect(ctx context.Context, since time.Time) ([]mode
 //
 // Pipeline:
 //   - Phase 1 (SEQUENTIAL walk): every filter (ext, cutover, authoritative
-//     index-skip, cloud 25 MiB size cap, local size cap, failedQuarantine
+//     색인된 파일 제외, 설정된 크기 제한, 격리 실패 파일 제외
 //     skip-set, header check + quarantine) runs single-goroutine inside
 //     WalkDir, preserving the single-writer safety of the failedQuarantine map
 //     (no mutex). Files that pass become `pending`.
@@ -1130,43 +1130,7 @@ func (c *WhisperCollector) CollectStream(ctx context.Context, since time.Time, o
 			}
 		}
 
-		// Cloud API hard limit (25 MiB): applies only to non-local endpoints
-		// (isLocal, captured once above CollectStream's walk). Unlike the
-		// configurable c.maxFileBytes cap below (a local disk-usage guard),
-		// this reflects a fixed server-side constraint — OpenAI rejects larger
-		// uploads outright. Submitting an oversized file anyway would waste a
-		// network round-trip and log a spurious API error, so it is caught
-		// here first.
-		//
-		// The file is valid audio, not corrupt, so it is skipped (walk
-		// continues) WITHOUT quarantine and WITHOUT emitting a Document —
-		// chunking oversized files for the cloud API is out of scope for this
-		// change.
-		//
-		// Ledger interaction: skipped files here are NEVER passed to the
-		// scheduler's onBatch, so they are never recorded in the transcription
-		// ledger either (RecordTranscribed only runs over documents that
-		// actually reach a batch). This means an oversized file re-triggers
-		// this same WARN on every future collection cycle until it either
-		// shrinks, moves under a local endpoint, or is chunked externally —
-		// deliberately mirroring the existing c.maxFileBytes cap immediately
-		// below, which has always skipped without ledgering (a pre-existing,
-		// accepted trade-off, not one introduced by this change). Doing
-		// anything else here (e.g. ledgering a skip so the WARN fires only
-		// once) would require plumbing store/ledger access into
-		// WhisperCollector, which today only produces model.Document values
-		// and has no store dependency at all — out of scope for this change,
-		// and unlike the original infinite-retry bug (#158) this cost is a
-		// single log line per cycle, not a repeated expensive network/CPU
-		// operation.
-		if !isLocal && info.Size() > whisperCloudMaxFileBytes {
-			c.log().Warn("whisper: skipping file over cloud API 25 MiB limit",
-				append(whisperFileAttrs(c.cfg.WhisperAudioDir, path),
-					"size_bytes", info.Size(),
-					"limit_bytes", whisperCloudMaxFileBytes,
-				)...)
-			return nil
-		}
+		// 클라우드 한도 초과 파일은 워커에서 재인코딩·분할한다(#300).
 
 		// Per-file size cap: skip files that exceed the configured limit.
 		// When maxFileBytes <= 0 the cap is disabled (unlimited).
@@ -1423,6 +1387,9 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 
 	txResult, err := c.transcribeFile(ctx, item.path, isLocal)
 	if err != nil {
+		if errors.Is(err, errWhisperRetryDeferred) {
+			return model.Document{}, false
+		}
 		c.log().Warn("whisper: transcription failed",
 			append(fileAttrs, logsafe.ErrAttrs(err)...)...)
 		return model.Document{}, false // partial success — skip
@@ -1500,6 +1467,14 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 	// authoritative speaker, so alignment would only introduce error (see
 	// nativeDiarizedSegsToRawLabelled doc comment).
 	switch {
+	case txResult.parts > 0:
+		// 분할 요청의 화자 A/B는 다른 구간의 A/B와 동일인이라고 볼 수 없다.
+		// 구간별 표기·시간을 붙인 본문을 그대로 쓰며 원본 식별자는 유지한다.
+		meta["transcription_parts"] = txResult.parts
+		if len(txResult.diarized) > 0 {
+			meta["diarization"] = "native_segmented"
+			meta["speaker_scope"] = "segment"
+		}
 	case modelSupportsNativeDiarization(c.cfg.WhisperModel):
 		if len(txResult.diarized) > 0 {
 			labelled, nSpeakers := renderSpeakerBlocks(nativeDiarizedSegsToRawLabelled(txResult.diarized))
@@ -1765,6 +1740,7 @@ func checkAudioFileHeader(path, ext string) error {
 
 // transcribeFileResult holds the output of a transcription call.
 type transcribeFileResult struct {
+	parts    int               // 클라우드 업로드용 재인코딩 구간 수; 원본 경로는 유지한다.
 	text     string            // flat transcript text
 	segments []whisperSegment  // time-stamped segments (verbose_json / pyannote path); may be nil/empty for older servers
 	diarized []diarizedSegment // speaker-labelled segments (diarized_json / native-diarizing models); nil unless requested
@@ -1832,7 +1808,20 @@ type transcribeFileResult struct {
 // OpenAI's cloud endpoint), gen_ai.request.model, and audio.size_bytes. err
 // is a named return so the deferred finalizer can record whichever error
 // this function's several return points ultimately produce.
-func (c *WhisperCollector) transcribeFile(ctx context.Context, path string, isLocal bool) (_ transcribeFileResult, err error) {
+func (c *WhisperCollector) transcribeFile(ctx context.Context, path string, isLocal bool) (transcribeFileResult, error) {
+	if !isLocal {
+		info, err := os.Stat(path)
+		if err != nil {
+			return transcribeFileResult{}, whisperStep("stat audio", logsafe.StripPath(err))
+		}
+		if info.Size() > whisperCloudMaxFileBytes {
+			return c.transcribeLargeCloudFile(ctx, path, info)
+		}
+	}
+	return c.transcribeUpload(ctx, path, isLocal)
+}
+
+func (c *WhisperCollector) transcribeUpload(ctx context.Context, path string, isLocal bool) (_ transcribeFileResult, err error) {
 	audioBytes, err := os.ReadFile(path)
 	if err != nil {
 		// StripPath(#297): buildDocument 가 이 오류를 로그로 남긴다. 원래

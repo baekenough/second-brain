@@ -623,7 +623,7 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 				contentChanged, upsertErr = s.store.UpsertTracked(ctx, &batch[i])
 			}
 			if upsertErr != nil {
-				if errors.Is(upsertErr, store.ErrDuplicateTranscript) {
+				if errors.Is(upsertErr, store.ErrDuplicateTranscript) || errors.Is(upsertErr, store.ErrDocumentDeleted) {
 					slog.Debug("scheduler: skipped duplicate call content",
 						"collector", col.Name(),
 						"source_id", logsafe.SafeSourceID(batch[i].SourceID))
@@ -1260,7 +1260,7 @@ func (s *Scheduler) ForceCollectSlackChannel(ctx context.Context, channelID, cha
 	count := 0
 	for i := range docs {
 		if err := s.store.Upsert(ctx, &docs[i]); err != nil {
-			if errors.Is(err, store.ErrDuplicateTranscript) {
+			if errors.Is(err, store.ErrDuplicateTranscript) || errors.Is(err, store.ErrDocumentDeleted) {
 				slog.Debug("scheduler: skipped duplicate call-transcript",
 					"source_id", logsafe.SafeSourceID(docs[i].SourceID))
 				continue

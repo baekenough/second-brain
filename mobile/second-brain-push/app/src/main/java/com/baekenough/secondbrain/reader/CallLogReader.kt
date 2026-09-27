@@ -23,17 +23,29 @@ class CallLogReader(private val contentResolver: ContentResolver) {
     }
 
     /**
-     * Returns all call-log entries with `date > cursor.lastCallDate`, ascending.
+     * Returns all call-log entries with `(date, id) > cursor` through the current time, ascending.
      */
     fun readSince(cursor: CursorSnapshot): List<RawCallEntry> {
-        val results = mutableListOf<RawCallEntry>()
+        return query(
+            "(${CallLog.Calls.DATE} > ? OR (${CallLog.Calls.DATE} = ? AND ${CallLog.Calls._ID} > ?)) AND ${CallLog.Calls.DATE} <= ?",
+            arrayOf(cursor.lastCallDate.toString(), cursor.lastCallDate.toString(), cursor.lastCallId.toString(), System.currentTimeMillis().toString()),
+        )
+    }
 
+    /** Recording retries must find calls even after their message cursor has advanced. */
+    fun readAround(recordingTimeMs: Long): List<RawCallEntry> = query(
+        "${CallLog.Calls.DATE} >= ? AND ${CallLog.Calls.DATE} <= ?",
+        arrayOf((recordingTimeMs - 60_000L).toString(), (recordingTimeMs + 60_000L).toString()),
+    )
+
+    private fun query(selection: String, args: Array<String>): List<RawCallEntry> {
+        val results = mutableListOf<RawCallEntry>()
         contentResolver.query(
             CallLog.Calls.CONTENT_URI,
             PROJECTION,
-            "${CallLog.Calls.DATE} > ?",
-            arrayOf(cursor.lastCallDate.toString()),
-            "${CallLog.Calls.DATE} ASC",
+            selection,
+            args,
+            "${CallLog.Calls.DATE} ASC, ${CallLog.Calls._ID} ASC",
         )?.use { c ->
             val idIdx = c.getColumnIndexOrThrow(CallLog.Calls._ID)
             val dateIdx = c.getColumnIndexOrThrow(CallLog.Calls.DATE)
