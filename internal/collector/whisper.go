@@ -965,7 +965,7 @@ const whisperStreamBatchSize = 5
 // never blocks the request either way — it is observability, not enforcement.
 //
 // 클라우드 업로드 한도를 넘는 파일은 원본을 보존한 채 임시 MP3로 재인코딩하고
-// 30분 단위로 분할한다. 한 구간이라도 실패하면 문서와 성공 원장을 만들지 않는다.
+// 10분 단위로 분할한다. 한 구간이라도 실패하면 문서와 성공 원장을 만들지 않는다.
 // 실패는 별도 재시도 상태에 남겨 여섯 시간 뒤 다시 시도한다.
 //
 // Partial success: individual transcription failures are logged as warnings and
@@ -1816,6 +1816,18 @@ func (c *WhisperCollector) transcribeFile(ctx context.Context, path string, isLo
 		}
 		if info.Size() > whisperCloudMaxFileBytes {
 			return c.transcribeLargeCloudFile(ctx, path, info)
+		}
+		if modelSupportsNativeDiarization(c.cfg.WhisperModel) {
+			probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			duration, probeErr := probeCloudAudioDuration(probeCtx, path)
+			cancel()
+			if ctx.Err() != nil {
+				return transcribeFileResult{}, ctx.Err()
+			}
+			// 길이를 읽을 수 없는 작은 파일은 기존처럼 API가 유효성을 판단한다.
+			if probeErr == nil && duration > cloudAudioNativeMaxSeconds {
+				return c.transcribeLargeCloudFile(ctx, path, info)
+			}
 		}
 	}
 	return c.transcribeUpload(ctx, path, isLocal)
