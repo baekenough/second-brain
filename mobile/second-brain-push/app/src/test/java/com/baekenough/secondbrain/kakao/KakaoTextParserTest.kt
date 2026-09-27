@@ -6,8 +6,7 @@ import java.time.Instant
 
 class KakaoTextParserTest {
     @Test fun `JSON escaping limits transmitted batch bytes before 413`() {
-        val lines = (1..300).map { NotificationLine("가상가", "key", "\"".repeat(65536), it.toLong()) }
-        val messages = notificationMessages("device", "room", "방", "unknown", lines)
+        val messages = (1..300).map { kakaoTestMessage(it.toString(), "\"".repeat(65536), it.toLong()) }
         messages.forEach { it.validate() }
         val batch = boundedKakaoBatch(messages)
         assertTrue(batch.size in 1..299)

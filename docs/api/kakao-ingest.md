@@ -1,5 +1,7 @@
 # 카카오톡 수집 API
 
+현재 제품의 수집 경로는 사용자가 선택한 카카오톡 TXT 대화 내보내기 파일 가져오기입니다. 알림 캡처 기능은 제공하지 않으며, 휴대폰의 카카오톡 비공개 DB를 15분마다 조회하는 기능도 지원하지 않습니다. Mac 수집 경로는 아직 확정하지 않았습니다.
+
 `POST /api/v1/ingest/kakao`는 기존 모바일 API와 같은 Bearer API 키로 인증합니다. 모바일은 Go backend 전용 터널에 직접 연결합니다. 본문은 `{"messages":[...]}`이며 한 요청은 최대 300건, JSON 전체는 최대 24 MiB입니다.
 
 | 필드 | 형식과 제한 |
@@ -14,9 +16,9 @@
 | `identity_confidence` | `confirmed`, `provisional` |
 | `body` | 비어 있지 않은 본문, UTF-8 최대 64 KiB, NUL 불가 |
 | `date_ms` | Unix 밀리초. 2000-01-01 이후, 서버 시각에서 최대 7일 앞까지 |
-| `capture_source` | `notification`, `text_import` |
+| `capture_source` | 현재 제품은 `text_import` 사용. `notification`은 외부 클라이언트 호환을 위해 API에서만 허용 |
 
-친구 여부가 `friend` 또는 `not_friend`이면 `friend_evidence=user_confirmed`가 필요합니다. 친구 여부가 `unknown`이면 근거도 `unknown`이어야 합니다. 서버는 방 유형·이름·본문에서 친구 관계나 본인 여부를 추론하지 않습니다. 알림으로 관찰한 신원은 `provisional`로 저장하고 사용자 확인 뒤 같은 `message_id`로 메타데이터를 갱신할 수 있습니다.
+친구 여부가 `friend` 또는 `not_friend`이면 `friend_evidence=user_confirmed`가 필요합니다. 친구 여부가 `unknown`이면 근거도 `unknown`이어야 합니다. 서버는 방 유형·이름·본문에서 친구 관계나 본인 여부를 추론하지 않습니다. 확정하지 않은 신원은 `provisional`로 저장하고 사용자 확인 뒤 같은 `message_id`로 메타데이터를 갱신할 수 있습니다. API가 `capture_source=notification`을 허용한다는 사실은 제품에 알림 캡처 기능이 있다는 뜻이 아닙니다.
 
 메시지는 `source_type=kakao`, `source_id=kakao:<message_id>` 문서 하나로 저장합니다. 제목에 방과 화자를 표시하고 본문 앞에 방·화자·발생 시각을 붙입니다. 모든 입력 분류 필드는 메타데이터에 보존합니다. 방·화자 ID를 별도로 남겨 같은 표시명의 다른 방이나 사람을 혼동하지 않습니다. 과거 대화 가져오기는 SMS 수집 시작일과 무관하며 날짜 하한만 적용합니다.
 

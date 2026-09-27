@@ -22,11 +22,8 @@ class KakaoStore private constructor(context: Context) : SQLiteOpenHelper(contex
         @Synchronized get() = prefs.getString("device_id", null) ?: UUID.randomUUID().toString().also {
             check(prefs.edit().putString("device_id", it).commit())
         }
-    var enabled: Boolean
-        get() = prefs.getBoolean("enabled", false)
-        set(value) { prefs.edit().putBoolean("enabled", value).apply() }
     var lastStatus: String
-        get() = prefs.getString("status", "아직 수집한 알림이 없습니다").orEmpty()
+        get() = prefs.getString("status", "아직 가져온 대화가 없습니다").orEmpty()
         set(value) { prefs.edit().putString("status", value).apply() }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -34,7 +31,6 @@ class KakaoStore private constructor(context: Context) : SQLiteOpenHelper(contex
         db.execSQL("CREATE INDEX messages_state ON messages(state)")
         db.execSQL("CREATE TABLE import_rooms (id TEXT PRIMARY KEY, name TEXT NOT NULL, settings TEXT)")
         db.execSQL("CREATE TABLE imports (fingerprint TEXT PRIMARY KEY, room_id TEXT NOT NULL)")
-        db.execSQL("CREATE TABLE snapshots (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL)")
     }
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
 
@@ -54,25 +50,6 @@ class KakaoStore private constructor(context: Context) : SQLiteOpenHelper(contex
             db.setTransactionSuccessful()
         } finally { db.endTransaction() }
         return added
-    }
-    @Synchronized fun enqueueNotification(key: String, fingerprint: String, messages: List<KakaoMessage>): Int {
-        val db = writableDatabase
-        db.beginTransaction()
-        try {
-            val previous = db.rawQuery("SELECT fingerprint FROM snapshots WHERE id = ?", arrayOf(key)).use {
-                if (it.moveToFirst()) it.getString(0) else null
-            }
-            if (previous == fingerprint) { db.setTransactionSuccessful(); return 0 }
-            val count = enqueue(messages)
-            db.insertWithOnConflict("snapshots", null, ContentValues().apply {
-                put("id", key); put("fingerprint", fingerprint)
-            }, SQLiteDatabase.CONFLICT_REPLACE)
-            db.setTransactionSuccessful()
-            return count
-        } finally { db.endTransaction() }
-    }
-    @Synchronized fun forgetNotification(key: String) {
-        writableDatabase.delete("snapshots", "id = ?", arrayOf(key))
     }
     @Synchronized fun pending(): List<KakaoMessage> = readableDatabase.rawQuery(
         "SELECT payload FROM messages WHERE state = 'pending' ORDER BY rowid LIMIT 300", null,

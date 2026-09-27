@@ -63,10 +63,9 @@ object SyncScheduler {
         enqueue(context, clamped, ExistingPeriodicWorkPolicy.UPDATE)
     }
 
-    /** Coalesce bursts of notification events; periodic work also drains the durable queue. */
+    /** Upload selected TXT imports; periodic work also drains the durable queue. */
     fun enqueueKakaoSync(context: Context) {
         val request = androidx.work.OneTimeWorkRequestBuilder<SyncWorker>()
-            .setInitialDelay(10, TimeUnit.SECONDS)
             .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 1, TimeUnit.MINUTES)
             .build()

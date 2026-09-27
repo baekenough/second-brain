@@ -60,33 +60,6 @@ internal fun kakaoHash(vararg values: String): String {
     }
 }
 
-@Serializable
-data class NotificationLine(val sender: String, val senderKey: String, val text: String, val timeMs: Long)
-
-/** Fingerprint occurrence keeps repeated identical messages in the same snapshot distinct. */
-internal fun notificationMessages(
-    deviceId: String, roomId: String, roomName: String, roomType: String,
-    lines: List<NotificationLine>,
-): List<KakaoMessage> {
-    val occurrences = mutableMapOf<String, Int>()
-    return lines.map { line ->
-        val fingerprint = kakaoHash(line.senderKey, line.timeMs.toString(), line.text)
-        val occurrence = occurrences.getOrDefault(fingerprint, 0)
-        occurrences[fingerprint] = occurrence + 1
-        KakaoMessage(
-            messageId = kakaoHash(deviceId, roomId, fingerprint, occurrence.toString()),
-            roomId = roomId, roomName = roomName, roomType = roomType,
-            senderId = kakaoHash(deviceId, roomId, line.senderKey), senderName = line.sender,
-            body = line.text, dateMs = line.timeMs, captureSource = "notification",
-        )
-    }
-}
-
-internal fun notificationFingerprint(roomId: String, lines: List<NotificationLine>, structured: Boolean): String =
-    kakaoHash(roomId, *lines.map {
-        kakaoHash(it.senderKey, it.text, if (structured) it.timeMs.toString() else "")
-    }.toTypedArray())
-
 /** JSON escaping can expand text by 6x; enforce wire bytes, not raw body bytes. */
 internal fun boundedKakaoBatch(messages: List<KakaoMessage>, maxBytes: Int = 8 * 1024 * 1024): List<KakaoMessage> {
     val json = Json { encodeDefaults = true }

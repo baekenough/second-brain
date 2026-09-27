@@ -80,7 +80,6 @@ class SettingsFragment : Fragment() {
         updateRecordingPathDisplay(settings.getRecordingPathOverride())
         binding.switchAudioWifi.isChecked = settings.isAudioWifiOnly()
         binding.switchAudioCharging.isChecked = settings.isAudioChargingOnly()
-        binding.switchKakaoCapture.isChecked = com.baekenough.secondbrain.kakao.KakaoStore.get(requireContext()).enabled
     }
 
     private fun saveSettings() {
@@ -122,13 +121,6 @@ class SettingsFragment : Fragment() {
     // ── Listeners ──────────────────────────────────────────────────────────
 
     private fun setupListeners() {
-        binding.switchKakaoCapture.setOnCheckedChangeListener { _, enabled ->
-            com.baekenough.secondbrain.kakao.KakaoStore.get(requireContext()).enabled = enabled
-            updatePermissionStatus()
-        }
-        binding.btnKakaoAccess.setOnClickListener {
-            startActivity(android.content.Intent(android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
-        }
         binding.btnKakaoImport.setOnClickListener {
             startActivity(android.content.Intent(requireContext(), com.baekenough.secondbrain.kakao.KakaoImportActivity::class.java))
         }
@@ -177,14 +169,6 @@ class SettingsFragment : Fragment() {
     }
 
     private fun updatePermissionStatus() {
-        val kakaoEnabled = com.baekenough.secondbrain.kakao.KakaoStore.get(requireContext()).enabled
-        val access = androidx.core.app.NotificationManagerCompat.getEnabledListenerPackages(requireContext()).contains(requireContext().packageName)
-        binding.tvKakaoPermission.text = when {
-            !kakaoEnabled -> "카카오톡 자동 수집 꺼짐 · 이미 저장한 전송 대기열은 유지됩니다"
-            !access -> "알림 접근 권한이 필요합니다. 아래 버튼에서 이 앱을 허용해 주세요"
-            else -> "알림 접근 허용됨 · 이후 카카오톡 알림을 수집합니다"
-        }
-
         val sms = isGranted(Manifest.permission.READ_SMS)
         val callLog = isGranted(Manifest.permission.READ_CALL_LOG)
         val audio = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {

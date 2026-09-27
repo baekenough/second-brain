@@ -77,7 +77,7 @@ class KakaoImportActivity : AppCompatActivity() {
     }
     private fun showStart() {
         container.removeAllViews()
-        label("카카오톡에서 내보낸 한국어 TXT를 선택하세요. 알림에서 놓친 과거 대화와 내가 보낸 메시지를 가져올 수 있습니다. 파일을 분석한 뒤 가져올 내용을 먼저 보여드립니다.")
+        label("카카오톡에서 내보낸 한국어 TXT를 선택하세요. 파일에 담긴 과거 대화와 내가 보낸 메시지를 가져올 수 있습니다. 파일을 분석한 뒤 가져올 내용을 먼저 보여드립니다.")
         button("TXT 파일 선택") { picker.launch(arrayOf("text/plain", "text/*", "application/octet-stream")) }
     }
     private fun showError(message: String) { showStart(); label(message) }
@@ -129,7 +129,7 @@ class KakaoImportActivity : AppCompatActivity() {
             label("전에 가져온 파일입니다. 기존 방을 선택했습니다. 같은 메시지는 건너뛰고 수정한 친구 여부·내 이름·방 종류는 갱신합니다.")
         }
         label("미리보기\n" + transcript.messages.take(5).joinToString("\n\n") { "${it.sender}: ${it.text.take(160)}" })
-        val status = label("알림 수집과 TXT의 중복은 자동으로 합치지 않습니다. 다른 기간의 TXT를 겹쳐 가져오면 동일 시각·동일 문장의 반복을 완전히 구분하지 못할 수 있습니다.")
+        val status = label("다른 기간의 TXT를 겹쳐 가져오면 동일 시각·동일 문장의 반복을 완전히 구분하지 못할 수 있습니다.")
         val importButton = button("확인한 대화 가져오기") { }
         importButton.setOnClickListener {
             importButton.isEnabled = false

@@ -19,7 +19,7 @@ import org.robolectric.annotation.Config
 class KakaoImportActivityTest {
     @Test fun `reopening same file prefills room and confirmed speaker metadata`() {
         val store = KakaoStore.get(ApplicationProvider.getApplicationContext())
-        for (table in listOf("messages", "snapshots", "import_rooms", "imports")) store.writableDatabase.execSQL("DELETE FROM $table")
+        for (table in listOf("messages", "import_rooms", "imports")) store.writableDatabase.execSQL("DELETE FROM $table")
         val transcript = KakaoTextParser.parse("2026년 9월 20일 오후 1:00, 가상가 : 합성 대화")
         store.importTranscript(transcript, "same-file", null, "저장한 방", ImportPreferences("direct", "가상가", mapOf("가상가" to "friend")))
         val controller = Robolectric.buildActivity(KakaoImportActivity::class.java).setup()

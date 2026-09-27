@@ -22,12 +22,10 @@ import org.robolectric.annotation.Config
 @Config(sdk = [28], application = Application::class)
 class KakaoQueueTest {
     private lateinit var store: KakaoStore
-    private val lines = listOf(NotificationLine("가상가", "speaker-key", "합성 테스트", 1000))
-    private fun messages() = notificationMessages("device", "room", "연습방", "unknown", lines)
+    private fun messages() = listOf(kakaoTestMessage())
     @Before fun clean() {
         store = KakaoStore.get(ApplicationProvider.getApplicationContext())
         store.writableDatabase.execSQL("DELETE FROM messages")
-        store.writableDatabase.execSQL("DELETE FROM snapshots")
         store.writableDatabase.execSQL("DELETE FROM import_rooms")
         store.writableDatabase.execSQL("DELETE FROM imports")
     }
@@ -84,39 +82,17 @@ class KakaoQueueTest {
         assertTrue(store.pending().isEmpty())
     }
 
-    @Test fun `nonmessage notifications and group summaries are excluded`() {
-        assertFalse(KakaoNotificationListener.shouldCaptureNotification("another.app", 0, "msg"))
-        assertFalse(KakaoNotificationListener.shouldCaptureNotification("com.kakao.talk", android.app.Notification.FLAG_GROUP_SUMMARY, "msg"))
-        for (category in listOf("call", "service", "transport", "progress", "status")) {
-            assertFalse(KakaoNotificationListener.shouldCaptureNotification("com.kakao.talk", 0, category))
-        }
-        assertTrue(KakaoNotificationListener.shouldCaptureNotification("com.kakao.talk", 0, "msg"))
-        assertTrue(KakaoNotificationListener.shouldCaptureNotification("com.kakao.talk", 0, null))
-    }
-
-    @Test fun `message update overlap deduplicates and repeated posts survive acknowledgement`() {
+    @Test fun `overlapping imports deduplicate and acknowledged IDs prevent repeats`() {
         val first = messages()
         assertEquals(1, store.enqueue(first))
         assertEquals(0, store.enqueue(first))
-        val next = notificationMessages("device", "room", "연습방", "unknown", lines + lines[0].copy(text = "두 번째", timeMs = 2000))
+        val next = first + kakaoTestMessage(id = "second", body = "두 번째", timeMs = 2000)
         assertEquals(1, store.enqueue(next))
         val batch = store.pending()
         store.acknowledge(batch, KakaoResponse(accepted = 2))
         assertTrue(store.pending().isEmpty())
         assertEquals(0, store.enqueue(next))
         assertEquals(2, store.count("acked"))
-    }
-    @Test fun `plain notification repost with changed post time is ignored until removed`() {
-        val first = messages()
-        val fingerprint = notificationFingerprint("room", lines, false)
-        assertEquals(1, store.enqueueNotification("key", fingerprint, first))
-        val later = lines.map { it.copy(timeMs = 3000) }
-        assertEquals(fingerprint, notificationFingerprint("room", later, false))
-        assertNotEquals(notificationFingerprint("room", lines, true), notificationFingerprint("room", later, true))
-        val updated = notificationMessages("device", "room", "연습방", "unknown", later)
-        assertEquals(0, store.enqueueNotification("key", notificationFingerprint("room", later, false), updated))
-        store.forgetNotification("key")
-        assertEquals(1, store.enqueueNotification("key", fingerprint, updated))
     }
     @Test fun `partial rejection is retained and malformed acknowledgement does not delete queue`() {
         store.enqueue(messages())
@@ -131,10 +107,5 @@ class KakaoQueueTest {
         store.readableDatabase.rawQuery("SELECT payload,reason FROM messages WHERE state='rejected'", null).use {
             assertTrue(it.moveToFirst()); assertNotNull(it.getString(0)); assertEquals("invalid_date", it.getString(1))
         }
-    }
-    @Test fun `same timestamp repeated identical messages retain occurrence`() {
-        val repeated = notificationMessages("device", "room", "방", "group", lines + lines)
-        assertNotEquals(repeated[0].messageId, repeated[1].messageId)
-        assertEquals(2, store.enqueue(repeated))
     }
 }

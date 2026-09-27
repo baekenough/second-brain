@@ -23,7 +23,7 @@ class KakaoUploadTest {
         assertTrue(wire.contains("\"is_self\":null"))
     }
 
-    private val batch = notificationMessages("device", "room", "연습방", "unknown", listOf(NotificationLine("가상가", "key", "합성 메시지", 1000)))
+    private val batch = listOf(kakaoTestMessage())
 
     @Test fun `503 and malformed success never acknowledge local messages`() = runBlocking {
         val api = mockk<ApiService>()
