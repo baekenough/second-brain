@@ -215,3 +215,54 @@ func TestAudioCommandCancellation(t *testing.T) {
 		t.Fatalf("command did not stop: %v", err)
 	}
 }
+
+func TestNativeCloudSmallLongAudioIsSplit(t *testing.T) {
+	for _, bin := range []string{"ffmpeg", "ffprobe"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skip("ffmpeg/ffprobe required")
+		}
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "long.mp3")
+	_, err := audioCommand(context.Background(), "ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000", "-t", "1500", "-ac", "1", "-c:a", "libmp3lame", "-b:a", "32k", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, _ := os.Stat(path)
+	if info.Size() >= whisperCloudMaxFileBytes {
+		t.Fatal("fixture must be below byte limit")
+	}
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if err := r.ParseMultipartForm(whisperCloudMaxFileBytes); err != nil {
+			t.Error(err)
+			w.WriteHeader(400)
+			return
+		}
+		defer r.MultipartForm.RemoveAll()
+		f, _, err := r.FormFile("file")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer f.Close()
+		raw, _ := io.ReadAll(f)
+		uploaded := filepath.Join(t.TempDir(), "uploaded.mp3")
+		if err := os.WriteFile(uploaded, raw, 0600); err != nil {
+			t.Error(err)
+			return
+		}
+		duration, err := probeCloudAudioDuration(context.Background(), uploaded)
+		if err != nil || duration > cloudAudioSegmentSeconds+1 {
+			t.Errorf("upload duration=%v err=%v", duration, err)
+		}
+		_ = json.NewEncoder(w).Encode(diarizedResponse{Text: "합성 음원", Segments: []diarizedSegment{{Start: 0, End: 1, Speaker: "A", Text: "합성 음원"}}})
+	}))
+	defer srv.Close()
+	c := makeCloudWhisperCollector(t, &config.Config{WhisperAudioDir: dir, WhisperModel: "gpt-4o-transcribe-diarize", WhisperChunkingStrategy: "auto"}, srv)
+	result, err := c.transcribeFile(context.Background(), path, false)
+	if err != nil || calls != 3 || result.parts != 3 {
+		t.Fatalf("calls=%d parts=%d err=%v", calls, result.parts, err)
+	}
+}

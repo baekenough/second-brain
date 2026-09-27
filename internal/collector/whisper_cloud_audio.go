@@ -24,7 +24,9 @@ import (
 var cloudAudioSlots = make(chan struct{}, 2)
 var errWhisperRetryDeferred = errors.New("large audio retry deferred")
 
-const cloudAudioSegmentSeconds = 1800
+// native diarize 실API 최대1400초보다 여유를 두고 작은 파일도 길이를 확인한다.
+const cloudAudioNativeMaxSeconds = 1200
+const cloudAudioSegmentSeconds = 600
 const cloudAudioMaxSeconds = 24 * 60 * 60
 const cloudAudioPrepareTimeout = 10 * time.Minute
 
@@ -55,6 +57,18 @@ func audioCommand(ctx context.Context, program string, args ...string) ([]byte, 
 	return out, nil
 }
 
+func probeCloudAudioDuration(ctx context.Context, path string) (float64, error) {
+	raw, err := audioCommand(ctx, "ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path)
+	if err != nil {
+		return 0, err
+	}
+	duration, err := strconv.ParseFloat(strings.TrimSpace(string(raw)), 64)
+	if err != nil || !(duration > 0) {
+		return 0, errors.New("invalid audio duration")
+	}
+	return duration, nil
+}
+
 func prepareCloudAudio(ctx context.Context, path string, segmentSeconds int) ([]cloudAudioPart, func(), error) {
 	select {
 	case cloudAudioSlots <- struct{}{}:
@@ -71,14 +85,14 @@ func prepareCloudAudio(ctx context.Context, path string, segmentSeconds int) ([]
 	cleanup := func() { _ = os.RemoveAll(dir) }
 	fail := func(err error) ([]cloudAudioPart, func(), error) { cleanup(); return nil, func() {}, err }
 	// 입력 길이를 먼저 확인해 무한 입력·과도한 디스크 사용을 제한한다.
-	durationRaw, err := audioCommand(ctx, "ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path)
+	duration, err := probeCloudAudioDuration(ctx, path)
 	if err != nil {
 		return fail(err)
 	}
-	duration, err := strconv.ParseFloat(strings.TrimSpace(string(durationRaw)), 64)
-	if err != nil || !(duration > 0 && duration <= cloudAudioMaxSeconds) {
+	if duration > cloudAudioMaxSeconds {
 		return fail(errors.New("audio duration exceeds preparation bounds"))
 	}
+
 	manifest := filepath.Join(dir, "parts.csv")
 	_, err = audioCommand(ctx, "ffmpeg", "-nostdin", "-v", "error", "-threads", "1", "-protocol_whitelist", "file,pipe", "-i", path, "-map", "0:a:0", "-t", strconv.Itoa(cloudAudioMaxSeconds+1), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "32k", "-threads", "1", "-map_metadata", "-1", "-f", "segment", "-segment_time", strconv.Itoa(segmentSeconds), "-segment_list", manifest, "-segment_list_type", "csv", "-reset_timestamps", "1", filepath.Join(dir, "part-%04d.mp3"))
 	if err != nil {
@@ -132,7 +146,7 @@ func (c *WhisperCollector) largeAudioConfiguration() string {
 	if parsed, err := url.Parse(c.baseURL); err == nil {
 		endpoint = parsed.Scheme + "://" + parsed.Host + parsed.Path
 	}
-	raw, _ := json.Marshal([]string{"cloud-audio-v1", endpoint, c.cfg.WhisperModel, c.cfg.WhisperLanguage, c.cfg.WhisperChunkingStrategy})
+	raw, _ := json.Marshal([]string{"cloud-audio-v2", endpoint, c.cfg.WhisperModel, c.cfg.WhisperLanguage, c.cfg.WhisperChunkingStrategy})
 	sum := sha256.Sum256(raw)
 	return fmt.Sprintf("%x", sum)
 }
