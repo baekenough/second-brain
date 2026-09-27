@@ -420,6 +420,7 @@ func (s *Server) buildHandler() http.Handler {
 		}
 		if s.messagesUpserter != nil {
 			r.Post("/api/v1/ingest/messages", s.ingestMessagesHandler)
+			r.Post("/api/v1/ingest/kakao", s.ingestKakaoHandler)
 		}
 		if s.recordingUpserter != nil && s.recordingDir != "" {
 			r.Post("/api/v1/ingest/recording", s.ingestRecordingHandler)

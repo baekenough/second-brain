@@ -12,6 +12,7 @@ func TestKnownSourceTypes_MatchesTaskSpec(t *testing.T) {
 	want := map[SourceType]bool{
 		SourceGmail:     true,
 		SourceSMS:       true,
+		SourceKakao:     true,
 		SourceCall:      true,
 		SourceCalendar:  true,
 		SourceInsight:   true,

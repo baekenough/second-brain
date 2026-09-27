@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/baekenough/second-brain/internal/store"
+	"github.com/google/uuid"
 )
 
 // stubRecentStore extends stubDocumentStore to also implement RecentItemsQuerier
@@ -23,7 +23,7 @@ type stubRecentStore struct {
 	total    int
 	countErr error
 	// gotKind captures the kind passed to ListRecentByKind so tests can assert it.
-	gotKind  store.RecentKind
+	gotKind store.RecentKind
 	// gotLimit captures the limit passed to ListRecentByKind.
 	gotLimit int
 }
@@ -524,5 +524,55 @@ func TestRecentDocuments_NullOccurredAt(t *testing.T) {
 	}
 	if resp.Items[0].OccurredAt != nil {
 		t.Errorf("occurred_at = %v, want nil", resp.Items[0].OccurredAt)
+	}
+}
+
+func TestRecentDocuments_Kakao(t *testing.T) {
+	t.Parallel()
+
+	collectedAt := time.Date(2026, 6, 11, 0, 23, 10, 0, time.UTC)
+	stub := &stubRecentStore{
+		items: []store.RecentItem{
+			{
+				ID:          uuid.MustParse("00000000-0000-0000-0000-000000000001"),
+				Title:       "테스트 대화방 · 테스트 화자",
+				OccurredAt:  makeTime(2026, 6, 10, 14, 0, 0),
+				CollectedAt: collectedAt,
+			},
+		},
+	}
+
+	srv := newTestServer(stub)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/documents/recent?kind=kakao", nil)
+	srv.recentDocumentsHandler(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusOK)
+	}
+
+	if stub.gotKind != store.RecentKindKakao {
+		t.Errorf("gotKind = %q, want %q", stub.gotKind, store.RecentKindKakao)
+	}
+	if stub.gotLimit != recentDefaultLimit {
+		t.Errorf("gotLimit = %d, want %d", stub.gotLimit, recentDefaultLimit)
+	}
+
+	var resp recentDocumentsResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Kind != "kakao" {
+		t.Errorf("kind = %q, want sms", resp.Kind)
+	}
+	if resp.Count != 1 {
+		t.Errorf("count = %d, want 1", resp.Count)
+	}
+	if len(resp.Items) != 1 {
+		t.Fatalf("len(items) = %d, want 1", len(resp.Items))
+	}
+	if resp.Items[0].Title != "테스트 대화방 · 테스트 화자" {
+		t.Errorf("items[0].title = %q, want %q", resp.Items[0].Title, "테스트 대화방 · 테스트 화자")
 	}
 }

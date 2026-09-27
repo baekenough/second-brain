@@ -950,6 +950,7 @@ func (s *DocumentStore) fulltextSearch(ctx context.Context, query model.SearchQu
 // the WHERE predicates — status, source type, and the occurred_at window — can
 // be asserted without a database, the same way buildEntityCTE is.
 func buildFulltextSearchQuery(query model.SearchQuery) (string, []interface{}) {
+	query = query.WithRetrievalDefaults()
 	args := []interface{}{query.Query, query.Limit}
 
 	statusFilter := "AND status = 'active'"
@@ -1274,6 +1275,7 @@ func (s *DocumentStore) resolveWeights(ctx context.Context, query model.SearchQu
 // lane does not merely widen that lane — it lets out-of-scope documents consume
 // candidate slots and push in-scope documents out of the fused result entirely.
 func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (string, []interface{}) {
+	query = query.WithRetrievalDefaults()
 	args := []interface{}{
 		query.Query,
 		pgvector.NewVector(query.Embedding),
@@ -2004,6 +2006,7 @@ func (s *DocumentStore) ListUnembedded(ctx context.Context, limit int) ([]*model
 		FROM documents
 		WHERE embedding IS NULL
 		  AND status = 'active'
+		  AND ` + backgroundSourceEligibilitySQL + `
 		ORDER BY collected_at ASC
 		LIMIT $1`
 
@@ -2039,6 +2042,7 @@ func (s *DocumentStore) ListDocumentsNeedingEmbedding(ctx context.Context, limit
 		       title_summary, bullet_summary, summary_embedding
 		FROM documents
 		WHERE status = 'active'
+		  AND ` + backgroundSourceEligibilitySQL + `
 		  AND (embedding IS NULL OR embedding_version IS DISTINCT FROM $2)
 		ORDER BY collected_at ASC
 		LIMIT $1`
@@ -2059,6 +2063,7 @@ func (s *DocumentStore) CountDocumentsNeedingEmbedding(ctx context.Context, curr
 	err := s.pg.pool.QueryRow(ctx, `
 		SELECT count(*) FROM documents
 		WHERE status = 'active'
+		  AND `+backgroundSourceEligibilitySQL+`
 		  AND (embedding IS NULL OR ($1 <> '' AND embedding_version IS DISTINCT FROM $1))`,
 		currentVersion,
 	).Scan(&n)
@@ -2083,6 +2088,7 @@ const listWithoutEntitiesQuery = `
 		       title_summary, bullet_summary, summary_embedding
 		FROM documents
 		WHERE status = 'active'
+		  AND ` + backgroundSourceEligibilitySQL + `
 		  AND entities_processed_at IS NULL
 		  AND source_type <> 'insight'
 		ORDER BY collected_at ASC
@@ -2396,6 +2402,7 @@ const listUnsummarizedQuery = `
 		FROM documents
 		WHERE title_summary IS NULL
 		  AND status = 'active'
+		  AND ` + backgroundSourceEligibilitySQL + `
 		  AND source_type <> 'insight'
 		ORDER BY collected_at ASC
 		LIMIT $1`
@@ -2438,7 +2445,7 @@ func (s *DocumentStore) SummaryCoverageRatio(ctx context.Context) (float64, erro
 			/ NULLIF(COUNT(*), 0),
 		0)
 		FROM documents
-		WHERE status = 'active'`).Scan(&ratio)
+		WHERE status = 'active' AND `+backgroundSourceEligibilitySQL).Scan(&ratio)
 	if err != nil {
 		return 0, fmt.Errorf("summary coverage ratio: %w", err)
 	}
@@ -2471,7 +2478,8 @@ func (s *DocumentStore) UpdateSummary(ctx context.Context, id uuid.UUID, titleSu
 		    summary_embedding = $3,
 		    updated_at        = now()
 		WHERE id = $4
-		  AND title_summary IS NULL`,
+		  AND title_summary IS NULL
+		  AND `+backgroundSourceEligibilitySQL,
 		titleSummary,
 		bulletSummary,
 		vecArg,
@@ -2498,7 +2506,7 @@ func (s *DocumentStore) UpdateEmbedding(ctx context.Context, doc *model.Document
 		SET embedding = $1,
 		    embedding_version = CASE WHEN $3 = '' THEN embedding_version ELSE $3 END,
 		    updated_at = now()
-		WHERE id = $2`,
+		WHERE id = $2 AND `+backgroundSourceEligibilitySQL,
 		pgvector.NewVector(doc.Embedding),
 		doc.ID,
 		doc.EmbeddingVersion,

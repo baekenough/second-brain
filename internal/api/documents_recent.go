@@ -46,13 +46,15 @@ func (s *Server) recentDocumentsHandler(w http.ResponseWriter, r *http.Request) 
 	switch kindStr {
 	case string(store.RecentKindSMS):
 		kind = store.RecentKindSMS
+	case string(store.RecentKindKakao):
+		kind = store.RecentKindKakao
 	case string(store.RecentKindCallRecording):
 		kind = store.RecentKindCallRecording
 	case string(store.RecentKindVoiceMemo):
 		kind = store.RecentKindVoiceMemo
 	default:
 		writeError(w, http.StatusBadRequest,
-			"kind must be one of: sms, call-recording, voice-memo")
+			"kind must be one of: sms, kakao, call-recording, voice-memo")
 		return
 	}
 

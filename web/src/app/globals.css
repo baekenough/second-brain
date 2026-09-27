@@ -177,6 +177,7 @@
     100% { background-position: -200% 0; }
   }
 
+  .badge-kakao { background: oklch(25% 0.07 95); color: oklch(85% 0.14 95); }
   .badge-sms { background: oklch(20% 0.07 145); color: oklch(62% 0.15 145); }
   .badge-call { background: oklch(19% 0.06 250); color: oklch(62% 0.13 250); }
   .badge-gmail { background: oklch(22% 0.07 25); color: oklch(62% 0.17 25); }

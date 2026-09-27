@@ -216,15 +216,24 @@ class DashboardFragment : Fragment() {
      */
     private suspend fun updateStatsCards() = coroutineScope {
         val serverUrl = settings.getServerUrl()
+        val kakao = com.baekenough.secondbrain.kakao.KakaoStore.get(requireContext())
+        val kakaoCounts = withContext(Dispatchers.IO) {
+            Triple(kakao.count("acked"), kakao.count("pending"), kakao.count("rejected"))
+        }
+        val kakaoStorageBytes = withContext(Dispatchers.IO) { kakao.storageBytes() }
+        val storageText = String.format(Locale.KOREA, "카카오 저장 공간 %.1f MB · 평상시 최대 32 MB", kakaoStorageBytes / (1024.0 * 1024.0))
+        binding.tvKakaoStatus.text = "전송 대기 ${kakaoCounts.second}건 · 서버 거부 ${kakaoCounts.third}건\n$storageText\n${kakao.lastStatus}"
         val tiles = listOf(
             Triple(DocumentListActivity.KIND_SMS, binding.tvSmsCount, stats.getSmsUploaded()),
             Triple(DocumentListActivity.KIND_CALL_RECORDING, binding.tvCallsCount, stats.getRecordingsUploaded()),
             Triple(DocumentListActivity.KIND_VOICE_MEMO, binding.tvRecordingsCount, stats.getVoiceMemoUploaded()),
+            Triple("kakao", binding.tvKakaoCount, kakaoCounts.first),
         )
         // Use the last server total immediately, including after a view/process restart.
         // Cumulative local uploads and server document totals are different quantities.
         tiles.forEach { (kind, tile, fallback) ->
-            tile.text = (stats.getServerCount(kind, serverUrl) ?: fallback).toString()
+            val count = stats.getServerCount(kind, serverUrl) ?: fallback
+            tile.text = if (kind == "kakao") "카카오톡 ${count}건" else count.toString()
         }
         if (!settings.isConfigured()) return@coroutineScope
         val api = try {
@@ -240,7 +249,7 @@ class DashboardFragment : Fragment() {
                     val body = response.takeIf { it.isSuccessful }?.body() ?: return@async
                     val count = body.total ?: body.count
                     stats.cacheServerCount(kind, serverUrl, count)
-                    tile.text = count.toString()
+                    tile.text = if (kind == "kakao") "카카오톡 ${count}건" else count.toString()
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (_: Exception) {
@@ -280,6 +289,8 @@ class DashboardFragment : Fragment() {
      * Each tap opens [DocumentListActivity] for the corresponding document kind.
      */
     private fun setupStatsTileClicks() {
+        binding.tvKakaoCount.setOnClickListener { DocumentListActivity.start(requireContext(), "kakao") }
+
         binding.tileSms.setOnClickListener {
             DocumentListActivity.start(requireContext(), DocumentListActivity.KIND_SMS)
         }

@@ -121,6 +121,10 @@ class SettingsFragment : Fragment() {
     // ── Listeners ──────────────────────────────────────────────────────────
 
     private fun setupListeners() {
+        binding.btnKakaoImport.setOnClickListener {
+            startActivity(android.content.Intent(requireContext(), com.baekenough.secondbrain.kakao.KakaoImportActivity::class.java))
+        }
+
         binding.btnSave.setOnClickListener {
             saveSettings()
             Toast.makeText(requireContext(), R.string.settings_saved, Toast.LENGTH_SHORT).show()

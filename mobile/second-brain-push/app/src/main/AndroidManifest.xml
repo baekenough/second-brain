@@ -63,6 +63,8 @@
             android:exported="false"
             android:parentActivityName=".ui.MainActivity" />
 
+        <activity android:name=".kakao.KakaoImportActivity" android:exported="false" />
+
         <!-- WorkManager initializer (use default initializer; no custom provider needed) -->
 
     </application>

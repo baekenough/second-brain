@@ -2,6 +2,8 @@ package com.baekenough.secondbrain.sync
 
 import android.util.Log
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import com.baekenough.secondbrain.classify.ClassifiedCall
 import com.baekenough.secondbrain.classify.ClassifiedRecording
 import com.baekenough.secondbrain.classify.ClassifiedSms
@@ -42,6 +44,7 @@ class Uploader(
 
     companion object {
         private const val TAG = "Uploader"
+        private val kakaoUploadMutex = Mutex()
         private val MEDIA_TEXT = "text/plain".toMediaType()
         private val MEDIA_AUDIO = "audio/mp4".toMediaType()
 
@@ -343,6 +346,42 @@ class Uploader(
                 UploadResult.TransientError("HTTP ${response.code()}")
             }
         }
+    }
+
+    suspend fun uploadKakao(store: com.baekenough.secondbrain.kakao.KakaoStore): UploadResult =
+        kakaoUploadMutex.withLock { uploadKakaoLocked(store) }
+
+    private suspend fun uploadKakaoLocked(store: com.baekenough.secondbrain.kakao.KakaoStore): UploadResult {
+        var accepted = 0
+        var skipped = 0
+        // Bound each wake so SMS, calls and recordings also get a turn.
+        repeat(10) {
+            val pending = store.pending()
+            if (pending.isEmpty()) return UploadResult.Success(accepted, skipped)
+            val batch = com.baekenough.secondbrain.kakao.boundedKakaoBatch(pending)
+            if (batch.isEmpty()) return UploadResult.TransientError("카카오톡 메시지가 전송 크기 제한을 넘습니다")
+            try {
+                val response = api.postKakao(com.baekenough.secondbrain.kakao.KakaoRequest(batch))
+                if (response.code() == 401 || response.code() == 403) return UploadResult.AuthError(response.code(), "인증 확인이 필요합니다")
+                val body = response.body()
+                if (!response.isSuccessful || body == null || !body.confirms(batch)) {
+                    store.lastStatus = "카카오톡 전송 보류: HTTP ${response.code()} 또는 처리 건수 불일치"
+                    return UploadResult.TransientError(store.lastStatus)
+                }
+                store.acknowledge(batch, body)
+                accepted += body.accepted
+                skipped += body.skipped
+                store.lastStatus = if (body.rejectedIds.isEmpty()) "카카오톡 메시지 전송을 확인했습니다"
+                    else "카카오톡 ${body.rejectedIds.size}건이 거부되었습니다. 원문은 앱에 보관했습니다"
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                store.lastStatus = "카카오톡 전송에 실패했습니다. 다음 동기화에서 재시도합니다"
+                return UploadResult.TransientError(store.lastStatus)
+            }
+        }
+        return if (store.pending().isNotEmpty()) UploadResult.TransientError("남은 카카오톡 메시지 전송 대기")
+            else UploadResult.Success(accepted, skipped)
     }
 
     // ── Private helpers ───────────────────────────────────────────────────

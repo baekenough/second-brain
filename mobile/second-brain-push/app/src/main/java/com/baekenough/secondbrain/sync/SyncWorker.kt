@@ -94,23 +94,27 @@ class SyncWorker(
         cursorStore.migrateVoiceMemoSentIfNeeded()
         val cursor = cursorStore.snapshot()
 
+        val uploader = buildUploader(serverUrl, apiToken, cursorStore)
+        val kakaoResult = uploader.uploadKakao(com.baekenough.secondbrain.kakao.KakaoStore.get(applicationContext))
+        if (kakaoResult is UploadResult.AuthError) return Result.failure()
+        val kakaoNeedsRetry = kakaoResult is UploadResult.TransientError
+
         // ── Stage: sms_read ────────────────────────────────────────────────
         Log.d(TAG, "stage=sms_read")
         val smsReader = SmsReader(applicationContext.contentResolver)
-        val rawSms = smsReader.readSince(cursor)
+        val rawSms = if (hasPermission(android.Manifest.permission.READ_SMS)) smsReader.readSince(cursor) else emptyList()
         val classifiedSms = rawSms.mapNotNull { Classifier.classifySms(it) }
         Log.i(TAG, "SMS: ${rawSms.size} raw → ${classifiedSms.size} classified")
 
         // ── Stage: call_read ───────────────────────────────────────────────
         Log.d(TAG, "stage=call_read")
         val callReader = CallLogReader(applicationContext.contentResolver)
-        val rawCalls = callReader.readSince(cursor)
+        val rawCalls = if (hasPermission(android.Manifest.permission.READ_CALL_LOG)) callReader.readSince(cursor) else emptyList()
         val classifiedCalls = rawCalls.map { Classifier.classifyCall(it) }
         Log.i(TAG, "Calls: ${rawCalls.size} raw → ${classifiedCalls.size} classified")
 
         // ── Stage: upload ──────────────────────────────────────────────────
         Log.d(TAG, "stage=upload")
-        val uploader = buildUploader(serverUrl, apiToken, cursorStore)
         val msgResult = uploader.uploadMessages(classifiedSms, classifiedCalls)
         Log.i(TAG, "Messages upload result: $msgResult")
 
@@ -141,11 +145,11 @@ class SyncWorker(
         Log.d(TAG, "stage=recording_gate")
         if (settings.isAudioWifiOnly() && !NetworkState.isUnmetered(applicationContext)) {
             Log.i(TAG, "Wi-Fi only: skipping recording upload on metered network")
-            return Result.success()
+            return if (kakaoNeedsRetry) Result.retry() else Result.success()
         }
         if (settings.isAudioChargingOnly() && !NetworkState.isCharging(applicationContext)) {
             Log.i(TAG, "Charging only: skipping recording upload while on battery")
-            return Result.success()
+            return if (kakaoNeedsRetry) Result.retry() else Result.success()
         }
 
         // ── Stage: recordings ──────────────────────────────────────────────
@@ -156,7 +160,7 @@ class SyncWorker(
 
         if (recordingDirs.isEmpty()) {
             Log.d(TAG, "No recording directory detected — skipping audio upload")
-            return Result.success()
+            return if (kakaoNeedsRetry) Result.retry() else Result.success()
         }
 
         // ── Stage: recording_scan ──────────────────────────────────────────
@@ -174,7 +178,7 @@ class SyncWorker(
 
             val recordingTime = raw.recordingTimeMs.takeIf { it > 0 }
                 ?: Classifier.parseRecordingTimestamp(raw.filename) ?: raw.lastModifiedMs
-            val recordingCalls = if (raw.sourceType == RecordingSourceType.CALL) {
+            val recordingCalls = if (raw.sourceType == RecordingSourceType.CALL && hasPermission(android.Manifest.permission.READ_CALL_LOG)) {
                 callReader.readAround(recordingTime).map { Classifier.classifyCall(it) }
             } else emptyList()
             val classified = Classifier.classifyRecording(raw, recordingCalls)
@@ -213,9 +217,12 @@ class SyncWorker(
         return when (recordingResult) {
             is UploadResult.AuthError -> Result.failure()
             is UploadResult.TransientError -> Result.retry()
-            else -> Result.success()
+            else -> if (kakaoNeedsRetry) Result.retry() else Result.success()
         }
     }
+
+    private fun hasPermission(permission: String): Boolean =
+        androidx.core.content.ContextCompat.checkSelfPermission(applicationContext, permission) == android.content.pm.PackageManager.PERMISSION_GRANTED
 
     private fun buildUploader(
         serverUrl: String,

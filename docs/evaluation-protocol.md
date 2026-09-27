@@ -26,7 +26,10 @@ hashes stay comparable — it is a frozen hash input, not a live claim.
   historical positive/negative document label resolves to negative.
 - `--golden` uses only `judge=user`; relevant, irrelevant, and noise judgments are
   exported, including negative-only questions. No questions or judgments are
-  created by evaluation.
+  created by evaluation. `--split` filters feedback-derived pairs only; it does
+  not partition the user-judged golden set. Use `--limit` for a deterministic
+  bounded golden sample. Reusing these labels during development is not held-out
+  validation.
 - Labels outside the default corpus (missing, deleted, disposable, insight) are
   excluded from the evaluation snapshot and counted in `excluded_labels`.
   `excluded_labels.reasons` splits that count by cause — `missing`,
@@ -298,8 +301,11 @@ extension creation/migrations, metric persistence, telemetry and webhook alerts.
 It rejects `--check-reindex`, which can write state. An old schema has no compatible
 baseline and is read without upgrading it. Embedding/reranking requests still
 consume configured remote services; bound the diagnostic sample before running.
-The default remains all eligible labels; development comparisons should explicitly
-use `--split=train`, not repeatedly inspect holdout results. Sampling is
+Feedback-derived development comparisons should explicitly use `--split=train`,
+not repeatedly inspect holdout results. `--golden` always uses all eligible
+user-judged labels (or its deterministic `--limit` sample); it currently has no
+train/holdout split. Evaluating that same golden set after development does not
+provide independent held-out evidence. Sampling is
 hash-ordered and deterministic. Keep any private query/result snapshots outside
 the repository with directory mode 0700 and file mode 0600.
 
@@ -325,14 +331,25 @@ set, and do not report answer-quality gains from retrieval-only scores.
 엔티티 추출 활성화 조건과 엔티티 레인 가중치가 충족되어야 효과가 있다.
 
 ```sh
-go run ./cmd/eval --golden --split=train --no-persist --window=plan \
+go run ./cmd/eval --golden --no-persist --window=plan \
   --as-of=2026-09-27T09:00:00+09:00 --rerank=true --rerank-input=best_chunk --dump=/secure/base.jsonl
-go run ./cmd/eval --golden --split=train --no-persist --window=plan \
+go run ./cmd/eval --golden --no-persist --window=plan \
   --as-of=2026-09-27T09:00:00+09:00 --rerank=true --rerank-input=best_chunk \
   --entity-query-contains-name --dump=/secure/entity.jsonl
-go run ./cmd/eval --golden --split=train --no-persist --window=plan \
+go run ./cmd/eval --golden --no-persist --window=plan \
   --as-of=2026-09-27T09:00:00+09:00 --rerank=true --rerank-input=best_chunk \
   --rerank-call-context --dump=/secure/call.jsonl
 go run ./cmd/evalcompare --baseline=/secure/base.jsonl --candidate=/secure/entity.jsonl
 go run ./cmd/evalcompare --baseline=/secure/base.jsonl --candidate=/secure/call.jsonl
 ```
+
+FP@10의 차이도 `candidate - baseline`으로 표시한다. NDCG·Recall과 달리
+FP가 늘면 악화(`regressed`), 줄면 개선(`improved_candidate`)이다. 전체
+회귀 종료 코드는 기존대로 NDCG만 기준으로 삼으며 FP 판정은 진단용이다.
+
+
+### 카카오톡 코퍼스 격리
+
+카카오톡 TXT는 기본 RAG와 자동 임베딩·요약·엔티티·그래프·골든 생성에서 제외한다. 명시 `source_type=kakao` 검색은 원문 FTS/bigm만 사용하며, 최근 목록과 ID 조회는 유지한다. 기본 후보 필터뿐 아니라 공유 HNSW 유입 및 요약 커버리지 분모를 차단한다. DB 회귀 테스트는 카카오 메시지를 추가해도 기존 검색 결과·점수와 작업 큐·커버리지가 변하지 않는지 확인한다.
+
+혼합 RAG 확대는 별도 품질 검증 후 결정한다. 짧은 메시지 단독 평가 대신 대화방·화자·시간 문맥을 보존한 묶음을 후보로 평가하고, 기존 사용자 골든의 회귀와 지연·비용을 함께 비교한다. 같은 코퍼스로 설계·튜닝한 평가는 held-out 증명이 아니므로 독립 표본을 추가한다. 현재 원문 저장 및 검색 격리는 카카오톡을 포함한 혼합 RAG 성능이 검증됐다는 뜻이 아니다.

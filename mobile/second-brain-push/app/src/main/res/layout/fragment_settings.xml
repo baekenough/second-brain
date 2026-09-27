@@ -166,6 +166,12 @@
             android:layout_marginTop="8dp"
             style="@style/Widget.Material3.Button.OutlinedButton" />
 
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="카카오톡에서 내보낸 TXT 파일을 선택해 대화를 가져옵니다. 방 종류·화자·친구 여부를 미리보기에서 확인할 수 있습니다." />
+        <com.google.android.material.button.MaterialButton android:id="@+id/btn_kakao_import"
+            android:layout_width="match_parent" android:layout_height="wrap_content" android:text="카카오톡 TXT 가져오기" />
+
         <!-- Save action -->
         <com.google.android.material.button.MaterialButton
             android:id="@+id/btn_save"

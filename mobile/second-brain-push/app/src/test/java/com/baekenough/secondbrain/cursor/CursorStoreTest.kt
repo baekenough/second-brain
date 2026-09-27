@@ -180,14 +180,14 @@ class CursorStoreTest {
 
     // ── SMS_CURSOR_VERSION / CALL_CURSOR_VERSION constants ───────────────
 
-    @Test fun `SMS_CURSOR_VERSION is 2`() {
+    @Test fun `SMS_CURSOR_VERSION is 3`() {
         // This constant must be bumped deliberately. Failing here means a bump was done
         // without updating this test — update the test AND confirm the reset is intentional.
-        assertEquals(2, CursorStore.SMS_CURSOR_VERSION)
+        assertEquals(3, CursorStore.SMS_CURSOR_VERSION)
     }
 
-    @Test fun `CALL_CURSOR_VERSION is 2`() {
-        assertEquals(2, CursorStore.CALL_CURSOR_VERSION)
+    @Test fun `CALL_CURSOR_VERSION is 3`() {
+        assertEquals(3, CursorStore.CALL_CURSOR_VERSION)
     }
 
     @Test fun `RECORDING_SENT_VERSION is 2`() {

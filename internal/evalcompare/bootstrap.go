@@ -82,10 +82,13 @@ func groupMetric(groupName, metricName string, values []float64, opts Options, p
 	metric.CILow = percentile(resampled, 0.025)
 	metric.CIHigh = percentile(resampled, 0.975)
 
+	// 차이와 신뢰구간은 언제나 candidate-baseline으로 표시한다.
+	// FP는 적을수록 좋으므로 판정 방향만 NDCG·Recall과 반대로 읽는다.
+	lowerIsBetter := metricName == "fp10"
 	switch {
-	case metric.CIHigh < 0:
+	case (metric.CIHigh < 0 && !lowerIsBetter) || (metric.CILow > 0 && lowerIsBetter):
 		metric.Verdict = VerdictRegressed
-	case metric.CILow > 0:
+	case (metric.CILow > 0 && !lowerIsBetter) || (metric.CIHigh < 0 && lowerIsBetter):
 		metric.Verdict = VerdictImprovedCandidate
 	default:
 		metric.Verdict = VerdictNoChange
