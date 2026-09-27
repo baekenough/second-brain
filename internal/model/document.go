@@ -47,7 +47,6 @@ const (
 	SourceGmail     SourceType = "gmail"
 	SourceCalendar  SourceType = "calendar"
 	SourceSMS       SourceType = "sms"
-	SourceKakao     SourceType = "kakao"
 	// SourceCallLog is DEPRECATED as of 2026-09-19 (migration 033) — DO NOT
 	// write new documents with this source_type.
 	//

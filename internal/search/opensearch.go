@@ -251,7 +251,6 @@ func (c *OpenSearchClient) Search(ctx context.Context, q model.SearchQuery, limi
 // caller as a soft failure) — the same fail-closed outcome, reached a
 // different way.
 func buildOpenSearchRequest(q model.SearchQuery, size int) map[string]any {
-	q = q.WithRetrievalDefaults()
 	must := []map[string]any{
 		{
 			"multi_match": map[string]any{

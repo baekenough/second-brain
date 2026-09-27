@@ -17,9 +17,6 @@ import retrofit2.http.Query
  * [AuthInterceptor] via OkHttp.
  */
 interface ApiService {
-    @POST("api/v1/ingest/kakao")
-    suspend fun postKakao(@Body request: com.baekenough.secondbrain.kakao.KakaoRequest): Response<com.baekenough.secondbrain.kakao.KakaoResponse>
-
 
     /**
      * POST /api/v1/ingest/messages

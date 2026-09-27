@@ -49,14 +49,14 @@ class CursorStore(private val context: Context) {
          * [CUTOVER_EPOCH_MS] on the next sync run. Use when the cursor is known to have
          * been written incorrectly (e.g. future-dated SMS jumped it to the future).
          *
-         * Current: 3 — replay equal-date omissions after server #295 replay protection is deployed.
+         * 현재 버전 3: 서버 #295 재전송 보호 배포 후 동일 시각의 누락 기록을 다시 수집합니다.
          */
         internal const val SMS_CURSOR_VERSION = 3
 
         /**
          * Schema version for the call-log cursor. Same semantics as [SMS_CURSOR_VERSION].
          *
-         * Current: 3 — replay equal-date omissions after server #295 replay protection is deployed.
+         * 현재 버전 3: 서버 #295 재전송 보호 배포 후 동일 시각의 누락 기록을 다시 수집합니다.
          */
         internal const val CALL_CURSOR_VERSION = 3
 

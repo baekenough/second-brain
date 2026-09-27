@@ -119,14 +119,8 @@ func TestServiceSearch_AlreadyExcluded_NoDuplicate(t *testing.T) {
 		t.Fatalf("Search returned error: %v", err)
 	}
 
-	count := 0
-	for _, source := range docs.gotQuery.ExcludeSourceTypes {
-		if source == model.SourceInsight {
-			count++
-		}
-	}
-	if count != 1 {
-		t.Errorf("insight exclusion count = %d, want 1", count)
+	if len(docs.gotQuery.ExcludeSourceTypes) != 1 {
+		t.Errorf("ExcludeSourceTypes = %v, want exactly one entry", docs.gotQuery.ExcludeSourceTypes)
 	}
 }
 

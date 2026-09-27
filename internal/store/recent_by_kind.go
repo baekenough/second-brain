@@ -16,9 +16,6 @@ const (
 	// RecentKindSMS returns documents with source_type = 'sms'.
 	RecentKindSMS RecentKind = "sms"
 
-	// RecentKindKakao는 방·화자 제목이 붙은 카카오톡 메시지다.
-	RecentKindKakao RecentKind = "kakao"
-
 	// RecentKindCallRecording returns call documents (source_type='call', or
 	// the deprecated pre-migration-033 'call-log') that have an audio_file
 	// entry in their metadata JSON (i.e. a recording was captured).
@@ -69,13 +66,6 @@ func (s *DocumentStore) ListRecentByKind(ctx context.Context, kind RecentKind, l
 		rows, err = s.pg.pool.Query(ctx, q, limit)
 		if err != nil {
 			return nil, fmt.Errorf("list recent sms: %w", err)
-		}
-
-	case RecentKindKakao:
-		const q = selectCols + ` AND source_type = 'kakao'` + orderBy
-		rows, err = s.pg.pool.Query(ctx, q, limit)
-		if err != nil {
-			return nil, fmt.Errorf("list recent kakao: %w", err)
 		}
 
 	case RecentKindCallRecording:
@@ -150,9 +140,6 @@ func (s *DocumentStore) CountByKind(ctx context.Context, kind RecentKind) (int, 
 	case RecentKindSMS:
 		q = base + `
 		  AND source_type = 'sms'`
-
-	case RecentKindKakao:
-		q = base + ` AND source_type = 'kakao'`
 
 	case RecentKindCallRecording:
 		// Mirrors the ListRecentByKind filter: call rows that carry an

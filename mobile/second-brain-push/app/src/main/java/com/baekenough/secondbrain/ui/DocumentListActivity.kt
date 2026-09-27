@@ -54,7 +54,6 @@ class DocumentListActivity : AppCompatActivity() {
         }
 
         val title = when (kind) {
-            "kakao" -> "카카오톡 대화"
             KIND_SMS -> getString(R.string.doc_list_title_sms)
             KIND_CALL_RECORDING -> getString(R.string.doc_list_title_calls)
             KIND_VOICE_MEMO -> getString(R.string.doc_list_title_recordings)

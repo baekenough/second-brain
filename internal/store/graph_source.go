@@ -32,9 +32,7 @@ const listRelationsSQL = `
 	  FROM entity_relations r
 	  JOIN entities fe ON fe.id = r.from_entity_id
 	  JOIN entities te ON te.id = r.to_entity_id
-	  JOIN documents d ON d.id = r.evidence_document_id
 	 WHERE r.id > $1
-	   AND d.` + backgroundSourceEligibilitySQL + `
 	 ORDER BY r.id
 	 LIMIT $2`
 
@@ -129,7 +127,6 @@ func (s *GraphSource) ListMentionsAfter(ctx context.Context, afterDocumentID str
 			  JOIN documents d ON d.id = de.document_id
 			  JOIN entities  e ON e.id = de.entity_id
 			 WHERE d.status = 'active'
-			   AND d.` + backgroundSourceEligibilitySQL + `
 			   ` + clause + `
 			 ORDER BY de.document_id, de.entity_id
 			 LIMIT $3`
@@ -141,7 +138,6 @@ func (s *GraphSource) ListMentionsAfter(ctx context.Context, afterDocumentID str
 			  JOIN documents d ON d.id = de.document_id
 			  JOIN entities  e ON e.id = de.entity_id
 			 WHERE d.status = 'active'
-			   AND d.` + backgroundSourceEligibilitySQL + `
 			 ORDER BY de.document_id, de.entity_id
 			 LIMIT $1`
 		args = []any{limit}

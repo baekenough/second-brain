@@ -142,7 +142,7 @@ export async function listRecentDocuments(
 }
 
 export async function listRecentByKind(
-  kind: "sms" | "kakao" | "call-recording" | "voice-memo",
+  kind: "sms" | "call-recording" | "voice-memo",
   limit = 50,
 ): Promise<RecentItemsResponse> {
   const params = new URLSearchParams({ kind, limit: String(limit) });
