@@ -141,3 +141,26 @@ func TestWorstByNDCG_TopThreeSortedAscendingWithTieBreak(t *testing.T) {
 		}
 	}
 }
+
+// FP의 증가를 개선으로 표시했던 회귀를 막고, 표기하는 차이의 부호는 지킨다.
+func TestGroupMetricFalsePositiveDirection(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		delta float64
+		want  Verdict
+	}{
+		{"more_false_positives", 1, VerdictRegressed},
+		{"fewer_false_positives", -1, VerdictImprovedCandidate},
+		{"unchanged", 0, VerdictNoChange},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := groupMetric("overall", "fp10", []float64{tc.delta, tc.delta, tc.delta}, Options{Seed: 1, Iterations: 100, MinN: 3}, false, 0)
+			if m.Verdict != tc.want {
+				t.Fatalf("verdict=%s want=%s", m.Verdict, tc.want)
+			}
+			if m.MeanDelta != tc.delta || m.CILow != tc.delta || m.CIHigh != tc.delta {
+				t.Fatalf("candidate-baseline 부호가 바뀜: %+v", m)
+			}
+		})
+	}
+}

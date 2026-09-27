@@ -26,7 +26,10 @@ hashes stay comparable — it is a frozen hash input, not a live claim.
   historical positive/negative document label resolves to negative.
 - `--golden` uses only `judge=user`; relevant, irrelevant, and noise judgments are
   exported, including negative-only questions. No questions or judgments are
-  created by evaluation.
+  created by evaluation. `--split` filters feedback-derived pairs only; it does
+  not partition the user-judged golden set. Use `--limit` for a deterministic
+  bounded golden sample. Reusing these labels during development is not held-out
+  validation.
 - Labels outside the default corpus (missing, deleted, disposable, insight) are
   excluded from the evaluation snapshot and counted in `excluded_labels`.
   `excluded_labels.reasons` splits that count by cause — `missing`,
@@ -298,8 +301,11 @@ extension creation/migrations, metric persistence, telemetry and webhook alerts.
 It rejects `--check-reindex`, which can write state. An old schema has no compatible
 baseline and is read without upgrading it. Embedding/reranking requests still
 consume configured remote services; bound the diagnostic sample before running.
-The default remains all eligible labels; development comparisons should explicitly
-use `--split=train`, not repeatedly inspect holdout results. Sampling is
+Feedback-derived development comparisons should explicitly use `--split=train`,
+not repeatedly inspect holdout results. `--golden` always uses all eligible
+user-judged labels (or its deterministic `--limit` sample); it currently has no
+train/holdout split. Evaluating that same golden set after development does not
+provide independent held-out evidence. Sampling is
 hash-ordered and deterministic. Keep any private query/result snapshots outside
 the repository with directory mode 0700 and file mode 0600.
 
@@ -325,14 +331,18 @@ set, and do not report answer-quality gains from retrieval-only scores.
 엔티티 추출 활성화 조건과 엔티티 레인 가중치가 충족되어야 효과가 있다.
 
 ```sh
-go run ./cmd/eval --golden --split=train --no-persist --window=plan \
+go run ./cmd/eval --golden --no-persist --window=plan \
   --as-of=2026-09-27T09:00:00+09:00 --rerank=true --rerank-input=best_chunk --dump=/secure/base.jsonl
-go run ./cmd/eval --golden --split=train --no-persist --window=plan \
+go run ./cmd/eval --golden --no-persist --window=plan \
   --as-of=2026-09-27T09:00:00+09:00 --rerank=true --rerank-input=best_chunk \
   --entity-query-contains-name --dump=/secure/entity.jsonl
-go run ./cmd/eval --golden --split=train --no-persist --window=plan \
+go run ./cmd/eval --golden --no-persist --window=plan \
   --as-of=2026-09-27T09:00:00+09:00 --rerank=true --rerank-input=best_chunk \
   --rerank-call-context --dump=/secure/call.jsonl
 go run ./cmd/evalcompare --baseline=/secure/base.jsonl --candidate=/secure/entity.jsonl
 go run ./cmd/evalcompare --baseline=/secure/base.jsonl --candidate=/secure/call.jsonl
 ```
+
+FP@10의 차이도 `candidate - baseline`으로 표시한다. NDCG·Recall과 달리
+FP가 늘면 악화(`regressed`), 줄면 개선(`improved_candidate`)이다. 전체
+회귀 종료 코드는 기존대로 NDCG만 기준으로 삼으며 FP 판정은 진단용이다.
