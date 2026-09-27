@@ -176,6 +176,8 @@ func run() error {
 			"rrf 는 융합 순위와 리랭커 순위를 1/(60+rank) 로 합산한다")
 	rerankBlendWeight := flag.Float64("rerank-blend-weight", model.DefaultRerankBlendWeight,
 		"--rerank-blend=rrf 에서 리랭커 항에 곱하는 가중치. 1.0(기본)이면 융합 순위와 동등하게 본다")
+	entityQueryContainsName := flag.Bool("entity-query-contains-name", false, "질의 안에서 두 글자 이상 엔티티 이름을 찾는 실험")
+	rerankCallContext := flag.Bool("rerank-call-context", false, "통화 리랭커 입력에 참여자와 본문 앞부분을 추가하는 실험")
 	rerankInput := flag.String("rerank-input", model.RerankInputHead,
 		"리랭커에 보내는 텍스트. head(기본)는 제목+본문 앞부분, best_chunk 는 "+
 			"[소스·날짜·제목] 머리글 한 줄 + 질의와 가장 잘 맞는 청크 본문")
@@ -213,16 +215,18 @@ func run() error {
 	// "실제로는 기본값으로 돈 실행" 이 갈라지면, 그 결과로 내린 판단이 전부
 	// 근거 없는 것이 된다 — --as-of 를 거부하는 위 분기와 같은 이유다.
 	tuning := model.SearchTuning{
-		RerankOverfetch:       *rerankOverfetch,
-		MergeMode:             *mergeMode,
-		RerankBlend:           *rerankBlend,
-		RerankBlendWeight:     *rerankBlendWeight,
-		RerankInput:           *rerankInput,
-		RecencyHalfLifeDays:   *recencyHalflife,
-		RecencyAlpha:          *recencyAlpha,
-		ChunkSparse:           *chunkSparse,
-		ChunkSparseCtxVersion: *chunkSparseCtxVersion,
-		SparseQuery:           *sparseQuery,
+		RerankOverfetch:         *rerankOverfetch,
+		MergeMode:               *mergeMode,
+		RerankBlend:             *rerankBlend,
+		RerankBlendWeight:       *rerankBlendWeight,
+		RerankInput:             *rerankInput,
+		EntityQueryContainsName: *entityQueryContainsName,
+		RerankCallContext:       *rerankCallContext,
+		RecencyHalfLifeDays:     *recencyHalflife,
+		RecencyAlpha:            *recencyAlpha,
+		ChunkSparse:             *chunkSparse,
+		ChunkSparseCtxVersion:   *chunkSparseCtxVersion,
+		SparseQuery:             *sparseQuery,
 	}
 	if err := validateTuningFlags(tuning); err != nil {
 		return err

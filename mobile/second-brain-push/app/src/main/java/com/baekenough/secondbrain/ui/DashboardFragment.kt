@@ -18,6 +18,9 @@ import com.baekenough.secondbrain.sync.AuthInterceptor
 import com.baekenough.secondbrain.sync.SyncWorker
 import com.baekenough.secondbrain.util.BatteryOptimizationHelper
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
@@ -61,6 +64,7 @@ class DashboardFragment : Fragment() {
     private var _binding: FragmentDashboardBinding? = null
     private val binding get() = _binding!!
 
+    private var statsRefreshJob: Job? = null
     private lateinit var settings: SettingsRepository
     private lateinit var stats: StatsRepository
 
@@ -129,7 +133,8 @@ class DashboardFragment : Fragment() {
         updateConnectionCard()
         updateBatteryStatusCard()
         updateLastSyncCard()
-        lifecycleScope.launch { updateStatsCards() }
+        statsRefreshJob?.cancel()
+        statsRefreshJob = viewLifecycleOwner.lifecycleScope.launch { updateStatsCards() }
     }
 
     private fun updateConnectionCard() {
@@ -196,7 +201,10 @@ class DashboardFragment : Fragment() {
         }
 
         val intervalMin = settings.getSyncIntervalMinutes()
-        binding.tvSyncInterval.text = getString(R.string.last_sync_auto_interval, intervalMin)
+        binding.tvSyncInterval.text = getString(R.string.last_sync_auto_interval, intervalMin) +
+            if (stats.getRecordingsExcluded() > 0) {
+                "\n녹음 영구 제외 ${stats.getRecordingsExcluded()}건 · 최근 사유: ${stats.getRecordingExclusionReason()}"
+            } else ""
     }
 
     /**
@@ -206,52 +214,40 @@ class DashboardFragment : Fragment() {
      * Falls back to local [StatsRepository] values when the server is
      * unreachable or the app is not yet configured — prevents blank cards.
      */
-    private suspend fun updateStatsCards() {
-        // Always show local counts first so the cards are never empty.
-        binding.tvSmsCount.text = stats.getSmsUploaded().toString()
-        binding.tvCallsCount.text = stats.getRecordingsUploaded().toString()
-        binding.tvRecordingsCount.text = stats.getVoiceMemoUploaded().toString()
-
-        if (!settings.isConfigured()) return
-
-        try {
-            val api = buildApiService(settings.getServerUrl(), settings.getApiToken())
-
-            // Fetch all three kinds concurrently.
-            val smsDeferred = lifecycleScope.async(Dispatchers.IO) {
-                runCatching { api.getRecentDocuments(kind = DocumentListActivity.KIND_SMS, limit = 1000) }
-            }
-            val callDeferred = lifecycleScope.async(Dispatchers.IO) {
-                runCatching { api.getRecentDocuments(kind = DocumentListActivity.KIND_CALL_RECORDING, limit = 1000) }
-            }
-            val voiceDeferred = lifecycleScope.async(Dispatchers.IO) {
-                runCatching { api.getRecentDocuments(kind = DocumentListActivity.KIND_VOICE_MEMO, limit = 1000) }
-            }
-
-            val smsResult = smsDeferred.await()
-            val callResult = callDeferred.await()
-            val voiceResult = voiceDeferred.await()
-
-            // Apply server counts; keep local fallback on failure.
-            // Prefer total (full aggregate) over count (capped at server limit of 200).
-            // Falls back to count when talking to an older server that does not emit total.
-            withContext(Dispatchers.Main) {
-                if (_binding == null) return@withContext
-                smsResult.getOrNull()?.body()?.let { body ->
-                    binding.tvSmsCount.text = (body.total ?: body.count).toString()
-                }
-                callResult.getOrNull()?.body()?.let { body ->
-                    // tvCallsCount shows call-recordings (TPhone/One UI, kind=call-recording)
-                    binding.tvCallsCount.text = (body.total ?: body.count).toString()
-                }
-                voiceResult.getOrNull()?.body()?.let { body ->
-                    // tvRecordingsCount shows voice memos (Samsung Voice Recorder, kind=voice-memo)
-                    binding.tvRecordingsCount.text = (body.total ?: body.count).toString()
-                }
-            }
-        } catch (_: Exception) {
-            // Network error or misconfiguration — local fallback already shown above.
+    private suspend fun updateStatsCards() = coroutineScope {
+        val serverUrl = settings.getServerUrl()
+        val tiles = listOf(
+            Triple(DocumentListActivity.KIND_SMS, binding.tvSmsCount, stats.getSmsUploaded()),
+            Triple(DocumentListActivity.KIND_CALL_RECORDING, binding.tvCallsCount, stats.getRecordingsUploaded()),
+            Triple(DocumentListActivity.KIND_VOICE_MEMO, binding.tvRecordingsCount, stats.getVoiceMemoUploaded()),
+        )
+        // Use the last server total immediately, including after a view/process restart.
+        // Cumulative local uploads and server document totals are different quantities.
+        tiles.forEach { (kind, tile, fallback) ->
+            tile.text = (stats.getServerCount(kind, serverUrl) ?: fallback).toString()
         }
+        if (!settings.isConfigured()) return@coroutineScope
+        val api = try {
+            buildApiService(serverUrl, settings.getApiToken())
+        } catch (_: IllegalArgumentException) {
+            // An invalid saved URL must leave the cached counts visible, not crash the screen.
+            return@coroutineScope
+        }
+        tiles.map { (kind, tile, _) ->
+            async {
+                try {
+                    val response = api.getRecentDocuments(kind = kind, limit = 1000)
+                    val body = response.takeIf { it.isSuccessful }?.body() ?: return@async
+                    val count = body.total ?: body.count
+                    stats.cacheServerCount(kind, serverUrl, count)
+                    tile.text = count.toString()
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    // Keep the cached server count while offline.
+                }
+            }
+        }.forEach { it.await() }
     }
 
     /**

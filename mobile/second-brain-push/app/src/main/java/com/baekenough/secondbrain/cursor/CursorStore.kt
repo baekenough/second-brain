@@ -49,14 +49,14 @@ class CursorStore(private val context: Context) {
          * [CUTOVER_EPOCH_MS] on the next sync run. Use when the cursor is known to have
          * been written incorrectly (e.g. future-dated SMS jumped it to the future).
          *
-         * Current: 2 — forces full re-collection since 2026-05-30 cutover.
+         * Current: 2 — retain existing cursors; historical replay requires a safe server.
          */
         internal const val SMS_CURSOR_VERSION = 2
 
         /**
          * Schema version for the call-log cursor. Same semantics as [SMS_CURSOR_VERSION].
          *
-         * Current: 2 — forces full re-collection since 2026-05-30 cutover.
+         * Current: 2 — retain existing cursors; historical replay requires a safe server.
          */
         internal const val CALL_CURSOR_VERSION = 2
 
@@ -104,6 +104,9 @@ class CursorStore(private val context: Context) {
          */
         internal fun isMonotonicAdvance(newDateMs: Long, storedDateMs: Long): Boolean =
             newDateMs >= storedDateMs
+
+        internal fun isMonotonicAdvance(newDateMs: Long, newId: Long, storedDateMs: Long, storedId: Long): Boolean =
+            newDateMs > storedDateMs || (newDateMs == storedDateMs && newId >= storedId)
 
         // Stored recording path detected by PathDetector (legacy single-path key — kept for migration)
         private val KEY_RECORDING_DIR = androidx.datastore.preferences.core.stringPreferencesKey("recording_dir")
@@ -157,7 +160,7 @@ class CursorStore(private val context: Context) {
         }
         dataStore.edit { prefs ->
             val storedDate = prefs[KEY_LAST_SMS_DATE] ?: CUTOVER_EPOCH_MS
-            if (isMonotonicAdvance(dateMs, storedDate)) {
+            if (isMonotonicAdvance(dateMs, id, storedDate, prefs[KEY_LAST_SMS_ID] ?: -1L)) {
                 prefs[KEY_LAST_SMS_ID] = id
                 prefs[KEY_LAST_SMS_DATE] = dateMs
             }
@@ -181,7 +184,7 @@ class CursorStore(private val context: Context) {
         }
         dataStore.edit { prefs ->
             val storedDate = prefs[KEY_LAST_CALL_DATE] ?: CUTOVER_EPOCH_MS
-            if (isMonotonicAdvance(dateMs, storedDate)) {
+            if (isMonotonicAdvance(dateMs, id, storedDate, prefs[KEY_LAST_CALL_ID] ?: -1L)) {
                 prefs[KEY_LAST_CALL_ID] = id
                 prefs[KEY_LAST_CALL_DATE] = dateMs
             }

@@ -26,7 +26,7 @@ class SmsReader(private val contentResolver: ContentResolver) {
     }
 
     /**
-     * Returns all SMS records with `date > cursor.lastSmsDate` ordered by date ascending.
+     * Returns all SMS records with `(date, id) > cursor` through the current time ordered by date ascending.
      * Ascending order matters: we advance the cursor to the last successfully processed id.
      */
     fun readSince(cursor: CursorSnapshot): List<RawSmsEntry> {
@@ -35,9 +35,9 @@ class SmsReader(private val contentResolver: ContentResolver) {
         contentResolver.query(
             SMS_URI,
             PROJECTION,
-            "${Telephony.Sms.DATE} > ?",
-            arrayOf(cursor.lastSmsDate.toString()),
-            "${Telephony.Sms.DATE} ASC",
+            "(${Telephony.Sms.DATE} > ? OR (${Telephony.Sms.DATE} = ? AND ${Telephony.Sms._ID} > ?)) AND ${Telephony.Sms.DATE} <= ?",
+            arrayOf(cursor.lastSmsDate.toString(), cursor.lastSmsDate.toString(), cursor.lastSmsId.toString(), System.currentTimeMillis().toString()),
+            "${Telephony.Sms.DATE} ASC, ${Telephony.Sms._ID} ASC",
         )?.use { c ->
             val idIdx = c.getColumnIndexOrThrow(Telephony.Sms._ID)
             val dateIdx = c.getColumnIndexOrThrow(Telephony.Sms.DATE)

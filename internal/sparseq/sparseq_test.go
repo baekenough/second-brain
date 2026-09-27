@@ -92,7 +92,7 @@ func TestExtract_ParticleStripping(t *testing.T) {
 		"일정이야":    "일정",
 		"진행하던":    "진행",
 		"통화했던":    "통화",
-		"무제한":     "무제",
+		"무제한":     "무제한",
 		"보냈었나":    "보냈",
 		"알려주세요":   "",
 		"했는지":     "",
@@ -298,20 +298,15 @@ func TestExtract_ReviewFollowups(t *testing.T) {
 	}
 }
 
-// TestExtract_KnownLimit_AdnominalHan 은 현재 동작을 기록할 뿐 바람직한
-// 동작을 주장하지 않는다.
-//
-// 알려진 한계: 관형형 어미 "한" 규칙(3 rune 이상 토큰)은 "통화한" → "통화"
-// 를 위해 넣었지만, "한" 으로 끝나는 세 글자 이름도 똑같이 자른다
-// ("박성한" → "박성"). 접두·부분 문자열 매치라 "박성한" 문서는 여전히
-// 찾지만 "박성호"·"박성민" 같은 다른 이름까지 끌어온다. 규칙을 유지할지는
-// 골든셋 측정으로 정하기로 했다 — 규칙을 바꾸면 이 테스트를 새 동작으로
-// 고치고 Version 을 올린다.
-func TestExtract_KnownLimit_AdnominalHan(t *testing.T) {
-	t.Parallel()
-	got := Extract("박성한")
-	if !reflect.DeepEqual(got.Like, []string{"박성"}) || !reflect.DeepEqual(got.TS, []string{"박성"}) {
-		t.Errorf(`Extract("박성한") = %+v, want 현재 동작 [박성]`, got)
+func TestExtract_AdnominalHanNames(t *testing.T) {
+	for _, name := range []string{"박성한", "김민한"} {
+		got := Extract(name)
+		if !reflect.DeepEqual(got.Like, []string{name}) {
+			t.Errorf("%s: %+v", name, got)
+		}
+	}
+	if got := Extract("통화한"); !reflect.DeepEqual(got.Like, []string{"통화"}) {
+		t.Errorf("verb: %+v", got)
 	}
 }
 
@@ -321,6 +316,7 @@ func TestExtract_KnownLimit_AdnominalHan(t *testing.T) {
 // 이력으로 남겨 둔다(v1 은 이 테스트가 생기기 전 판이라 지문이 없다).
 var lexiconDigests = map[string]string{
 	"v2": "30edc7673e0bd81d",
+	"v3": "90da6b9a46cef03e",
 }
 
 func lexiconDigest() string {
@@ -329,7 +325,13 @@ func lexiconDigest() string {
 		words = append(words, w)
 	}
 	sort.Strings(words)
+	verbs := make([]string, 0, len(hanVerbs))
+	for w := range hanVerbs {
+		verbs = append(verbs, w)
+	}
+	sort.Strings(verbs)
 	parts := []string{
+		strings.Join(verbs, ","),
 		strings.Join(words, ","),
 		strings.Join(particles, ","),
 		strings.Join(predicateSuffixes, ","),

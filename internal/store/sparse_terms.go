@@ -24,9 +24,7 @@ type sparseSQL struct {
 // 때(raw 모드)와 있을 때 기존 플레이스홀더 번호가 하나도 움직이지 않고,
 // 엔티티 CTE 같은 기존 조각이 바이트 단위로 그대로 남는다.
 //
-// LIKE 키워드는 이스케이프하지 않는다. sparseq 의 Like 키워드에는 '%' 와
-// '\' 가 들어갈 수 없고(분리 문자), '_' 만 한 글자 와일드카드로 남는다 —
-// 질문 원문을 그대로 바인딩하는 raw 경로와 같은 의미다.
+// LIKE 키워드는 리터럴로 취급하며 %, _, 백슬래시를 이스케이프한다.
 func appendSparseTerms(args []interface{}, t model.SparseTerms) ([]interface{}, sparseSQL) {
 	var s sparseSQL
 	if t.TSQuery != "" {
@@ -37,7 +35,7 @@ func appendSparseTerms(args []interface{}, t model.SparseTerms) ([]interface{}, 
 		if i == sparseq.MaxTerms {
 			break
 		}
-		args = append(args, term)
+		args = append(args, escapeLikeTerm(term))
 		s.like = append(s.like, fmt.Sprintf("$%d", len(args)))
 	}
 	return args, s
@@ -70,7 +68,7 @@ func termMatch(p string, contact bool, cols ...string) string {
 		parts = append(parts, fmt.Sprintf("%s LIKE '%%' || %s || '%%'", c, p))
 	}
 	if contact {
-		parts = append(parts, fmt.Sprintf("(source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower(%s)) > 0)", p))
+		parts = append(parts, fmt.Sprintf("(source_type = 'call' AND lower(metadata->>'contact_name') LIKE '%%' || lower(%s) || '%%')", p))
 	}
 	return strings.Join(parts, " OR ")
 }
@@ -109,7 +107,7 @@ func (s sparseSQL) likeCount(contact bool, cols ...string) string {
 // 0.02 라 bigm 만 맞은 청크는 여전히 진짜 FTS 히트(보통 0.01~0.5) 아래에
 // 머문다 — raw 경로 주석의 근거(#146)를 그대로 따른다.
 func (s sparseSQL) chunkSparseRank(col string) string {
-	return fmt.Sprintf("(0.01 * %s / %d + CASE WHEN %s LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END)",
+	return fmt.Sprintf("(0.01 * %s / %d + CASE WHEN %s LIKE '%%' || "+escapedRawLikeSQL+" || '%%' THEN 0.01 ELSE 0 END)",
 		s.likeCount(false, col), max(len(s.like), 1), col)
 }
 
@@ -153,6 +151,31 @@ func bindChunkSparse(args []interface{}, t model.SparseTerms) ([]interface{}, *s
 // docSparseRank 는 fulltext 경로(임베딩 없음)의 bigm 쪽 점수로,
 // chunkSparseRank 와 같은 척도를 content·title·contact_name 에 적용한다.
 func (s sparseSQL) docSparseRank() string {
-	return fmt.Sprintf("(0.01 * %s / %d + CASE WHEN content LIKE '%%' || $1 || '%%' OR title LIKE '%%' || $1 || '%%' THEN 0.01 ELSE 0 END)",
+	return fmt.Sprintf("(0.01 * %s / %d + CASE WHEN content LIKE '%%' || "+escapedRawLikeSQL+" || '%%' OR title LIKE '%%' || "+escapedRawLikeSQL+" || '%%' THEN 0.01 ELSE 0 END)",
 		s.likeCount(true, "content", "title"), max(len(s.like), 1))
 }
+
+// escapeLikeTerm은 foo_bar 같은 식별자의 밑줄을 리터럴로 유지한다.
+func escapeLikeTerm(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
+}
+
+// docMatch는 연락처 조건을 별도 분기로 분리해 본문 분기가 GIN 인덱스를 쓰게 한다.
+func (s sparseSQL) docMatch(fts bool) string {
+	text := s.likeAny(false, "content", "title")
+	if fts {
+		text = "(" + s.tsMatch("tsv", "simple") + " OR " + s.tsMatch("tsv", "english") + " OR " + text + ")"
+	}
+	contacts := make([]string, 0, len(s.like))
+	for _, p := range s.like {
+		contacts = append(contacts, fmt.Sprintf("lower(metadata->>'contact_name') LIKE '%%' || lower(%s) || '%%'", p))
+	}
+	contact := "false"
+	if len(contacts) > 0 {
+		contact = strings.Join(contacts, " OR ")
+	}
+	return "id IN (SELECT id FROM documents WHERE " + text + " UNION SELECT id FROM documents WHERE source_type = 'call' AND (" + contact + "))"
+}
+
+// 원문 보너스도 밑줄·퍼센트를 리터럴로 비교하되 raw 모드 SQL은 유지한다.
+const escapedRawLikeSQL = `replace(replace(replace($1, chr(92), chr(92)||chr(92)), chr(37), chr(92)||chr(37)), '_', chr(92)||'_')`

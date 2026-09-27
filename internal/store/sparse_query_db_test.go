@@ -405,3 +405,43 @@ func explainNoSeqscan(t *testing.T, pg *Postgres, sql string, args []interface{}
 	}
 	return b.String()
 }
+
+func TestDB_SparseDocumentIndexesAndLiteralUnderscore(t *testing.T) {
+	pg := sparseDB(t)
+	args, sp := appendSparseTerms(nil, model.SparseTerms{Like: []string{"zz_회의", "zz일정"}})
+	for _, fts := range []bool{false, true} {
+		sql := "SELECT id FROM documents WHERE " + sp.docMatch(fts)
+		plan := explainNoSeqscan(t, pg, sql, args)
+		if !strings.Contains(plan, "idx_documents_content_bigm") || !strings.Contains(plan, "idx_documents_title_bigm") {
+			t.Fatalf("문서 인덱스 누락:\n%s", plan)
+		}
+	}
+	ctx := context.Background()
+	for _, value := range []string{"foo_bar", "fooXbar", "foo%bar", `foo\bar`} {
+		args, sp := appendSparseTerms([]interface{}{value}, model.SparseTerms{Like: []string{"foo_bar"}})
+		var matched bool
+		if err := pg.pool.QueryRow(ctx, "SELECT "+sp.likeAny(false, "$1::text"), args...).Scan(&matched); err != nil {
+			t.Fatal(err)
+		}
+		if matched != (value == "foo_bar") {
+			t.Errorf("%q: matched=%v", value, matched)
+		}
+	}
+}
+
+func TestDB_EntityContainsQueryDirection(t *testing.T) {
+	pg := sparseDB(t)
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		want bool
+	}{{"홍길동", true}, {"홍", false}, {"홍길순", false}, {"", false}} {
+		var got bool
+		if err := pg.pool.QueryRow(ctx, `SELECT char_length($1::text) >= 2 AND strpos(lower($2), $1) > 0`, tc.name, "홍길동이랑 통화한 거").Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != tc.want {
+			t.Errorf("name=%q got=%v", tc.name, got)
+		}
+	}
+}

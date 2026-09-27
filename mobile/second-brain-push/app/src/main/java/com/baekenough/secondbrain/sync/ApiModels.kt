@@ -44,6 +44,7 @@ data class MessagesResponse(
 data class RecordingResponse(
     val accepted: Boolean = false,
     val skipped: Boolean = false,
+    val reason: String? = null,
     @SerialName("document_id") val documentId: String? = null,
 )
 

@@ -195,3 +195,19 @@ func TestApplyTuningProfile_SparseTermsVersionValue(t *testing.T) {
 		t.Errorf("sparse_query = %v, want %q", got, model.SparseQueryChunk)
 	}
 }
+
+func TestApplyTuningProfileSearchFollowups(t *testing.T) {
+	for _, tc := range []struct {
+		tune model.SearchTuning
+		key  string
+	}{
+		{model.SearchTuning{EntityQueryContainsName: true}, "entity_query_contains_name"},
+		{model.SearchTuning{RerankCallContext: true}, "rerank_call_context"},
+	} {
+		profile := map[string]any{}
+		applyTuningProfile(profile, tc.tune.Normalized())
+		if _, ok := profile[tc.key]; !ok {
+			t.Fatalf("실험 노브가 평가 지문에 없음: %s", tc.key)
+		}
+	}
+}

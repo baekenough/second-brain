@@ -2,6 +2,7 @@ package com.baekenough.secondbrain.sync
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.baekenough.secondbrain.classify.Classifier
@@ -58,6 +59,8 @@ class SyncWorker(
             val ok = result == Result.success()
             statsRepo.recordSyncCompleted(ok)
             result
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (t: Throwable) {
             Log.e(TAG, "sync failed with uncaught exception", t)
             statsRepo.recordSyncCompleted(false)
@@ -165,17 +168,22 @@ class SyncWorker(
         // Refresh cursor after message upload may have advanced it
         val freshCursor = cursorStore.snapshot()
 
-        for (raw in newRecordings) {
-            if (freshCursor.sentRecordings.contains(raw.filename)) continue // double-check
+        val recordingResult = uploadRecordingQueue(
+            newRecordings.filterNot { it.filename in freshCursor.sentRecordings },
+        ) { raw ->
 
-            val classified = Classifier.classifyRecording(raw, classifiedCalls)
+            val recordingTime = raw.recordingTimeMs.takeIf { it > 0 }
+                ?: Classifier.parseRecordingTimestamp(raw.filename) ?: raw.lastModifiedMs
+            val recordingCalls = if (raw.sourceType == RecordingSourceType.CALL) {
+                callReader.readAround(recordingTime).map { Classifier.classifyCall(it) }
+            } else emptyList()
+            val classified = Classifier.classifyRecording(raw, recordingCalls)
             val recResult = uploader.uploadRecording(classified)
             Log.i(TAG, "Recording upload [${raw.filename}]: $recResult")
 
             when (recResult) {
                 is UploadResult.AuthError -> {
                     Log.e(TAG, "Auth error on recording — aborting audio uploads")
-                    return Result.failure()
                 }
                 is UploadResult.PerFileClientError -> {
                     // This specific file is permanently bad (e.g. server 400). It has already
@@ -187,7 +195,6 @@ class SyncWorker(
                     Log.w(TAG, "Transient recording error — will retry next wake")
                     // Don't fail the whole run; partial progress is fine.
                     // The recording cursor (sentRecordings set) was NOT advanced for this file.
-                    break
                 }
                 is UploadResult.Success -> {
                     if (recResult.accepted > 0) {
@@ -199,10 +206,15 @@ class SyncWorker(
                 }
                 else -> Unit
             }
+            recResult
         }
 
         Log.i(TAG, "Sync run complete")
-        return Result.success()
+        return when (recordingResult) {
+            is UploadResult.AuthError -> Result.failure()
+            is UploadResult.TransientError -> Result.retry()
+            else -> Result.success()
+        }
     }
 
     private fun buildUploader(
@@ -214,7 +226,7 @@ class SyncWorker(
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(120, TimeUnit.SECONDS)
             .writeTimeout(120, TimeUnit.SECONDS)
-            .callTimeout(180, TimeUnit.SECONDS)
+            .callTimeout(300, TimeUnit.SECONDS)
             .addInterceptor(AuthInterceptor { apiToken })
             .also { builder ->
                 if (BuildConfigCompat.DEBUG) {
@@ -243,6 +255,7 @@ class SyncWorker(
             // "4 KB garbage upload" caused by sdcardfs page-cache misses in OkHttp's
             // FileInputStream streaming path.
             cacheDir = applicationContext.cacheDir,
+            statsRepository = StatsRepository(applicationContext),
         )
     }
 }

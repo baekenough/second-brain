@@ -1,6 +1,7 @@
 package com.baekenough.secondbrain.sync
 
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import com.baekenough.secondbrain.classify.ClassifiedCall
 import com.baekenough.secondbrain.classify.ClassifiedRecording
 import com.baekenough.secondbrain.classify.ClassifiedSms
@@ -36,6 +37,7 @@ class Uploader(
      * storage.  Null disables staging (for tests that supply pre-validated files).
      */
     private val cacheDir: java.io.File? = null,
+    private val statsRepository: com.baekenough.secondbrain.ui.StatsRepository? = null,
 ) {
 
     companion object {
@@ -90,6 +92,8 @@ class Uploader(
             val result = try {
                 val response = api.postMessages(request)
                 handleMessagesResponse(response, batchSms, batchCalls, batchNum, totalBatches)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "uploadMessages batch $batchNum/$totalBatches network error", e)
                 UploadResult.TransientError(e.message ?: "network error")
@@ -125,7 +129,7 @@ class Uploader(
 
         val combined = smsList.map { Tagged(it.dateMs, it, null) } +
             callList.map { Tagged(it.dateMs, null, it) }
-        val sorted = combined.sortedBy { it.dateMs }
+        val sorted = combined.sortedWith(compareBy<Tagged> { it.dateMs }.thenBy { it.sms?.id ?: it.call!!.id })
         val chunks = sorted.chunked(BATCH_SIZE)
 
         return chunks.map { chunk ->
@@ -211,6 +215,11 @@ class Uploader(
             return UploadResult.Skipped("file not found")
         }
 
+        // A recorder may still be writing even when its header already looks valid.
+        if (!RecordingIntegrityGuard.isSettled(sourceFile.lastModified(), System.currentTimeMillis())) {
+            return UploadResult.TransientError("녹음 파일 저장이 끝나기를 기다리는 중")
+        }
+
         // ── Integrity guard: copy to cache + validate before upload ───────────
         val uploadFile: File
         val cacheHandle: RecordingIntegrityGuard.IntegrityResult.Ready?
@@ -229,6 +238,7 @@ class Uploader(
                 is RecordingIntegrityGuard.IntegrityResult.InvalidContent -> {
                     Log.w(TAG, "uploadRecording integrity failed (permanent): ${recording.filename} — ${guardResult.reason}")
                     // Advance cursor so this permanently-corrupt file is never retried.
+                    statsRepository?.recordRecordingExcluded("파일 형식 오류")
                     cursorStore.markRecordingSent(recording.filename)
                     return UploadResult.PerFileClientError(400, recording.filename)
                 }
@@ -262,6 +272,8 @@ class Uploader(
                 kind = kindBody,
             )
             handleRecordingResponse(response, recording.filename)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "uploadRecording network error: ${recording.filename}", e)
             UploadResult.TransientError(e.message ?: "network error")
@@ -290,6 +302,11 @@ class Uploader(
                         // outcome — do NOT retry. Advance the cursor so the same file is not
                         // re-uploaded on every subsequent wake.
                         Log.i(TAG, "uploadRecording skipped by server (cutover?): $filename")
+                        statsRepository?.recordRecordingExcluded(when (body.reason) {
+                            "cutover" -> "수집 시작일 이전 녹음"
+                            "document_deleted" -> "삭제된 문서의 녹음"
+                            else -> "서버 수집 기준에 따라 제외됨"
+                        })
                         cursorStore.markRecordingSent(filename)
                         UploadResult.Success(0, 1)
                     }
@@ -306,14 +323,18 @@ class Uploader(
                 Log.e(TAG, "uploadRecording auth error ${response.code()}: $filename")
                 UploadResult.AuthError(response.code(), response.message())
             }
+            response.code() in listOf(408, 413, 429) -> {
+                UploadResult.TransientError("HTTP ${response.code()}: 다음 동기화에서 재시도")
+            }
             response.code() in 400..499 -> {
-                // Per-file client error (bad request, 404, 413, etc.) — this recording
+                // Permanent per-file client error (bad request, 404, etc.) — this recording
                 // is permanently invalid from the server's perspective. Mark it as handled
                 // so it is never retried, but do NOT abort the rest of the sync run.
                 Log.w(
                     TAG,
                     "uploadRecording per-file client error ${response.code()} — marking handled, continuing: $filename",
                 )
+                statsRepository?.recordRecordingExcluded("HTTP ${response.code()}")
                 cursorStore.markRecordingSent(filename)
                 UploadResult.PerFileClientError(response.code(), filename)
             }
@@ -366,8 +387,8 @@ sealed interface UploadResult {
      */
     data class AuthError(val code: Int, val message: String) : UploadResult
     /**
-     * 4xx (non-auth) on a single recording file — the payload is permanently invalid
-     * for this file (e.g. missing number, oversized). The file has already been marked
+     * Permanent 4xx on a single recording file — the payload is permanently invalid
+     * for this file (e.g. missing number). The file has already been marked
      * sent so it will not be retried. The overall sync run should CONTINUE to the next file.
      */
     data class PerFileClientError(val code: Int, val filename: String) : UploadResult

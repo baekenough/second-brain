@@ -173,6 +173,12 @@ func applyTuningProfile(profile map[string]any, t model.SearchTuning) {
 		profile["rerank_blend"] = t.RerankBlend
 		profile["rerank_blend_weight"] = t.RerankBlendWeight
 	}
+	if t.EntityQueryContainsName {
+		profile["entity_query_contains_name"] = true
+	}
+	if t.RerankCallContext {
+		profile["rerank_call_context"] = "v1-contact-head"
+	}
 	if t.RerankInput == model.RerankInputBestChunk {
 		profile["rerank_input"] = t.RerankInput
 	}

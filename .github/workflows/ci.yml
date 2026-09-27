@@ -45,7 +45,7 @@ jobs:
       # integration tests actually invoke pdftotext, so it must be present
       # here just like it already is in the collector image's Dockerfile.
       - name: Install PDF extraction tools
-        run: sudo apt-get update && sudo apt-get install -y poppler-utils
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils ffmpeg
       - name: go test
         run: go test -race -count=1 ./...
 

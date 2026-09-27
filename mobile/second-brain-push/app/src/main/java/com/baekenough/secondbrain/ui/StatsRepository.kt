@@ -27,6 +27,8 @@ class StatsRepository(context: Context) {
     companion object {
         private const val PREFS_FILE = "second_brain_settings"
         private const val KEY_LAST_SYNC_AT_MS = "stats_last_sync_at_ms"
+        private const val KEY_RECORDINGS_EXCLUDED = "stats_recordings_excluded"
+        private const val KEY_RECORDING_EXCLUSION_REASON = "stats_recording_exclusion_reason"
         private const val KEY_LAST_SYNC_OK = "stats_last_sync_ok"
         private const val KEY_SMS_UPLOADED = "stats_sms_uploaded"
         private const val KEY_CALLS_UPLOADED = "stats_calls_uploaded"
@@ -55,6 +57,23 @@ class StatsRepository(context: Context) {
     fun getRecordingsUploaded(): Int = prefs.getInt(KEY_RECORDINGS_UPLOADED, 0)
     /** Returns the cumulative count of voice memos (kind=voice-memo) uploaded. */
     fun getVoiceMemoUploaded(): Int = prefs.getInt(KEY_VOICE_MEMO_UPLOADED, 0)
+
+    fun getRecordingsExcluded(): Int = prefs.getInt(KEY_RECORDINGS_EXCLUDED, 0)
+    fun getRecordingExclusionReason(): String = prefs.getString(KEY_RECORDING_EXCLUSION_REASON, "").orEmpty()
+
+    fun recordRecordingExcluded(reason: String) {
+        prefs.edit()
+            .putInt(KEY_RECORDINGS_EXCLUDED, getRecordingsExcluded() + 1)
+            .putString(KEY_RECORDING_EXCLUSION_REASON, reason)
+            .apply()
+    }
+
+    fun getServerCount(kind: String, serverUrl: String): Int? =
+        if (prefs.contains("server_count_${serverUrl.trimEnd('/')}_$kind")) prefs.getInt("server_count_${serverUrl.trimEnd('/')}_$kind", 0) else null
+
+    fun cacheServerCount(kind: String, serverUrl: String, count: Int) {
+        prefs.edit().putInt("server_count_${serverUrl.trimEnd('/')}_$kind", count).apply()
+    }
 
     fun recordSyncCompleted(ok: Boolean) {
         prefs.edit()

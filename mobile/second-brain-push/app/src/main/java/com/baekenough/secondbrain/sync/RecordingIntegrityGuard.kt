@@ -42,6 +42,10 @@ import java.io.IOException
  * because re-reading the same corrupt source will never produce a valid upload.
  */
 object RecordingIntegrityGuard {
+    /** Recently written files may still be recording; leave them queued for five minutes. */
+    internal fun isSettled(lastModifiedMs: Long, nowMs: Long): Boolean =
+        lastModifiedMs > 0 && nowMs - lastModifiedMs >= 5 * 60_000L
+
 
     private const val TAG = "RecordingIntegrityGuard"
 

@@ -337,7 +337,7 @@ func TestWhisperLog_SizeCaps(t *testing.T) {
 		assertNoLogSentinel(t, "logs", buf.String())
 	})
 
-	t.Run("cloud 25MiB cap", func(t *testing.T) {
+	t.Run("cloud large audio preparation failure", func(t *testing.T) {
 		t.Parallel()
 		dir := t.TempDir()
 		p := filepath.Join(dir, logSentinelFile)
@@ -349,6 +349,7 @@ func TestWhisperLog_SizeCaps(t *testing.T) {
 		if err := f.Truncate(whisperCloudMaxFileBytes + 1); err != nil {
 			t.Fatal(err)
 		}
+		_, _ = f.WriteAt([]byte("ftyp"), 4)
 		_ = f.Close()
 		cfg := &config.Config{WhisperAudioDir: dir, WhisperAPIURL: "https://cloud.example.test", WhisperModel: "whisper-1"}
 		c, buf := newLogTestCollector(t, cfg, nil)
@@ -356,7 +357,7 @@ func TestWhisperLog_SizeCaps(t *testing.T) {
 		if _, err := c.Collect(context.Background(), time.Time{}); err != nil {
 			t.Fatalf("Collect: %v", err)
 		}
-		requireEvent(t, buf, "whisper: skipping file over cloud API 25 MiB limit")
+		requireEvent(t, buf, "whisper: transcription failed")
 		assertNoLogSentinel(t, "logs", buf.String())
 	})
 }

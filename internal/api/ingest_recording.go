@@ -21,6 +21,7 @@ import (
 	"github.com/baekenough/second-brain/internal/collector/smsmap"
 	"github.com/baekenough/second-brain/internal/logsafe"
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/baekenough/second-brain/internal/store"
 )
 
 // defaultIngestRecordingMaxFileBytes is the per-upload size cap for recording
@@ -591,6 +592,10 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	if err := s.recordingUpserter.Upsert(r.Context(), doc); err != nil {
+		if errors.Is(err, store.ErrDocumentDeleted) {
+			writeJSON(w, http.StatusOK, IngestRecordingResponse{Accepted: false, Skipped: true, Reason: "document_deleted"})
+			return
+		}
 		// 오디오·사이드카는 이미 디스크에 있다. 분류는 ingest/messages 와 같은
 		// classifyIngestErr 를 쓴다. source_id·경로는 로그에 남기지 않는다.
 		class := classifyIngestErr(r.Context(), err)

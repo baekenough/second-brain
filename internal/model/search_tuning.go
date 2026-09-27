@@ -146,6 +146,12 @@ type SearchTuning struct {
 	// 레인은 질문 원문을 그대로 받는다 — 바뀌는 것은 희소 레인의 매칭
 	// 조건뿐이다.
 	SparseQuery string
+
+	// EntityQueryContainsName은 질의 안에서 두 글자 이상 엔티티 이름을 찾는다.
+	// 기본 false: 골든 평가 후에만 운영 기본값 변경을 검토한다.
+	EntityQueryContainsName bool
+	// RerankCallContext는 통화 리랭커 입력에 참여자와 본문 앞부분을 보탠다.
+	RerankCallContext bool
 }
 
 // IsZero 는 노브가 하나도 설정되지 않았는지 — 즉 "현행 동작" 인지 — 알린다.
@@ -211,16 +217,18 @@ func (t SearchTuning) Normalized() SearchTuning {
 // 잘못된 값은 경고를 남기고 무시한다 — 오타 하나로 검색이 멈추면 안 된다.
 func EnvSearchTuning() SearchTuning {
 	return SearchTuning{
-		RerankOverfetch:       envTuningInt("SEARCH_RERANK_OVERFETCH"),
-		MergeMode:             envTuningChoice("SEARCH_MERGE_MODE", MergeAsymmetric, MergeSymmetric),
-		RerankBlend:           envTuningChoice("SEARCH_RERANK_BLEND", RerankBlendReplace, RerankBlendRRF),
-		RerankBlendWeight:     envTuningFloat("SEARCH_RERANK_BLEND_WEIGHT"),
-		RerankInput:           envTuningChoice("SEARCH_RERANK_INPUT", RerankInputHead, RerankInputBestChunk),
-		RecencyHalfLifeDays:   envTuningFloat("SEARCH_RECENCY_HALFLIFE_DAYS"),
-		RecencyAlpha:          envTuningFloat("SEARCH_RECENCY_ALPHA"),
-		ChunkSparse:           envTuningChoice("SEARCH_CHUNK_SPARSE", ChunkSparseFallback, ChunkSparseFuse, ChunkSparseFuseCtx),
-		ChunkSparseCtxVersion: envChunkSparseCtxVersion(),
-		SparseQuery:           envTuningChoice("SEARCH_SPARSE_QUERY", SparseQueryRaw, SparseQueryChunk, SparseQueryChunkDoc),
+		EntityQueryContainsName: envTuningChoice("SEARCH_ENTITY_QUERY_CONTAINS_NAME", "false", "true") == "true",
+		RerankCallContext:       envTuningChoice("SEARCH_RERANK_CALL_CONTEXT", "false", "true") == "true",
+		RerankOverfetch:         envTuningInt("SEARCH_RERANK_OVERFETCH"),
+		MergeMode:               envTuningChoice("SEARCH_MERGE_MODE", MergeAsymmetric, MergeSymmetric),
+		RerankBlend:             envTuningChoice("SEARCH_RERANK_BLEND", RerankBlendReplace, RerankBlendRRF),
+		RerankBlendWeight:       envTuningFloat("SEARCH_RERANK_BLEND_WEIGHT"),
+		RerankInput:             envTuningChoice("SEARCH_RERANK_INPUT", RerankInputHead, RerankInputBestChunk),
+		RecencyHalfLifeDays:     envTuningFloat("SEARCH_RECENCY_HALFLIFE_DAYS"),
+		RecencyAlpha:            envTuningFloat("SEARCH_RECENCY_ALPHA"),
+		ChunkSparse:             envTuningChoice("SEARCH_CHUNK_SPARSE", ChunkSparseFallback, ChunkSparseFuse, ChunkSparseFuseCtx),
+		ChunkSparseCtxVersion:   envChunkSparseCtxVersion(),
+		SparseQuery:             envTuningChoice("SEARCH_SPARSE_QUERY", SparseQueryRaw, SparseQueryChunk, SparseQueryChunkDoc),
 	}.Normalized()
 }
 

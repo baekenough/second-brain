@@ -241,6 +241,8 @@ the matching `cmd/eval` flag.
 | `SEARCH_RECENCY_ALPHA` | `--recency-alpha=A` | `0.3` | Maximum strength `α` of the recency decay. |
 | `SEARCH_CHUNK_SPARSE` | `--chunk-sparse=fallback\|fuse\|fuse_ctx` | `fallback` | 청크 FTS/bigm 레인을 RRF 융합에 상시 참여시킨다(#270). 자세한 내용은 `docs/chunk-sparse-context.md`. |
 | `SEARCH_SPARSE_QUERY` | `--sparse-query=raw\|chunk\|chunk_doc` | `raw` | 희소 레인이 질문 원문 대신 `internal/sparseq` 추출 키워드를 쓴다(#276). 아래 절 참고. |
+| `SEARCH_ENTITY_QUERY_CONTAINS_NAME` | `--entity-query-contains-name` | `false` | 두 글자 이상 엔티티 이름이 질의에 포함되는지 찾는다. 엔티티 레인의 기존 활성화 조건·필터는 그대로 적용한다. |
+| `SEARCH_RERANK_CALL_CONTEXT` | `--rerank-call-context` | `false` | 통화 리랭커 입력에 `contact_name`을 추가한다. `best_chunk`의 문서 결과에는 본문 앞 250자도 보탠다. 청크 결과는 참여자만 추가하며 전체 1,000자 예산을 유지한다. |
 
 Only non-default knob values are written into the config-hash profile, so a run
 with every knob at its default keeps matching existing baselines, while any
@@ -270,7 +272,7 @@ enabled knob establishes a separate baseline exactly like `--window=plan`.
   때만 돌기 때문에 `chunk` 범위의 효과를 재려면 `--chunk-sparse=fuse` 또는
   `fuse_ctx` 와 함께 돌린다.
 - `raw` 가 아니면 실행 프로필에 `sparse_query` 와 `sparse_terms_version`
-  (`sparseq.Version`, 현재 `v2`)이 함께 들어가 별도 baseline 계열이 된다.
+  (`sparseq.Version`, 현재 `v3`)이 함께 들어가 별도 baseline 계열이 된다.
   불용어·조사·시간 표현 목록을 바꾸면 `sparseq.Version` 을 올려야 한다 —
   어휘가 다른 실행이 같은 계열로 섞이지 않게 하기 위해서다.
 - 추출 키워드는 질문에서 파생된 개인 데이터라 로그·trace·덤프에 싣지 않고
@@ -307,3 +309,30 @@ with the same limit, rerank and filter settings, then compute aggregate metrics
 using the same scoring protocol. Record server revisions and failure counts.
 Do not call `/ask`, generation, or judgment endpoints to manufacture an evaluation
 set, and do not report answer-quality gains from retrieval-only scores.
+
+검색 후속 실험(#264, #281, #283, #284): `raw` 기본값은 유지한다. 키워드
+모드에서는 LIKE 와일드카드를 이스케이프하고 문서 본문·연락처 후보를 별도로
+찾으며, 원문 전체의 `bigm_similarity` 동점 계산을 생략한다. sparseq v3는
+세 글자 `-한` 이름을 보존한다(`통화한` 등 명시한 동사 제외). 새 엔티티·통화
+노브는 기본값이 꺼져 있다. 폐기용 DB의 가상 데이터·EXPLAIN 검사는 정확성과
+인덱스 사용 가능성을 검증하지만 실제 검색 품질이나 운영 지연 개선을 입증하지
+않는다. 기본값을 바꾸기 전 같은 날·같은 `--as-of`로 골든 평가를 다시 실행하고,
+통화·person slice와 `92a9dba4`, `60ab999e` 덤프를 비교해야 한다.
+
+두 노브의 영향은 각각 기준 실행과 비교한다. 아래 예시는 기준 시각과
+`best_chunk` 설정을 고정하고 한 번에 노브 하나만 켠다. `/secure`는 앞서
+설명한 권한으로 준비한 로컬 평가 디렉터리로 바꾼다. 엔티티 실험은 기존
+엔티티 추출 활성화 조건과 엔티티 레인 가중치가 충족되어야 효과가 있다.
+
+```sh
+go run ./cmd/eval --golden --split=train --no-persist --window=plan \
+  --as-of=2026-09-27T09:00:00+09:00 --rerank=true --rerank-input=best_chunk --dump=/secure/base.jsonl
+go run ./cmd/eval --golden --split=train --no-persist --window=plan \
+  --as-of=2026-09-27T09:00:00+09:00 --rerank=true --rerank-input=best_chunk \
+  --entity-query-contains-name --dump=/secure/entity.jsonl
+go run ./cmd/eval --golden --split=train --no-persist --window=plan \
+  --as-of=2026-09-27T09:00:00+09:00 --rerank=true --rerank-input=best_chunk \
+  --rerank-call-context --dump=/secure/call.jsonl
+go run ./cmd/evalcompare --baseline=/secure/base.jsonl --candidate=/secure/entity.jsonl
+go run ./cmd/evalcompare --baseline=/secure/base.jsonl --candidate=/secure/call.jsonl
+```
