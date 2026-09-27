@@ -220,7 +220,9 @@ class DashboardFragment : Fragment() {
         val kakaoCounts = withContext(Dispatchers.IO) {
             Triple(kakao.count("acked"), kakao.count("pending"), kakao.count("rejected"))
         }
-        binding.tvKakaoStatus.text = "전송 대기 ${kakaoCounts.second}건 · 서버 거부 ${kakaoCounts.third}건\n${kakao.lastStatus}"
+        val kakaoStorageBytes = withContext(Dispatchers.IO) { kakao.storageBytes() }
+        val storageText = String.format(Locale.KOREA, "카카오 저장 공간 %.1f MB · 평상시 최대 32 MB", kakaoStorageBytes / (1024.0 * 1024.0))
+        binding.tvKakaoStatus.text = "전송 대기 ${kakaoCounts.second}건 · 서버 거부 ${kakaoCounts.third}건\n$storageText\n${kakao.lastStatus}"
         val tiles = listOf(
             Triple(DocumentListActivity.KIND_SMS, binding.tvSmsCount, stats.getSmsUploaded()),
             Triple(DocumentListActivity.KIND_CALL_RECORDING, binding.tvCallsCount, stats.getRecordingsUploaded()),
