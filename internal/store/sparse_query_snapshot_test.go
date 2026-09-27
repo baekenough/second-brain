@@ -14,7 +14,7 @@ import (
 )
 
 // updateSparseSnapshot 은 raw 모드 SQL 스냅샷을 다시 쓴다. #276 이전 코드로
-// 한 번 생성해 고정한 파일이므로, 이 플래그로 덮어쓰는 것은 "raw 모드 SQL 을
+// 생성한 뒤 카카오 기본 격리 정책을 반영한 파일이다. 덮어쓰는 것은 "raw 모드 SQL 을
 // 의도적으로 바꾼다" 는 결정과 같다 — 리뷰에서 그 diff 를 반드시 설명해야 한다.
 var updateSparseSnapshot = flag.Bool("update-sparse-snapshot", false,
 	"testdata/sparse_query_raw.golden 을 현재 빌더 출력으로 다시 쓴다")
@@ -141,7 +141,7 @@ func TestSparseQueryRaw_SQLByteIdentical(t *testing.T) {
 		gl, wl := strings.Split(got, "\n"), strings.Split(string(want), "\n")
 		for i := 0; i < len(gl) && i < len(wl); i++ {
 			if gl[i] != wl[i] {
-				t.Fatalf("raw 모드 SQL 이 #276 이전과 달라졌다 (%d번째 줄)\n got: %q\nwant: %q", i+1, gl[i], wl[i])
+				t.Fatalf("raw 모드 SQL 이 승인된 스냅샷과 달라졌다 (%d번째 줄)\n got: %q\nwant: %q", i+1, gl[i], wl[i])
 			}
 		}
 		t.Fatalf("raw 모드 SQL 길이가 달라졌다: got %d줄, want %d줄", len(gl), len(wl))

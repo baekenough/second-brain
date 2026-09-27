@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # PostgreSQL chunks → OpenSearch(sb-chunks) 색인
+# 카카오 원문은 혼합 검색 검증 전까지 공유 BM25 통계에 넣지 않는다.
 #
 # 기존 검색 경로에는 영향이 없다. 같은 청크를 nori 형태소 분석으로 색인해
 # pg_bigm 방식과 결과를 나란히 비교하기 위한 실험 인덱스다.
@@ -20,6 +21,7 @@ SELECT json_build_object('index', json_build_object('_index','sb-chunks','_id',c
          'content',     c.content
        )::text
 FROM chunks c JOIN documents d ON d.id = c.document_id
+WHERE d.source_type <> 'kakao'
 ORDER BY c.id;
 "
 docker cp second-brain-postgres:/tmp/sb_bulk_raw.ndjson "$OUT"
