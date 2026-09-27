@@ -32,6 +32,7 @@ func KnownSourceTypes() []SourceType {
 	return []SourceType{
 		SourceGmail,
 		SourceSMS,
+		SourceKakao,
 		SourceCall,
 		SourceCalendar,
 		SourceInsight,

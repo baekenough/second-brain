@@ -166,6 +166,19 @@
             android:layout_marginTop="8dp"
             style="@style/Widget.Material3.Button.OutlinedButton" />
 
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/switch_kakao_capture"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="16dp" android:text="카카오톡 알림 자동 수집" />
+        <TextView android:id="@+id/tv_kakao_permission"
+            android:layout_width="match_parent" android:layout_height="wrap_content" />
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:text="허용 후 카카오톡 알림의 본문만 수집합니다. 과거 대화·내가 보낸 메시지·숨겨진 본문은 알림만으로 가져올 수 없습니다. 다른 앱의 알림은 저장하지 않습니다." />
+        <com.google.android.material.button.MaterialButton android:id="@+id/btn_kakao_access"
+            android:layout_width="match_parent" android:layout_height="wrap_content" android:text="알림 접근 허용 설정" />
+        <com.google.android.material.button.MaterialButton android:id="@+id/btn_kakao_import"
+            android:layout_width="match_parent" android:layout_height="wrap_content" android:text="카카오톡 TXT 가져오기" />
+
         <!-- Save action -->
         <com.google.android.material.button.MaterialButton
             android:id="@+id/btn_save"

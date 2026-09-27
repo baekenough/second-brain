@@ -63,6 +63,18 @@ object SyncScheduler {
         enqueue(context, clamped, ExistingPeriodicWorkPolicy.UPDATE)
     }
 
+    /** Coalesce bursts of notification events; periodic work also drains the durable queue. */
+    fun enqueueKakaoSync(context: Context) {
+        val request = androidx.work.OneTimeWorkRequestBuilder<SyncWorker>()
+            .setInitialDelay(10, TimeUnit.SECONDS)
+            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 1, TimeUnit.MINUTES)
+            .build()
+        WorkManager.getInstance(context).enqueueUniqueWork(
+            "second_brain_kakao_sync", androidx.work.ExistingWorkPolicy.KEEP, request,
+        )
+    }
+
     /** Cancels the periodic sync (e.g., if the user disables it). */
     fun cancel(context: Context) {
         WorkManager.getInstance(context).cancelUniqueWork(WORK_NAME)

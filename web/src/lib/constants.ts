@@ -21,6 +21,7 @@ export const SOURCE_LABELS: Record<SourceType, string> = {
   gmail: "Gmail",
   calendar: "Calendar",
   sms: "SMS",
+  kakao: "카카오톡",
   call: "통화",
   "call-log": "통화",
   "call-transcript": "통화",
@@ -37,6 +38,7 @@ export const SOURCE_LABELS: Record<SourceType, string> = {
  */
 export const SOURCE_BADGE_CLASSES: Record<SourceType, string> = {
   sms: "badge-sms",
+  kakao: "badge-kakao",
   call: "badge-call",
   "call-log": "badge-call",
   "call-transcript": "badge-call",
@@ -60,6 +62,7 @@ export const SOURCE_BADGE_CLASSES: Record<SourceType, string> = {
 export const SEARCH_FILTER_SOURCES: (SourceType | "all")[] = [
   "all",
   "sms",
+  "kakao",
   "call",
   "gmail",
   "calendar",
@@ -73,6 +76,7 @@ export const DEFAULT_EXCLUDED_SOURCES: SourceType[] = ["slack"];
 /** Source types shown in the dashboard stats grid. */
 export const DASHBOARD_SOURCES: SourceType[] = [
   "sms",
+  "kakao",
   "call",
   "gmail",
   "calendar",
