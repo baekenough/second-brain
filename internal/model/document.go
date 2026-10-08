@@ -448,6 +448,16 @@ type SearchQuery struct {
 	// 거친(소문자·trim·중복 제거·길이 상한) 형태여야 하며, 저장소도 한 번 더
 	// 같은 정규화를 적용한다.
 	EntityKeywords []string `json:"-"`
+
+	// SourceIncludeFromPlan 은 소스 포함 집합(SourceType/SourceTypes)을 사람이
+	// 아니라 질의 계획(intent 플래너 — 운영 /ask 의 assembleRetrieval, eval 의
+	// --plan-sources)이 골랐다는 표시다. 계획이 고른 집합만 "추정" 이라
+	// Tuning.PlanSourceSpillK 가 그 밖의 후보를 소량 섞을 수 있다. 사용자가
+	// 지정한 포함 집합은 이 값이 false 이므로 어떤 노브로도 넓혀지지 않는다.
+	//
+	// json:"-" 인 이유: REST·MCP 클라이언트가 자기 필터를 "계획이 골랐다" 고
+	// 속여 넓힐 수 없어야 한다. 서버 코드만 채운다.
+	SourceIncludeFromPlan bool `json:"-"`
 }
 
 // SparseTerms 는 저장소가 희소 레인에서 쓸 키워드다. model 이 leaf 패키지로

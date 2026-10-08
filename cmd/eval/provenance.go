@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/baekenough/second-brain/internal/config"
+	"github.com/baekenough/second-brain/internal/intent"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/sparseq"
@@ -306,6 +307,23 @@ func validatePostFusionFlags(t model.SearchTuning) error {
 	if t.RerankInput == model.RerankInputYAML && t.RerankCallContext {
 		return errors.New("eval: --rerank-call-context has no effect with --rerank-input=yaml (counterpart is already a field)")
 	}
+	if t.ScheduleIntentBoost < 0 || t.ScheduleIntentBoost > 1 || math.IsNaN(t.ScheduleIntentBoost) {
+		return fmt.Errorf("eval: --schedule-intent-boost must be 0 (off) or in (0, 1], got %v", t.ScheduleIntentBoost)
+	}
+	if t.PlanSourceSpillK < 0 || t.PlanSourceSpillK > model.MaxPlanSourceSpillK {
+		return fmt.Errorf("eval: --plan-source-spill-k must be in [0, %d], got %d",
+			model.MaxPlanSourceSpillK, t.PlanSourceSpillK)
+	}
+	return nil
+}
+
+// validatePlanSpill 은 --plan-source-spill-k 가 효과를 낼 수 있는지 본다. 넘침
+// 검색은 계획이 고른 소스 포함 집합(SearchQuery.SourceIncludeFromPlan)에만
+// 동작하고, eval 에서 그 집합을 거는 것은 --plan-sources 뿐이다.
+func validatePlanSpill(t model.SearchTuning, planSources bool) error {
+	if t.PlanSourceSpillK > 0 && !planSources {
+		return errors.New("eval: --plan-source-spill-k needs --plan-sources (it only widens planner-chosen source filters)")
+	}
 	return nil
 }
 
@@ -424,6 +442,13 @@ func applyPostFusionProfile(profile map[string]any, t model.SearchTuning) {
 		profile["mmr_lambda"] = t.MMRLambda
 		profile["mmr_window"] = search.MMRWindow
 		profile["mmr_rank_k"] = search.MMRRankK
+	}
+	if t.ScheduleIntentBoost > 0 {
+		profile["schedule_intent_boost"] = t.ScheduleIntentBoost
+		profile["schedule_cue_version"] = intent.ScheduleCueVersion
+	}
+	if t.PlanSourceSpillK > 0 {
+		profile["plan_source_spill_k"] = t.PlanSourceSpillK
 	}
 }
 

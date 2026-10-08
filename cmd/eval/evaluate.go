@@ -60,6 +60,8 @@ func deterministicPlanSources(query *model.SearchQuery, anchor time.Time) []stri
 		return nil
 	}
 	query.SourceTypes = append([]model.SourceType(nil), plan.SourceTypes...)
+	// 사용자가 아니라 계획이 고른 집합이다 — PlanSourceSpillK 가 넓힐 수 있다.
+	query.SourceIncludeFromPlan = true
 	names := make([]string, len(plan.SourceTypes))
 	for i, st := range plan.SourceTypes {
 		names[i] = string(st)

@@ -63,3 +63,29 @@ func TestEnvSearchTuning_PostFusion(t *testing.T) {
 		t.Fatalf("invalid env not ignored: %+v", got)
 	}
 }
+
+func TestSearchTuning_PlanAwareKnobs(t *testing.T) {
+	if n := (SearchTuning{}).Normalized(); n.ScheduleIntentBoost != 0 || n.PlanSourceSpillK != 0 {
+		t.Fatalf("zero tuning enabled a plan-aware knob: %+v", n)
+	}
+	for in, want := range map[float64]float64{-1: 0, 0.4: 0.4, 1: 1, 1.01: 0, math.NaN(): 0} {
+		if got := (SearchTuning{ScheduleIntentBoost: in}).Normalized().ScheduleIntentBoost; got != want {
+			t.Errorf("boost %v → %v, want %v", in, got, want)
+		}
+	}
+	for in, want := range map[int]int{-1: 0, 3: 3, 99: MaxPlanSourceSpillK} {
+		if got := (SearchTuning{PlanSourceSpillK: in}).Normalized().PlanSourceSpillK; got != want {
+			t.Errorf("spill %d → %d, want %d", in, got, want)
+		}
+	}
+	t.Setenv("SEARCH_SCHEDULE_INTENT_BOOST", "0.3")
+	t.Setenv("SEARCH_PLAN_SOURCE_SPILL_K", "5")
+	if got := EnvSearchTuning(); got.ScheduleIntentBoost != 0.3 || got.PlanSourceSpillK != 5 {
+		t.Fatalf("env not applied: %+v", got)
+	}
+	t.Setenv("SEARCH_SCHEDULE_INTENT_BOOST", "2")
+	t.Setenv("SEARCH_PLAN_SOURCE_SPILL_K", "-3")
+	if got := EnvSearchTuning(); got.ScheduleIntentBoost != 0 || got.PlanSourceSpillK != 0 {
+		t.Fatalf("invalid env not ignored: %+v", got)
+	}
+}
