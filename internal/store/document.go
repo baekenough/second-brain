@@ -1441,10 +1441,13 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 		}
 		if graphLane {
 			// 그래프 레인도 엔티티 레인과 같은 d. 한정 필터를 레인 안에 넣는다.
-			graphCTEs = buildGraphCTEs(kwParam, prefixParam, entityStatusFilter, entitySourceFilter, entityExcludeFilter, entityRetentionFilter, entityOccurredFilter)
+			graphCTEs = buildGraphCTEs(kwParam, prefixParam, entityStatusFilter, entitySourceFilter, entityExcludeFilter, entityRetentionFilter, entityOccurredFilter, query.Tuning.GraphHubDamping)
 			graphID = ", graph.id"
 			graphJoin = "\n\t\t\tFULL OUTER JOIN graph   ON COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) = graph.id"
 			graphScore = buildGraphScoreTerm(query.Tuning.GraphWeight, w.RRFK)
+			if query.Tuning.RRFMissingRank == model.RRFMissingRankCutoff {
+				graphScore = buildGraphScoreTermCutoff(query.Tuning.GraphWeight, w.RRFK)
+			}
 		}
 	}
 
@@ -1538,7 +1541,7 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, // summvec
 		entityCTE, graphCTEs, // entity lane carries the same filters in d.-qualified form
 		graphID,
-		buildRRFScoreExpr(w), graphScore,
+		rrfScoreExpr(query.Tuning, w), graphScore,
 		graphJoin,
 		sortOrder(query, time.Now(), "d"))
 
@@ -1571,6 +1574,53 @@ func buildRRFScoreExpr(w model.SearchWeights) string {
 		w.SummaryVec, w.RRFK,
 		w.EntityWeight, w.RRFK,
 	)
+}
+
+// rrfScoreExpr 는 RRFMissingRank 노브에 따라 다섯 레인 RRF 식을 고른다. 노브가
+// 꺼져 있으면 buildRRFScoreExpr 를 그대로 부른다(SQL 바이트 동일).
+func rrfScoreExpr(t model.SearchTuning, w model.SearchWeights) string {
+	if t.RRFMissingRank == model.RRFMissingRankCutoff {
+		return buildRRFScoreExprCutoff(w)
+	}
+	return buildRRFScoreExpr(w)
+}
+
+// rrfCutoffTerm 은 RRFMissingRankCutoff 의 레인 항 하나다(R2R 가중 RRF).
+//
+// 레인에 있는 문서는 현행과 같은 w/(k+rank) 를 받는다. 레인에 없는 문서는 그
+// 레인이 결과를 하나라도 냈을 때만 w/(k + $3 + 1) — 레인 상한(LIMIT $3) 바로
+// 다음 순위 — 을 받는다. 비어 있는 레인(키워드가 안 맞은 엔티티 레인, 임베딩이
+// 없는 summvec 등)은 "모든 문서가 똑같이 빠진" 레인이라 0 을 준다: 상수를 모든
+// 행에 더하는 것은 순서를 바꾸지 않지만 점수 스케일만 흔든다.
+//
+// 레인이 비었는지는 COUNT(lane.id) OVER () 로 rrf 의 FULL OUTER JOIN 결과 위에서
+// 센다. 레인 CTE 를 EXISTS 로 한 번 더 참조하면 PostgreSQL 이 그 CTE 를 인라인
+// 대신 물질화하게 되어(두 번 이상 참조) 벡터 레인의 계획이 바뀔 수 있다.
+//
+// 가중치가 0 이하인 레인은 현행 항을 그대로 쓴다(어차피 0). 레인 상한 $3 은
+// LIMIT 에서 이미 bigint 로 정해진 파라미터라 float8 산술에 그대로 쓴다.
+func rrfCutoffTerm(weight, rrfK float64, lane string) string {
+	if weight <= 0 {
+		return fmt.Sprintf("COALESCE(%g::float8/(%g::float8 + %s.rank), 0)", weight, rrfK, lane)
+	}
+	return fmt.Sprintf("COALESCE(%[1]g::float8/(%[2]g::float8 + %[3]s.rank), CASE WHEN COUNT(%[3]s.id) OVER () > 0 THEN %[1]g::float8/(%[2]g::float8 + $3 + 1) ELSE 0 END)",
+		weight, rrfK, lane)
+}
+
+// buildRRFScoreExprCutoff 는 buildRRFScoreExpr 의 RRFMissingRankCutoff 판이다.
+func buildRRFScoreExprCutoff(w model.SearchWeights) string {
+	return strings.Join([]string{
+		rrfCutoffTerm(w.FTSWeight, w.RRFK, "fts"),
+		rrfCutoffTerm(w.VecWeight, w.RRFK, "vec"),
+		rrfCutoffTerm(w.BigmWeight, w.RRFK, "bigm"),
+		rrfCutoffTerm(w.SummaryVec, w.RRFK, "summvec"),
+		rrfCutoffTerm(w.EntityWeight, w.RRFK, "entity"),
+	}, "\n\t\t\t\t+ ")
+}
+
+// buildGraphScoreTermCutoff 는 buildGraphScoreTerm 의 RRFMissingRankCutoff 판이다.
+func buildGraphScoreTermCutoff(weight, rrfK float64) string {
+	return "\n\t\t\t\t+ " + rrfCutoffTerm(weight, rrfK, "graph")
 }
 
 // buildGraphScoreTerm 은 그래프 레인의 RRF 항이다. 노브가 꺼져 있으면 호출되지

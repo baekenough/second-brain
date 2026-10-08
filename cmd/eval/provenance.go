@@ -259,6 +259,16 @@ func validateTuningFlags(t model.SearchTuning) error {
 		(t.EntityKeywordMode != model.EntityKeywordsLLM || t.SparseQuery == model.SparseQueryRaw) {
 		return errors.New("eval: --high-level-keywords-to-sparse needs --entity-keywords=llm and --sparse-query=chunk|chunk_doc")
 	}
+	if t.GraphHubDamping && t.GraphWeight <= 0 {
+		return errors.New("eval: --graph-hub-damping needs --graph-weight>0 (it only changes the graph lane's ranking)")
+	}
+	if t.GraphExpandBoost < 0 || t.GraphExpandBoost > 1 || math.IsNaN(t.GraphExpandBoost) {
+		return fmt.Errorf("eval: --graph-expand-boost must be in [0, 1], got %v", t.GraphExpandBoost)
+	}
+	if t.RRFMissingRank != model.RRFMissingRankZero && t.RRFMissingRank != model.RRFMissingRankCutoff {
+		return fmt.Errorf("eval: invalid --rrf-missing-rank %q (want \"\" or %q)",
+			t.RRFMissingRank, model.RRFMissingRankCutoff)
+	}
 	return nil
 }
 
@@ -330,6 +340,15 @@ func applyTuningProfile(profile map[string]any, t model.SearchTuning) {
 	}
 	if t.GraphWeight > 0 && t.EntityKeywordMode != model.EntityKeywordsOff {
 		profile["graph_weight"] = t.GraphWeight
+		if t.GraphHubDamping {
+			profile["graph_hub_damping"] = true
+		}
+	}
+	if t.GraphExpandBoost > 0 {
+		profile["graph_expand_boost"] = t.GraphExpandBoost
+	}
+	if t.RRFMissingRank == model.RRFMissingRankCutoff {
+		profile["rrf_missing_rank"] = t.RRFMissingRank
 	}
 }
 

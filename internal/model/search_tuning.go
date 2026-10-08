@@ -91,6 +91,15 @@ const (
 	// 키워드를 뽑는다(LightRAG 의 이중 키워드). 어떤 실패든 EntityKeywordsSparse
 	// 결과로 조용히 되돌아간다.
 	EntityKeywordsLLM = "llm"
+
+	// RRFMissingRankZero 는 현행 동작이다. 어떤 레인에도 없는 문서는 그 레인에서
+	// 0 을 받는다.
+	RRFMissingRankZero = ""
+	// RRFMissingRankCutoff 는 R2R 의 가중 RRF 처럼, 켜져 있고(가중치>0) 결과가
+	// 하나라도 있는 레인에 없는 문서를 "레인 상한 바로 다음 순위"(LIMIT+1)로
+	// 본다 — w/(k + lane_limit + 1). 레인 하나에만 잡힌 문서가 여러 레인에서
+	// 중간쯤 잡힌 문서를 이기는 일을 줄인다.
+	RRFMissingRankCutoff = "cutoff"
 )
 
 // 노브 기본값. 제로값이 곧 "현행 동작" 이 되도록 잡았다 — 새 필드가 생겼다는
@@ -182,6 +191,21 @@ type SearchTuning struct {
 	// EntityKeywordMode 의 저수준 키워드로 찾으므로, 모드가 꺼져 있거나
 	// 키워드가 없는 질의에서는 이 값이 있어도 레인이 생기지 않는다.
 	GraphWeight float64
+
+	// GraphHubDamping 이 true 이면 그래프 레인이 관계 근거 문서를
+	// SUM(confidence * seed_weight) 로 순위 매긴다. seed_weight =
+	// 1/ln(e + 시드 엔티티의 document_entities 행 수)(HippoRAG 의 노드 특이성).
+	// 사용자 본인·가족처럼 거의 모든 문서에 나오는 허브 엔티티가 레인을
+	// 채우는 것을 누른다. GraphWeight 가 0 이면 레인이 없으므로 Normalized 가
+	// false 로 되돌린다.
+	GraphHubDamping bool
+	// GraphExpandBoost 는 결과 시드 그래프 확장(Graphiti edge_search·Hindsight)의
+	// 승수 강도다. 0(기본)이면 끈다. 융합 상위 문서의 엔티티 ∪ 키워드 시드
+	// 엔티티와 관계로 이어진 기존 후보만 score *= 1 + boost*s (s∈[0,1]) 로
+	// 올린다 — 새 문서를 더하지 않는 재정렬이다. 1 을 넘으면 1 로 자른다.
+	GraphExpandBoost float64
+	// RRFMissingRank 는 RRFMissingRankZero(기본) 또는 RRFMissingRankCutoff.
+	RRFMissingRank string
 }
 
 // IsZero 는 노브가 하나도 설정되지 않았는지 — 즉 "현행 동작" 인지 — 알린다.
@@ -245,6 +269,19 @@ func (t SearchTuning) Normalized() SearchTuning {
 	if t.GraphWeight < 0 || isBadFloat(t.GraphWeight) {
 		t.GraphWeight = 0
 	}
+	// 허브 감쇠는 그래프 레인의 순위 식이라, 레인이 없으면 효과가 없다.
+	if t.GraphWeight == 0 {
+		t.GraphHubDamping = false
+	}
+	if t.GraphExpandBoost < 0 || isBadFloat(t.GraphExpandBoost) {
+		t.GraphExpandBoost = 0
+	}
+	if t.GraphExpandBoost > 1 {
+		t.GraphExpandBoost = 1
+	}
+	if t.RRFMissingRank != RRFMissingRankCutoff {
+		t.RRFMissingRank = RRFMissingRankZero
+	}
 	return t
 }
 
@@ -275,6 +312,10 @@ func EnvSearchTuning() SearchTuning {
 		EntityKeywordMode:         envTuningChoice("SEARCH_ENTITY_KEYWORDS", EntityKeywordsOff, EntityKeywordsSparse, EntityKeywordsLLM),
 		HighLevelKeywordsToSparse: envTuningChoice("SEARCH_HIGH_LEVEL_KEYWORDS_TO_SPARSE", "false", "true") == "true",
 		GraphWeight:               envTuningFloat("SEARCH_GRAPH_WEIGHT"),
+
+		GraphHubDamping:  envTuningChoice("SEARCH_GRAPH_HUB_DAMPING", "false", "true") == "true",
+		GraphExpandBoost: envTuningFloat("SEARCH_GRAPH_EXPAND_BOOST"),
+		RRFMissingRank:   envTuningChoice("SEARCH_RRF_MISSING_RANK", RRFMissingRankZero, RRFMissingRankCutoff),
 	}
 	n := t.Normalized()
 	if t.HighLevelKeywordsToSparse && !n.HighLevelKeywordsToSparse {
@@ -283,6 +324,14 @@ func EnvSearchTuning() SearchTuning {
 	}
 	if n.GraphWeight > 0 && n.EntityKeywordMode == EntityKeywordsOff {
 		slog.Warn("search tuning: SEARCH_GRAPH_WEIGHT needs SEARCH_ENTITY_KEYWORDS, graph lane will stay empty")
+	}
+	if t.GraphHubDamping && !n.GraphHubDamping {
+		slog.Warn("search tuning: SEARCH_GRAPH_HUB_DAMPING has no effect, ignoring",
+			"requires", "SEARCH_GRAPH_WEIGHT>0")
+	}
+	if t.GraphExpandBoost > 1 {
+		slog.Warn("search tuning: SEARCH_GRAPH_EXPAND_BOOST above 1, clamping",
+			"key", "SEARCH_GRAPH_EXPAND_BOOST", "max", 1)
 	}
 	return n
 }

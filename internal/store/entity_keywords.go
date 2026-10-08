@@ -137,7 +137,10 @@ func buildKeywordEntityCTE(kwParam, prefixParam, statusFilter, sourceFilter, exc
 // 문서가 후보 슬롯을 차지해 범위 안 문서를 밀어낸다(buildHybridSearchQuery 주석 참고).
 // 시드 문서 자신은 일부러 넣지 않는다 — 그건 엔티티 레인의 몫이고, 이 레인의
 // 역할은 "이름이 직접 나오지 않지만 관계로 이어진 문서" 를 더하는 것이다.
-func buildGraphCTEs(kwParam, prefixParam, statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredRangeFilter string) string {
+func buildGraphCTEs(kwParam, prefixParam, statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredRangeFilter string, hubDamping bool) string {
+	if hubDamping {
+		return buildDampedGraphCTEs(kwParam, prefixParam, statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredRangeFilter)
+	}
 	return fmt.Sprintf(`,
 		graph_seed AS (
 			SELECT e.id
@@ -149,6 +152,56 @@ func buildGraphCTEs(kwParam, prefixParam, statusFilter, sourceFilter, excludeFil
 			       row_number() OVER (ORDER BY SUM(er.confidence) DESC, d.occurred_at DESC NULLS LAST, er.evidence_document_id ASC) AS rank
 			FROM entity_relations er
 			JOIN documents d ON d.id = er.evidence_document_id
+			WHERE (er.from_entity_id IN (SELECT id FROM graph_seed)
+			    OR er.to_entity_id   IN (SELECT id FROM graph_seed))
+			%s
+			%s
+			%s
+			%s
+			%s
+			GROUP BY er.evidence_document_id, d.occurred_at
+			ORDER BY rank
+			LIMIT $3
+		)`, entityKeywordMatch("e", kwParam, prefixParam),
+		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredRangeFilter)
+}
+
+// buildDampedGraphCTEs 는 GraphHubDamping 을 켠 그래프 레인이다(HippoRAG 의 노드
+// 특이성). buildGraphCTEs 와 시드 매칭·WHERE·필터·LIMIT 이 같고, 순위 식만 다르다:
+//
+//	seed_weight(e) = 1 / ln(e + doc_mention_count(e))
+//	rank 키       = SUM(confidence * seed_weight(관계의 시드 쪽 끝점))
+//
+// doc_mention_count 는 그 엔티티의 document_entities 행 수다. 시드 집합에 대해서만
+// LATERAL 로 센다 — idx_document_entities_entity_id 를 시드마다 한 번 타므로
+// document_entities 전체를 집계하지 않는다. 언급이 0 이면 가중치 1(감쇠 없음),
+// 1000 건이면 약 0.145 다. 양 끝점이 모두 시드인 관계는 둘 중 큰 가중치를 쓴다
+// (GREATEST 는 NULL 을 건너뛴다) — 관계 하나가 두 번 세지지 않게 하고, 모든 시드의
+// 언급이 0 이면 순위가 감쇠를 끈 레인과 같아지게 하기 위해서다.
+//
+// WHERE 를 감쇠 없는 레인과 글자 그대로 같게 둔 것은 관계를 고르는 계획(from/to
+// 인덱스)을 바꾸지 않기 위해서다. graph_seed 를 두 번 LEFT JOIN 하는 것은 이미
+// 고른 관계 행에 가중치를 붙이는 해시 조회일 뿐이다.
+func buildDampedGraphCTEs(kwParam, prefixParam, statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredRangeFilter string) string {
+	return fmt.Sprintf(`,
+		graph_seed AS (
+			SELECT e.id,
+			       1.0::float8 / ln(exp(1.0::float8) + m.n) AS w
+			FROM entities e
+			CROSS JOIN LATERAL (
+				SELECT count(*) AS n
+				FROM document_entities de
+				WHERE de.entity_id = e.id
+			) m
+			WHERE %s
+		),
+		graph AS (
+			SELECT er.evidence_document_id AS id,
+			       row_number() OVER (ORDER BY SUM(er.confidence::float8 * GREATEST(gf.w, gt.w)) DESC, d.occurred_at DESC NULLS LAST, er.evidence_document_id ASC) AS rank
+			FROM entity_relations er
+			JOIN documents d ON d.id = er.evidence_document_id
+			LEFT JOIN graph_seed gf ON gf.id = er.from_entity_id
+			LEFT JOIN graph_seed gt ON gt.id = er.to_entity_id
 			WHERE (er.from_entity_id IN (SELECT id FROM graph_seed)
 			    OR er.to_entity_id   IN (SELECT id FROM graph_seed))
 			%s

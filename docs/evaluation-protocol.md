@@ -304,6 +304,9 @@ the matching `cmd/eval` flag.
 | `SEARCH_ENTITY_KEYWORDS` | `--entity-keywords=sparse\|llm` | off (빈 값) | 엔티티 레인이 질문 원문 대신 질문에서 뽑은 저수준 키워드로 엔티티를 찾는다(LightRAG 이중 키워드). 아래 절 참고. |
 | `SEARCH_HIGH_LEVEL_KEYWORDS_TO_SPARSE` | `--high-level-keywords-to-sparse` | `false` | `llm` 모드의 고수준(주제) 키워드를 희소 레인(fts·bigm) 키워드에 덧붙인다. `SEARCH_SPARSE_QUERY=chunk\|chunk_doc` 필요. |
 | `SEARCH_GRAPH_WEIGHT` | `--graph-weight=W` | `0` (off) | 여섯 번째 RRF 레인: 키워드로 찾은 엔티티와 `entity_relations` 로 1-hop 이웃인 근거 문서. `SEARCH_ENTITY_KEYWORDS` 필요. |
+| `SEARCH_GRAPH_HUB_DAMPING` | `--graph-hub-damping` | `false` | 그래프 레인 순위를 `SUM(confidence × 1/ln(e + 시드 엔티티 문서 언급 수))` 로 바꿔 허브 엔티티를 누른다(HippoRAG). `SEARCH_GRAPH_WEIGHT>0` 필요. |
+| `SEARCH_GRAPH_EXPAND_BOOST` | `--graph-expand-boost=B` | `0` (off) | 융합 후·리랭크 전, 상위 10건의 엔티티 ∪ 키워드 엔티티와 관계로 이어진 기존 후보만 `score × (1 + B·s)` 로 올린다(재정렬만, 0≤B≤1). |
+| `SEARCH_RRF_MISSING_RANK` | `--rrf-missing-rank=cutoff` | off (빈 값) | 결과가 있는 레인에 없는 문서가 0 대신 `w/(k + 레인 상한 + 1)` 을 받는다(R2R 가중 RRF). |
 | `SEARCH_RERANK_CALL_CONTEXT` | `--rerank-call-context` | `false` | 통화 리랭커 입력에 `contact_name`을 추가한다. `best_chunk`의 문서 결과에는 본문 앞 250자도 보탠다. 청크 결과는 참여자만 추가하며 전체 1,000자 예산을 유지한다. |
 
 Only non-default knob values are written into the config-hash profile, so a run
@@ -354,6 +357,42 @@ go run ./cmd/eval --golden --no-persist --window=plan --entity-keywords=sparse -
 go run ./cmd/eval --golden --no-persist --window=plan --entity-keywords=llm --graph-weight=0.5 --dump=/tmp/kw-llm-graph.jsonl
 go run ./cmd/eval --golden --no-persist --window=plan --sparse-query=chunk_doc --entity-keywords=llm --high-level-keywords-to-sparse --graph-weight=0.5 --dump=/tmp/kw-llm-full.jsonl
 go run ./cmd/evalcompare --baseline=/tmp/base.jsonl --candidate=/tmp/kw-sparse.jsonl
+```
+
+### 그래프 허브 감쇠·결과 시드 확장·누락 레인 순위 (`--graph-hub-damping`, `--graph-expand-boost`, `--rrf-missing-rank`)
+
+세 노브 모두 기본 꺼짐이고, 꺼진 상태의 저장소 SQL·인자는 바이트 단위로 같다
+(`sparse_query_raw.golden`, `internal/store/graph_expand_test.go`).
+
+- **허브 감쇠**(HippoRAG 노드 특이성): 시드 가중치 `w(e) = 1/ln(e + n(e))`, `n(e)` 는 그
+  엔티티의 `document_entities` 행 수다. 시드 집합에 대해서만 `LATERAL` 로 센다
+  (`idx_document_entities_entity_id`). 그래프 레인은 근거 문서를
+  `SUM(confidence × w(시드 쪽 끝점))` 로 순위 매기고, 양 끝이 모두 시드면 큰 쪽 가중치를
+  쓴다. 언급 0 이면 `w=1` 이라 순위가 감쇠 없는 레인과 같고, 1000 건이면 약 0.145 다.
+  WHERE·필터·LIMIT 은 감쇠 없는 레인과 같다. `--graph-weight>0` 없이 켜면 eval 이 거부한다.
+- **결과 시드 확장**(Graphiti edge_search / Hindsight): 문서 저장소·청크·OpenSearch 융합이
+  끝난 후보 풀(보존 페널티·최신성 감쇠·리랭크 전)에서 상위 10건의 엔티티 ∪ 키워드로 찾은
+  엔티티를 시드로 삼는다. 저장소(`DocumentStore.GraphSupportCounts`)가 후보마다 시드와
+  이어진 서로 다른 관계 수 `n` 을 센다 — 관계의 `evidence_document_id` 가 후보이고 from/to 중
+  한쪽이 시드인 관계다. 후보 자신의 엔티티만으로 이어진 관계는 세지 않는다(상위 문서가 자기
+  관계로 자기를 올리는 순환 방지). 상태·소스·retention·occurred 필터를 다시 걸고, 후보(최대
+  200건)만 대상으로 한다. 승수는 `1 + B·s`, `s = ln(1+n)/ln(1+max n)` ∈ [0,1] 이며 후보를
+  더하지 않는다. 최신순 정렬 질의, 저장소 실패, 엔티티가 없는 코퍼스에서는 아무것도 바꾸지
+  않는다. 로그에는 개수만 남긴다.
+- **누락 레인 순위 cutoff**(R2R): 레인 항이 `COALESCE(w/(k+rank), CASE WHEN COUNT(lane.id)
+  OVER () > 0 THEN w/(k + $3 + 1) ELSE 0 END)` 가 된다. `$3` 은 레인 상한(LIMIT)이다.
+  결과가 하나도 없는 레인(맞는 엔티티가 없는 엔티티·그래프 레인 등)과 가중치 0 레인은 여전히
+  0 이다. 레인 CTE 를 다시 참조하지 않으므로 계획은 바뀌지 않는다.
+- 프로필 키: `graph_hub_damping`(그래프 레인이 있을 때만), `graph_expand_boost`,
+  `rrf_missing_rank`.
+
+```sh
+export ENTITY_EXTRACTION_ENABLED=true
+go run ./cmd/eval --golden --no-persist --window=plan --entity-keywords=sparse --graph-weight=0.5 --dump=/tmp/graph.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --entity-keywords=sparse --graph-weight=0.5 --graph-hub-damping --dump=/tmp/graph-damped.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --entity-keywords=sparse --graph-weight=0.5 --graph-expand-boost=0.3 --dump=/tmp/graph-expand.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --rrf-missing-rank=cutoff --dump=/tmp/rrf-cutoff.jsonl
+go run ./cmd/evalcompare --baseline=/tmp/graph.jsonl --candidate=/tmp/graph-damped.jsonl
 ```
 
 ### 희소 레인 질의 키워드 (`--sparse-query`, #276)

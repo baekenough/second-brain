@@ -942,6 +942,13 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 		chunkFused = true
 	}
 
+	// --- graph expand boost (SEARCH_GRAPH_EXPAND_BOOST, default off) ---
+	// 융합이 끝난 후보 풀(문서 스토어 + 청크/OpenSearch 병합)을 리랭크 전에
+	// 그래프 지지로 한 번 재정렬한다. 새 문서는 더하지 않는다. 꺼져 있거나
+	// 최신순 질의면 no-op — graph_expand.go 참고.
+	results = s.applyGraphExpandBoost(ctx, q, results, tune)
+	// --- end graph expand boost ---
+
 	// Single fusion-time enforcement point for the retention="low" score
 	// penalty (see applyLowRetentionPenalty's doc comment for why it has to
 	// live here rather than per-lane above): every lane has now either

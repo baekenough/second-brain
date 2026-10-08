@@ -207,6 +207,15 @@ func run() error {
 	graphWeight := flag.Float64("graph-weight", 0,
 		"그래프 1-hop 레인(entity_relations)의 RRF 가중치. 0(기본)이면 레인이 SQL 에 들어가지 않는다. "+
 			"--entity-keywords 가 필요하다")
+	graphHubDamping := flag.Bool("graph-hub-damping", false,
+		"그래프 레인 순위를 SUM(confidence * 1/ln(e + 시드 엔티티의 문서 언급 수)) 로 바꿔 허브 엔티티를 "+
+			"누른다(HippoRAG). --graph-weight>0 이 필요하다")
+	graphExpandBoost := flag.Float64("graph-expand-boost", 0,
+		"결과 시드 그래프 확장의 승수 강도(0..1). 0(기본)이면 끈다. 융합 상위 10건의 엔티티 ∪ 키워드 "+
+			"엔티티와 관계로 이어진 기존 후보만 score*(1+boost*s) 로 올린다(새 문서 없음, 리랭크 전)")
+	rrfMissingRank := flag.String("rrf-missing-rank", model.RRFMissingRankZero,
+		"레인에 없는 문서의 RRF 기여. 빈 값(기본)은 0, cutoff 는 결과가 있는 레인에서 "+
+			"w/(k + 레인 상한 + 1) 을 준다(R2R 가중 RRF)")
 	windowAnchor := flag.String("window-anchor", windowAnchorJudgedAt,
 		"--window=plan 에서 상대 기간 표현을 풀 기준 시각. judged_at(기본)은 질의마다 첫 판정 "+
 			"시각을 쓴다 — 후보 화면이 리뷰 시각 기준으로 창을 풀기 때문에 라벨이 붙은 순간의 창을 "+
@@ -264,6 +273,10 @@ func run() error {
 		EntityKeywordMode:         *entityKeywords,
 		HighLevelKeywordsToSparse: *highLevelToSparse,
 		GraphWeight:               *graphWeight,
+
+		GraphHubDamping:  *graphHubDamping,
+		GraphExpandBoost: *graphExpandBoost,
+		RRFMissingRank:   *rrfMissingRank,
 	}
 	if err := validateTuningFlags(tuning); err != nil {
 		return err
