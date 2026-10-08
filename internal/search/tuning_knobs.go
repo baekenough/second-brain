@@ -231,6 +231,8 @@ const maxRerankDocRunes = 1000
 //   - model.RerankInputHead(기본): 제목 + 본문 앞부분 절단. 현행 동작.
 //   - model.RerankInputBestChunk: "[소스 · 날짜 · 제목]" 머리글 한 줄 +
 //     질의와 가장 잘 맞는 청크 본문.
+//   - model.RerankInputYAML: best_chunk 와 같은 본문을 YAML 필드로 감싼다
+//     (buildRerankDocsYAML).
 //
 // head 가 약한 이유(실측): 통화 전사와 긴 메일은 근거가 본문 중간에 있는데
 // 앞 1000 rune 만 보내면 리랭커가 보는 것은 인사말과 서명뿐이다. 판정 정답
@@ -243,6 +245,9 @@ const maxRerankDocRunes = 1000
 // 어느 쪽이든 "청크를 못 읽은 문서는 head" 라는 같은 규칙이다.
 func (s *Service) buildRerankDocs(ctx context.Context, query string,
 	results []*model.SearchResult, tune model.SearchTuning) []string {
+	if tune.RerankInput == model.RerankInputYAML {
+		return s.buildRerankDocsYAML(ctx, query, results) // rerank_yaml.go
+	}
 	docs := make([]string, len(results))
 	if tune.RerankInput != model.RerankInputBestChunk {
 		for i, r := range results {

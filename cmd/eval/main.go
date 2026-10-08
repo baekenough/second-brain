@@ -180,7 +180,8 @@ func run() error {
 	rerankCallContext := flag.Bool("rerank-call-context", false, "통화 리랭커 입력에 참여자와 본문 앞부분을 추가하는 실험")
 	rerankInput := flag.String("rerank-input", model.RerankInputHead,
 		"리랭커에 보내는 텍스트. head(기본)는 제목+본문 앞부분, best_chunk 는 "+
-			"[소스·날짜·제목] 머리글 한 줄 + 질의와 가장 잘 맞는 청크 본문")
+			"[소스·날짜·제목] 머리글 한 줄 + 질의와 가장 잘 맞는 청크 본문, yaml 은 best_chunk 와 같은 "+
+			"본문을 source/date/title/counterpart/text YAML 필드로 보낸다(--rerank 필요)")
 	recencyHalflife := flag.Float64("recency-halflife-days", 0,
 		"최신성 감쇠 반감기(일). 0(기본)이면 감쇠하지 않는다. 시간창이 없는 질의에만 적용된다")
 	recencyAlpha := flag.Float64("recency-alpha", model.DefaultRecencyAlpha,
@@ -207,6 +208,20 @@ func run() error {
 	graphWeight := flag.Float64("graph-weight", 0,
 		"그래프 1-hop 레인(entity_relations)의 RRF 가중치. 0(기본)이면 레인이 SQL 에 들어가지 않는다. "+
 			"--entity-keywords 가 필요하다")
+	// --- 융합 이후 노브 (internal/search/postfusion.go, 전부 기본 꺼짐) ---
+	sourceStratifyK := flag.Int("source-stratify-k", 0,
+		"소스별 보조 검색: 소스 포함 집합이 없는 질의에서 일정·통화·문자·메일·노트마다 저장소 검색을 "+
+			"한 번 더 돌려 소스별 상위 K건을 전역 후보와 RRF 로 합친다. 0(기본)이면 끈다. 최대 10")
+	collapseContactDay := flag.Bool("collapse-contact-day", false,
+		"통화·문자를 (소스, 상대, KST 날짜) 그룹으로 접어 대표만 리랭크·순위 경쟁에 남기고, "+
+			"최종 순서 뒤 대표 바로 뒤에 같은 그룹을 다시 편다(후보는 버리지 않는다)")
+	collapseExpandMax := flag.Int("collapse-expand-max", model.DefaultCollapseExpandMax,
+		"--collapse-contact-day 에서 대표 바로 뒤에 펼칠 같은 그룹 문서 수(1~20). 나머지는 목록 끝으로 간다")
+	windowBucketDiversify := flag.Bool("window-bucket-diversify", false,
+		"하루를 넘는 occurred 시간창이 있는 질의에서 날짜(KST)별 최상위 문서를 먼저 세우고 나머지를 뒤에 둔다")
+	mmrLambda := flag.Float64("mmr-lambda", 0,
+		"리랭크(합산) 뒤 상위 30건에 MMR 을 적용한다. (0,1] 의 λ, 0(기본)이면 끈다. "+
+			"유사도 벌점은 같은 소스 문서끼리만 준다")
 	windowAnchor := flag.String("window-anchor", windowAnchorJudgedAt,
 		"--window=plan 에서 상대 기간 표현을 풀 기준 시각. judged_at(기본)은 질의마다 첫 판정 "+
 			"시각을 쓴다 — 후보 화면이 리뷰 시각 기준으로 창을 풀기 때문에 라벨이 붙은 순간의 창을 "+
@@ -264,6 +279,12 @@ func run() error {
 		EntityKeywordMode:         *entityKeywords,
 		HighLevelKeywordsToSparse: *highLevelToSparse,
 		GraphWeight:               *graphWeight,
+
+		SourceStratifyK:       *sourceStratifyK,
+		CollapseContactDay:    *collapseContactDay,
+		CollapseExpandMax:     *collapseExpandMax,
+		WindowBucketDiversify: *windowBucketDiversify,
+		MMRLambda:             *mmrLambda,
 	}
 	if err := validateTuningFlags(tuning); err != nil {
 		return err
@@ -302,6 +323,9 @@ func run() error {
 	})
 	if !explicitRerank {
 		*rerank = cfg.RerankDefault
+	}
+	if err := validateRerankTuning(tuning, *rerank); err != nil {
+		return err
 	}
 	if *noPersist && *checkReindex {
 		return errors.New("--no-persist cannot be combined with --check-reindex (writes state)")
