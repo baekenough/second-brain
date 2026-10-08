@@ -218,7 +218,8 @@ jobs:
           # -json 출력 스트림에서 "호출 경로가 있는" finding의 OSV ID만 모은다 (trace가 비어 있으면 import-only라 원래도 exit 0).
           govulncheck -json ./... > govulncheck.json || true
           jq -r 'select(.finding != null) | .finding | select((.trace // []) | length > 0 and .[0].function != null) | .osv' govulncheck.json | sort -u > found.txt
-          grep -vE '^\s*(#|$)' .govulncheck-ignore | awk '{print $1}' | sort -u > ignored.txt
+          # grep exits 1 when the allowlist holds only comments; that must not fail the step under pipefail.
+          { grep -vE '^\s*(#|$)' .govulncheck-ignore || true; } | awk '{print $1}' | sort -u > ignored.txt
           echo "== called vulnerabilities =="; cat found.txt || true
           echo "== allowlisted =="; cat ignored.txt || true
           comm -23 found.txt ignored.txt > new.txt
