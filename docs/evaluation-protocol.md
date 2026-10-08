@@ -333,6 +333,8 @@ the matching `cmd/eval` flag.
 | `SEARCH_COLLAPSE_EXPAND_MAX` | `--collapse-expand-max=N` | `3` | 대표 뒤에 펼칠 같은 그룹 문서 수(1~20). `--collapse-contact-day` 필요. |
 | `SEARCH_WINDOW_BUCKET_DIVERSIFY` | `--window-bucket-diversify` | `false` | 하루를 넘는 시간창에서 날짜별 최상위 문서를 먼저 세운다. |
 | `SEARCH_MMR_LAMBDA` | `--mmr-lambda=λ` | `0` (off) | 리랭크 뒤 상위 30건 MMR, λ∈(0,1]. |
+| `SEARCH_SCHEDULE_INTENT_BOOST` | `--schedule-intent-boost=B` | `0` (off) | 일정 의도 질문에서 캘린더 후보 점수 ×(1+B), B∈(0,1]. 아래 "계획 인지 노브" 절 참고. |
+| `SEARCH_PLAN_SOURCE_SPILL_K` | `--plan-source-spill-k=K` | `0` (off) | 계획이 고른 소스 포함 집합 밖 상위 K건(최대 10)을 후보에 섞는다. `--plan-sources` 필요. |
 | `SEARCH_RERANK_CALL_CONTEXT` | `--rerank-call-context` | `false` | 통화 리랭커 입력에 `contact_name`을 추가한다. `best_chunk`의 문서 결과에는 본문 앞 250자도 보탠다. 청크 결과는 참여자만 추가하며 전체 1,000자 예산을 유지한다. |
 
 Only non-default knob values are written into the config-hash profile, so a run
@@ -531,6 +533,37 @@ go run ./cmd/eval --golden --no-persist --window=plan --rerank=true --collapse-c
 go run ./cmd/eval --golden --no-persist --window=plan --rerank=true --rerank-input=yaml --rerank-blend=rrf --dump=/tmp/yaml.jsonl
 go run ./cmd/eval --golden --no-persist --window=plan --rerank=true --mmr-lambda=0.7 --dump=/tmp/mmr.jsonl
 go run ./cmd/evalcompare --baseline=/tmp/base.jsonl --candidate=/tmp/strat.jsonl
+```
+
+### 계획 인지 노브 (`--schedule-intent-boost`, `--plan-source-spill-k`)
+
+`--plan-sources` 실행의 잔여 손실 둘을 겨냥한다. 둘 다 기본 꺼짐이고, 꺼져 있으면 저장소
+호출 수·결과가 노브 도입 전과 같다.
+
+- **일정 의도 캘린더 가산** (`--schedule-intent-boost=B`, 실패 유형: 계획이 캘린더로 좁히지
+  않은 일정 질문에서 통화·메일이 관련 캘린더 문서 위를 차지). `intent.HasScheduleIntent` 가
+  일정 질문으로 판정하면 — 기록 단어(메일·문자·통화·노트·기록·대화 등)가 있으면 항상 아니고,
+  그 밖에는 일정·스케줄·캘린더·약속 또는 보수적 단서 `미팅|회의|예정|계획|뭐 해|뭐 하|언제|몇 시|가야|만나`
+  (`회의록`·`계획서` 는 단서에서 제외) — 캘린더 후보의 양수 융합 점수에 `(1+B)` 를 곱하고
+  `sortByScore` 로 재정렬한다. 소스 포함 집합이 있거나 `Sort=recent` 이면 하지 않는다. 후보를
+  더하거나 빼지 않고, 움직이는 것은 캘린더 문서가 위로 올라가는 것뿐이다. 적용 지점은 보조 검색
+  합류·그래프 가산 뒤, 보존 페널티 앞(`search.go` 의 schedule intent boost 블록). 프로필에
+  `schedule_intent_boost` 와 판정 규칙 판 `schedule_cue_version`(`intent.ScheduleCueVersion`)이 들어간다.
+- **계획 소스 넘침 검색** (`--plan-source-spill-k=K`, 실패 유형: 계획이 소스를 잘못 좁혀(문자로
+  계획, 정답은 메일) 하드 필터 때문에 정답에 도달 불가 — 운영 /ask 도 같다). `model.SearchQuery.SourceIncludeFromPlan`
+  (json 비노출, 서버만 채움)이 true 인 질의 — 운영 /ask 의 `assembleRetrieval` 이 플래너의 소스를
+  걸 때, eval 의 `--plan-sources` 가 비어 있지 않은 집합을 걸 때 — 에서만, 본 검색과 같은
+  질의(시간창·retention·제외 소스·가중치·키워드 동일)를 포함 제한 없이 한 번 더 돌려 포함 집합
+  밖 상위 K건을 소스별 보조 검색과 똑같이 RRF 로 합류시킨다. 저장소에는 포함 집합 소스를 제외
+  집합에 더해 보내므로("제한 없이 돌린 뒤 거르기" 와 멤버십은 같고, 포함 소스가 상위를 채워 넘침이
+  0건이 되는 일이 없다) 결과에서 포함 소스 문서를 한 번 더 거른다. 같은 취소 가능 ctx·실패 흡수·
+  리랭크 입력 상한(`laneLimit + K`, 200 이하) 규칙을 따른다. 사용자가 지정한 포함 집합
+  (SourceIncludeFromPlan=false)과 /ask 의 insight 레인은 절대 넓히지 않는다. 넘침 후보는 `--dump`
+  레인 이름 `plan_source_spill` 로 남는다. `--plan-sources` 없이 켜면 eval 이 거부한다.
+
+```sh
+go run ./cmd/eval --golden --no-persist --window=plan --plan-sources --entity-keywords=sparse --graph-weight=1.0 \
+  --source-stratify-k=8 --window-bucket-diversify --schedule-intent-boost=0.5 --plan-source-spill-k=5 --dump=/tmp/plan-aware.jsonl
 ```
 
 ## Read-only comparisons

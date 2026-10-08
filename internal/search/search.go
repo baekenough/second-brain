@@ -823,7 +823,7 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 		storeQuery.SparseTerms = sparseTerms
 	}
 	// 융합 이후 노브(postfusion.go): 소스별 보조 검색은 본 검색과 동시에 띄운다.
-	arms := s.startSourceArms(ctx, storeQuery, tune.SourceStratifyK)
+	arms := s.startSourceArms(ctx, storeQuery, tune)
 	defer arms.stop() // 일찍 반환하는 경로에서도 보조 검색 질의를 끊는다
 	results, err := s.store.Search(ctx, storeQuery)
 	if err != nil {
@@ -950,7 +950,8 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 		}
 	}
 
-	// SEARCH_SOURCE_STRATIFY_K: 소스별 보조 검색 결과를 RRF 로 합류(stratify.go).
+	// SEARCH_SOURCE_STRATIFY_K / SEARCH_PLAN_SOURCE_SPILL_K: 보조 검색 결과를
+	// RRF 로 합류(stratify.go).
 	if merged, ok := arms.merge(q, results, trace); ok {
 		results = merged
 		chunkFused = true // 저장소 ORDER BY 가 더는 이 목록의 순서가 아니다
@@ -962,6 +963,12 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 	// 더하지 않는다. 꺼져 있거나 최신순 질의면 no-op — graph_expand.go 참고.
 	results = s.applyGraphExpandBoost(ctx, q, results, tune)
 	// --- end graph expand boost ---
+
+	// --- schedule intent boost (SEARCH_SCHEDULE_INTENT_BOOST, default off) ---
+	// 일정 의도 질문에서 캘린더 후보 점수를 (1+boost) 배 해 재정렬한다. 순서만
+	// 바꾼다 — schedule_boost.go 참고.
+	results = applyScheduleIntentBoost(q, results, tune)
+	// --- end schedule intent boost ---
 
 	// Single fusion-time enforcement point for the retention="low" score
 	// penalty (see applyLowRetentionPenalty's doc comment for why it has to

@@ -155,6 +155,42 @@ var complexTimeRe = regexp.MustCompile(`비교|대비|차이|부터|까지|\d{1,
 var recordOccurredRe = regexp.MustCompile(`받|보낸|보냈|수신|발신|통화했|전화했`)
 var recordSourceRe = regexp.MustCompile(`메일|이메일|문자|메시지|메세지|통화|전화|슬랙|노션|문서|노트|기록|대화`)
 
+// scheduleCueRe 는 일정 키워드(calendarKwR) 없이도 일정 질문으로 읽히는 표현이다.
+// HasScheduleIntent 전용이며 계획(DeterministicPlan)의 소스 판정에는 쓰지 않는다 —
+// 이 신호는 하드 필터가 아니라 순위 가산(search 의 ScheduleIntentBoost)에만 쓰인다.
+//
+// 보수적으로 고른 목록이다. 만남·회의 명사(미팅·회의), 계획 표현(예정·계획),
+// 하루 일과 질문(뭐 해/뭐 하), 시점 질문(언제·몇 시), 이동 의무(가야),
+// 만남 동사(만나). "오늘"·"다음" 같은 일반 시간어나 "할 일" 은 넣지 않는다 —
+// 메일·메모 질문에도 흔해서 캘린더를 엉뚱하게 끌어올린다.
+var scheduleCueRe = regexp.MustCompile(`미팅|회의|예정|계획|뭐\s?해|뭐\s?하|언제|몇\s?시|가야|만나`)
+
+// ScheduleCueVersion 은 HasScheduleIntent 의 판정 규칙(scheduleCueRe·
+// scheduleRecordNounRe·기록 단어 우선) 판이다. 목록을 바꾸면 올린다 — 같은
+// 노브 값이라도 판정이 달라지면 다른 평가 baseline 계열이어야 한다(cmd/eval
+// 실행 프로필에 기록).
+const ScheduleCueVersion = "v1"
+
+// scheduleRecordNounRe 는 일정 단서 단어를 포함하지만 그 자체가 기록물인
+// 명사다("회의록", "계획서"). 단서 매칭 전에 지운다.
+var scheduleRecordNounRe = regexp.MustCompile(`회의록|계획서`)
+
+// HasScheduleIntent 는 질문이 일정(캘린더)을 묻는지 알린다.
+//
+// 질문이 명시적인 기록 단어(recordSourceRe: 메일·문자·통화·노트·기록 등)를
+// 담으면 false 다 — "어제 회의 관련 메일" 은 회의가 아니라 메일을 묻는다.
+// 그 밖에는 calendarKwR(일정·스케줄·캘린더·약속) 또는 scheduleCueRe 가 맞으면
+// true 다. LLM 호출이 없고 결정론적이다.
+func HasScheduleIntent(question string) bool {
+	if recordSourceRe.MatchString(question) {
+		return false
+	}
+	if calendarKwR.MatchString(question) {
+		return true
+	}
+	return scheduleCueRe.MatchString(scheduleRecordNounRe.ReplaceAllString(question, " "))
+}
+
 // periodMentionRegexes는 requiresSemanticWindow의 "몇 개 기간이 언급됐는가" 집계와
 // hasPeriodMention의 "기간이 하나라도 있는가" 판정이 공유하는 단일 목록이다. 두
 // 함수가 각자 다른 목록을 들고 있으면 나중에 표현을 하나 추가할 때 한쪽만 고치고

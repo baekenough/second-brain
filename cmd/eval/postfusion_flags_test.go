@@ -3,9 +3,12 @@ package main
 import (
 	"math"
 	"testing"
+	"time"
 
+	"github.com/baekenough/second-brain/internal/intent"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/search"
+	"github.com/baekenough/second-brain/internal/timeutil"
 )
 
 func TestValidatePostFusionFlags(t *testing.T) {
@@ -41,6 +44,10 @@ func TestValidatePostFusionFlags(t *testing.T) {
 		{"--mmr-lambda 음수", func(t *model.SearchTuning) { t.MMRLambda = -0.1 }, true},
 		{"--mmr-lambda NaN", func(t *model.SearchTuning) { t.MMRLambda = math.NaN() }, true},
 		{"--rerank-input 오타", func(t *model.SearchTuning) { t.RerankInput = "yml" }, true},
+		{"--schedule-intent-boost", func(t *model.SearchTuning) { t.ScheduleIntentBoost = 0.5 }, false},
+		{"--schedule-intent-boost 범위 밖", func(t *model.SearchTuning) { t.ScheduleIntentBoost = 1.5 }, true},
+		{"--plan-source-spill-k", func(t *model.SearchTuning) { t.PlanSourceSpillK = 5 }, false},
+		{"--plan-source-spill-k 상한 초과", func(t *model.SearchTuning) { t.PlanSourceSpillK = model.MaxPlanSourceSpillK + 1 }, true},
 		{"--rerank-input=yaml + --rerank-call-context", func(t *model.SearchTuning) {
 			t.RerankInput = model.RerankInputYAML
 			t.RerankCallContext = true
@@ -95,6 +102,10 @@ func TestApplyTuningProfile_PostFusionKeys(t *testing.T) {
 			map[string]any{"window_bucket_diversify": true}},
 		{"MMR 은 창 크기까지", func(t *model.SearchTuning) { t.MMRLambda = 0.5 },
 			map[string]any{"mmr_lambda": 0.5, "mmr_window": search.MMRWindow, "mmr_rank_k": search.MMRRankK}},
+		{"일정 의도 가산은 단서 판까지", func(t *model.SearchTuning) { t.ScheduleIntentBoost = 0.5 },
+			map[string]any{"schedule_intent_boost": 0.5, "schedule_cue_version": intent.ScheduleCueVersion}},
+		{"계획 소스 넘침", func(t *model.SearchTuning) { t.PlanSourceSpillK = 4 },
+			map[string]any{"plan_source_spill_k": 4}},
 		{"YAML 입력은 형식 판까지", func(t *model.SearchTuning) { t.RerankInput = model.RerankInputYAML },
 			map[string]any{"rerank_input": model.RerankInputYAML, "rerank_yaml_version": search.RerankYAMLVersion}},
 	}
@@ -114,5 +125,41 @@ func TestApplyTuningProfile_PostFusionKeys(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestValidatePlanSpill(t *testing.T) {
+	t.Parallel()
+	on := defaultTuningFlags()
+	on.PlanSourceSpillK = 3
+	if err := validatePlanSpill(on, false); err == nil {
+		t.Error("--plan-source-spill-k without --plan-sources accepted")
+	}
+	if err := validatePlanSpill(on, true); err != nil {
+		t.Errorf("valid combo rejected: %v", err)
+	}
+	boost := defaultTuningFlags()
+	boost.ScheduleIntentBoost = 0.5
+	if err := validatePlanSpill(boost, false); err != nil {
+		t.Errorf("--schedule-intent-boost alone rejected: %v", err)
+	}
+}
+
+// --plan-sources 가 건 포함 집합만 "계획이 골랐다" 로 표시돼야 넘침 검색이
+// 그 집합에만 동작한다. 계획이 거절한 질의는 표시도 집합도 없다.
+func TestDeterministicPlanSources_MarksPlannerChosen(t *testing.T) {
+	t.Parallel()
+	anchor := time.Date(2026, 9, 10, 12, 0, 0, 0, timeutil.KST())
+	q := model.SearchQuery{Query: "내일 일정 알려줘"}
+	if names := deterministicPlanSources(&q, anchor); len(names) == 0 {
+		t.Fatal("fixture premise: planner should narrow 내일 일정 to calendar")
+	}
+	if !q.SourceIncludeFromPlan {
+		t.Error("planner-chosen include set not marked")
+	}
+	none := model.SearchQuery{Query: "프로젝트 예산"}
+	deterministicPlanSources(&none, anchor)
+	if none.SourceIncludeFromPlan || len(none.SourceTypes) != 0 {
+		t.Error("unplanned query marked as planner-chosen")
 	}
 }
