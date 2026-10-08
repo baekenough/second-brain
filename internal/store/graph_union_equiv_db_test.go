@@ -44,7 +44,7 @@ func legacyGraphCTEs(kwParam, prefixParam, statusFilter, sourceFilter, excludeFi
 			GROUP BY er.evidence_document_id, d.occurred_at
 			ORDER BY rank
 			LIMIT $3
-		)`, entityKeywordMatch("e", kwParam, prefixParam),
+		)`, legacyEntityKeywordMatch("e", kwParam, prefixParam),
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredRangeFilter)
 }
 
@@ -79,8 +79,15 @@ func legacyDampedGraphCTEs(kwParam, prefixParam, statusFilter, sourceFilter, exc
 			GROUP BY er.evidence_document_id, d.occurred_at
 			ORDER BY rank
 			LIMIT $3
-		)`, entityKeywordMatch("e", kwParam, prefixParam),
+		)`, legacyEntityKeywordMatch("e", kwParam, prefixParam),
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredRangeFilter)
+}
+
+// legacyEntityKeywordMatch 는 상한 없는 예전 시드 매칭(79e0bf7)이다. 시드가
+// MaxEntityKeywordSeeds 개 미만이면 entityKeywordSeeds 와 같은 집합을 고른다.
+func legacyEntityKeywordMatch(alias, kwParam, prefixParam string) string {
+	return fmt.Sprintf("(%[1]s.normalized_name = ANY(%[2]s::text[]) OR %[1]s.normalized_name LIKE ANY(%[3]s::text[]))",
+		alias, kwParam, prefixParam)
 }
 
 type laneRow struct {

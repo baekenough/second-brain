@@ -115,6 +115,27 @@ intended meaning of the phrase. Measured on the golden set, `judged_at` scored
 ndcg@10 0.640 against 0.550 for `asked_at` (baseline run, same labels);
 `window_applied` and `window_anchor_date` in the dump show every miss.
 
+**Questions judged on several days.** The golden export groups judgments by
+question text, so a relative question ("내일 일정 뭐야") judged on two different days
+became one pair anchored at its *earliest* judgment — the documents labeled on
+the later day sit outside that window and could never be retrieved. Under
+`--window=plan` with `--window-anchor=judged_at|asked_at`, `cmd/eval` therefore
+loads per-judgment rows (`GoldenStore.ExportEvalJudgmentRows`) and splits such a
+question into one pair per anchor date (KST), each with only that day's labels and
+anchored at that day's first judgment (`cmd/eval/golden_split.go`). Only questions
+in which `intent.DeterministicWindow` finds a period expression **and** whose
+judgments span more than one anchor date are split; every other question is grouped
+by text exactly as `ExportEvalPairs` does (same labels, anchor, ids — pinned by a
+real-DB test). Consequences:
+
+- `label_hash` changes for a golden set that contains such a question (its labels
+  are now several pairs instead of one union). Runs before and after this change are
+  not comparable for that label set; a set without split questions keeps its hash.
+- A split pair's `query_id` in the dump is `<golden_query_id>@YYYY-MM-DD`, so
+  `cmd/evalcompare` treats the days as separate queries.
+- `golden_queries.text` is unique, so a question has one `asked_at`; in practice only
+  `judged_at` anchoring splits. `--as-of` and `--window=none` never split.
+
 ### Source include set (`--plan-sources`)
 
 `--window=plan` alone reproduces only the window. Production `/ask` also applies
@@ -329,8 +350,11 @@ LightRAG 의 두 아이디어를 Postgres 안에서 실험 노브로 옮긴 것�
   `internal/sparseq.Extract` 키워드를, `llm` 은 LLM 한 번으로 뽑은
   `{"low_level": 고유명사, "high_level": 주제}` 의 low_level 을 쓴다. 키워드는
   소문자·trim·중복 제거·2~40자·최대 8개로 정규화하고(`store.NormalizeEntityKeywords`),
-  `normalized_name = ANY(키워드)` 또는 `LIKE ANY(키워드%)`(LIKE 메타문자 이스케이프)로
-  맞춘다. 문서 순위는 맞은 서로 다른 엔티티 수 내림차순, 문서 id 오름차순이다.
+  `normalized_name LIKE ANY(키워드%)`(LIKE 메타문자 이스케이프, 정확 일치를 포함한다)로
+  맞춘다. 맞는 엔티티(시드)는 최대 64개(`store.MaxEntityKeywordSeeds`)이며, 넘으면 정확
+  일치 → 짧은 이름 → id 순으로 남긴다 — 두 글자 키워드 접두가 엔티티 수천 개와 맞아 문장
+  전체가 느려지는 것을 막는다. 엔티티 레인·그래프 레인·결과 시드 확장이 같은 상한을 쓴다.
+  문서 순위는 맞은 서로 다른 엔티티 수 내림차순, 최신 사건 시각, 문서 id 오름차순이다.
 - **LLM 폴백**: LLM 이 없거나(`llm.Completer` 비활성)·8초 안에 못 답하거나·JSON 이
   깨졌거나·고유명사가 하나도 없으면 sparse 키워드로 되돌아간다. 검색은 실패하지
   않는다. 키워드 내용·LLM 응답은 로그에 남기지 않고 개수와 실패 사유(고정 문자열)만
@@ -381,7 +405,8 @@ go run ./cmd/evalcompare --baseline=/tmp/base.jsonl --candidate=/tmp/kw-sparse.j
   이어진 서로 다른 관계 수 `n` 을 센다 — 관계의 `evidence_document_id` 가 후보이고 from/to 중
   한쪽이 시드인 관계다. 후보 자신의 엔티티만으로 이어진 관계는 세지 않는다(상위 문서가 자기
   관계로 자기를 올리는 순환 방지). 상태·소스·retention·occurred 필터를 다시 걸고, 후보(최대
-  200건)만 대상으로 한다. 승수는 `1 + B·s`, `s = ln(1+n)/ln(1+max n)` ∈ [0,1] 이며 후보를
+  200건)만 대상으로 한다. 시드와의 연결은 from 쪽·to 쪽 등치 조인 두 개를 UNION 으로 합쳐
+  관계 id 로 중복을 없앤 뒤 센다(해시 조인 가능; 양 끝이 모두 시드인 관계는 한 번). 승수는 `1 + B·s`, `s = ln(1+n)/ln(1+max n)` ∈ [0,1] 이며 후보를
   더하지 않는다. 최신순 정렬 질의, 저장소 실패, 엔티티가 없는 코퍼스에서는 아무것도 바꾸지
   않는다. 로그에는 개수만 남긴다.
 - **누락 레인 순위 cutoff**(R2R): 레인 항이 `COALESCE(w/(k+rank), CASE WHEN COUNT(lane.id)

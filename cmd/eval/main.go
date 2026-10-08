@@ -470,7 +470,15 @@ func run() error {
 	// GoldenStore.ExportEvalPairs and .UpsertJudgments for the enforcement of
 	// that same rule on the write side.
 	var pairs []store.EvalPair
-	if *useGolden {
+	if *useGolden && goldenSplitApplies(*windowMode, anchorKind) {
+		// 상대 기간 질문을 판정 날짜(KST)별로 나눈다 — golden_split.go 참고.
+		// 나뉘지 않는 질문은 ExportEvalPairs 와 같은 쌍이 된다.
+		rows, rerr := goldenStore.ExportEvalJudgmentRows(ctx, "user")
+		if rerr != nil {
+			return fmt.Errorf("build golden eval pairs: %w", rerr)
+		}
+		pairs = goldenPairsFromJudgments(rows, anchorKind)
+	} else if *useGolden {
 		pairs, err = goldenStore.ExportEvalPairs(ctx, "user")
 		if err != nil {
 			return fmt.Errorf("build golden eval pairs: %w", err)

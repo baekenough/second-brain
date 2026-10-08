@@ -577,7 +577,7 @@ func (s *GoldenStore) ExportEvalPairs(ctx context.Context, judge string) ([]Eval
 		JOIN golden_queries q ON q.id = j.query_id
 		WHERE j.judge = $1
 		GROUP BY q.text
-		ORDER BY MIN(j.judged_at) DESC
+		ORDER BY MIN(j.judged_at) DESC, q.text COLLATE "C" ASC
 	`, judge)
 	if err != nil {
 		return nil, fmt.Errorf("golden: export eval pairs: %w", err)
@@ -598,6 +598,48 @@ func (s *GoldenStore) ExportEvalPairs(ctx context.Context, judge string) ([]Eval
 		pairs = append(pairs, p)
 	}
 	return pairs, rows.Err()
+}
+
+// GoldenJudgmentRow 는 판정 한 건과 그 질의 행이다. ExportEvalPairs 가 SQL 로
+// 묶는 것을 평가 도구가 직접 묶어야 할 때(cmd/eval 의 상대 기간 질의 날짜 분리)
+// 쓴다. 문서 id 는 ExportEvalPairs 와 같은 text 형태다.
+type GoldenJudgmentRow struct {
+	QueryText   string
+	QueryID     string
+	QuerySource string
+	AskedAt     time.Time
+	DocumentID  string
+	Judgment    string
+	JudgedAt    time.Time
+}
+
+// ExportEvalJudgmentRows 는 주어진 judge 의 판정을 한 건씩 돌려준다. 묶지 않는다는
+// 점만 빼면 ExportEvalPairs 와 같은 행 집합이다(같은 JOIN, 같은 judge 필터). 순서는
+// (질의 문구 바이트 순, 판정 시각, 질의 id, 문서 id) — 호출자가 결정론적으로 묶을 수
+// 있도록 고정한다. 판정이 "user" 여야 한다는 규칙은 ExportEvalPairs 와 같다.
+func (s *GoldenStore) ExportEvalJudgmentRows(ctx context.Context, judge string) ([]GoldenJudgmentRow, error) {
+	rows, err := s.pg.pool.Query(ctx, `
+		SELECT q.text, q.id::text, q.source, q.asked_at, j.document_id::text, j.judgment, j.judged_at
+		FROM golden_judgments j
+		JOIN golden_queries q ON q.id = j.query_id
+		WHERE j.judge = $1
+		ORDER BY q.text COLLATE "C", j.judged_at, q.id, j.document_id
+	`, judge)
+	if err != nil {
+		return nil, fmt.Errorf("golden: export judgment rows: %w", err)
+	}
+	defer rows.Close()
+
+	var out []GoldenJudgmentRow
+	for rows.Next() {
+		var r GoldenJudgmentRow
+		if err := rows.Scan(&r.QueryText, &r.QueryID, &r.QuerySource, &r.AskedAt,
+			&r.DocumentID, &r.Judgment, &r.JudgedAt); err != nil {
+			return nil, fmt.Errorf("golden: scan judgment row: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // FindQueryByText resolves an existing query without creating or updating it.

@@ -83,15 +83,30 @@ func entityKeywordPrefixes(kws []string) []string {
 	return out
 }
 
-// entityKeywordMatch 는 normalized_name 이 키워드와 맞는 조건이다. 정확 일치는
-// idx_entities_normalized_type (normalized_name, type) 의 선두 컬럼을 탄다.
-// 접두 일치(LIKE ANY)는 비-C 콜레이션에서 btree 를 못 쓰지만, entities 는
-// 문서 수보다 훨씬 작은 테이블이고 키워드가 최대 MaxEntityKeywords 개로
-// 묶여 있어 순차 비교 비용이 한정된다 — 새 인덱스·마이그레이션은 추가하지
-// 않는다. kwParam/prefixParam 은 각각 text[] 로 바인딩된 "$n" 이다.
-func entityKeywordMatch(alias, kwParam, prefixParam string) string {
-	return fmt.Sprintf("(%[1]s.normalized_name = ANY(%[2]s::text[]) OR %[1]s.normalized_name LIKE ANY(%[3]s::text[]))",
-		alias, kwParam, prefixParam)
+// MaxEntityKeywordSeeds 는 키워드가 맞힐 수 있는 엔티티(시드) 수 상한이다.
+// 두 글자 키워드의 접두 일치("김민%")는 엔티티 수천 개와 맞을 수 있고, 그 수가
+// 그대로 엔티티 레인의 document_entities 조인·그래프 레인의 관계 조회·허브 감쇠의
+// 언급 수 집계 횟수가 된다(실측: 시드 11k 에서 문장 전체 0.5초).
+const MaxEntityKeywordSeeds = 64
+
+// entityKeywordSeeds 는 키워드에 맞는 엔티티 id 를 최대 MaxEntityKeywordSeeds 개
+// 고르는 SELECT 다. 엔티티 레인·그래프 레인·결과 시드 확장이 모두 이 하나를 쓴다.
+//
+// 매칭은 접두 일치(LIKE ANY) 하나다 — 키워드 kw 는 언제나 자기 패턴 "kw%" 와
+// 맞으므로 정확 일치(= ANY)를 WHERE 에 OR 로 더해도 결과가 같다. 정확 일치는
+// 상한을 넘을 때 무엇을 남길지 정하는 ORDER BY 에만 쓴다: 정확히 맞은 이름 먼저,
+// 그다음 짧은 이름(키워드에 가까운 이름), 마지막으로 id(결정론).
+//
+// 인덱스: LIKE 접두 일치는 비-C 콜레이션에서 btree(idx_entities_normalized_type)를
+// 쓰지 못해 entities 를 순차로 읽는다. entities 는 문서 수보다 훨씬 작고 키워드가
+// 최대 MaxEntityKeywords 개라 비교 비용이 한정된다 — 새 인덱스·마이그레이션은 추가하지
+// 않는다. kwParam/prefixParam 은 각각 text[] 로 바인딩된 "$n" 이다(entityKeywordPrefixes).
+func entityKeywordSeeds(kwParam, prefixParam string) string {
+	return fmt.Sprintf(`SELECT e.id
+				FROM entities e
+				WHERE e.normalized_name LIKE ANY(%s::text[])
+				ORDER BY (e.normalized_name = ANY(%s::text[])) DESC, char_length(e.normalized_name) ASC, e.id ASC
+				LIMIT %d`, prefixParam, kwParam, MaxEntityKeywordSeeds)
 }
 
 // buildKeywordEntityCTE 는 키워드 모드의 엔티티 레인이다. buildEntityCTE 와
@@ -109,9 +124,10 @@ func buildKeywordEntityCTE(kwParam, prefixParam, statusFilter, sourceFilter, exc
 			SELECT de.document_id AS id,
 			       row_number() OVER (ORDER BY COUNT(DISTINCT de.entity_id) DESC, d.occurred_at DESC NULLS LAST, de.document_id ASC) AS rank
 			FROM document_entities de
-			JOIN entities e ON e.id = de.entity_id
 			JOIN documents d ON d.id = de.document_id
-			WHERE %s
+			WHERE de.entity_id IN (
+				%s
+			)
 			%s
 			%s
 			%s
@@ -120,7 +136,7 @@ func buildKeywordEntityCTE(kwParam, prefixParam, statusFilter, sourceFilter, exc
 			GROUP BY de.document_id, d.occurred_at
 			ORDER BY rank
 			LIMIT $3
-		)`, entityKeywordMatch("e", kwParam, prefixParam),
+		)`, entityKeywordSeeds(kwParam, prefixParam),
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredRangeFilter)
 }
 
@@ -128,7 +144,7 @@ func buildKeywordEntityCTE(kwParam, prefixParam, statusFilter, sourceFilter, exc
 // WITH 절에 이어 붙는 조각을 돌려주며, 맨 앞에 쉼표와 줄바꿈이 있다 — 레인이
 // 꺼진 호출자는 이 함수를 부르지 않아 SQL 이 한 글자도 달라지지 않는다.
 //
-//	graph_seed: 키워드와 이름이 맞는 엔티티(시드).
+//	graph_seed: 키워드와 이름이 맞는 엔티티(시드, 최대 MaxEntityKeywordSeeds 개).
 //	graph_rel:  시드가 from 또는 to 인 관계(graphRelCTE 참고 — 인덱스 두 번, 관계 id 로 중복 제거).
 //	graph:      그 관계의 evidence_document_id 를 SUM(confidence) 내림차순,
 //	            최신 사건 시각, 문서 id 오름차순으로 순위 매긴다.
@@ -144,9 +160,7 @@ func buildGraphCTEs(kwParam, prefixParam, statusFilter, sourceFilter, excludeFil
 	}
 	return fmt.Sprintf(`,
 		graph_seed AS (
-			SELECT e.id
-			FROM entities e
-			WHERE %s
+			%s
 		),
 		%s,
 		graph AS (
@@ -163,7 +177,7 @@ func buildGraphCTEs(kwParam, prefixParam, statusFilter, sourceFilter, excludeFil
 			GROUP BY er.evidence_document_id, d.occurred_at
 			ORDER BY rank
 			LIMIT $3
-		)`, entityKeywordMatch("e", kwParam, prefixParam), graphRelCTE,
+		)`, entityKeywordSeeds(kwParam, prefixParam), graphRelCTE,
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredRangeFilter)
 }
 
@@ -202,8 +216,8 @@ const graphRelCTE = `graph_rel AS (
 //	seed_weight(e) = 1 / ln(e + doc_mention_count(e))
 //	rank 키       = SUM(confidence * seed_weight(관계의 시드 쪽 끝점))
 //
-// doc_mention_count 는 그 엔티티의 document_entities 행 수다. 시드 집합에 대해서만
-// LATERAL 로 센다 — idx_document_entities_entity_id 를 시드마다 한 번 타므로
+// doc_mention_count 는 그 엔티티의 document_entities 행 수다. 상한으로 자른 시드
+// 집합에 대해서만 LATERAL 로 센다 — idx_document_entities_entity_id 를 시드마다 한 번 타므로
 // document_entities 전체를 집계하지 않는다. 언급이 0 이면 가중치 1(감쇠 없음),
 // 1000 건이면 약 0.145 다. 양 끝점이 모두 시드인 관계는 둘 중 큰 가중치를 쓴다
 // (GREATEST 는 NULL 을 건너뛴다) — 관계 하나가 두 번 세지지 않게 하고, 모든 시드의
@@ -215,15 +229,16 @@ const graphRelCTE = `graph_rel AS (
 func buildDampedGraphCTEs(kwParam, prefixParam, statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredRangeFilter string) string {
 	return fmt.Sprintf(`,
 		graph_seed AS (
-			SELECT e.id,
+			SELECT c.id,
 			       1.0::float8 / ln(exp(1.0::float8) + m.n) AS w
-			FROM entities e
+			FROM (
+				%s
+			) c
 			CROSS JOIN LATERAL (
 				SELECT count(*) AS n
 				FROM document_entities de
-				WHERE de.entity_id = e.id
+				WHERE de.entity_id = c.id
 			) m
-			WHERE %s
 		),
 		%s,
 		graph AS (
@@ -242,6 +257,6 @@ func buildDampedGraphCTEs(kwParam, prefixParam, statusFilter, sourceFilter, excl
 			GROUP BY er.evidence_document_id, d.occurred_at
 			ORDER BY rank
 			LIMIT $3
-		)`, entityKeywordMatch("e", kwParam, prefixParam), graphRelCTE,
+		)`, entityKeywordSeeds(kwParam, prefixParam), graphRelCTE,
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredRangeFilter)
 }

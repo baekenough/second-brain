@@ -67,8 +67,16 @@ func (s *DocumentStore) GraphSupportCounts(ctx context.Context, query model.Sear
 //
 // 계획 의도: 관계는 evidence_document_id = ANY(후보) 로 idx_entity_relations_evidence
 // 에서 고르고(최대 MaxGraphExpandCandidates 문서), 시드 쪽은 document_entities 의
-// document_id 인덱스(상위 MaxGraphExpandSeedDocs 문서)와 entities 이름 매칭에서만
-// 나온다. documents·임베딩·entity_relations 전체를 훑는 경로가 없다.
+// document_id 인덱스(상위 MaxGraphExpandSeedDocs 문서)와 entities 이름 매칭(최대
+// MaxEntityKeywordSeeds 개)에서만 나온다. documents·임베딩·entity_relations 전체를
+// 훑는 경로가 없다.
+//
+// 시드와의 연결은 from 쪽·to 쪽 등치 조인 두 개를 UNION 으로 합친다(support CTE).
+// 예전 형태 EXISTS (... s.entity_id = er.from_entity_id OR s.entity_id = er.to_entity_id)
+// 는 OR 때문에 해시 조인을 못 써서 시드 수 × 관계 수의 중첩 루프가 됐다(시드 10k 에서
+// 123ms). UNION 은 (관계 id, 근거 문서) 행의 중복을 없애므로 양 끝점이 모두 시드인
+// 관계도 한 번만 센다 — EXISTS 의 "있으면 한 번" 과 같은 의미다. 자기 지지 제외
+// 조건(s.src <> evidence)은 두 조인 조건에 똑같이 들어간다.
 func buildGraphSupportQuery(query model.SearchQuery, seedDocIDs, candidateIDs []uuid.UUID) (string, []interface{}, bool) {
 	if len(seedDocIDs) > MaxGraphExpandSeedDocs {
 		seedDocIDs = seedDocIDs[:MaxGraphExpandSeedDocs]
@@ -94,9 +102,10 @@ func buildGraphSupportQuery(query model.SearchQuery, seedDocIDs, candidateIDs []
 		args = append(args, keywords, entityKeywordPrefixes(keywords))
 		keywordSeed = fmt.Sprintf(`
 			UNION ALL
-			SELECT e.id, NULL::uuid
-			FROM entities e
-			WHERE %s`, entityKeywordMatch("e", kwParam, prefixParam))
+			SELECT k.id, NULL::uuid
+			FROM (
+				%s
+			) k`, entityKeywordSeeds(kwParam, prefixParam))
 	}
 
 	sql := fmt.Sprintf(`
@@ -104,19 +113,27 @@ func buildGraphSupportQuery(query model.SearchQuery, seedDocIDs, candidateIDs []
 			SELECT de.entity_id, de.document_id AS src
 			FROM document_entities de
 			WHERE de.document_id = ANY($1::uuid[])%s
+		),
+		support AS (
+			SELECT er.id, er.evidence_document_id
+			FROM entity_relations er
+			JOIN seed s ON s.entity_id = er.from_entity_id
+			           AND (s.src IS NULL OR s.src <> er.evidence_document_id)
+			WHERE er.evidence_document_id = ANY($2::uuid[])
+			UNION
+			SELECT er.id, er.evidence_document_id
+			FROM entity_relations er
+			JOIN seed s ON s.entity_id = er.to_entity_id
+			           AND (s.src IS NULL OR s.src <> er.evidence_document_id)
+			WHERE er.evidence_document_id = ANY($2::uuid[])
 		)
-		SELECT er.evidence_document_id AS id, COUNT(*) AS n
-		FROM entity_relations er
-		JOIN documents d ON d.id = er.evidence_document_id
-		WHERE er.evidence_document_id = ANY($2::uuid[])
-		  AND EXISTS (
-			SELECT 1 FROM seed s
-			WHERE (s.entity_id = er.from_entity_id OR s.entity_id = er.to_entity_id)
-			  AND (s.src IS NULL OR s.src <> er.evidence_document_id)
-		  )
+		SELECT r.evidence_document_id AS id, COUNT(*) AS n
+		FROM support r
+		JOIN documents d ON d.id = r.evidence_document_id
+		WHERE true
 		%s
-		GROUP BY er.evidence_document_id
-		ORDER BY n DESC, er.evidence_document_id ASC
+		GROUP BY r.evidence_document_id
+		ORDER BY n DESC, r.evidence_document_id ASC
 		LIMIT $3`, keywordSeed, strings.Join(filters, "\n\t\t"))
 	return sql, args, true
 }

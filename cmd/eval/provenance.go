@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime/debug"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/baekenough/second-brain/internal/config"
@@ -70,7 +71,19 @@ func labelFingerprint(pairs []store.EvalPair) string {
 		sort.Strings(b)
 		labels = append(labels, label{p.Query, a, b})
 	}
-	sort.Slice(labels, func(i, j int) bool { return labels[i].Query < labels[j].Query })
+	// 문구가 같은 쌍(상대 기간 질문의 날짜 분리, golden_split.go)은 라벨 내용으로
+	// 순서를 정한다. 문구가 모두 다른 실행에서는 첫 비교에서 끝나므로 기존 해시가
+	// 그대로다.
+	sort.Slice(labels, func(i, j int) bool {
+		a, b := labels[i], labels[j]
+		if a.Query != b.Query {
+			return a.Query < b.Query
+		}
+		if x, y := strings.Join(a.Positive, ","), strings.Join(b.Positive, ","); x != y {
+			return x < y
+		}
+		return strings.Join(a.Negative, ",") < strings.Join(b.Negative, ",")
+	})
 	return digest(labels)
 }
 func runConfiguration(cfg *config.Config, rerank, golden bool, weights model.SearchWeights, hnsw map[string]string) map[string]any {
@@ -417,7 +430,13 @@ func applyPostFusionProfile(profile map[string]any, t model.SearchTuning) {
 // Subset ordering never depends on database row order or query language.
 func deterministicSubset(pairs []store.EvalPair, limit int) []store.EvalPair {
 	copied := append([]store.EvalPair(nil), pairs...)
-	sort.Slice(copied, func(i, j int) bool { return digest(copied[i].Query) < digest(copied[j].Query) })
+	// 문구가 같은 쌍(날짜 분리)은 결정론적인 ID 순으로 둔다.
+	sort.SliceStable(copied, func(i, j int) bool {
+		if di, dj := digest(copied[i].Query), digest(copied[j].Query); di != dj {
+			return di < dj
+		}
+		return copied[i].ID < copied[j].ID
+	})
 	if limit > 0 && limit < len(copied) {
 		copied = copied[:limit]
 	}

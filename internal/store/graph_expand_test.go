@@ -97,7 +97,8 @@ func TestHybridGraphLane_HubDamping(t *testing.T) {
 		for _, frag := range []string{
 			"1.0::float8 / ln(exp(1.0::float8) + m.n) AS w",
 			"CROSS JOIN LATERAL (",
-			"WHERE de.entity_id = e.id",
+			"WHERE de.entity_id = c.id",
+			"LIMIT 64",
 			"e.normalized_name = ANY($",
 		} {
 			if !strings.Contains(seed, frag) {
@@ -209,8 +210,10 @@ func TestGraphSupportQuery_FiltersAndBounds(t *testing.T) {
 	for _, frag := range []string{
 		"WHERE de.document_id = ANY($1::uuid[])",
 		"WHERE er.evidence_document_id = ANY($2::uuid[])",
-		"JOIN documents d ON d.id = er.evidence_document_id",
-		"(s.src IS NULL OR s.src <> er.evidence_document_id)",
+		"JOIN documents d ON d.id = r.evidence_document_id",
+		"JOIN seed s ON s.entity_id = er.from_entity_id\n\t\t\t           AND (s.src IS NULL OR s.src <> er.evidence_document_id)",
+		"JOIN seed s ON s.entity_id = er.to_entity_id\n\t\t\t           AND (s.src IS NULL OR s.src <> er.evidence_document_id)",
+		"\n\t\t\tUNION\n",
 		"UNION ALL",
 		"e.normalized_name = ANY($",
 		"e.normalized_name LIKE ANY($",
@@ -283,5 +286,50 @@ func TestHybridGraphLane_RelationsViaIndexedUnion(t *testing.T) {
 		if i, j := strings.Index(sql, "graph_rel AS ("), strings.Index(sql, "graph AS ("); i < 0 || j < i {
 			t.Errorf("damping=%v: graph_rel 이 graph 앞에 없다", damping)
 		}
+	}
+}
+
+// TestEntityKeywordSeeds_CappedAndOrdered 는 키워드 시드를 고르는 세 곳(엔티티 레인,
+// 그래프 레인 시드, 결과 시드 확장)이 모두 상한·순서가 있는 같은 SELECT 를 쓰는지,
+// 정확 일치가 WHERE 에서 빠지고 ORDER BY 에만 남았는지, OR 형태가 사라졌는지 본다.
+func TestEntityKeywordSeeds_CappedAndOrdered(t *testing.T) {
+	t.Parallel()
+	seedFrag := "WHERE e.normalized_name LIKE ANY($"
+	orderFrag := "::text[])) DESC, char_length(e.normalized_name) ASC, e.id ASC\n\t\t\t\tLIMIT 64"
+
+	q := sparseSnapshotCases()[0].q
+	q.EntityKeywords = []string{"alice", "acme"}
+	q.Tuning.GraphWeight = 0.5
+	for _, damping := range []bool{false, true} {
+		q.Tuning.GraphHubDamping = damping
+		sql, args := buildHybridSearchQuery(q, hybridKeywordWeights(model.DefaultEntityWeight))
+		assertPlaceholdersDense(t, "seeds", sql, args)
+		// 엔티티 레인 1 + graph_seed 1
+		if n := strings.Count(sql, seedFrag); n != 2 {
+			t.Errorf("damping=%v: 시드 SELECT %d개, want 2", damping, n)
+		}
+		if n := strings.Count(sql, orderFrag); n != 2 {
+			t.Errorf("damping=%v: 상한·순서 %d개, want 2", damping, n)
+		}
+		for _, bad := range []string{"OR e.normalized_name LIKE", "JOIN entities e ON e.id = de.entity_id"} {
+			if strings.Contains(sql, bad) {
+				t.Errorf("damping=%v: %q 가 남았다", damping, bad)
+			}
+		}
+		if !strings.Contains(sql, "WHERE de.entity_id IN (") {
+			t.Errorf("damping=%v: 엔티티 레인이 상한 시드로 거르지 않는다", damping)
+		}
+	}
+
+	sql, args, ok := buildGraphSupportQuery(model.SearchQuery{EntityKeywords: []string{"alice"}}, nil, []uuid.UUID{uuid.New()})
+	if !ok {
+		t.Fatal("질의가 없다")
+	}
+	assertPlaceholdersDense(t, "support-seeds", sql, args)
+	if !strings.Contains(sql, seedFrag) || !strings.Contains(sql, orderFrag) {
+		t.Errorf("결과 시드 확장의 키워드 시드가 상한 SELECT 가 아니다\n%s", sql)
+	}
+	if strings.Contains(sql, "OR s.entity_id") {
+		t.Error("지지 질의에 OR 형태 시드 연결이 남았다")
 	}
 }
