@@ -583,6 +583,26 @@ func matchRecentRange(question string, now time.Time) (from, to time.Time, label
 // nine of spec §4.1 plus the past/relative expressions documented on that
 // function) without an LLM call. ok is false when nothing matched.
 func (p *LLMPlanner) deterministicPlan(question string, now time.Time) (QueryPlan, bool) {
+	plan, ok := DeterministicPlan(question, now)
+	if !ok {
+		return QueryPlan{}, false
+	}
+	plan.Limit = p.limit
+	return plan, true
+}
+
+// DeterministicPlan is the LLM-free pre-pass of LLMPlanner.Plan, exported so
+// offline tools (cmd/eval --plan-sources) apply exactly the window AND the
+// source include set production /ask would, instead of re-deriving either with
+// a second copy of the regexes. LLMPlanner.deterministicPlan is a thin wrapper
+// that adds its configured Limit, so the two cannot drift.
+//
+// now should already be normalised to timeutil.KST() (see DeterministicWindow).
+// ok is false when no phrase matched OR when the question is a record/event-time
+// question the fast path refuses; in both cases the caller must not assume any
+// window or source constraint from this function. The returned plan's Limit is
+// zero — it is the caller's to set.
+func DeterministicPlan(question string, now time.Time) (QueryPlan, bool) {
 	from, to, label, ok := DeterministicWindow(question, now)
 	if !ok {
 		return QueryPlan{}, false
@@ -600,12 +620,11 @@ func (p *LLMPlanner) deterministicPlan(question string, now time.Time) (QueryPla
 			return QueryPlan{}, false
 		}
 	}
-	sources := p.deterministicSources(question, from, now)
+	sources := deterministicSources(question, from, now)
 	return QueryPlan{
 		OccurredFrom: &from,
 		OccurredTo:   &to,
 		SourceTypes:  sources,
-		Limit:        p.limit,
 		Reason:       planReason(label, from, to, sources),
 		Origin:       OriginDeterministic,
 	}, true
@@ -615,7 +634,7 @@ func (p *LLMPlanner) deterministicPlan(question string, now time.Time) (QueryPla
 // words such as 일정 or 약속. Complex record/event-time questions never reach
 // this fast path. Otherwise direct calendar topics and future periods select
 // calendar; unknown source intent stays unconstrained.
-func (p *LLMPlanner) deterministicSources(question string, from, now time.Time) []model.SourceType {
+func deterministicSources(question string, from, now time.Time) []model.SourceType {
 	if sources := explicitRecordSources(question); len(sources) > 0 {
 		return sources
 	}

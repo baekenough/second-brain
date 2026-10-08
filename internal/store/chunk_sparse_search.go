@@ -118,7 +118,7 @@ func buildSparseContextQuery(filter model.SearchQuery, limit int, version string
 			  AND sc.fingerprint = ` + chunkSparseFingerprintSQL + `
 			  AND (` + fe.matchTS + ` OR ` + fe.matchLike + `)
 			  AND d.status = 'active' ` + filters + `
-			ORDER BY rank DESC
+			ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 			LIMIT $2
 		),
 		raw AS (
@@ -144,13 +144,13 @@ func buildSparseContextQuery(filter model.SearchQuery, limit int, version string
 			)
 			AND (` + re.matchTS + ` OR ` + re.matchLike + `)
 			AND d.status = 'active' ` + filters + `
-			ORDER BY rank DESC
+			ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 			LIMIT $2
 		)
 		SELECT * FROM fresh
 		UNION ALL
 		SELECT * FROM raw
-		ORDER BY rank DESC`
+		ORDER BY rank DESC, document_occurred_at DESC NULLS LAST, id ASC`
 
 	return q, args
 }

@@ -26,6 +26,13 @@ type EvalPair struct {
 	GoldenQueryID     string `json:"golden_query_id,omitempty"`
 	GoldenQuerySource string `json:"golden_query_source,omitempty"`
 
+	// AskedAt 은 골든 질의 행의 asked_at(마이그레이션 032)이다. 질의 안의 상대
+	// 기간 표현("내일", "지난주")을 어느 시각 기준으로 풀어야 하는지 평가
+	// 도구(cmd/eval --window=plan)가 읽는다. 골든셋에서 뽑은 쌍에만 채워지고
+	// 피드백 기반 쌍에서는 제로값이다. 같은 문구의 행이 여럿으로 합쳐진 쌍에서는
+	// 가장 이른 값이다. API 로는 내보내지 않는다(json:"-").
+	AskedAt time.Time `json:"-"`
+
 	Metadata map[string]any `json:"metadata,omitempty"`
 }
 

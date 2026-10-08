@@ -62,8 +62,8 @@ const (
 	// 비교 불가가 되기 때문이다.
 	windowModeNone = "none"
 	// windowModePlan 은 골든 후보 화면과 같은 결정론적 기간 파서를 적용한다.
-	// 실행 프로필에 window_mode 와 기준 KST 날짜가 추가되므로 none 과는
-	// 자동으로 다른 baseline 계열이 된다.
+	// 실행 프로필에 window_mode 와 기준 출처(window_anchor 또는 기준 KST 날짜)가
+	// 추가되므로 none 과는 자동으로 다른 baseline 계열이 된다.
 	windowModePlan = "plan"
 )
 
@@ -196,6 +196,26 @@ func run() error {
 			"chunk 는 청크 희소 레인에만, chunk_doc 은 문서 fts·bigm 레인까지 internal/sparseq 가 "+
 			"뽑은 키워드(접두 OR tsquery + 키워드별 LIKE)를 쓴다. 리랭커·임베딩·엔티티 레인은 "+
 			"어느 값이든 원문을 받는다. 청크 범위는 --chunk-sparse=fuse|fuse_ctx 와 함께 써야 거의 매번 돈다")
+	entityKeywords := flag.String("entity-keywords", model.EntityKeywordsOff,
+		"엔티티·그래프 레인의 저수준 키워드 추출 방식. 빈 값(기본)은 질문 원문 전체 LIKE 라는 "+
+			"현행 동작이고, sparse 는 internal/sparseq 키워드(LLM 없음), llm 은 LLM 한 번으로 "+
+			"{low_level, high_level} 을 뽑는다(실패하면 sparse 로 폴백). 엔티티 레인이 켜져 있어야 "+
+			"효과가 있다(ENTITY_EXTRACTION_ENABLED=true)")
+	highLevelToSparse := flag.Bool("high-level-keywords-to-sparse", false,
+		"--entity-keywords=llm 의 고수준(주제) 키워드를 희소 레인(fts·bigm) 키워드에 덧붙인다. "+
+			"--sparse-query=chunk|chunk_doc 이 필요하다")
+	graphWeight := flag.Float64("graph-weight", 0,
+		"그래프 1-hop 레인(entity_relations)의 RRF 가중치. 0(기본)이면 레인이 SQL 에 들어가지 않는다. "+
+			"--entity-keywords 가 필요하다")
+	windowAnchor := flag.String("window-anchor", windowAnchorJudgedAt,
+		"--window=plan 에서 상대 기간 표현을 풀 기준 시각. judged_at(기본)은 질의마다 첫 판정 "+
+			"시각을 쓴다 — 후보 화면이 리뷰 시각 기준으로 창을 풀기 때문에 라벨이 붙은 순간의 창을 "+
+			"재현한다. asked_at 은 질의마다 golden_queries.asked_at 을 쓴다. "+
+			"--as-of 를 주면 그 시각 하나를 모든 질의에 쓰고 이 플래그는 같이 쓸 수 없다")
+	planSources := flag.Bool("plan-sources", false,
+		"--window=plan 에서 운영 /ask 의 결정론적 계획(intent.DeterministicPlan)이 만드는 소스 포함 "+
+			"집합을 질의마다 함께 건다(LLM 호출 없음). 결정론적 계획이 거절하는 질의는 창만 걸고 "+
+			"소스는 제약하지 않는다. 별도 baseline 계열이 된다")
 	flag.Parse()
 	if *pairLimit < 0 || (*split != "all" && *split != "train" && *split != "holdout") {
 		return errors.New("invalid eval --split or --limit")
@@ -210,6 +230,19 @@ func run() error {
 	// 실행이 갈라진다. 효력이 없는 조합은 받지 않는다.
 	if *asOf != "" && *windowMode != windowModePlan {
 		return fmt.Errorf("eval: --as-of requires --window=%s", windowModePlan)
+	}
+	anchorExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "window-anchor" {
+			anchorExplicit = true
+		}
+	})
+	if err := validatePlanSources(*windowMode, *planSources); err != nil {
+		return err
+	}
+	anchorKind, err := resolveWindowAnchor(*windowMode, *asOf, *windowAnchor, anchorExplicit)
+	if err != nil {
+		return err
 	}
 	// 노브는 조용히 무시하지 않는다. 오타 하나로 "실험을 켰다고 믿는 실행" 과
 	// "실제로는 기본값으로 돈 실행" 이 갈라지면, 그 결과로 내린 판단이 전부
@@ -227,6 +260,10 @@ func run() error {
 		ChunkSparse:             *chunkSparse,
 		ChunkSparseCtxVersion:   *chunkSparseCtxVersion,
 		SparseQuery:             *sparseQuery,
+
+		EntityKeywordMode:         *entityKeywords,
+		HighLevelKeywordsToSparse: *highLevelToSparse,
+		GraphWeight:               *graphWeight,
 	}
 	if err := validateTuningFlags(tuning); err != nil {
 		return err
@@ -373,10 +410,13 @@ func run() error {
 	profile["entity_vector_enabled"] = entityFlag == "true" || entityFlag == "1" || entityFlag == "yes"
 	// 시간창 설정은 config_hash 에도 들어간다 — applyWindowProfile 참고.
 	windows := windowResolver(nil)
+	var anchors anchorSelector
 	if *windowMode == windowModePlan {
-		windows = planWindowResolver(asOfTime)
+		windows = planWindowResolver
+		anchors = windowAnchorFor(anchorKind, asOfTime)
 	}
-	applyWindowProfile(profile, *windowMode, asOfTime)
+	applyWindowProfile(profile, *windowMode, anchorKind, asOfTime)
+	applyPlanSourcesProfile(profile, *planSources)
 	applyTuningProfile(profile, tuning)
 	revision := currentCodeRevision()
 	configHash := digest(profile)
@@ -427,6 +467,8 @@ func run() error {
 	evaluated := evaluatePairs(ctx, searchSvc, pairs, evalRunOptions{
 		rerank:   *rerank,
 		window:   windows,
+		anchor:   anchors,
+		planSrcs: *planSources,
 		diagnose: *dumpPath != "",
 		tuning:   tuning,
 	})

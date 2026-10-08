@@ -78,6 +78,19 @@ const (
 	// fts·bigm 레인과 임베딩 없는 fulltext 경로에도 키워드를 쓴다. 엔티티
 	// 레인은 어떤 값에서도 바뀌지 않는다(방향 문제는 별도 이슈).
 	SparseQueryChunkDoc = "chunk_doc"
+
+	// EntityKeywordsOff 는 현행 동작이다. 엔티티 레인은 질문 원문 전체를
+	// 소문자로 만들어 normalized_name LIKE '%질문 전체%' 로 맞춘다(실제로는
+	// 문장형 질문에서 거의 맞지 않는다).
+	EntityKeywordsOff = ""
+	// EntityKeywordsSparse 는 internal/sparseq.Extract 가 뽑은 키워드를
+	// 저수준(low-level) 키워드로 써서 엔티티 레인을 normalized_name 정확
+	// 일치·접두 일치로 맞춘다. LLM 호출이 없고 결정론적이다.
+	EntityKeywordsSparse = "sparse"
+	// EntityKeywordsLLM 은 LLM 한 번으로 저수준(고유명사)·고수준(주제)
+	// 키워드를 뽑는다(LightRAG 의 이중 키워드). 어떤 실패든 EntityKeywordsSparse
+	// 결과로 조용히 되돌아간다.
+	EntityKeywordsLLM = "llm"
 )
 
 // 노브 기본값. 제로값이 곧 "현행 동작" 이 되도록 잡았다 — 새 필드가 생겼다는
@@ -152,6 +165,23 @@ type SearchTuning struct {
 	EntityQueryContainsName bool
 	// RerankCallContext는 통화 리랭커 입력에 참여자와 본문 앞부분을 보탠다.
 	RerankCallContext bool
+
+	// EntityKeywordMode 는 EntityKeywordsOff(기본)·EntityKeywordsSparse·
+	// EntityKeywordsLLM 중 하나다. 꺼져 있지 않으면 search.Service 가 질문에서
+	// 저수준 키워드를 뽑아 SearchQuery.EntityKeywords 에 싣고, 엔티티 레인과
+	// 그래프 레인(GraphWeight)이 그 키워드로 엔티티를 찾는다. 키워드가 하나도
+	// 안 나온 질의는 현행 엔티티 레인 SQL 을 그대로 탄다.
+	EntityKeywordMode string
+	// HighLevelKeywordsToSparse 가 true 이면 EntityKeywordsLLM 이 뽑은 고수준
+	// (주제) 키워드를 희소 레인(fts·bigm) 키워드에 덧붙인다. SparseQuery 가
+	// raw 이면 덧붙일 키워드 경로가 없으므로 Normalized 가 false 로 되돌린다.
+	// vec·summvec 레인은 건드리지 않는다.
+	HighLevelKeywordsToSparse bool
+	// GraphWeight 는 그래프 1-hop 레인(entity_relations)의 RRF 가중치다.
+	// 0(기본)이면 레인 자체가 SQL 에 들어가지 않는다. 시드 엔티티는
+	// EntityKeywordMode 의 저수준 키워드로 찾으므로, 모드가 꺼져 있거나
+	// 키워드가 없는 질의에서는 이 값이 있어도 레인이 생기지 않는다.
+	GraphWeight float64
 }
 
 // IsZero 는 노브가 하나도 설정되지 않았는지 — 즉 "현행 동작" 인지 — 알린다.
@@ -203,6 +233,18 @@ func (t SearchTuning) Normalized() SearchTuning {
 	if t.SparseQuery != SparseQueryChunk && t.SparseQuery != SparseQueryChunkDoc {
 		t.SparseQuery = SparseQueryRaw
 	}
+	if t.EntityKeywordMode != EntityKeywordsSparse && t.EntityKeywordMode != EntityKeywordsLLM {
+		t.EntityKeywordMode = EntityKeywordsOff
+	}
+	// 고수준 키워드는 LLM 모드에서만 생기고, 덧붙일 희소 키워드 경로(raw 가
+	// 아닌 SparseQuery)가 있어야 쓰인다. 효과가 없는 조합을 켠 채로 두면
+	// 실행 프로필(config_hash)만 갈라진다.
+	if t.EntityKeywordMode != EntityKeywordsLLM || t.SparseQuery == SparseQueryRaw {
+		t.HighLevelKeywordsToSparse = false
+	}
+	if t.GraphWeight < 0 || isBadFloat(t.GraphWeight) {
+		t.GraphWeight = 0
+	}
 	return t
 }
 
@@ -216,7 +258,7 @@ func (t SearchTuning) Normalized() SearchTuning {
 //
 // 잘못된 값은 경고를 남기고 무시한다 — 오타 하나로 검색이 멈추면 안 된다.
 func EnvSearchTuning() SearchTuning {
-	return SearchTuning{
+	t := SearchTuning{
 		EntityQueryContainsName: envTuningChoice("SEARCH_ENTITY_QUERY_CONTAINS_NAME", "false", "true") == "true",
 		RerankCallContext:       envTuningChoice("SEARCH_RERANK_CALL_CONTEXT", "false", "true") == "true",
 		RerankOverfetch:         envTuningInt("SEARCH_RERANK_OVERFETCH"),
@@ -229,7 +271,20 @@ func EnvSearchTuning() SearchTuning {
 		ChunkSparse:             envTuningChoice("SEARCH_CHUNK_SPARSE", ChunkSparseFallback, ChunkSparseFuse, ChunkSparseFuseCtx),
 		ChunkSparseCtxVersion:   envChunkSparseCtxVersion(),
 		SparseQuery:             envTuningChoice("SEARCH_SPARSE_QUERY", SparseQueryRaw, SparseQueryChunk, SparseQueryChunkDoc),
-	}.Normalized()
+
+		EntityKeywordMode:         envTuningChoice("SEARCH_ENTITY_KEYWORDS", EntityKeywordsOff, EntityKeywordsSparse, EntityKeywordsLLM),
+		HighLevelKeywordsToSparse: envTuningChoice("SEARCH_HIGH_LEVEL_KEYWORDS_TO_SPARSE", "false", "true") == "true",
+		GraphWeight:               envTuningFloat("SEARCH_GRAPH_WEIGHT"),
+	}
+	n := t.Normalized()
+	if t.HighLevelKeywordsToSparse && !n.HighLevelKeywordsToSparse {
+		slog.Warn("search tuning: SEARCH_HIGH_LEVEL_KEYWORDS_TO_SPARSE has no effect, ignoring",
+			"requires", "SEARCH_ENTITY_KEYWORDS=llm and SEARCH_SPARSE_QUERY=chunk|chunk_doc")
+	}
+	if n.GraphWeight > 0 && n.EntityKeywordMode == EntityKeywordsOff {
+		slog.Warn("search tuning: SEARCH_GRAPH_WEIGHT needs SEARCH_ENTITY_KEYWORDS, graph lane will stay empty")
+	}
+	return n
 }
 
 func envTuningInt(key string) int {

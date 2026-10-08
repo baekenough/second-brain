@@ -81,21 +81,74 @@ different candidate pools.
 
 `--window=plan` applies the same deterministic parser
 (`intent.DeterministicWindow`, no LLM call) and passes the resolved
-`[from, to)` to `OccurredFrom`/`OccurredTo`. `--as-of=<RFC3339>` anchors the
-resolution; it defaults to the run time and is rejected without
-`--window=plan`. Questions with no period phrase stay unwindowed. Only the
-window is reproduced: the screen's relevance/recency two-stream merge and its
-`IncludeRetention` opt-out are not, because the first is review ergonomics
-rather than ranking and the second would measure a wider corpus than `/ask`
-retrieves from.
+`[from, to)` to `OccurredFrom`/`OccurredTo`. Questions with no period phrase stay
+unwindowed. Only the window is reproduced: the screen's relevance/recency
+two-stream merge and its `IncludeRetention` opt-out are not, because the first
+is review ergonomics rather than ranking and the second would measure a wider
+corpus than `/ask` retrieves from.
 
-`--window=plan` adds `window_mode`, `window_resolver` and `window_as_of_kst_date`
-to the config hash and is therefore a separate baseline family; do not report a
-plan-mode score as an improvement over a `none`-mode baseline. The as-of anchor
-enters the hash as a KST calendar date because every branch of the parser lands
-on KST day boundaries, so two runs on the same day are comparable and two runs
-on different days are not. `--window=none` adds no keys at all, leaving existing
-baselines comparable.
+### Anchor: which "now" a relative phrase means
+
+"내일", "이번 주", "지난달" mean nothing without a reference instant. Golden
+questions were asked and judged weeks before the run, so resolving all of them
+against one global anchor (the run time) puts the labeled documents outside the
+window for every relative phrase, and those queries score 0 regardless of
+retrieval quality. The anchor is therefore chosen **per query**:
+
+| Selection | Anchor per query | Notes |
+|---|---|---|
+| `--window=plan` (default, `--window-anchor=judged_at`) | the query's first judgment time (`MIN(judged_at)`), in KST | Reproduces the window the review screen resolved. See below. Pairs without a judgment time fall back to the run time. |
+| `--window-anchor=asked_at` | `golden_queries.asked_at` (migration 032), in KST | Semantically the phrase's intended meaning; feedback-derived pairs have no `asked_at` and fall back to their label time. |
+| `--as-of=<RFC3339>` | that single instant for every query | Explicit global override. Cannot be combined with `--window-anchor`. |
+
+Both `--as-of` and `--window-anchor` are rejected without `--window=plan`.
+
+**Which anchor were the labels judged under?** The review screen
+(`goldenResolveWindow` in `internal/api/golden.go`) anchors at *review time*,
+`s.nowFunc()` of the request, deliberately **not** at `asked_at` (its doc comment
+explains that anchoring at `asked_at` surfaced stale candidates). So the window
+a reviewer actually saw is the one resolved at judgment time. `asked_at` equals
+that only when a question was judged shortly after it was asked; for a question
+asked on one day and judged weeks later the two differ. `judged_at` is the
+faithful replay of the screen and is the default; `asked_at` is the semantically
+intended meaning of the phrase. Measured on the golden set, `judged_at` scored
+ndcg@10 0.640 against 0.550 for `asked_at` (baseline run, same labels);
+`window_applied` and `window_anchor_date` in the dump show every miss.
+
+### Source include set (`--plan-sources`)
+
+`--window=plan` alone reproduces only the window. Production `/ask` also applies
+the source include set of the deterministic plan (`intent.DeterministicPlan`,
+shared with `LLMPlanner`): an explicit record word (메일/문자/통화/슬랙/노션/노트)
+selects that source, a calendar keyword (일정/스케줄/캘린더/약속) or a window that
+starts after the anchor's today selects `calendar` only. Without it, calendar
+questions compete with sms/call documents for the 20-slot candidate pool and
+miss in-window calendar documents.
+
+`--plan-sources` (requires `--window=plan`, default off) applies that set per
+query, using the same per-query anchor as the window. No LLM is called. When the
+deterministic plan declines a question (e.g. a record question that also names a
+calendar topic, such as "내일 일정에 관한 메일") or the question has no period
+phrase, the query keeps today's behaviour: the window from
+`DeterministicWindow` alone and no source constraint. Enabling it adds
+`plan_sources: true` to the config hash (a separate baseline family; the key is
+absent when off), and each dump row carries `plan_sources` — the include set that
+was actually applied (omitted when none).
+
+### Config hash
+
+`--window=plan` adds `window_mode` and `window_resolver`, plus the anchor:
+
+- `--as-of`: `window_as_of_kst_date` only, exactly as before this change, so
+  existing `--as-of` baselines keep matching. The date enters the hash as a KST
+  calendar date because every parser branch lands on KST day boundaries.
+- `judged_at` / `asked_at`: `window_anchor` (`judged_at` or `asked_at`) and **no**
+  date, because the anchors come from the labels, not the run date; the same
+  labels give the same series on any day.
+
+Each anchor mode is its own baseline family, and all of them differ from `none`:
+do not report a plan-mode score as an improvement over a `none`-mode baseline.
+`--window=none` adds no keys at all, leaving existing baselines comparable.
 
 ## Per-query diagnostics (`--dump`)
 
@@ -105,7 +158,10 @@ retrieved (`in_overfetch_pool` false), retrieved but below the page
 (`in_overfetch_pool` true, `final_rank` null), or demoted by reranking
 (`pre_rerank_rank` above `final_rank`). `lanes_hit` names the lanes that
 surfaced it (`document_store`, `chunk_vector`, `opensearch`, `chunk_fts`).
-Rows are written for failed searches too.
+Rows are written for failed searches too. With `--window=plan` every row also
+carries `window_anchor_date` (KST date, `YYYY-MM-DD`) — the anchor the query's
+relative phrase was resolved against — so a `window_applied` that excludes the
+label can be audited without the question text.
 
 The file carries **no question text, document title or body**. Queries are
 identified by `golden_queries.id`, or by a `sha256:` prefix of the question for
@@ -245,11 +301,60 @@ the matching `cmd/eval` flag.
 | `SEARCH_CHUNK_SPARSE` | `--chunk-sparse=fallback\|fuse\|fuse_ctx` | `fallback` | 청크 FTS/bigm 레인을 RRF 융합에 상시 참여시킨다(#270). 자세한 내용은 `docs/chunk-sparse-context.md`. |
 | `SEARCH_SPARSE_QUERY` | `--sparse-query=raw\|chunk\|chunk_doc` | `raw` | 희소 레인이 질문 원문 대신 `internal/sparseq` 추출 키워드를 쓴다(#276). 아래 절 참고. |
 | `SEARCH_ENTITY_QUERY_CONTAINS_NAME` | `--entity-query-contains-name` | `false` | 두 글자 이상 엔티티 이름이 질의에 포함되는지 찾는다. 엔티티 레인의 기존 활성화 조건·필터는 그대로 적용한다. |
+| `SEARCH_ENTITY_KEYWORDS` | `--entity-keywords=sparse\|llm` | off (빈 값) | 엔티티 레인이 질문 원문 대신 질문에서 뽑은 저수준 키워드로 엔티티를 찾는다(LightRAG 이중 키워드). 아래 절 참고. |
+| `SEARCH_HIGH_LEVEL_KEYWORDS_TO_SPARSE` | `--high-level-keywords-to-sparse` | `false` | `llm` 모드의 고수준(주제) 키워드를 희소 레인(fts·bigm) 키워드에 덧붙인다. `SEARCH_SPARSE_QUERY=chunk\|chunk_doc` 필요. |
+| `SEARCH_GRAPH_WEIGHT` | `--graph-weight=W` | `0` (off) | 여섯 번째 RRF 레인: 키워드로 찾은 엔티티와 `entity_relations` 로 1-hop 이웃인 근거 문서. `SEARCH_ENTITY_KEYWORDS` 필요. |
 | `SEARCH_RERANK_CALL_CONTEXT` | `--rerank-call-context` | `false` | 통화 리랭커 입력에 `contact_name`을 추가한다. `best_chunk`의 문서 결과에는 본문 앞 250자도 보탠다. 청크 결과는 참여자만 추가하며 전체 1,000자 예산을 유지한다. |
 
 Only non-default knob values are written into the config-hash profile, so a run
 with every knob at its default keeps matching existing baselines, while any
 enabled knob establishes a separate baseline exactly like `--window=plan`.
+
+### 엔티티 이중 키워드와 그래프 1-hop 레인 (`--entity-keywords`, `--graph-weight`)
+
+LightRAG 의 두 아이디어를 Postgres 안에서 실험 노브로 옮긴 것이다. 기본은 모두
+꺼져 있고, 꺼진 상태의 SQL·인자는 바이트 단위로 기존과 같다
+(`internal/store/testdata/sparse_query_raw.golden` 가 고정).
+
+- **저수준 키워드**: 현행 엔티티 레인은 `normalized_name LIKE '%질문 전체%'` 라
+  문장형 질문에서는 거의 맞지 않는다. `--entity-keywords=sparse` 는
+  `internal/sparseq.Extract` 키워드를, `llm` 은 LLM 한 번으로 뽑은
+  `{"low_level": 고유명사, "high_level": 주제}` 의 low_level 을 쓴다. 키워드는
+  소문자·trim·중복 제거·2~40자·최대 8개로 정규화하고(`store.NormalizeEntityKeywords`),
+  `normalized_name = ANY(키워드)` 또는 `LIKE ANY(키워드%)`(LIKE 메타문자 이스케이프)로
+  맞춘다. 문서 순위는 맞은 서로 다른 엔티티 수 내림차순, 문서 id 오름차순이다.
+- **LLM 폴백**: LLM 이 없거나(`llm.Completer` 비활성)·8초 안에 못 답하거나·JSON 이
+  깨졌거나·고유명사가 하나도 없으면 sparse 키워드로 되돌아간다. 검색은 실패하지
+  않는다. 키워드 내용·LLM 응답은 로그에 남기지 않고 개수와 실패 사유(고정 문자열)만
+  남긴다.
+- **고수준 키워드**: `--high-level-keywords-to-sparse` 는 `llm` 모드의 high_level 을
+  `sparseq.Extract` 로 다시 풀어 희소 레인(fts·bigm) 키워드 뒤에 붙인다(질문에서 직접
+  뽑은 키워드가 먼저, 전체 `sparseq.MaxTerms` 안에서 남는 자리만). vec·summvec 레인은
+  건드리지 않는다.
+- **그래프 레인**: `--graph-weight>0` 이면 저수준 키워드로 찾은 엔티티를 시드로,
+  `entity_relations` 의 from/to 가 시드인 관계의 `evidence_document_id` 를
+  `SUM(confidence)` 내림차순으로 순위 매긴 레인이 RRF 에 합류한다. 상태·소스 포함/제외·
+  retention·occurred 필터는 엔티티 레인과 똑같이 레인 안에서 `d.` 한정형으로 건다.
+  키워드가 없는 질의는 레인이 생기지 않는다. 엔티티 레인(`EntityWeight`)과 독립이다.
+- 키워드가 하나도 안 나온 질의의 엔티티 레인은 현행 SQL 을 그대로 탄다.
+- 엔티티 레인 자체가 켜져 있어야(`ENTITY_EXTRACTION_ENABLED=true` 또는 명시 가중치)
+  `--entity-keywords` 가 엔티티 레인에 효과가 있다. 이 환경변수는 실행 프로필에 들어가지
+  않으므로 baseline 과 후보를 같은 환경에서 돌려야 한다.
+- 프로필에는 `entity_keyword_mode`, `llm` 이면 `entity_keyword_prompt_version`
+  (`search.EntityKeywordPromptVersion`), 켠 경우 `high_level_keywords_to_sparse`,
+  `graph_weight`, `sparse_terms_version` 이 들어간다. LLM 모델 이름은 들어가지 않는다.
+  LLM 출력은 비결정적일 수 있어 `llm` 실행은 반복해 편차를 확인한다.
+
+```sh
+# baseline(노브 off) 대 후보. 두 실행 모두 같은 ENTITY_EXTRACTION_ENABLED 환경에서 돌린다.
+export ENTITY_EXTRACTION_ENABLED=true
+go run ./cmd/eval --golden --no-persist --window=plan --dump=/tmp/base.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --entity-keywords=sparse --dump=/tmp/kw-sparse.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --entity-keywords=sparse --graph-weight=0.5 --dump=/tmp/kw-sparse-graph.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --entity-keywords=llm --graph-weight=0.5 --dump=/tmp/kw-llm-graph.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --sparse-query=chunk_doc --entity-keywords=llm --high-level-keywords-to-sparse --graph-weight=0.5 --dump=/tmp/kw-llm-full.jsonl
+go run ./cmd/evalcompare --baseline=/tmp/base.jsonl --candidate=/tmp/kw-sparse.jsonl
+```
 
 ### 희소 레인 질의 키워드 (`--sparse-query`, #276)
 

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/baekenough/second-brain/internal/config"
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/sparseq"
 	"github.com/baekenough/second-brain/internal/store"
 	"github.com/baekenough/second-brain/internal/timeutil"
@@ -85,6 +87,66 @@ func runConfiguration(cfg *config.Config, rerank, golden bool, weights model.Sea
 	}
 }
 
+// 상대 기간 표현을 풀 기준 시각의 출처. --window=plan 에서만 의미가 있다.
+const (
+	// windowAnchorAsOf 는 --as-of(또는 생략 시 실행 시각) 하나를 모든 질의에
+	// 공통으로 쓰는 방식이다. --as-of 를 명시했을 때만 선택된다.
+	windowAnchorAsOf = "as_of"
+	// windowAnchorAskedAt 은 질의마다 golden_queries.asked_at(마이그레이션 032)을
+	// 쓴다. --window=plan 의 기본값이다.
+	windowAnchorAskedAt = "asked_at"
+	// windowAnchorJudgedAt 은 질의마다 그 질의의 첫 판정 시각을 쓴다. 후보
+	// 화면(goldenResolveWindow)이 리뷰 시각을 기준으로 창을 풀기 때문에, 라벨이
+	// 붙은 순간의 창을 그대로 재현한다.
+	windowAnchorJudgedAt = "judged_at"
+)
+
+// resolveWindowAnchor 는 플래그 조합에서 기준 시각의 출처를 정한다. 시간창 모드가
+// plan 이 아니면 빈 문자열이다. --as-of 가 있으면 항상 그쪽이 이기며(명시적
+// 전역 덮어쓰기), 이때 --window-anchor 를 같이 주면 어느 쪽을 믿어야 할지
+// 모호하므로 거부한다.
+func resolveWindowAnchor(mode, asOfFlag, anchorFlag string, anchorExplicit bool) (string, error) {
+	switch anchorFlag {
+	case windowAnchorAskedAt, windowAnchorJudgedAt:
+	default:
+		return "", fmt.Errorf("eval: invalid --window-anchor %q (want %q or %q)",
+			anchorFlag, windowAnchorAskedAt, windowAnchorJudgedAt)
+	}
+	if mode != windowModePlan {
+		if anchorExplicit {
+			return "", fmt.Errorf("eval: --window-anchor requires --window=%s", windowModePlan)
+		}
+		return "", nil
+	}
+	if asOfFlag != "" {
+		if anchorExplicit {
+			return "", errors.New("eval: --as-of already pins one anchor for every query; drop --window-anchor")
+		}
+		return windowAnchorAsOf, nil
+	}
+	return anchorFlag, nil
+}
+
+// windowAnchorFor 는 평가 쌍별 기준 시각을 고르는 함수를 만든다. 기준 시각이
+// 없는 쌍(피드백 기반 쌍은 asked_at 이 없다)은 CreatedAt, 그것도 없으면
+// asOf 로 내려간다.
+func windowAnchorFor(kind string, asOf time.Time) anchorSelector {
+	return func(p store.EvalPair) time.Time {
+		switch kind {
+		case windowAnchorAsOf:
+			return asOf
+		case windowAnchorAskedAt:
+			if !p.AskedAt.IsZero() {
+				return p.AskedAt
+			}
+		}
+		if !p.CreatedAt.IsZero() {
+			return p.CreatedAt
+		}
+		return asOf
+	}
+}
+
 // applyWindowProfile 은 시간창 설정을 실행 프로필(= config_hash 의 입력)에
 // 반영한다. 시간창은 "어떤 후보가 검색에 들어오는가" 를 바꾸므로 설정
 // 정체성의 일부이며, plan 실행 점수를 none 실행 baseline 과 나란히 놓으면
@@ -94,17 +156,46 @@ func runConfiguration(cfg *config.Config, rerank, golden bool, weights model.Sea
 // 지금까지 쌓인 baseline 이 전부 해시 불일치로 비교 불가가 되는데, 검색
 // 동작은 하나도 바뀌지 않았으므로 그 대가를 치를 이유가 없다.
 //
-// 기준 시각은 KST 달력 날짜까지만 넣는다. 결정론적 파서의 모든 분기가 KST
+// 기준 출처가 as_of(--as-of 명시)이면 예전과 같은 키 집합을 쓴다 — 이미 쌓인
+// --as-of baseline 의 해시를 지키기 위해 window_anchor 키를 넣지 않는다.
+// 이때 기준 시각은 KST 달력 날짜까지만 넣는다. 결정론적 파서의 모든 분기가 KST
 // 하루 경계로 떨어지므로(internal/intent 의 dayRange/weekRange/monthRange)
 // 같은 날 실행한 두 번은 정확히 같은 시간창을 만든다. 초 단위까지 넣으면
 // 매 실행이 고유해져 baseline 이 영영 맞지 않는다.
-func applyWindowProfile(profile map[string]any, mode string, asOf time.Time) {
+//
+// asked_at/judged_at 은 질의마다 기준이 라벨 데이터에서 나오므로 실행 날짜가
+// 결과에 영향을 주지 않는다. 그래서 날짜 키를 넣지 않고 window_anchor 만
+// 남겨, 같은 라벨이면 언제 돌려도 같은 baseline 계열이 되게 한다.
+func applyWindowProfile(profile map[string]any, mode, anchor string, asOf time.Time) {
 	if mode != windowModePlan {
 		return
 	}
 	profile["window_mode"] = windowModePlan
 	profile["window_resolver"] = "intent.DeterministicWindow"
-	profile["window_as_of_kst_date"] = asOf.In(timeutil.KST()).Format(time.DateOnly)
+	if anchor == windowAnchorAsOf {
+		profile["window_as_of_kst_date"] = asOf.In(timeutil.KST()).Format(time.DateOnly)
+		return
+	}
+	profile["window_anchor"] = anchor
+}
+
+// validatePlanSources 는 --plan-sources 가 시간창 없이 켜지는 것을 막는다. 소스
+// 집합은 결정론적 계획이 창과 함께 만드는 것이라, 창이 없는 실행에서는 조용히
+// 아무 일도 하지 않는다.
+func validatePlanSources(mode string, on bool) error {
+	if on && mode != windowModePlan {
+		return fmt.Errorf("eval: --plan-sources requires --window=%s", windowModePlan)
+	}
+	return nil
+}
+
+// applyPlanSourcesProfile 은 --plan-sources 를 켠 실행만 프로필에 표시한다. 소스
+// 집합은 intent 패키지의 정규식·키워드 목록에서 나오므로 켠 실행은 별도
+// baseline 계열이 되고, 끈 실행은 키를 넣지 않아 기존 baseline 을 지킨다.
+func applyPlanSourcesProfile(profile map[string]any, on bool) {
+	if on {
+		profile["plan_sources"] = true
+	}
 }
 
 // validateTuningFlags 는 노브 플래그를 검사한다. 잘못된 값은 조용히 기본값으로
@@ -148,6 +239,25 @@ func validateTuningFlags(t model.SearchTuning) error {
 	if t.SparseQuery != model.SparseQueryRaw && t.SparseQuery != model.SparseQueryChunk && t.SparseQuery != model.SparseQueryChunkDoc {
 		return fmt.Errorf("eval: invalid --sparse-query %q (want %q, %q or %q)",
 			t.SparseQuery, model.SparseQueryRaw, model.SparseQueryChunk, model.SparseQueryChunkDoc)
+	}
+	switch t.EntityKeywordMode {
+	case model.EntityKeywordsOff, model.EntityKeywordsSparse, model.EntityKeywordsLLM:
+	default:
+		return fmt.Errorf("eval: invalid --entity-keywords %q (want \"\", %q or %q)",
+			t.EntityKeywordMode, model.EntityKeywordsSparse, model.EntityKeywordsLLM)
+	}
+	if t.GraphWeight < 0 || math.IsNaN(t.GraphWeight) || math.IsInf(t.GraphWeight, 0) {
+		return fmt.Errorf("eval: --graph-weight must be >= 0, got %v", t.GraphWeight)
+	}
+	// 효과가 없는 조합은 거부한다. 조용히 무시하면 "그래프 레인을 켰다고 믿는
+	// 실행" 이 실제로는 레인 없이 돌아, 그 점수가 기본 baseline 과 같은데도
+	// 별도 계열로 기록된다.
+	if t.GraphWeight > 0 && t.EntityKeywordMode == model.EntityKeywordsOff {
+		return errors.New("eval: --graph-weight needs --entity-keywords=sparse|llm (the graph lane is seeded by the keywords)")
+	}
+	if t.HighLevelKeywordsToSparse &&
+		(t.EntityKeywordMode != model.EntityKeywordsLLM || t.SparseQuery == model.SparseQueryRaw) {
+		return errors.New("eval: --high-level-keywords-to-sparse needs --entity-keywords=llm and --sparse-query=chunk|chunk_doc")
 	}
 	return nil
 }
@@ -203,6 +313,23 @@ func applyTuningProfile(profile map[string]any, t model.SearchTuning) {
 		// 쓰이지 않으므로 넣지 않는다.
 		profile["sparse_query"] = t.SparseQuery
 		profile["sparse_terms_version"] = sparseq.Version
+	}
+	if t.EntityKeywordMode != model.EntityKeywordsOff {
+		// 두 모드 모두 sparseq 어휘로 키워드를 뽑는다(llm 은 폴백과 고수준
+		// 키워드 재분석에 쓴다). llm 은 프롬프트 판도 함께 남겨, 프롬프트가
+		// 다른 실행이 같은 계열로 섞이지 않게 한다. LLM 모델 자체는 이 프로필에
+		// 없다 — 모델을 바꿔 비교하려면 별도 baseline 이름을 쓴다.
+		profile["entity_keyword_mode"] = t.EntityKeywordMode
+		profile["sparse_terms_version"] = sparseq.Version
+		if t.EntityKeywordMode == model.EntityKeywordsLLM {
+			profile["entity_keyword_prompt_version"] = search.EntityKeywordPromptVersion
+		}
+		if t.HighLevelKeywordsToSparse {
+			profile["high_level_keywords_to_sparse"] = true
+		}
+	}
+	if t.GraphWeight > 0 && t.EntityKeywordMode != model.EntityKeywordsOff {
+		profile["graph_weight"] = t.GraphWeight
 	}
 }
 

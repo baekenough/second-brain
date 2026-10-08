@@ -24,12 +24,16 @@ type tracedSearcher interface {
 	SearchTraced(context.Context, model.SearchQuery) ([]*model.SearchResult, *search.SearchTrace, error)
 }
 
-// windowResolver 는 질의 문구에서 사건 시각 창 [from, to) 를 뽑는다.
+// windowResolver 는 질의 문구에서 사건 시각 창 [from, to) 를 뽑는다. anchor 는
+// "내일"·"이번 주" 같은 상대 기간 표현을 풀 기준 시각이며 질의마다 다를 수 있다.
 // ok=false 는 "기간 표현이 없다"는 뜻이며, 그 질의는 시간창 없이 검색한다.
-type windowResolver func(query string) (from, to time.Time, ok bool)
+type windowResolver func(query string, anchor time.Time) (from, to time.Time, ok bool)
+
+// anchorSelector 는 평가 쌍 하나가 시간창을 풀 때 쓸 기준 시각을 고른다.
+type anchorSelector func(pair store.EvalPair) time.Time
 
 // planWindowResolver 는 골든 후보 화면(internal/api/golden.go 의
-// goldenResolveWindow)이 쓰는 것과 동일한 결정론적 기간 파서를 asOf 기준으로
+// goldenResolveWindow)이 쓰는 것과 동일한 결정론적 기간 파서를 anchor 기준으로
 // 적용한다. LLM 은 호출하지 않는다 — 평가가 모델 응답에 따라 흔들리면 같은
 // 라벨로 같은 점수가 두 번 나오지 않는다.
 //
@@ -37,11 +41,30 @@ type windowResolver func(query string) (from, to time.Time, ok bool)
 // 관련도/최신순 두 스트림 병합과 IncludeRetention 은 재현하지 않는다. 전자는
 // 검색 순위가 아니라 검토 편의를 위한 화면 구성이고, 후자는 운영 /ask 가 쓰지
 // 않는 설정이라 여기서 켜면 운영보다 넓은 코퍼스를 재는 셈이 된다.
-func planWindowResolver(asOf time.Time) windowResolver {
-	return func(query string) (time.Time, time.Time, bool) {
-		from, to, _, ok := intent.DeterministicWindow(query, asOf.In(timeutil.KST()))
-		return from, to, ok
+func planWindowResolver(query string, anchor time.Time) (time.Time, time.Time, bool) {
+	from, to, _, ok := intent.DeterministicWindow(query, anchor.In(timeutil.KST()))
+	return from, to, ok
+}
+
+// deterministicPlanSources 는 운영 /ask 의 결정론적 계획이 이 질문에 만드는 소스
+// 포함 집합을 query 에 건다. intent.DeterministicPlan 은 LLMPlanner 의 LLM 없는
+// 선처리와 같은 구현이라 명시 기록 단어는 그 소스로, 일정 키워드나 미래 창은
+// 캘린더로 좁힌다. 계획이 거절하면(ok=false) 아무것도 바꾸지 않는다 — 창은
+// 호출자가 DeterministicWindow 로 이미 걸었다. 건 집합을 이름으로 돌려준다.
+//
+// 계획이 돌려주는 창은 DeterministicWindow 와 같은 호출이므로 여기서 다시 걸지
+// 않는다. 기준 시각은 창을 풀 때 쓴 anchor 와 같아야 미래 창 판정이 일치한다.
+func deterministicPlanSources(query *model.SearchQuery, anchor time.Time) []string {
+	plan, ok := intent.DeterministicPlan(query.Query, anchor.In(timeutil.KST()))
+	if !ok || len(plan.SourceTypes) == 0 {
+		return nil
 	}
+	query.SourceTypes = append([]model.SourceType(nil), plan.SourceTypes...)
+	names := make([]string, len(plan.SourceTypes))
+	for i, st := range plan.SourceTypes {
+		names[i] = string(st)
+	}
+	return names
 }
 
 // evalRunOptions 는 한 번의 평가 실행 설정이다.
@@ -49,6 +72,12 @@ type evalRunOptions struct {
 	rerank bool
 	// window 가 nil 이면 시간창 없이 전체 코퍼스에서 검색한다(기존 동작).
 	window windowResolver
+	// anchor 는 window 가 있을 때 질의별 기준 시각을 고른다. nil 이면 질의마다
+	// 현재 시각(time.Now)을 쓴다 — 실행 중 값이 바뀌지 않도록 main 은 항상 채운다.
+	anchor anchorSelector
+	// planSrcs 가 true 면 window 가 있는 실행에서 질의마다 결정론적 계획의 소스
+	// 포함 집합도 건다(--plan-sources). 계획이 거절하면 창만 걸고 소스는 비운다.
+	planSrcs bool
 	// diagnose 가 true 면 질의별 진단 행을 모은다(--dump).
 	diagnose bool
 	// tuning 은 검색 튜닝 노브다. 제로값이면 서비스 기본값(= 환경변수)을
@@ -91,10 +120,22 @@ func evaluatePairs(ctx context.Context, svc evalSearcher, pairs []store.EvalPair
 		group.Go(func() error {
 			query := model.SearchQuery{Query: p.Query, Limit: 10, UseRerank: opts.rerank, Tuning: opts.tuning}
 			var applied *dumpWindow
+			var anchorDate string
+			var planSources []string
 			if opts.window != nil {
-				if from, to, ok := opts.window(p.Query); ok {
+				anchor := time.Now()
+				if opts.anchor != nil {
+					anchor = opts.anchor(p)
+				}
+				// 날짜(KST)만 덤프에 남긴다 — 시각까지 넣으면 감사에는 필요 없는
+				// 정밀도로 실행마다 달라진다.
+				anchorDate = anchor.In(timeutil.KST()).Format(time.DateOnly)
+				if from, to, ok := opts.window(p.Query, anchor); ok {
 					query.OccurredFrom, query.OccurredTo = &from, &to
 					applied = &dumpWindow{From: from.Format(time.RFC3339), To: to.Format(time.RFC3339)}
+				}
+				if opts.planSrcs {
+					planSources = deterministicPlanSources(&query, anchor)
 				}
 			}
 
@@ -117,6 +158,8 @@ func evaluatePairs(ctx context.Context, svc evalSearcher, pairs []store.EvalPair
 			}
 			if opts.diagnose {
 				diagnostics[i] = buildDiagnostics(p, applied, rows, trace, failed[i], negative[i])
+				diagnostics[i].WindowAnchorDate = anchorDate
+				diagnostics[i].PlanSources = planSources
 			}
 			return nil
 		})

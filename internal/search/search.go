@@ -3,6 +3,7 @@
 package search
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -747,7 +748,16 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 	// 키워드를 싣는다. q.Query 자체는 바꾸지 않으므로 임베딩·리랭커·엔티티
 	// 레인·OpenSearch 는 어느 값에서든 질문 원문을 받는다.
 	q.SparseTerms = model.SparseTerms{}
-	sparseTerms := sparseTermsFor(ctx, q.Query, tune)
+
+	// 엔티티·그래프 레인용 이중 키워드(EntityKeywordMode, LightRAG). 호출자가
+	// 넣은 EntityKeywords 는 먼저 버리고, 노브가 켜졌을 때만 추출 결과를 싣는다.
+	// 꺼져 있으면 kw 는 비어 있어 저장소는 현행 엔티티 레인 SQL 을 그대로 탄다.
+	// 추출은 어떤 실패에도 에러를 내지 않는다(LLM 실패 → sparse 키워드).
+	q.EntityKeywords = nil
+	kw := s.queryKeywordsFor(ctx, q.Query, tune)
+	q.EntityKeywords = kw.Low
+
+	sparseTerms := sparseTermsWithHighLevel(ctx, q.Query, kw.High, tune)
 	chunkSparseQ := q
 	chunkSparseQ.SparseTerms = sparseTerms
 
@@ -1429,16 +1439,37 @@ func chunkToSearchResult(r store.ChunkSearchResult) *model.SearchResult {
 	}
 }
 
-// sortByScore sorts results in-place by Score descending.
+// sortByScore sorts results in-place by a TOTAL order: Score descending, then
+// the event time newest first (a result with no occurred_at goes last among
+// equal scores), then ID ascending.
+//
+// It must be total rather than merely stable. Most callers build their input by
+// flattening a map (chunk-lane per-document aggregation, OpenSearch hit
+// de-duplication), so an order left to the input would differ run to run, and
+// equal scores are common — short, near-identical SMS get identical lane
+// scores. The tie-break mirrors the store's lane ORDER BYs (relevance, then
+// occurred_at DESC NULLS LAST, then id) so a result's position does not depend
+// on which layer happened to settle the tie. NaN scores sort last instead of
+// breaking the comparison's transitivity.
 func sortByScore(results []*model.SearchResult) {
-	// Insertion sort is fine for small slices (< 20 results).
-	for i := 1; i < len(results); i++ {
-		key := results[i]
-		j := i - 1
-		for j >= 0 && results[j].Score < key.Score {
-			results[j+1] = results[j]
-			j--
-		}
-		results[j+1] = key
+	sort.SliceStable(results, func(i, j int) bool { return resultBefore(results[i], results[j]) })
+}
+
+// resultBefore is sortByScore's comparison: true when a must precede b.
+func resultBefore(a, b *model.SearchResult) bool {
+	as, bs := a.Score, b.Score
+	aNaN, bNaN := math.IsNaN(as), math.IsNaN(bs)
+	switch {
+	case aNaN != bNaN:
+		return bNaN
+	case !aNaN && as != bs:
+		return as > bs
 	}
+	switch {
+	case (a.OccurredAt == nil) != (b.OccurredAt == nil):
+		return a.OccurredAt != nil
+	case a.OccurredAt != nil && !a.OccurredAt.Equal(*b.OccurredAt):
+		return a.OccurredAt.After(*b.OccurredAt)
+	}
+	return bytes.Compare(a.ID[:], b.ID[:]) < 0
 }

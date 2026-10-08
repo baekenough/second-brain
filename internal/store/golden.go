@@ -571,7 +571,8 @@ func (s *GoldenStore) ExportEvalPairs(ctx context.Context, judge string) ([]Eval
 		       COALESCE(ARRAY_AGG(DISTINCT j.document_id::text) FILTER (WHERE j.judgment IN ('irrelevant','noise')), ARRAY[]::text[]) AS negative_ids,
 		       MIN(j.judged_at) AS judged_at,
 		       MIN(q.id::text) AS query_id,
-		       MIN(q.source) AS query_source
+		       MIN(q.source) AS query_source,
+		       MIN(q.asked_at) AS asked_at
 		FROM golden_judgments j
 		JOIN golden_queries q ON q.id = j.query_id
 		WHERE j.judge = $1
@@ -588,7 +589,7 @@ func (s *GoldenStore) ExportEvalPairs(ctx context.Context, judge string) ([]Eval
 	for rows.Next() {
 		var p EvalPair
 		if err := rows.Scan(&p.Query, &p.RelevantDocIDs, &p.IrrelevantDocIDs, &p.CreatedAt,
-			&p.GoldenQueryID, &p.GoldenQuerySource); err != nil {
+			&p.GoldenQueryID, &p.GoldenQuerySource, &p.AskedAt); err != nil {
 			return nil, fmt.Errorf("golden: scan eval pair: %w", err)
 		}
 		idx++

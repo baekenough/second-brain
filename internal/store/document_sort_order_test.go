@@ -41,6 +41,14 @@ func recentQuery(from, to *time.Time) model.SearchQuery {
 	}
 }
 
+// relevanceOrder 는 관련도 정렬 절이다. 동점은 최신 사건 시각(NULL 은 뒤), 그다음
+// id 로 깬다 — LIMIT 이 동점을 임의로 자르면 같은 설정의 두 실행이 서로 다른
+// 상위 집합을 돌려준다.
+const (
+	relevanceOrder        = "score DESC, occurred_at DESC NULLS LAST, id ASC"
+	relevanceOrderAliased = "score DESC, d.occurred_at DESC NULLS LAST, d.id ASC"
+)
+
 // (a) A window that lies entirely in the future must order soonest-first.
 func TestSortOrder_FutureWindow_SoonestFirst(t *testing.T) {
 	t.Parallel()
@@ -61,11 +69,11 @@ func TestSortOrder_FutureWindow_SoonestFirst(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := sortOrder(recentQuery(tc.from, tc.to), sortNow, ""); got != "occurred_at ASC" {
-				t.Fatalf("unqualified: want %q, got %q", "occurred_at ASC", got)
+			if got := sortOrder(recentQuery(tc.from, tc.to), sortNow, ""); got != "occurred_at ASC, id ASC" {
+				t.Fatalf("unqualified: want %q, got %q", "occurred_at ASC, id ASC", got)
 			}
-			if got := sortOrder(recentQuery(tc.from, tc.to), sortNow, "d"); got != "d.occurred_at ASC" {
-				t.Fatalf("aliased: want %q, got %q", "d.occurred_at ASC", got)
+			if got := sortOrder(recentQuery(tc.from, tc.to), sortNow, "d"); got != "d.occurred_at ASC, d.id ASC" {
+				t.Fatalf("aliased: want %q, got %q", "d.occurred_at ASC, d.id ASC", got)
 			}
 		})
 	}
@@ -95,11 +103,11 @@ func TestSortOrder_PastWindow_Unchanged(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			want := "COALESCE(occurred_at, collected_at) DESC"
+			want := "COALESCE(occurred_at, collected_at) DESC, id ASC"
 			if got := sortOrder(recentQuery(tc.from, tc.to), sortNow, ""); got != want {
 				t.Fatalf("unqualified: want %q, got %q", want, got)
 			}
-			wantAliased := "COALESCE(d.occurred_at, d.collected_at) DESC"
+			wantAliased := "COALESCE(d.occurred_at, d.collected_at) DESC, d.id ASC"
 			if got := sortOrder(recentQuery(tc.from, tc.to), sortNow, "d"); got != wantAliased {
 				t.Fatalf("aliased: want %q, got %q", wantAliased, got)
 			}
@@ -116,9 +124,9 @@ func TestSortOrder_NoWindow_Unchanged(t *testing.T) {
 		sort              string
 		want, wantAliased string
 	}{
-		{"recent", "COALESCE(occurred_at, collected_at) DESC", "COALESCE(d.occurred_at, d.collected_at) DESC"},
-		{"relevance", "score DESC", "score DESC"},
-		{"", "score DESC", "score DESC"},
+		{"recent", "COALESCE(occurred_at, collected_at) DESC, id ASC", "COALESCE(d.occurred_at, d.collected_at) DESC, d.id ASC"},
+		{"relevance", relevanceOrder, relevanceOrderAliased},
+		{"", relevanceOrder, relevanceOrderAliased},
 	}
 
 	for _, tc := range cases {
@@ -168,8 +176,12 @@ func TestSortOrder_NonWhitelistedSort_NeverReachesSQL(t *testing.T) {
 
 			for _, alias := range []string{"", "d"} {
 				got := sortOrder(q, sortNow, alias)
-				if got != "score DESC" {
-					t.Fatalf("alias=%q: want %q, got %q", alias, "score DESC", got)
+				want := relevanceOrder
+				if alias != "" {
+					want = relevanceOrderAliased
+				}
+				if got != want {
+					t.Fatalf("alias=%q: want %q, got %q", alias, want, got)
 				}
 				if strings.Contains(got, p) {
 					t.Fatalf("alias=%q: clause echoed caller input %q: %s", alias, p, got)
@@ -274,13 +286,14 @@ func TestSortOrder_DirectionFollowsTheSharedRule(t *testing.T) {
 				got := sortOrder(q, sortNow, alias)
 
 				if !q.SortsByRecency() {
-					if got != "score DESC" {
+					if !strings.HasPrefix(got, "score DESC, ") {
 						t.Fatalf("alias=%q: SortsByRecency()=false but clause is %q", alias, got)
 					}
 					continue
 				}
 
-				gotAscending := strings.HasSuffix(got, "ASC")
+				// 모든 절은 id 동점 처리로 끝나므로 방향은 첫 키로 읽는다.
+				gotAscending := strings.HasPrefix(got, "occurred_at ASC") || strings.HasPrefix(got, "d.occurred_at ASC")
 				if want := q.RecencyAscending(sortNow); gotAscending != want {
 					t.Fatalf("alias=%q: clause %q is ascending=%v, but RecencyAscending=%v — the SQL must not carry its own copy of the rule",
 						alias, got, gotAscending, want)
