@@ -269,7 +269,7 @@ func buildChunkFTSQuery(filter model.SearchQuery, limit int) (string, []interfac
 		WHERE (` + e.matchTS + `
 		   OR ` + e.matchLike + `)
 		  AND d.status = 'active' ` + filters + `
-		ORDER BY rank DESC
+		ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 		LIMIT $2`
 
 	return q, args
@@ -609,30 +609,7 @@ func (s *ChunkStore) SearchVectorFiltered(ctx context.Context, filter model.Sear
 		return nil, fmt.Errorf("chunk vector search: empty query vector")
 	}
 
-	// cosine distance operator <=> returns 0 (identical) to 2 (opposite).
-	// Score = 1 - distance maps it to [−1, 1] with 1 being perfect match.
-	args, filters := chunkEligibilitySQL([]interface{}{pgvector.NewVector(queryVec), limit}, filter)
-	q := `
-		SELECT
-			c.id,
-			c.document_id,
-			c.chunk_index,
-			c.content,
-			c.byte_size,
-			c.created_at,
-			1 - (c.embedding <=> $1::vector)  AS score,
-			d.title          AS document_title,
-			d.source_type    AS document_source,
-			d.status         AS document_status,
-			d.occurred_at    AS document_occurred_at,
-			d.collected_at   AS document_collected_at,
-			d.metadata       AS document_metadata
-		FROM chunks c
-		JOIN documents d ON d.id = c.document_id
-		WHERE c.embedding IS NOT NULL
-		  AND d.status = 'active' ` + filters + `
-		ORDER BY c.embedding <=> $1::vector
-		LIMIT $2`
+	q, args := buildChunkVectorQuery(filter, limit)
 
 	rows, err := s.pg.pool.Query(ctx, q, args...)
 	if err != nil {
@@ -671,6 +648,47 @@ func (s *ChunkStore) SearchVectorFiltered(ctx context.Context, filter model.Sear
 }
 
 // chunkEligibilitySQL shares the document lane's bound filter semantics.
+
+// buildChunkVectorQuery 는 SearchVectorFiltered 의 SQL 과 인자를 만든다. DB 없이 순서
+// 절을 검사할 수 있게 떼어 냈다.
+//
+// 후보 절단은 HNSW 거리 순서 그대로이고(인덱스를 쓸 수 있어야 한다), 절단된 후보
+// 안의 동점(중복 문장의 동일 임베딩)만 최신 사건 시각(NULL 은 뒤) → 청크 id 로 깬다.
+func buildChunkVectorQuery(filter model.SearchQuery, limit int) (string, []interface{}) {
+	// cosine distance operator <=> returns 0 (identical) to 2 (opposite).
+	// Score = 1 - distance maps it to [−1, 1] with 1 being perfect match.
+	args, filters := chunkEligibilitySQL([]interface{}{pgvector.NewVector(filter.Embedding), limit}, filter)
+	// 안쪽은 이전과 같은 "ORDER BY 거리 LIMIT" 라 HNSW 인덱스 순서로 후보를 자르고,
+	// 바깥에서 같은 거리(동일 임베딩)의 순서만 최신 사건 시각 → 청크 id 로 깬다.
+	// 동점 키를 안쪽 ORDER BY 에 넣으면 인덱스 순서를 못 써서 전 테이블 정렬이 된다.
+	q := `
+		SELECT * FROM (
+			SELECT
+				c.id,
+				c.document_id,
+				c.chunk_index,
+				c.content,
+				c.byte_size,
+				c.created_at,
+				1 - (c.embedding <=> $1::vector)  AS score,
+				d.title          AS document_title,
+				d.source_type    AS document_source,
+				d.status         AS document_status,
+				d.occurred_at    AS document_occurred_at,
+				d.collected_at   AS document_collected_at,
+				d.metadata       AS document_metadata
+			FROM chunks c
+			JOIN documents d ON d.id = c.document_id
+			WHERE c.embedding IS NOT NULL
+			  AND d.status = 'active' ` + filters + `
+			ORDER BY c.embedding <=> $1::vector
+			LIMIT $2
+		) ann
+		ORDER BY score DESC, document_occurred_at DESC NULLS LAST, id ASC`
+
+	return q, args
+}
+
 func chunkEligibilitySQL(args []interface{}, q model.SearchQuery) ([]interface{}, string) {
 	filters := ""
 	if sources := q.IncludeSourceTypes(); len(sources) > 0 {

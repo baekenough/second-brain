@@ -13,6 +13,24 @@ import (
 	"github.com/pgvector/pgvector-go"
 )
 
+// 스냅샷 이력.
+//
+//   - #276: #276 이전 빌더로 처음 생성했다(raw 모드가 노브 도입 전과 바이트 동일함을 고정).
+//   - 결정론 수정: 모든 검색 레인의 순서에 동점 처리를 넣으면서 의도적으로 다시
+//     생성했다. 전에는 레인 ORDER BY 에 동점 처리가 없어(점수만, 일부는 id 만),
+//     같은 점수의 문서가 많으면(짧고 비슷한 SMS) LIMIT 이 임의의 부분집합을 잘랐고
+//     병렬 스캔 때문에 실행마다 달랐다. 같은 설정·같은 라벨의 평가가 질의 하나의
+//     상위 10 집합이 바뀌어 ndcg 가 흔들렸다. 바뀐 것은 정렬 절뿐이다:
+//     fts/vec/bigm/summvec/엔티티 레인의 window 순서 끝에 "occurred_at DESC NULLS
+//     LAST, id ASC"(엔티티는 문서 id)를 붙이고 각 CTE 에 "ORDER BY rank" 를 LIMIT
+//     앞에 명시했으며, 최종 SELECT·fulltext 의 sortOrder 는 id 로, 청크 레인은
+//     "d.occurred_at DESC NULLS LAST, c.id ASC" 로 끝난다. 필터·인자·플레이스홀더는
+//     그대로다. 벡터 레인(vec/summvec, 청크 벡터)만 구조가 다르다: 안쪽 "ORDER BY
+//     거리 LIMIT" 는 HNSW 인덱스 순서를 쓰도록 그대로 두고 바깥 window/ORDER BY 에서
+//     동점을 깬다(동점 키를 안쪽에 넣으면 인덱스 스캔이 전 테이블 Seq Scan + Sort 가
+//     된다는 것을 EXPLAIN 으로 확인했다). 이 파일의 다른 테스트("노브 off == 기준 SQL")는 새 스냅샷을
+//     기준선으로 계속 의미가 있다.
+//
 // updateSparseSnapshot 은 raw 모드 SQL 스냅샷을 다시 쓴다. #276 이전 코드로
 // 한 번 생성해 고정한 파일이므로, 이 플래그로 덮어쓰는 것은 "raw 모드 SQL 을
 // 의도적으로 바꾼다" 는 결정과 같다 — 리뷰에서 그 diff 를 반드시 설명해야 한다.

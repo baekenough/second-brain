@@ -62,8 +62,8 @@ const (
 	// 비교 불가가 되기 때문이다.
 	windowModeNone = "none"
 	// windowModePlan 은 골든 후보 화면과 같은 결정론적 기간 파서를 적용한다.
-	// 실행 프로필에 window_mode 와 기준 KST 날짜가 추가되므로 none 과는
-	// 자동으로 다른 baseline 계열이 된다.
+	// 실행 프로필에 window_mode 와 기준 출처(window_anchor 또는 기준 KST 날짜)가
+	// 추가되므로 none 과는 자동으로 다른 baseline 계열이 된다.
 	windowModePlan = "plan"
 )
 
@@ -180,7 +180,8 @@ func run() error {
 	rerankCallContext := flag.Bool("rerank-call-context", false, "통화 리랭커 입력에 참여자와 본문 앞부분을 추가하는 실험")
 	rerankInput := flag.String("rerank-input", model.RerankInputHead,
 		"리랭커에 보내는 텍스트. head(기본)는 제목+본문 앞부분, best_chunk 는 "+
-			"[소스·날짜·제목] 머리글 한 줄 + 질의와 가장 잘 맞는 청크 본문")
+			"[소스·날짜·제목] 머리글 한 줄 + 질의와 가장 잘 맞는 청크 본문, yaml 은 best_chunk 와 같은 "+
+			"본문을 source/date/title/counterpart/text YAML 필드로 보낸다(--rerank 필요)")
 	recencyHalflife := flag.Float64("recency-halflife-days", 0,
 		"최신성 감쇠 반감기(일). 0(기본)이면 감쇠하지 않는다. 시간창이 없는 질의에만 적용된다")
 	recencyAlpha := flag.Float64("recency-alpha", model.DefaultRecencyAlpha,
@@ -196,6 +197,55 @@ func run() error {
 			"chunk 는 청크 희소 레인에만, chunk_doc 은 문서 fts·bigm 레인까지 internal/sparseq 가 "+
 			"뽑은 키워드(접두 OR tsquery + 키워드별 LIKE)를 쓴다. 리랭커·임베딩·엔티티 레인은 "+
 			"어느 값이든 원문을 받는다. 청크 범위는 --chunk-sparse=fuse|fuse_ctx 와 함께 써야 거의 매번 돈다")
+	entityKeywords := flag.String("entity-keywords", model.EntityKeywordsOff,
+		"엔티티·그래프 레인의 저수준 키워드 추출 방식. 빈 값(기본)은 질문 원문 전체 LIKE 라는 "+
+			"현행 동작이고, sparse 는 internal/sparseq 키워드(LLM 없음), llm 은 LLM 한 번으로 "+
+			"{low_level, high_level} 을 뽑는다(실패하면 sparse 로 폴백). 엔티티 레인이 켜져 있어야 "+
+			"효과가 있다(ENTITY_EXTRACTION_ENABLED=true)")
+	highLevelToSparse := flag.Bool("high-level-keywords-to-sparse", false,
+		"--entity-keywords=llm 의 고수준(주제) 키워드를 희소 레인(fts·bigm) 키워드에 덧붙인다. "+
+			"--sparse-query=chunk|chunk_doc 이 필요하다")
+	graphWeight := flag.Float64("graph-weight", 0,
+		"그래프 1-hop 레인(entity_relations)의 RRF 가중치. 0(기본)이면 레인이 SQL 에 들어가지 않는다. "+
+			"--entity-keywords 가 필요하다")
+	graphHubDamping := flag.Bool("graph-hub-damping", false,
+		"그래프 레인 순위를 SUM(confidence * 1/ln(e + 시드 엔티티의 문서 언급 수)) 로 바꿔 허브 엔티티를 "+
+			"누른다(HippoRAG). --graph-weight>0 이 필요하다")
+	graphExpandBoost := flag.Float64("graph-expand-boost", 0,
+		"결과 시드 그래프 확장의 승수 강도(0..1). 0(기본)이면 끈다. 융합 상위 10건의 엔티티 ∪ 키워드 "+
+			"엔티티와 관계로 이어진 기존 후보만 score*(1+boost*s) 로 올린다(새 문서 없음, 리랭크 전)")
+	rrfMissingRank := flag.String("rrf-missing-rank", model.RRFMissingRankZero,
+		"레인에 없는 문서의 RRF 기여. 빈 값(기본)은 0, cutoff 는 결과가 있는 레인에서 "+
+			"w/(k + 레인 상한 + 1) 을 준다(R2R 가중 RRF)")
+	// --- 융합 이후 노브 (internal/search/postfusion.go, 전부 기본 꺼짐) ---
+	sourceStratifyK := flag.Int("source-stratify-k", 0,
+		"소스별 보조 검색: 소스 포함 집합이 없는 질의에서 일정·통화·문자·메일·노트마다 저장소 검색을 "+
+			"한 번 더 돌려 소스별 상위 K건을 전역 후보와 RRF 로 합친다. 0(기본)이면 끈다. 최대 10")
+	collapseContactDay := flag.Bool("collapse-contact-day", false,
+		"통화·문자를 (소스, 상대, KST 날짜) 그룹으로 접어 대표만 리랭크·순위 경쟁에 남기고, "+
+			"최종 순서 뒤 대표 바로 뒤에 같은 그룹을 다시 편다(후보는 버리지 않는다)")
+	collapseExpandMax := flag.Int("collapse-expand-max", model.DefaultCollapseExpandMax,
+		"--collapse-contact-day 에서 대표 바로 뒤에 펼칠 같은 그룹 문서 수(1~20). 나머지는 목록 끝으로 간다")
+	windowBucketDiversify := flag.Bool("window-bucket-diversify", false,
+		"하루를 넘는 occurred 시간창이 있는 질의에서 날짜(KST)별 최상위 문서를 먼저 세우고 나머지를 뒤에 둔다")
+	mmrLambda := flag.Float64("mmr-lambda", 0,
+		"리랭크(합산) 뒤 상위 30건에 MMR 을 적용한다. (0,1] 의 λ, 0(기본)이면 끈다. "+
+			"유사도 벌점은 같은 소스 문서끼리만 준다")
+	scheduleIntentBoost := flag.Float64("schedule-intent-boost", 0,
+		"일정 의도 질문(intent.HasScheduleIntent)에서 소스 포함 집합이 없을 때 캘린더 후보 점수에 "+
+			"(1+boost) 를 곱해 재정렬한다. (0,1], 0(기본)이면 끈다")
+	planSourceSpillK := flag.Int("plan-source-spill-k", 0,
+		"--plan-sources 가 건 소스 포함 집합 밖에서 상위 K건(최대 10)을 보조 검색해 후보에 섞는다. "+
+			"계획이 소스를 잘못 좁힌 질의를 구제한다. 0(기본)이면 끈다. --plan-sources 필요")
+	windowAnchor := flag.String("window-anchor", windowAnchorJudgedAt,
+		"--window=plan 에서 상대 기간 표현을 풀 기준 시각. judged_at(기본)은 질의마다 첫 판정 "+
+			"시각을 쓴다 — 후보 화면이 리뷰 시각 기준으로 창을 풀기 때문에 라벨이 붙은 순간의 창을 "+
+			"재현한다. asked_at 은 질의마다 golden_queries.asked_at 을 쓴다. "+
+			"--as-of 를 주면 그 시각 하나를 모든 질의에 쓰고 이 플래그는 같이 쓸 수 없다")
+	planSources := flag.Bool("plan-sources", false,
+		"--window=plan 에서 운영 /ask 의 결정론적 계획(intent.DeterministicPlan)이 만드는 소스 포함 "+
+			"집합을 질의마다 함께 건다(LLM 호출 없음). 결정론적 계획이 거절하는 질의는 창만 걸고 "+
+			"소스는 제약하지 않는다. 별도 baseline 계열이 된다")
 	flag.Parse()
 	if *pairLimit < 0 || (*split != "all" && *split != "train" && *split != "holdout") {
 		return errors.New("invalid eval --split or --limit")
@@ -210,6 +260,19 @@ func run() error {
 	// 실행이 갈라진다. 효력이 없는 조합은 받지 않는다.
 	if *asOf != "" && *windowMode != windowModePlan {
 		return fmt.Errorf("eval: --as-of requires --window=%s", windowModePlan)
+	}
+	anchorExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "window-anchor" {
+			anchorExplicit = true
+		}
+	})
+	if err := validatePlanSources(*windowMode, *planSources); err != nil {
+		return err
+	}
+	anchorKind, err := resolveWindowAnchor(*windowMode, *asOf, *windowAnchor, anchorExplicit)
+	if err != nil {
+		return err
 	}
 	// 노브는 조용히 무시하지 않는다. 오타 하나로 "실험을 켰다고 믿는 실행" 과
 	// "실제로는 기본값으로 돈 실행" 이 갈라지면, 그 결과로 내린 판단이 전부
@@ -227,8 +290,27 @@ func run() error {
 		ChunkSparse:             *chunkSparse,
 		ChunkSparseCtxVersion:   *chunkSparseCtxVersion,
 		SparseQuery:             *sparseQuery,
+
+		EntityKeywordMode:         *entityKeywords,
+		HighLevelKeywordsToSparse: *highLevelToSparse,
+		GraphWeight:               *graphWeight,
+
+		GraphHubDamping:  *graphHubDamping,
+		GraphExpandBoost: *graphExpandBoost,
+		RRFMissingRank:   *rrfMissingRank,
+
+		SourceStratifyK:       *sourceStratifyK,
+		CollapseContactDay:    *collapseContactDay,
+		CollapseExpandMax:     *collapseExpandMax,
+		WindowBucketDiversify: *windowBucketDiversify,
+		MMRLambda:             *mmrLambda,
+		ScheduleIntentBoost:   *scheduleIntentBoost,
+		PlanSourceSpillK:      *planSourceSpillK,
 	}
 	if err := validateTuningFlags(tuning); err != nil {
+		return err
+	}
+	if err := validatePlanSpill(tuning, *planSources); err != nil {
 		return err
 	}
 	tuning = tuning.Normalized()
@@ -265,6 +347,9 @@ func run() error {
 	})
 	if !explicitRerank {
 		*rerank = cfg.RerankDefault
+	}
+	if err := validateRerankTuning(tuning, *rerank); err != nil {
+		return err
 	}
 	if *noPersist && *checkReindex {
 		return errors.New("--no-persist cannot be combined with --check-reindex (writes state)")
@@ -373,10 +458,13 @@ func run() error {
 	profile["entity_vector_enabled"] = entityFlag == "true" || entityFlag == "1" || entityFlag == "yes"
 	// 시간창 설정은 config_hash 에도 들어간다 — applyWindowProfile 참고.
 	windows := windowResolver(nil)
+	var anchors anchorSelector
 	if *windowMode == windowModePlan {
-		windows = planWindowResolver(asOfTime)
+		windows = planWindowResolver
+		anchors = windowAnchorFor(anchorKind, asOfTime)
 	}
-	applyWindowProfile(profile, *windowMode, asOfTime)
+	applyWindowProfile(profile, *windowMode, anchorKind, asOfTime)
+	applyPlanSourcesProfile(profile, *planSources)
 	applyTuningProfile(profile, tuning)
 	revision := currentCodeRevision()
 	configHash := digest(profile)
@@ -393,7 +481,15 @@ func run() error {
 	// GoldenStore.ExportEvalPairs and .UpsertJudgments for the enforcement of
 	// that same rule on the write side.
 	var pairs []store.EvalPair
-	if *useGolden {
+	if *useGolden && goldenSplitApplies(*windowMode, anchorKind) {
+		// 상대 기간 질문을 판정 날짜(KST)별로 나눈다 — golden_split.go 참고.
+		// 나뉘지 않는 질문은 ExportEvalPairs 와 같은 쌍이 된다.
+		rows, rerr := goldenStore.ExportEvalJudgmentRows(ctx, "user")
+		if rerr != nil {
+			return fmt.Errorf("build golden eval pairs: %w", rerr)
+		}
+		pairs = goldenPairsFromJudgments(rows, anchorKind)
+	} else if *useGolden {
 		pairs, err = goldenStore.ExportEvalPairs(ctx, "user")
 		if err != nil {
 			return fmt.Errorf("build golden eval pairs: %w", err)
@@ -427,6 +523,8 @@ func run() error {
 	evaluated := evaluatePairs(ctx, searchSvc, pairs, evalRunOptions{
 		rerank:   *rerank,
 		window:   windows,
+		anchor:   anchors,
+		planSrcs: *planSources,
 		diagnose: *dumpPath != "",
 		tuning:   tuning,
 	})

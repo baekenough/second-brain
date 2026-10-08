@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -914,20 +915,26 @@ func (s *DocumentStore) Search(ctx context.Context, query model.SearchQuery) ([]
 // elsewhere), and every returned clause remains a compile-time constant modulo
 // the caller-supplied alias. A non-whitelisted Sort still collapses to
 // "score DESC" regardless of the window.
+//
+// Every returned clause ends in a deterministic tie-break, because LIMIT cuts
+// whatever the ORDER BY leaves tied in an arbitrary — and, under parallel
+// scans, run-to-run varying — subset. Relevance ties (very common for short,
+// near-identical SMS) fall back to the newest event time, then to the id; the
+// recency orders fall back to the id alone, their own key already being time.
 func sortOrder(query model.SearchQuery, now time.Time, tableAlias string) string {
-	if !query.SortsByRecency() {
-		return "score DESC"
-	}
-
 	prefix := ""
 	if tableAlias != "" {
 		prefix = tableAlias + "."
 	}
 
-	if query.RecencyAscending(now) {
-		return fmt.Sprintf("%soccurred_at ASC", prefix)
+	if !query.SortsByRecency() {
+		return fmt.Sprintf("score DESC, %soccurred_at DESC NULLS LAST, %sid ASC", prefix, prefix)
 	}
-	return fmt.Sprintf("COALESCE(%soccurred_at, %scollected_at) DESC", prefix, prefix)
+
+	if query.RecencyAscending(now) {
+		return fmt.Sprintf("%soccurred_at ASC, %sid ASC", prefix, prefix)
+	}
+	return fmt.Sprintf("COALESCE(%soccurred_at, %scollected_at) DESC, %sid ASC", prefix, prefix, prefix)
 }
 
 // fulltextSearch uses PostgreSQL ts_rank against the pre-computed tsvector column.
@@ -1351,8 +1358,16 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 	// The entity param position depends on how many args are already bound:
 	// $4 when no source filter is active, $5 or $6 when source/exclude filters
 	// push it further. The actual placeholder is computed via len(args)+1.
+	//
+	// 키워드 모드(EntityKeywordMode, LightRAG 이중 키워드)에서는 질문 원문 대신
+	// query.EntityKeywords 로 엔티티를 찾으므로 위 질문 파라미터를 붙이지 않는다.
+	// 키워드 파라미터는 희소 키워드 인자까지 붙인 뒤 맨 끝에 붙는다 — 노브를
+	// 끈 요청의 기존 $n 이 하나도 움직이지 않게 하기 위해서다.
+	entityKeywords := NormalizeEntityKeywords(query.EntityKeywords)
+	keywordLane := len(entityKeywords) > 0
+	graphLane := keywordLane && query.Tuning.GraphWeight > 0 && !isBadWeight(query.Tuning.GraphWeight)
 	entityFilterParam := ""
-	if w.EntityWeight > 0 {
+	if w.EntityWeight > 0 && !keywordLane {
 		entityFilterParam = fmt.Sprintf("$%d", len(args)+1)
 		args = append(args, strings.ToLower(strings.TrimSpace(query.Query)))
 	}
@@ -1360,7 +1375,7 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 	// entityCTE is the SQL fragment for the entity lane. When the lane is
 	// disabled (weight=0), we use a trivially-empty CTE to avoid syntax errors.
 	entityCTE := emptyEntityCTE
-	if w.EntityWeight > 0 {
+	if w.EntityWeight > 0 && !keywordLane {
 		entityCTE = buildEntityCTE(entityFilterParam, entityStatusFilter, entitySourceFilter, entityExcludeFilter, entityRetentionFilter, entityOccurredFilter)
 		if query.Tuning.EntityQueryContainsName {
 			legacy := "e.normalized_name LIKE '%%' || " + entityFilterParam + " || '%%'"
@@ -1369,6 +1384,17 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 		}
 	}
 
+	// 레인 동점 처리. 모든 레인의 순서는 (점수, 최신 사건 시각 NULLS LAST, id) 전순서이고
+	// 각 CTE 는 LIMIT 앞에 ORDER BY rank 를 명시한다 — 레인이 LIMIT $3 으로 잘리므로
+	// 동점을 남기면 PostgreSQL 이 임의의 부분집합을 자르고, 병렬 스캔에서는 그 부분집합이
+	// 실행마다 달라진다(짧고 비슷한 SMS 가 많을 때 같은 설정의 평가가 흔들린 원인).
+	//
+	// 단 벡터 레인(vec, summvec)은 안쪽 질의가 "ORDER BY embedding <=> $2 LIMIT $3" 그대로다.
+	// 동점 키를 그 ORDER BY 에 넣으면 HNSW 인덱스 순서를 쓸 수 없어 전 테이블을 읽고
+	// 정렬하게 되므로(실측: 30k 행에서 인덱스 스캔 → Seq Scan + Sort), 인덱스 순서로
+	// 후보를 자른 뒤 바깥 window 에서 동점을 깬다. 같은 거리의 행이 LIMIT 경계에 걸리면
+	// 어느 쪽이 들어오는지는 HNSW 탐색 순서(고정된 인덱스 상태에서 결정론적)를 따른다.
+	//
 	// 질의 형태(#276). 아래 네 조각의 기본값은 #276 이전 SQL 과 글자 하나까지
 	// 같다. 키워드가 있으면 fts·bigm 레인만 바꾸고 vec·summvec·entity 레인은
 	// 건드리지 않는다. 키워드 인자는 엔티티 파라미터까지 전부 붙인 뒤 맨
@@ -1384,7 +1410,7 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 			               bigm_similarity(content, $1),
 			               bigm_similarity(title,   $1),
 			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
-			           ) DESC, id ASC`
+			           ) DESC, occurred_at DESC NULLS LAST, id ASC`
 	bigmMatch := `(content LIKE '%%' || $1 || '%%'
 			    OR title   LIKE '%%' || $1 || '%%'
 			    OR (source_type = 'call' AND strpos(lower(metadata->>'contact_name'), lower($1)) > 0))`
@@ -1396,16 +1422,39 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 		ftsMatch = fmt.Sprintf("(%s\n\t\t\t   OR %s)", sp.tsMatch("tsv", "simple"), sp.tsMatch("tsv", "english"))
 		// bigm 레인 순서: 맞은 키워드 수 → 질문 전체 일치 보너스(기존의 정밀
 		// 일치가 동점일 때 이기게) → id. 원문 전체의 bigm_similarity 계산은 하지 않는다.
-		bigmOrder = fmt.Sprintf("\n\t\t\t           %s DESC,\n\t\t\t           %s DESC, id ASC",
+		bigmOrder = fmt.Sprintf("\n\t\t\t           %s DESC,\n\t\t\t           %s DESC, occurred_at DESC NULLS LAST, id ASC",
 			sp.likeCount(true, "content", "title"),
 			"CASE WHEN content LIKE '%' || "+escapedRawLikeSQL+" || '%' OR title LIKE '%' || "+escapedRawLikeSQL+" || '%' THEN 1 ELSE 0 END")
 		bigmMatch = sp.docMatch(false)
 	}
 
+	// 엔티티 키워드 파라미터(위 주석 참고). 엔티티 레인이든 그래프 레인이든
+	// 쓰는 쪽이 있을 때만 붙인다: 참조되지 않는 바인딩 파라미터는 PostgreSQL 이
+	// 타입을 정하지 못해 질의 전체를 실패시킨다.
+	graphCTEs, graphID, graphJoin, graphScore := "", "", "", ""
+	if keywordLane && (w.EntityWeight > 0 || graphLane) {
+		kwParam := fmt.Sprintf("$%d", len(args)+1)
+		prefixParam := fmt.Sprintf("$%d", len(args)+2)
+		args = append(args, entityKeywords, entityKeywordPrefixes(entityKeywords))
+		if w.EntityWeight > 0 {
+			entityCTE = buildKeywordEntityCTE(kwParam, prefixParam, entityStatusFilter, entitySourceFilter, entityExcludeFilter, entityRetentionFilter, entityOccurredFilter)
+		}
+		if graphLane {
+			// 그래프 레인도 엔티티 레인과 같은 d. 한정 필터를 레인 안에 넣는다.
+			graphCTEs = buildGraphCTEs(kwParam, prefixParam, entityStatusFilter, entitySourceFilter, entityExcludeFilter, entityRetentionFilter, entityOccurredFilter, query.Tuning.GraphHubDamping)
+			graphID = ", graph.id"
+			graphJoin = "\n\t\t\tFULL OUTER JOIN graph   ON COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) = graph.id"
+			graphScore = buildGraphScoreTerm(query.Tuning.GraphWeight, w.RRFK)
+			if query.Tuning.RRFMissingRank == model.RRFMissingRankCutoff {
+				graphScore = buildGraphScoreTermCutoff(query.Tuning.GraphWeight, w.RRFK)
+			}
+		}
+	}
+
 	q := fmt.Sprintf(`
 		WITH fts AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY %s DESC) AS rank
+			       row_number() OVER (ORDER BY %s DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE %s
 			%s
@@ -1413,18 +1462,25 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 			%s
 			%s
 			%s
+			ORDER BY rank
 			LIMIT $3
 		),
 		vec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE embedding IS NOT NULL
-			%s
-			%s
-			%s
-			%s
-			%s
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, embedding <=> $2 AS dist
+				FROM documents
+				WHERE embedding IS NOT NULL
+				%s
+				%s
+				%s
+				%s
+				%s
+				ORDER BY embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		bigm AS (
@@ -1437,30 +1493,37 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 			%s
 			%s
 			%s
+			ORDER BY rank
 			LIMIT $3
 		),
 		summvec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE summary_embedding IS NOT NULL
-			%s
-			%s
-			%s
-			%s
-			%s
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, summary_embedding <=> $2 AS dist
+				FROM documents
+				WHERE summary_embedding IS NOT NULL
+				%s
+				%s
+				%s
+				%s
+				%s
+				ORDER BY summary_embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
-		%s,
+		%s%s,
 		rrf AS (
 			SELECT
-				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id) AS id,
-				%s AS score
+				COALESCE(fts.id, vec.id, bigm.id, summvec.id, entity.id%s) AS id,
+				%s%s AS score
 			FROM fts
 			FULL OUTER JOIN vec     ON fts.id = vec.id
 			FULL OUTER JOIN bigm    ON COALESCE(fts.id, vec.id) = bigm.id
 			FULL OUTER JOIN summvec ON COALESCE(fts.id, vec.id, bigm.id) = summvec.id
-			FULL OUTER JOIN entity  ON COALESCE(fts.id, vec.id, bigm.id, summvec.id) = entity.id
+			FULL OUTER JOIN entity  ON COALESCE(fts.id, vec.id, bigm.id, summvec.id) = entity.id%s
 		)
 		SELECT d.id, d.source_type, d.source_id, d.title, d.content, d.metadata,
 		       d.embedding, d.status, d.deleted_at, d.occurred_at, d.collected_at, d.created_at, d.updated_at,
@@ -1476,8 +1539,10 @@ func buildHybridSearchQuery(query model.SearchQuery, w model.SearchWeights) (str
 		bigmOrder, bigmMatch, // bigm: 질의 형태(#276)
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, // bigm
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredFilter, // summvec
-		entityCTE, // entity lane carries the same filters in d.-qualified form
-		buildRRFScoreExpr(w),
+		entityCTE, graphCTEs, // entity lane carries the same filters in d.-qualified form
+		graphID,
+		rrfScoreExpr(query.Tuning, w), graphScore,
+		graphJoin,
 		sortOrder(query, time.Now(), "d"))
 
 	return q, args
@@ -1511,6 +1576,63 @@ func buildRRFScoreExpr(w model.SearchWeights) string {
 	)
 }
 
+// rrfScoreExpr 는 RRFMissingRank 노브에 따라 다섯 레인 RRF 식을 고른다. 노브가
+// 꺼져 있으면 buildRRFScoreExpr 를 그대로 부른다(SQL 바이트 동일).
+func rrfScoreExpr(t model.SearchTuning, w model.SearchWeights) string {
+	if t.RRFMissingRank == model.RRFMissingRankCutoff {
+		return buildRRFScoreExprCutoff(w)
+	}
+	return buildRRFScoreExpr(w)
+}
+
+// rrfCutoffTerm 은 RRFMissingRankCutoff 의 레인 항 하나다(R2R 가중 RRF).
+//
+// 레인에 있는 문서는 현행과 같은 w/(k+rank) 를 받는다. 레인에 없는 문서는 그
+// 레인이 결과를 하나라도 냈을 때만 w/(k + $3 + 1) — 레인 상한(LIMIT $3) 바로
+// 다음 순위 — 을 받는다. 비어 있는 레인(키워드가 안 맞은 엔티티 레인, 임베딩이
+// 없는 summvec 등)은 "모든 문서가 똑같이 빠진" 레인이라 0 을 준다: 상수를 모든
+// 행에 더하는 것은 순서를 바꾸지 않지만 점수 스케일만 흔든다.
+//
+// 레인이 비었는지는 COUNT(lane.id) OVER () 로 rrf 의 FULL OUTER JOIN 결과 위에서
+// 센다. 레인 CTE 를 EXISTS 로 한 번 더 참조하면 PostgreSQL 이 그 CTE 를 인라인
+// 대신 물질화하게 되어(두 번 이상 참조) 벡터 레인의 계획이 바뀔 수 있다.
+//
+// 가중치가 0 이하인 레인은 현행 항을 그대로 쓴다(어차피 0). 레인 상한 $3 은
+// LIMIT 에서 이미 bigint 로 정해진 파라미터라 float8 산술에 그대로 쓴다.
+func rrfCutoffTerm(weight, rrfK float64, lane string) string {
+	if weight <= 0 {
+		return fmt.Sprintf("COALESCE(%g::float8/(%g::float8 + %s.rank), 0)", weight, rrfK, lane)
+	}
+	return fmt.Sprintf("COALESCE(%[1]g::float8/(%[2]g::float8 + %[3]s.rank), CASE WHEN COUNT(%[3]s.id) OVER () > 0 THEN %[1]g::float8/(%[2]g::float8 + $3 + 1) ELSE 0 END)",
+		weight, rrfK, lane)
+}
+
+// buildRRFScoreExprCutoff 는 buildRRFScoreExpr 의 RRFMissingRankCutoff 판이다.
+func buildRRFScoreExprCutoff(w model.SearchWeights) string {
+	return strings.Join([]string{
+		rrfCutoffTerm(w.FTSWeight, w.RRFK, "fts"),
+		rrfCutoffTerm(w.VecWeight, w.RRFK, "vec"),
+		rrfCutoffTerm(w.BigmWeight, w.RRFK, "bigm"),
+		rrfCutoffTerm(w.SummaryVec, w.RRFK, "summvec"),
+		rrfCutoffTerm(w.EntityWeight, w.RRFK, "entity"),
+	}, "\n\t\t\t\t+ ")
+}
+
+// buildGraphScoreTermCutoff 는 buildGraphScoreTerm 의 RRFMissingRankCutoff 판이다.
+func buildGraphScoreTermCutoff(weight, rrfK float64) string {
+	return "\n\t\t\t\t+ " + rrfCutoffTerm(weight, rrfK, "graph")
+}
+
+// buildGraphScoreTerm 은 그래프 레인의 RRF 항이다. 노브가 꺼져 있으면 호출되지
+// 않는다(buildRRFScoreExpr 가 만드는 다섯 항은 그대로 둔다).
+func buildGraphScoreTerm(weight, rrfK float64) string {
+	return fmt.Sprintf("\n\t\t\t\t+ COALESCE(%g::float8/(%g::float8 + graph.rank),   0)", weight, rrfK)
+}
+
+// isBadWeight 는 NaN·무한대를 걸러낸다. %g 로 SQL 리터럴이 되는 값이라
+// 숫자가 아닌 토큰이 문장에 들어가지 않게 하는 마지막 방어선이다.
+func isBadWeight(f float64) bool { return math.IsNaN(f) || math.IsInf(f, 0) }
+
 // emptyEntityCTE is the entity lane when its RRF weight is zero: a
 // trivially-empty CTE, so the FULL OUTER JOIN below stays syntactically valid
 // and contributes nothing to the score.
@@ -1536,7 +1658,7 @@ const emptyEntityCTE = `entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank
 func buildEntityCTE(entityFilterParam, statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredRangeFilter string) string {
 	return fmt.Sprintf(`entity AS (
 			SELECT de.document_id AS id,
-			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			       row_number() OVER (ORDER BY COUNT(*) DESC, d.occurred_at DESC NULLS LAST, de.document_id ASC) AS rank
 			FROM document_entities de
 			JOIN entities e ON e.id = de.entity_id
 			JOIN documents d ON d.id = de.document_id
@@ -1546,7 +1668,8 @@ func buildEntityCTE(entityFilterParam, statusFilter, sourceFilter, excludeFilter
 			%s
 			%s
 			%s
-			GROUP BY de.document_id
+			GROUP BY de.document_id, d.occurred_at
+			ORDER BY rank
 			LIMIT $3
 		)`, entityFilterParam, statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredRangeFilter)
 }

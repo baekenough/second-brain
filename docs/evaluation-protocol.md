@@ -81,21 +81,95 @@ different candidate pools.
 
 `--window=plan` applies the same deterministic parser
 (`intent.DeterministicWindow`, no LLM call) and passes the resolved
-`[from, to)` to `OccurredFrom`/`OccurredTo`. `--as-of=<RFC3339>` anchors the
-resolution; it defaults to the run time and is rejected without
-`--window=plan`. Questions with no period phrase stay unwindowed. Only the
-window is reproduced: the screen's relevance/recency two-stream merge and its
-`IncludeRetention` opt-out are not, because the first is review ergonomics
-rather than ranking and the second would measure a wider corpus than `/ask`
-retrieves from.
+`[from, to)` to `OccurredFrom`/`OccurredTo`. Questions with no period phrase stay
+unwindowed. Only the window is reproduced: the screen's relevance/recency
+two-stream merge and its `IncludeRetention` opt-out are not, because the first
+is review ergonomics rather than ranking and the second would measure a wider
+corpus than `/ask` retrieves from.
 
-`--window=plan` adds `window_mode`, `window_resolver` and `window_as_of_kst_date`
-to the config hash and is therefore a separate baseline family; do not report a
-plan-mode score as an improvement over a `none`-mode baseline. The as-of anchor
-enters the hash as a KST calendar date because every branch of the parser lands
-on KST day boundaries, so two runs on the same day are comparable and two runs
-on different days are not. `--window=none` adds no keys at all, leaving existing
-baselines comparable.
+### Anchor: which "now" a relative phrase means
+
+"내일", "이번 주", "지난달" mean nothing without a reference instant. Golden
+questions were asked and judged weeks before the run, so resolving all of them
+against one global anchor (the run time) puts the labeled documents outside the
+window for every relative phrase, and those queries score 0 regardless of
+retrieval quality. The anchor is therefore chosen **per query**:
+
+| Selection | Anchor per query | Notes |
+|---|---|---|
+| `--window=plan` (default, `--window-anchor=judged_at`) | the query's first judgment time (`MIN(judged_at)`), in KST | Reproduces the window the review screen resolved. See below. Pairs without a judgment time fall back to the run time. |
+| `--window-anchor=asked_at` | `golden_queries.asked_at` (migration 032), in KST | Semantically the phrase's intended meaning; feedback-derived pairs have no `asked_at` and fall back to their label time. |
+| `--as-of=<RFC3339>` | that single instant for every query | Explicit global override. Cannot be combined with `--window-anchor`. |
+
+Both `--as-of` and `--window-anchor` are rejected without `--window=plan`.
+
+**Which anchor were the labels judged under?** The review screen
+(`goldenResolveWindow` in `internal/api/golden.go`) anchors at *review time*,
+`s.nowFunc()` of the request, deliberately **not** at `asked_at` (its doc comment
+explains that anchoring at `asked_at` surfaced stale candidates). So the window
+a reviewer actually saw is the one resolved at judgment time. `asked_at` equals
+that only when a question was judged shortly after it was asked; for a question
+asked on one day and judged weeks later the two differ. `judged_at` is the
+faithful replay of the screen and is the default; `asked_at` is the semantically
+intended meaning of the phrase. Measured on the golden set, `judged_at` scored
+ndcg@10 0.640 against 0.550 for `asked_at` (baseline run, same labels);
+`window_applied` and `window_anchor_date` in the dump show every miss.
+
+**Questions judged on several days.** The golden export groups judgments by
+question text, so a relative question ("내일 일정 뭐야") judged on two different days
+became one pair anchored at its *earliest* judgment — the documents labeled on
+the later day sit outside that window and could never be retrieved. Under
+`--window=plan` with `--window-anchor=judged_at|asked_at`, `cmd/eval` therefore
+loads per-judgment rows (`GoldenStore.ExportEvalJudgmentRows`) and splits such a
+question into one pair per anchor date (KST), each with only that day's labels and
+anchored at that day's first judgment (`cmd/eval/golden_split.go`). Only questions
+in which `intent.DeterministicWindow` finds a period expression **and** whose
+judgments span more than one anchor date are split; every other question is grouped
+by text exactly as `ExportEvalPairs` does (same labels, anchor, ids — pinned by a
+real-DB test). Consequences:
+
+- `label_hash` changes for a golden set that contains such a question (its labels
+  are now several pairs instead of one union). Runs before and after this change are
+  not comparable for that label set; a set without split questions keeps its hash.
+- A split pair's `query_id` in the dump is `<golden_query_id>@YYYY-MM-DD`, so
+  `cmd/evalcompare` treats the days as separate queries.
+- `golden_queries.text` is unique, so a question has one `asked_at`; in practice only
+  `judged_at` anchoring splits. `--as-of` and `--window=none` never split.
+
+### Source include set (`--plan-sources`)
+
+`--window=plan` alone reproduces only the window. Production `/ask` also applies
+the source include set of the deterministic plan (`intent.DeterministicPlan`,
+shared with `LLMPlanner`): an explicit record word (메일/문자/통화/슬랙/노션/노트)
+selects that source, a calendar keyword (일정/스케줄/캘린더/약속) or a window that
+starts after the anchor's today selects `calendar` only. Without it, calendar
+questions compete with sms/call documents for the 20-slot candidate pool and
+miss in-window calendar documents.
+
+`--plan-sources` (requires `--window=plan`, default off) applies that set per
+query, using the same per-query anchor as the window. No LLM is called. When the
+deterministic plan declines a question (e.g. a record question that also names a
+calendar topic, such as "내일 일정에 관한 메일") or the question has no period
+phrase, the query keeps today's behaviour: the window from
+`DeterministicWindow` alone and no source constraint. Enabling it adds
+`plan_sources: true` to the config hash (a separate baseline family; the key is
+absent when off), and each dump row carries `plan_sources` — the include set that
+was actually applied (omitted when none).
+
+### Config hash
+
+`--window=plan` adds `window_mode` and `window_resolver`, plus the anchor:
+
+- `--as-of`: `window_as_of_kst_date` only, exactly as before this change, so
+  existing `--as-of` baselines keep matching. The date enters the hash as a KST
+  calendar date because every parser branch lands on KST day boundaries.
+- `judged_at` / `asked_at`: `window_anchor` (`judged_at` or `asked_at`) and **no**
+  date, because the anchors come from the labels, not the run date; the same
+  labels give the same series on any day.
+
+Each anchor mode is its own baseline family, and all of them differ from `none`:
+do not report a plan-mode score as an improvement over a `none`-mode baseline.
+`--window=none` adds no keys at all, leaving existing baselines comparable.
 
 ## Per-query diagnostics (`--dump`)
 
@@ -105,7 +179,10 @@ retrieved (`in_overfetch_pool` false), retrieved but below the page
 (`in_overfetch_pool` true, `final_rank` null), or demoted by reranking
 (`pre_rerank_rank` above `final_rank`). `lanes_hit` names the lanes that
 surfaced it (`document_store`, `chunk_vector`, `opensearch`, `chunk_fts`).
-Rows are written for failed searches too.
+Rows are written for failed searches too. With `--window=plan` every row also
+carries `window_anchor_date` (KST date, `YYYY-MM-DD`) — the anchor the query's
+relative phrase was resolved against — so a `window_applied` that excludes the
+label can be audited without the question text.
 
 The file carries **no question text, document title or body**. Queries are
 identified by `golden_queries.id`, or by a `sha256:` prefix of the question for
@@ -239,17 +316,116 @@ the matching `cmd/eval` flag.
 | `SEARCH_MERGE_MODE` | `--merge=asymmetric\|symmetric` | `asymmetric` | `symmetric` lets chunk/OpenSearch-only hits compete on RRF score instead of only filling slots the document store left open. |
 | `SEARCH_RERANK_BLEND` | `--rerank-blend=replace\|rrf` | `replace` | `rrf` orders results by `1/(60+fused_rank) + w*1/(60+rerank_rank)` instead of replacing the fused order with the reranker's. |
 | `SEARCH_RERANK_BLEND_WEIGHT` | `--rerank-blend-weight=W` | `1.0` | Weight `w` of the reranker term in `rrf` blending. |
-| `SEARCH_RERANK_INPUT` | `--rerank-input=head\|best_chunk` | `head` | `best_chunk` sends `[source · date · title]` plus the chunk closest to the query instead of the document head. |
+| `SEARCH_RERANK_INPUT` | `--rerank-input=head\|best_chunk\|yaml` | `head` | `best_chunk` sends `[source · date · title]` plus the chunk closest to the query instead of the document head. `yaml` sends the same body as YAML fields — see the post-fusion section below. |
 | `SEARCH_RECENCY_HALFLIFE_DAYS` | `--recency-halflife-days=D` | `0` (off) | Multiplies fused scores by `(1-α)+α*2^(-age/D)` on queries that carry no event-time window. |
 | `SEARCH_RECENCY_ALPHA` | `--recency-alpha=A` | `0.3` | Maximum strength `α` of the recency decay. |
 | `SEARCH_CHUNK_SPARSE` | `--chunk-sparse=fallback\|fuse\|fuse_ctx` | `fallback` | 청크 FTS/bigm 레인을 RRF 융합에 상시 참여시킨다(#270). 자세한 내용은 `docs/chunk-sparse-context.md`. |
 | `SEARCH_SPARSE_QUERY` | `--sparse-query=raw\|chunk\|chunk_doc` | `raw` | 희소 레인이 질문 원문 대신 `internal/sparseq` 추출 키워드를 쓴다(#276). 아래 절 참고. |
 | `SEARCH_ENTITY_QUERY_CONTAINS_NAME` | `--entity-query-contains-name` | `false` | 두 글자 이상 엔티티 이름이 질의에 포함되는지 찾는다. 엔티티 레인의 기존 활성화 조건·필터는 그대로 적용한다. |
+| `SEARCH_ENTITY_KEYWORDS` | `--entity-keywords=sparse\|llm` | off (빈 값) | 엔티티 레인이 질문 원문 대신 질문에서 뽑은 저수준 키워드로 엔티티를 찾는다(LightRAG 이중 키워드). 아래 절 참고. |
+| `SEARCH_HIGH_LEVEL_KEYWORDS_TO_SPARSE` | `--high-level-keywords-to-sparse` | `false` | `llm` 모드의 고수준(주제) 키워드를 희소 레인(fts·bigm) 키워드에 덧붙인다. `SEARCH_SPARSE_QUERY=chunk\|chunk_doc` 필요. |
+| `SEARCH_GRAPH_WEIGHT` | `--graph-weight=W` | `0` (off) | 여섯 번째 RRF 레인: 키워드로 찾은 엔티티와 `entity_relations` 로 1-hop 이웃인 근거 문서. `SEARCH_ENTITY_KEYWORDS` 필요. |
+| `SEARCH_GRAPH_HUB_DAMPING` | `--graph-hub-damping` | `false` | 그래프 레인 순위를 `SUM(confidence × 1/ln(e + 시드 엔티티 문서 언급 수))` 로 바꿔 허브 엔티티를 누른다(HippoRAG). `SEARCH_GRAPH_WEIGHT>0` 필요. |
+| `SEARCH_GRAPH_EXPAND_BOOST` | `--graph-expand-boost=B` | `0` (off) | 융합 후·리랭크 전, 상위 10건의 엔티티 ∪ 키워드 엔티티와 관계로 이어진 기존 후보만 `score × (1 + B·s)` 로 올린다(재정렬만, 0≤B≤1). |
+| `SEARCH_RRF_MISSING_RANK` | `--rrf-missing-rank=cutoff` | off (빈 값) | 결과가 있는 레인에 없는 문서가 0 대신 `w/(k + 레인 상한 + 1)` 을 받는다(R2R 가중 RRF). |
+| `SEARCH_SOURCE_STRATIFY_K` | `--source-stratify-k=K` | `0` (off) | 소스별 보조 검색(최대 10). 아래 "융합 이후 노브" 절 참고. |
+| `SEARCH_COLLAPSE_CONTACT_DAY` | `--collapse-contact-day` | `false` | 통화·문자 상대-날짜 접기/펼치기. |
+| `SEARCH_COLLAPSE_EXPAND_MAX` | `--collapse-expand-max=N` | `3` | 대표 뒤에 펼칠 같은 그룹 문서 수(1~20). `--collapse-contact-day` 필요. |
+| `SEARCH_WINDOW_BUCKET_DIVERSIFY` | `--window-bucket-diversify` | `false` | 하루를 넘는 시간창에서 날짜별 최상위 문서를 먼저 세운다. |
+| `SEARCH_MMR_LAMBDA` | `--mmr-lambda=λ` | `0` (off) | 리랭크 뒤 상위 30건 MMR, λ∈(0,1]. |
+| `SEARCH_SCHEDULE_INTENT_BOOST` | `--schedule-intent-boost=B` | `0` (off) | 일정 의도 질문에서 캘린더 후보 점수 ×(1+B), B∈(0,1]. 아래 "계획 인지 노브" 절 참고. |
+| `SEARCH_PLAN_SOURCE_SPILL_K` | `--plan-source-spill-k=K` | `0` (off) | 계획이 고른 소스 포함 집합 밖 상위 K건(최대 10)을 후보에 섞는다. `--plan-sources` 필요. |
 | `SEARCH_RERANK_CALL_CONTEXT` | `--rerank-call-context` | `false` | 통화 리랭커 입력에 `contact_name`을 추가한다. `best_chunk`의 문서 결과에는 본문 앞 250자도 보탠다. 청크 결과는 참여자만 추가하며 전체 1,000자 예산을 유지한다. |
 
 Only non-default knob values are written into the config-hash profile, so a run
 with every knob at its default keeps matching existing baselines, while any
 enabled knob establishes a separate baseline exactly like `--window=plan`.
+
+### 엔티티 이중 키워드와 그래프 1-hop 레인 (`--entity-keywords`, `--graph-weight`)
+
+LightRAG 의 두 아이디어를 Postgres 안에서 실험 노브로 옮긴 것이다. 기본은 모두
+꺼져 있고, 꺼진 상태의 SQL·인자는 바이트 단위로 기존과 같다
+(`internal/store/testdata/sparse_query_raw.golden` 가 고정).
+
+- **저수준 키워드**: 현행 엔티티 레인은 `normalized_name LIKE '%질문 전체%'` 라
+  문장형 질문에서는 거의 맞지 않는다. `--entity-keywords=sparse` 는
+  `internal/sparseq.Extract` 키워드를, `llm` 은 LLM 한 번으로 뽑은
+  `{"low_level": 고유명사, "high_level": 주제}` 의 low_level 을 쓴다. 키워드는
+  소문자·trim·중복 제거·2~40자·최대 8개로 정규화하고(`store.NormalizeEntityKeywords`),
+  `normalized_name LIKE ANY(키워드%)`(LIKE 메타문자 이스케이프, 정확 일치를 포함한다)로
+  맞춘다. 맞는 엔티티(시드)는 최대 64개(`store.MaxEntityKeywordSeeds`)이며, 넘으면 정확
+  일치 → 짧은 이름 → id 순으로 남긴다 — 두 글자 키워드 접두가 엔티티 수천 개와 맞아 문장
+  전체가 느려지는 것을 막는다. 엔티티 레인·그래프 레인·결과 시드 확장이 같은 상한을 쓴다.
+  문서 순위는 맞은 서로 다른 엔티티 수 내림차순, 최신 사건 시각, 문서 id 오름차순이다.
+- **LLM 폴백**: LLM 이 없거나(`llm.Completer` 비활성)·8초 안에 못 답하거나·JSON 이
+  깨졌거나·고유명사가 하나도 없으면 sparse 키워드로 되돌아간다. 검색은 실패하지
+  않는다. 키워드 내용·LLM 응답은 로그에 남기지 않고 개수와 실패 사유(고정 문자열)만
+  남긴다.
+- **고수준 키워드**: `--high-level-keywords-to-sparse` 는 `llm` 모드의 high_level 을
+  `sparseq.Extract` 로 다시 풀어 희소 레인(fts·bigm) 키워드 뒤에 붙인다(질문에서 직접
+  뽑은 키워드가 먼저, 전체 `sparseq.MaxTerms` 안에서 남는 자리만). vec·summvec 레인은
+  건드리지 않는다.
+- **그래프 레인**: `--graph-weight>0` 이면 저수준 키워드로 찾은 엔티티를 시드로,
+  `entity_relations` 의 from/to 가 시드인 관계의 `evidence_document_id` 를
+  `SUM(confidence)` 내림차순으로 순위 매긴 레인이 RRF 에 합류한다. 상태·소스 포함/제외·
+  retention·occurred 필터는 엔티티 레인과 똑같이 레인 안에서 `d.` 한정형으로 건다.
+  키워드가 없는 질의는 레인이 생기지 않는다. 엔티티 레인(`EntityWeight`)과 독립이다.
+- 키워드가 하나도 안 나온 질의의 엔티티 레인은 현행 SQL 을 그대로 탄다.
+- 엔티티 레인 자체가 켜져 있어야(`ENTITY_EXTRACTION_ENABLED=true` 또는 명시 가중치)
+  `--entity-keywords` 가 엔티티 레인에 효과가 있다. 이 환경변수는 실행 프로필에 들어가지
+  않으므로 baseline 과 후보를 같은 환경에서 돌려야 한다.
+- 프로필에는 `entity_keyword_mode`, `llm` 이면 `entity_keyword_prompt_version`
+  (`search.EntityKeywordPromptVersion`), 켠 경우 `high_level_keywords_to_sparse`,
+  `graph_weight`, `sparse_terms_version` 이 들어간다. LLM 모델 이름은 들어가지 않는다.
+  LLM 출력은 비결정적일 수 있어 `llm` 실행은 반복해 편차를 확인한다.
+
+```sh
+# baseline(노브 off) 대 후보. 두 실행 모두 같은 ENTITY_EXTRACTION_ENABLED 환경에서 돌린다.
+export ENTITY_EXTRACTION_ENABLED=true
+go run ./cmd/eval --golden --no-persist --window=plan --dump=/tmp/base.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --entity-keywords=sparse --dump=/tmp/kw-sparse.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --entity-keywords=sparse --graph-weight=0.5 --dump=/tmp/kw-sparse-graph.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --entity-keywords=llm --graph-weight=0.5 --dump=/tmp/kw-llm-graph.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --sparse-query=chunk_doc --entity-keywords=llm --high-level-keywords-to-sparse --graph-weight=0.5 --dump=/tmp/kw-llm-full.jsonl
+go run ./cmd/evalcompare --baseline=/tmp/base.jsonl --candidate=/tmp/kw-sparse.jsonl
+```
+
+### 그래프 허브 감쇠·결과 시드 확장·누락 레인 순위 (`--graph-hub-damping`, `--graph-expand-boost`, `--rrf-missing-rank`)
+
+세 노브 모두 기본 꺼짐이고, 꺼진 상태의 저장소 SQL·인자는 바이트 단위로 같다
+(`sparse_query_raw.golden`, `internal/store/graph_expand_test.go`).
+
+- **허브 감쇠**(HippoRAG 노드 특이성): 시드 가중치 `w(e) = 1/ln(e + n(e))`, `n(e)` 는 그
+  엔티티의 `document_entities` 행 수다. 시드 집합에 대해서만 `LATERAL` 로 센다
+  (`idx_document_entities_entity_id`). 그래프 레인은 근거 문서를
+  `SUM(confidence × w(시드 쪽 끝점))` 로 순위 매기고, 양 끝이 모두 시드면 큰 쪽 가중치를
+  쓴다. 언급 0 이면 `w=1` 이라 순위가 감쇠 없는 레인과 같고, 1000 건이면 약 0.145 다.
+  WHERE·필터·LIMIT 은 감쇠 없는 레인과 같다. `--graph-weight>0` 없이 켜면 eval 이 거부한다.
+- **결과 시드 확장**(Graphiti edge_search / Hindsight): 문서 저장소·청크·OpenSearch 융합이
+  끝난 후보 풀(소스별 보조 검색 합류 뒤, 보존 페널티·최신성 감쇠·리랭크 전)에서 상위 10건의 엔티티 ∪ 키워드로 찾은
+  엔티티를 시드로 삼는다. 저장소(`DocumentStore.GraphSupportCounts`)가 후보마다 시드와
+  이어진 서로 다른 관계 수 `n` 을 센다 — 관계의 `evidence_document_id` 가 후보이고 from/to 중
+  한쪽이 시드인 관계다. 후보 자신의 엔티티만으로 이어진 관계는 세지 않는다(상위 문서가 자기
+  관계로 자기를 올리는 순환 방지). 상태·소스·retention·occurred 필터를 다시 걸고, 후보(최대
+  200건)만 대상으로 한다. 시드와의 연결은 from 쪽·to 쪽 등치 조인 두 개를 UNION 으로 합쳐
+  관계 id 로 중복을 없앤 뒤 센다(해시 조인 가능; 양 끝이 모두 시드인 관계는 한 번). 승수는 `1 + B·s`, `s = ln(1+n)/ln(1+max n)` ∈ [0,1] 이며 후보를
+  더하지 않는다. 최신순 정렬 질의, 저장소 실패, 엔티티가 없는 코퍼스에서는 아무것도 바꾸지
+  않는다. 로그에는 개수만 남긴다.
+- **누락 레인 순위 cutoff**(R2R): 레인 항이 `COALESCE(w/(k+rank), CASE WHEN COUNT(lane.id)
+  OVER () > 0 THEN w/(k + $3 + 1) ELSE 0 END)` 가 된다. `$3` 은 레인 상한(LIMIT)이다.
+  결과가 하나도 없는 레인(맞는 엔티티가 없는 엔티티·그래프 레인 등)과 가중치 0 레인은 여전히
+  0 이다. 레인 CTE 를 다시 참조하지 않으므로 계획은 바뀌지 않는다.
+- 프로필 키: `graph_hub_damping`(그래프 레인이 있을 때만), `graph_expand_boost`,
+  `rrf_missing_rank`.
+
+```sh
+export ENTITY_EXTRACTION_ENABLED=true
+go run ./cmd/eval --golden --no-persist --window=plan --entity-keywords=sparse --graph-weight=0.5 --dump=/tmp/graph.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --entity-keywords=sparse --graph-weight=0.5 --graph-hub-damping --dump=/tmp/graph-damped.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --entity-keywords=sparse --graph-weight=0.5 --graph-expand-boost=0.3 --dump=/tmp/graph-expand.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --rrf-missing-rank=cutoff --dump=/tmp/rrf-cutoff.jsonl
+go run ./cmd/evalcompare --baseline=/tmp/graph.jsonl --candidate=/tmp/graph-damped.jsonl
+```
 
 ### 희소 레인 질의 키워드 (`--sparse-query`, #276)
 
@@ -285,6 +461,109 @@ enabled knob establishes a separate baseline exactly like `--window=plan`.
 go run ./cmd/eval --golden --no-persist --window=plan --chunk-sparse=fuse --dump=/tmp/c1.jsonl
 go run ./cmd/eval --golden --no-persist --window=plan --chunk-sparse=fuse --sparse-query=chunk --dump=/tmp/t1.jsonl
 go run ./cmd/evalcompare --baseline=/tmp/c1.jsonl --candidate=/tmp/t1.jsonl
+```
+
+### 융합 이후 노브 (`--source-stratify-k`, `--collapse-contact-day`, `--window-bucket-diversify`, `--rerank-input=yaml`, `--mmr-lambda`)
+
+골든셋 실패 유형 넷을 겨냥한 실험 노브다. 전부 기본 꺼짐이며, 꺼진 상태에서는
+저장소 SQL·호출 횟수·결과 순서가 노브 도입 전과 같다(`TestPostFusion_KnobsOffIdentity`).
+구현은 `internal/search/postfusion.go`·`stratify.go`·`rerank_yaml.go`.
+
+파이프라인 안의 적용 순서:
+
+```
+레인 융합 → [보조 검색 합류] → [그래프 지지 승수(--graph-expand-boost)] → 보존 페널티 → 최신성 감쇠 → recent 재정렬 → (FusedIDs)
+→ [상대-날짜 접기] → 리랭크/합산 → [MMR] → [날짜 버킷] → [접힌 문서 펼치기] → (PoolIDs) → limit 절단
+```
+
+- **소스별 보조 검색** (`--source-stratify-k=K`, 실패 유형: 다른 소스 문서에 밀려
+  후보 풀에 못 든 정답, 일정 질문에서 빠진 캘린더). 질의에 소스 포함 집합이 없을 때만,
+  일정·통화·문자·메일·노트 중 질의가 제외하지 않은 소스마다 본 저장소 검색과 같은 질의
+  (시간창·제외 소스·retention 제외·가중치·키워드 동일)를 소스 하나로 제한해 `Limit=K` 로
+  동시에 돌린다. 본 검색과 병렬이며 요청 ctx 에서 파생한 취소 가능 ctx 를 쓴다 — 본 검색이
+  실패해 일찍 반환하면 남은 보조 질의도 끊긴다. 실패한 소스는 경고 로그만 남기고 빠지고,
+  청크 FTS 폴백이 실패한 경로에서도 보조 검색 결과는 합류한다. 각 소스 상위 K건은 전역 목록과 `Σ 1/(60+rank)` RRF 로 합쳐지고(두 목록에 다
+  있으면 두 항 모두), 결과는 합집합이라 후보 풀이 최대 `소스 수 × K` 건 커진다. 리랭크를
+  켜면 리랭커 입력은 `min(laneLimit + 소스 수 × K, 200)` 건으로 제한되고(`overfetchLimitCap`
+  을 넘지 않는다), 넘친 후보는 버리지 않고 리랭크된 머리 뒤에 융합 순서대로 붙는다. 저장소 질의가 최대 5회 더 나가므로 지연시간은
+  `slog.Debug("search: source stratify arms done", elapsed_ms)` 와 eval 의 p50/p95 로 본다.
+  보조 검색 후보는 `--dump` 의 레인 이름 `source_stratify` 로 남는다.
+- **상대-날짜 접기** (`--collapse-contact-day`, `--collapse-expand-max=N`, 실패 유형: 월
+  단위 창에서 같은 상대 통화·문자가 상위를 독식해 정답이 11~14위). 문자·통화 문서를
+  (소스, 상대, KST 날짜)로 묶는다. 상대는 `metadata.number_hash` → `metadata.thread_id` →
+  SourceID 의 번호 해시 구간(`sms:{ms}:{hash}:…`, `call-log:{ms}:{hash}:…`) 순으로 찾고,
+  없거나 occurred_at 이 없으면 묶지 않는다. 리랭크 전에 그룹마다 점수 최상위 대표만 순위에
+  남겨 리랭커 예산과 상위 자리를 연다. 최종 순서가 정해진 뒤 대표 바로 뒤에 같은 그룹을 점수
+  순으로 N건(기본 3) 다시 편다. N 을 넘은 멤버는 꼬리로 보내지 않는다: 접기 직전 순위에서
+  자기 바로 위에 있던 블록 머리(대표 또는 그룹 밖 문서)를 앵커로 삼아 최종 순위에서 그 블록
+  바로 뒤에 붙는다. 리랭크가 순서를 바꾸지 않았다면 초과 멤버와 그룹 밖 문서의 상대 순서는
+  접기 전과 같다. 끼워 넣은 문서(펼침·초과분)의 응답 Score 는 바로 앞 문서 점수를 이어받는다
+  (대표는 리랭커 척도, 멤버는 융합 척도라 그대로 두면 점수가 순서와 어긋난다). 후보는 하나도
+  버리지 않는다(PoolIDs 에 모두 남는다). 그룹 키는 로그·덤프에 싣지 않는다.
+- **날짜 버킷 다변화** (`--window-bucket-diversify`). occurred 창이 KST 로 하루를 넘을 때만
+  (한쪽 경계만 있는 열린 창 포함), 후보 풀 전체에서 날짜마다 순위 최상위 문서 하나씩을 현재
+  순위 순으로 먼저 세우고 나머지를 그 뒤에 둔다. occurred_at 없는 문서는 첫 바퀴에서 빠진다.
+- **리랭커 YAML 입력** (`--rerank-input=yaml`, 실패 유형: 리랭커가 맥락 없이 정답을 내림).
+  best_chunk 와 같은 본문을 `source`/`date`(KST 일 단위)/`title`/`counterpart`(연락처 표시
+  이름만. 구분 기호 `공백 - . ( ) +` 를 무시하고 숫자 7개 이상이 이어지는 구간이 있으면
+  — 예: `엄마 010-1234-5678` — 칸째 생략)/`text`(literal block) YAML 로 보낸다. 문서당 1,000 rune
+  예산은 같다. 전화번호·number_hash·SourceID 는 싣지 않는다. `--rerank=true` 가 필요하고
+  `--rerank-call-context` 와는 같이 쓸 수 없다. 프로필에 `rerank_yaml_version` 이 들어간다.
+- **MMR** (`--mmr-lambda=λ`). 리랭크·합산 뒤 상위 30건에서
+  `λ·rel − (1−λ)·max cos(같은 소스로 이미 뽑힌 문서)` 를 탐욕적으로 고른다. rel 은 원점수가
+  아니라 창 안 순위로 정한다: `rel = 11/(10+rank)`(1위 1.0, k=10). 리랭커가 상위 N건만
+  돌려주면 나머지는 점수 0 으로 채워지는데, 리랭커 점수가 음수일 때 점수 정규화를 쓰면 그
+  꼬리가 위로 올라오기 때문이다. k 는 RRF 의 60 대신 10 — 60 이면 30건 창 안 관련도가
+  1.0→0.68 로 거의 평평해 유사도 벌점만 남는다. 문서 임베딩이 없는 후보는 자기 자리를 지키고, 재배치는 임베딩이
+  있는 후보들의 자리 안에서만 일어난다.
+- 응답 점수: MMR·날짜 버킷·접기 펼치기·리랭크 입력 상한 꼬리 중 하나라도 실제로 일어나면,
+  마지막에 Score 를 최종 순서를 따라 비증가가 되도록 앞 문서 점수로 내려 깎는다(올리지는 않음,
+  NaN 은 그대로). 노브가 모두 꺼져 있으면 점수는 손대지 않는다. 점수 임계값으로 후보를 거르는
+  호출자는 노브를 켠 실행에서 이 보정을 감안해야 한다.
+- `Sort=recent` 질의에는 접기·날짜 버킷·MMR 이 적용되지 않는다(순서는 시간이 정한다).
+- 효과 없는 조합은 eval 이 거부한다: `--collapse-expand-max` 만 단독, `--rerank-input=yaml`
+  인데 리랭크 꺼짐, 범위 밖 `--source-stratify-k`/`--mmr-lambda`.
+- 프로필에는 켠 노브만 들어간다: `source_stratify_k`, `collapse_contact_day`+`collapse_expand_max`,
+  `window_bucket_diversify`, `rerank_input`+`rerank_yaml_version`, `mmr_lambda`+`mmr_window`+`mmr_rank_k`.
+
+```sh
+go run ./cmd/eval --golden --no-persist --window=plan --rerank=true --dump=/tmp/base.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --rerank=true --source-stratify-k=5 --dump=/tmp/strat.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --rerank=true --collapse-contact-day --window-bucket-diversify --dump=/tmp/collapse.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --rerank=true --rerank-input=yaml --rerank-blend=rrf --dump=/tmp/yaml.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --rerank=true --mmr-lambda=0.7 --dump=/tmp/mmr.jsonl
+go run ./cmd/evalcompare --baseline=/tmp/base.jsonl --candidate=/tmp/strat.jsonl
+```
+
+### 계획 인지 노브 (`--schedule-intent-boost`, `--plan-source-spill-k`)
+
+`--plan-sources` 실행의 잔여 손실 둘을 겨냥한다. 둘 다 기본 꺼짐이고, 꺼져 있으면 저장소
+호출 수·결과가 노브 도입 전과 같다.
+
+- **일정 의도 캘린더 가산** (`--schedule-intent-boost=B`, 실패 유형: 계획이 캘린더로 좁히지
+  않은 일정 질문에서 통화·메일이 관련 캘린더 문서 위를 차지). `intent.HasScheduleIntent` 가
+  일정 질문으로 판정하면 — 기록 단어(메일·문자·통화·노트·기록·대화 등)가 있으면 항상 아니고,
+  그 밖에는 일정·스케줄·캘린더·약속 또는 보수적 단서 `미팅|회의|예정|계획|뭐 해|뭐 하|언제|몇 시|가야|만나`
+  (`회의록`·`계획서` 는 단서에서 제외) — 캘린더 후보의 양수 융합 점수에 `(1+B)` 를 곱하고
+  `sortByScore` 로 재정렬한다. 소스 포함 집합이 있거나 `Sort=recent` 이면 하지 않는다. 후보를
+  더하거나 빼지 않고, 움직이는 것은 캘린더 문서가 위로 올라가는 것뿐이다. 적용 지점은 보조 검색
+  합류·그래프 가산 뒤, 보존 페널티 앞(`search.go` 의 schedule intent boost 블록). 프로필에
+  `schedule_intent_boost` 와 판정 규칙 판 `schedule_cue_version`(`intent.ScheduleCueVersion`)이 들어간다.
+- **계획 소스 넘침 검색** (`--plan-source-spill-k=K`, 실패 유형: 계획이 소스를 잘못 좁혀(문자로
+  계획, 정답은 메일) 하드 필터 때문에 정답에 도달 불가 — 운영 /ask 도 같다). `model.SearchQuery.SourceIncludeFromPlan`
+  (json 비노출, 서버만 채움)이 true 인 질의 — 운영 /ask 의 `assembleRetrieval` 이 플래너의 소스를
+  걸 때, eval 의 `--plan-sources` 가 비어 있지 않은 집합을 걸 때 — 에서만, 본 검색과 같은
+  질의(시간창·retention·제외 소스·가중치·키워드 동일)를 포함 제한 없이 한 번 더 돌려 포함 집합
+  밖 상위 K건을 소스별 보조 검색과 똑같이 RRF 로 합류시킨다. 저장소에는 포함 집합 소스를 제외
+  집합에 더해 보내므로("제한 없이 돌린 뒤 거르기" 와 멤버십은 같고, 포함 소스가 상위를 채워 넘침이
+  0건이 되는 일이 없다) 결과에서 포함 소스 문서를 한 번 더 거른다. 같은 취소 가능 ctx·실패 흡수·
+  리랭크 입력 상한(`laneLimit + K`, 200 이하) 규칙을 따른다. 사용자가 지정한 포함 집합
+  (SourceIncludeFromPlan=false)과 /ask 의 insight 레인은 절대 넓히지 않는다. 넘침 후보는 `--dump`
+  레인 이름 `plan_source_spill` 로 남는다. `--plan-sources` 없이 켜면 eval 이 거부한다.
+
+```sh
+go run ./cmd/eval --golden --no-persist --window=plan --plan-sources --entity-keywords=sparse --graph-weight=1.0 \
+  --source-stratify-k=8 --window-bucket-diversify --schedule-intent-boost=0.5 --plan-source-spill-k=5 --dump=/tmp/plan-aware.jsonl
 ```
 
 ## Read-only comparisons

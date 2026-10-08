@@ -38,6 +38,15 @@ type queryDiagnostics struct {
 	// WindowApplied 는 --window=plan 에서 실제로 검색에 걸린 시간창이다.
 	// 모드가 none 이거나 기간 표현이 없어 파서가 매칭하지 못하면 null.
 	WindowApplied *dumpWindow `json:"window_applied"`
+	// WindowAnchorDate 는 --window=plan 이 이 질의의 상대 기간 표현을 푼 기준
+	// 날짜(KST, YYYY-MM-DD)다. window_applied 가 null 인 질의에서도 채워져
+	// "창이 안 걸린 것" 과 "엉뚱한 날짜로 풀린 것" 을 가를 수 있다. 시간창
+	// 모드가 none 이면 비어 있어 생략된다.
+	WindowAnchorDate string `json:"window_anchor_date,omitempty"`
+	// PlanSources 는 --plan-sources 가 이 질의에 실제로 건 소스 포함 집합이다.
+	// 결정론적 계획이 거절했거나 소스를 좁히지 않은 질의, 플래그를 끈 실행에서는
+	// 비어 있어 생략된다.
+	PlanSources []string `json:"plan_sources,omitempty"`
 
 	RelevantDocIDs []string    `json:"relevant_doc_ids"`
 	RelevantDocs   []dumpLabel `json:"relevant_docs"`

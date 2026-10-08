@@ -39,6 +39,10 @@ const (
 	// 본문을 보낸다. 통화 전사·긴 메일처럼 근거가 앞부분에 없는 문서를
 	// 겨냥한다.
 	RerankInputBestChunk = "best_chunk"
+	// RerankInputYAML 은 best_chunk 와 같은 본문을 Cohere 의 구조화 문서
+	// 권고대로 YAML 필드(source·date·title·counterpart·text)로 감싸 보낸다.
+	// 전화번호·number_hash 는 절대 넣지 않는다 — 연락처 표시 이름만.
+	RerankInputYAML = "yaml"
 
 	// ChunkSparseFallback 은 현행 동작이다(#270). 청크 FTS/bigm 레인은
 	// 1차 경로(문서 하이브리드 + 청크 벡터 + OpenSearch)가 결과를 하나도
@@ -78,6 +82,28 @@ const (
 	// fts·bigm 레인과 임베딩 없는 fulltext 경로에도 키워드를 쓴다. 엔티티
 	// 레인은 어떤 값에서도 바뀌지 않는다(방향 문제는 별도 이슈).
 	SparseQueryChunkDoc = "chunk_doc"
+
+	// EntityKeywordsOff 는 현행 동작이다. 엔티티 레인은 질문 원문 전체를
+	// 소문자로 만들어 normalized_name LIKE '%질문 전체%' 로 맞춘다(실제로는
+	// 문장형 질문에서 거의 맞지 않는다).
+	EntityKeywordsOff = ""
+	// EntityKeywordsSparse 는 internal/sparseq.Extract 가 뽑은 키워드를
+	// 저수준(low-level) 키워드로 써서 엔티티 레인을 normalized_name 정확
+	// 일치·접두 일치로 맞춘다. LLM 호출이 없고 결정론적이다.
+	EntityKeywordsSparse = "sparse"
+	// EntityKeywordsLLM 은 LLM 한 번으로 저수준(고유명사)·고수준(주제)
+	// 키워드를 뽑는다(LightRAG 의 이중 키워드). 어떤 실패든 EntityKeywordsSparse
+	// 결과로 조용히 되돌아간다.
+	EntityKeywordsLLM = "llm"
+
+	// RRFMissingRankZero 는 현행 동작이다. 어떤 레인에도 없는 문서는 그 레인에서
+	// 0 을 받는다.
+	RRFMissingRankZero = ""
+	// RRFMissingRankCutoff 는 R2R 의 가중 RRF 처럼, 켜져 있고(가중치>0) 결과가
+	// 하나라도 있는 레인에 없는 문서를 "레인 상한 바로 다음 순위"(LIMIT+1)로
+	// 본다 — w/(k + lane_limit + 1). 레인 하나에만 잡힌 문서가 여러 레인에서
+	// 중간쯤 잡힌 문서를 이기는 일을 줄인다.
+	RRFMissingRankCutoff = "cutoff"
 )
 
 // 노브 기본값. 제로값이 곧 "현행 동작" 이 되도록 잡았다 — 새 필드가 생겼다는
@@ -89,6 +115,18 @@ const (
 	// DefaultRecencyAlpha 는 최신성 감쇠의 최대 강도다. 0.3 이면 아무리
 	// 오래된 문서라도 점수가 원래의 70% 밑으로는 내려가지 않는다.
 	DefaultRecencyAlpha = 0.3
+
+	// MaxSourceStratifyK 는 소스별 보조 검색(SourceStratifyK)이 소스당 가져오는
+	// 후보 수의 상한이다. 보조 검색은 소스 수만큼 저장소 질의를 더 하므로,
+	// 실험 노브가 후보 풀과 DB 부하를 무한정 키울 수 없게 막는다.
+	MaxSourceStratifyK = 10
+	// DefaultCollapseExpandMax 는 CollapseContactDay 에서 대표 문서 바로 뒤에
+	// 다시 펼쳐 놓는 같은 그룹 문서 수의 기본값이다.
+	DefaultCollapseExpandMax = 3
+	// MaxCollapseExpandMax 는 CollapseExpandMax 의 상한이다.
+	MaxCollapseExpandMax = 20
+	// MaxPlanSourceSpillK 는 PlanSourceSpillK 의 상한이다.
+	MaxPlanSourceSpillK = 10
 )
 
 // SearchTuning 은 검색 실험용 노브 묶음이다.
@@ -152,6 +190,76 @@ type SearchTuning struct {
 	EntityQueryContainsName bool
 	// RerankCallContext는 통화 리랭커 입력에 참여자와 본문 앞부분을 보탠다.
 	RerankCallContext bool
+
+	// EntityKeywordMode 는 EntityKeywordsOff(기본)·EntityKeywordsSparse·
+	// EntityKeywordsLLM 중 하나다. 꺼져 있지 않으면 search.Service 가 질문에서
+	// 저수준 키워드를 뽑아 SearchQuery.EntityKeywords 에 싣고, 엔티티 레인과
+	// 그래프 레인(GraphWeight)이 그 키워드로 엔티티를 찾는다. 키워드가 하나도
+	// 안 나온 질의는 현행 엔티티 레인 SQL 을 그대로 탄다.
+	EntityKeywordMode string
+	// HighLevelKeywordsToSparse 가 true 이면 EntityKeywordsLLM 이 뽑은 고수준
+	// (주제) 키워드를 희소 레인(fts·bigm) 키워드에 덧붙인다. SparseQuery 가
+	// raw 이면 덧붙일 키워드 경로가 없으므로 Normalized 가 false 로 되돌린다.
+	// vec·summvec 레인은 건드리지 않는다.
+	HighLevelKeywordsToSparse bool
+	// GraphWeight 는 그래프 1-hop 레인(entity_relations)의 RRF 가중치다.
+	// 0(기본)이면 레인 자체가 SQL 에 들어가지 않는다. 시드 엔티티는
+	// EntityKeywordMode 의 저수준 키워드로 찾으므로, 모드가 꺼져 있거나
+	// 키워드가 없는 질의에서는 이 값이 있어도 레인이 생기지 않는다.
+	GraphWeight float64
+
+	// GraphHubDamping 이 true 이면 그래프 레인이 관계 근거 문서를
+	// SUM(confidence * seed_weight) 로 순위 매긴다. seed_weight =
+	// 1/ln(e + 시드 엔티티의 document_entities 행 수)(HippoRAG 의 노드 특이성).
+	// 사용자 본인·가족처럼 거의 모든 문서에 나오는 허브 엔티티가 레인을
+	// 채우는 것을 누른다. GraphWeight 가 0 이면 레인이 없으므로 Normalized 가
+	// false 로 되돌린다.
+	GraphHubDamping bool
+	// GraphExpandBoost 는 결과 시드 그래프 확장(Graphiti edge_search·Hindsight)의
+	// 승수 강도다. 0(기본)이면 끈다. 융합 상위 문서의 엔티티 ∪ 키워드 시드
+	// 엔티티와 관계로 이어진 기존 후보만 score *= 1 + boost*s (s∈[0,1]) 로
+	// 올린다 — 새 문서를 더하지 않는 재정렬이다. 1 을 넘으면 1 로 자른다.
+	GraphExpandBoost float64
+	// RRFMissingRank 는 RRFMissingRankZero(기본) 또는 RRFMissingRankCutoff.
+	RRFMissingRank string
+
+	// --- 융합 이후(post-fusion) 노브. 전부 기본 꺼짐이며, 꺼져 있으면 저장소
+	// SQL·결과 순서가 이 필드들이 생기기 전과 완전히 같다. 구현과 파이프라인
+	// 내 적용 순서는 internal/search/postfusion.go 참고. ---
+
+	// SourceStratifyK 가 0 보다 크면, 질의에 소스 포함 집합이 없을 때 주요
+	// 소스(일정·통화·문자·메일·노트)별로 저장소 하이브리드 검색을 한 번씩 더
+	// 돌려 각 소스 상위 K건을 전역 융합 목록과 RRF 로 합친다(LightRAG
+	// round-robin / Hindsight per-arm). 상한 MaxSourceStratifyK.
+	SourceStratifyK int
+	// CollapseContactDay 가 true 이면 문자·통화 문서를 (소스, 상대, KST 날짜)
+	// 그룹으로 접어 대표 하나만 리랭크·순위 경쟁에 남기고, 최종 순서가 정해진
+	// 뒤 대표 바로 뒤에 같은 그룹 문서를 CollapseExpandMax 건까지 다시 편다.
+	// 어떤 후보도 버리지 않는다 — 위치만 바뀐다.
+	CollapseContactDay bool
+	// CollapseExpandMax 는 CollapseContactDay 에서만 쓰인다. 0 이면
+	// DefaultCollapseExpandMax. CollapseContactDay 가 꺼져 있으면 Normalized 가
+	// 0 으로 비운다.
+	CollapseExpandMax int
+	// WindowBucketDiversify 가 true 이면 하루를 넘는 occurred 시간창이 있는
+	// 질의에서, 날짜(KST)별 최상위 문서를 먼저 순위 순으로 세우고 나머지를
+	// 뒤에 둔다. 순서만 바꾼다.
+	WindowBucketDiversify bool
+	// MMRLambda 가 (0,1] 이면 리랭크(합산) 뒤 상위 문서에 MMR 을 적용한다.
+	// 유사도 벌점은 같은 소스 문서끼리만 준다. 0(기본)이면 끈다. 범위 밖
+	// 값은 Normalized 가 0 으로 되돌린다.
+	MMRLambda float64
+
+	// ScheduleIntentBoost 가 (0,1] 이면, 소스 포함 집합이 없고 Sort 가 recent
+	// 가 아닌 질의에서 질문에 일정 의도(intent.HasScheduleIntent)가 있을 때
+	// 캘린더 후보의 융합 점수에 (1+boost) 를 곱하고 다시 정렬한다. 순서만
+	// 바꾼다. 0(기본)이면 끈다. 범위 밖 값은 Normalized 가 0 으로 되돌린다.
+	ScheduleIntentBoost float64
+	// PlanSourceSpillK 가 0 보다 크면, 질의 계획이 고른 소스 포함 집합
+	// (SearchQuery.SourceIncludeFromPlan)이 있을 때 포함 집합 밖에서 상위 K 건을
+	// 보조 검색해 후보에 RRF 로 섞는다. 사용자가 지정한 포함 집합은 넓히지
+	// 않는다. 상한 MaxPlanSourceSpillK.
+	PlanSourceSpillK int
 }
 
 // IsZero 는 노브가 하나도 설정되지 않았는지 — 즉 "현행 동작" 인지 — 알린다.
@@ -175,8 +283,13 @@ func (t SearchTuning) Normalized() SearchTuning {
 	if t.RerankBlendWeight <= 0 || isBadFloat(t.RerankBlendWeight) {
 		t.RerankBlendWeight = DefaultRerankBlendWeight
 	}
-	if t.RerankInput != RerankInputBestChunk {
+	if t.RerankInput != RerankInputBestChunk && t.RerankInput != RerankInputYAML {
 		t.RerankInput = RerankInputHead
+	}
+	// yaml 입력은 counterpart 필드로 참여자를 이미 싣는다. 통화 문맥 노브를
+	// 함께 켜면 같은 정보가 두 번 들어가거나(무의미) 형식이 깨지므로 끈다.
+	if t.RerankInput == RerankInputYAML {
+		t.RerankCallContext = false
 	}
 	if t.RecencyHalfLifeDays < 0 || isBadFloat(t.RecencyHalfLifeDays) {
 		t.RecencyHalfLifeDays = 0
@@ -203,6 +316,57 @@ func (t SearchTuning) Normalized() SearchTuning {
 	if t.SparseQuery != SparseQueryChunk && t.SparseQuery != SparseQueryChunkDoc {
 		t.SparseQuery = SparseQueryRaw
 	}
+	if t.EntityKeywordMode != EntityKeywordsSparse && t.EntityKeywordMode != EntityKeywordsLLM {
+		t.EntityKeywordMode = EntityKeywordsOff
+	}
+	// 고수준 키워드는 LLM 모드에서만 생기고, 덧붙일 희소 키워드 경로(raw 가
+	// 아닌 SparseQuery)가 있어야 쓰인다. 효과가 없는 조합을 켠 채로 두면
+	// 실행 프로필(config_hash)만 갈라진다.
+	if t.EntityKeywordMode != EntityKeywordsLLM || t.SparseQuery == SparseQueryRaw {
+		t.HighLevelKeywordsToSparse = false
+	}
+	if t.GraphWeight < 0 || isBadFloat(t.GraphWeight) {
+		t.GraphWeight = 0
+	}
+	// 허브 감쇠는 그래프 레인의 순위 식이라, 레인이 없으면 효과가 없다.
+	if t.GraphWeight == 0 {
+		t.GraphHubDamping = false
+	}
+	if t.GraphExpandBoost < 0 || isBadFloat(t.GraphExpandBoost) {
+		t.GraphExpandBoost = 0
+	}
+	if t.GraphExpandBoost > 1 {
+		t.GraphExpandBoost = 1
+	}
+	if t.RRFMissingRank != RRFMissingRankCutoff {
+		t.RRFMissingRank = RRFMissingRankZero
+	}
+	if t.SourceStratifyK < 0 {
+		t.SourceStratifyK = 0
+	}
+	if t.SourceStratifyK > MaxSourceStratifyK {
+		t.SourceStratifyK = MaxSourceStratifyK
+	}
+	switch {
+	case !t.CollapseContactDay:
+		t.CollapseExpandMax = 0
+	case t.CollapseExpandMax <= 0:
+		t.CollapseExpandMax = DefaultCollapseExpandMax
+	case t.CollapseExpandMax > MaxCollapseExpandMax:
+		t.CollapseExpandMax = MaxCollapseExpandMax
+	}
+	if t.MMRLambda <= 0 || t.MMRLambda > 1 || isBadFloat(t.MMRLambda) {
+		t.MMRLambda = 0
+	}
+	if t.ScheduleIntentBoost <= 0 || t.ScheduleIntentBoost > 1 || isBadFloat(t.ScheduleIntentBoost) {
+		t.ScheduleIntentBoost = 0
+	}
+	if t.PlanSourceSpillK < 0 {
+		t.PlanSourceSpillK = 0
+	}
+	if t.PlanSourceSpillK > MaxPlanSourceSpillK {
+		t.PlanSourceSpillK = MaxPlanSourceSpillK
+	}
 	return t
 }
 
@@ -216,20 +380,62 @@ func (t SearchTuning) Normalized() SearchTuning {
 //
 // 잘못된 값은 경고를 남기고 무시한다 — 오타 하나로 검색이 멈추면 안 된다.
 func EnvSearchTuning() SearchTuning {
-	return SearchTuning{
+	t := SearchTuning{
 		EntityQueryContainsName: envTuningChoice("SEARCH_ENTITY_QUERY_CONTAINS_NAME", "false", "true") == "true",
 		RerankCallContext:       envTuningChoice("SEARCH_RERANK_CALL_CONTEXT", "false", "true") == "true",
 		RerankOverfetch:         envTuningInt("SEARCH_RERANK_OVERFETCH"),
 		MergeMode:               envTuningChoice("SEARCH_MERGE_MODE", MergeAsymmetric, MergeSymmetric),
 		RerankBlend:             envTuningChoice("SEARCH_RERANK_BLEND", RerankBlendReplace, RerankBlendRRF),
 		RerankBlendWeight:       envTuningFloat("SEARCH_RERANK_BLEND_WEIGHT"),
-		RerankInput:             envTuningChoice("SEARCH_RERANK_INPUT", RerankInputHead, RerankInputBestChunk),
+		RerankInput:             envTuningChoice("SEARCH_RERANK_INPUT", RerankInputHead, RerankInputBestChunk, RerankInputYAML),
 		RecencyHalfLifeDays:     envTuningFloat("SEARCH_RECENCY_HALFLIFE_DAYS"),
 		RecencyAlpha:            envTuningFloat("SEARCH_RECENCY_ALPHA"),
 		ChunkSparse:             envTuningChoice("SEARCH_CHUNK_SPARSE", ChunkSparseFallback, ChunkSparseFuse, ChunkSparseFuseCtx),
 		ChunkSparseCtxVersion:   envChunkSparseCtxVersion(),
 		SparseQuery:             envTuningChoice("SEARCH_SPARSE_QUERY", SparseQueryRaw, SparseQueryChunk, SparseQueryChunkDoc),
-	}.Normalized()
+
+		EntityKeywordMode:         envTuningChoice("SEARCH_ENTITY_KEYWORDS", EntityKeywordsOff, EntityKeywordsSparse, EntityKeywordsLLM),
+		HighLevelKeywordsToSparse: envTuningChoice("SEARCH_HIGH_LEVEL_KEYWORDS_TO_SPARSE", "false", "true") == "true",
+		GraphWeight:               envTuningFloat("SEARCH_GRAPH_WEIGHT"),
+
+		GraphHubDamping:  envTuningChoice("SEARCH_GRAPH_HUB_DAMPING", "false", "true") == "true",
+		GraphExpandBoost: envTuningFloat("SEARCH_GRAPH_EXPAND_BOOST"),
+		RRFMissingRank:   envTuningChoice("SEARCH_RRF_MISSING_RANK", RRFMissingRankZero, RRFMissingRankCutoff),
+
+		SourceStratifyK:       envTuningInt("SEARCH_SOURCE_STRATIFY_K"),
+		CollapseContactDay:    envTuningChoice("SEARCH_COLLAPSE_CONTACT_DAY", "false", "true") == "true",
+		CollapseExpandMax:     envTuningInt("SEARCH_COLLAPSE_EXPAND_MAX"),
+		WindowBucketDiversify: envTuningChoice("SEARCH_WINDOW_BUCKET_DIVERSIFY", "false", "true") == "true",
+		MMRLambda:             envTuningFloat("SEARCH_MMR_LAMBDA"),
+		ScheduleIntentBoost:   envTuningFloat("SEARCH_SCHEDULE_INTENT_BOOST"),
+		PlanSourceSpillK:      envTuningInt("SEARCH_PLAN_SOURCE_SPILL_K"),
+	}
+	n := t.Normalized()
+	if t.HighLevelKeywordsToSparse && !n.HighLevelKeywordsToSparse {
+		slog.Warn("search tuning: SEARCH_HIGH_LEVEL_KEYWORDS_TO_SPARSE has no effect, ignoring",
+			"requires", "SEARCH_ENTITY_KEYWORDS=llm and SEARCH_SPARSE_QUERY=chunk|chunk_doc")
+	}
+	if t.MMRLambda > 0 && n.MMRLambda == 0 {
+		slog.Warn("search tuning: SEARCH_MMR_LAMBDA out of range (0,1], ignoring")
+	}
+	if t.ScheduleIntentBoost > 0 && n.ScheduleIntentBoost == 0 {
+		slog.Warn("search tuning: SEARCH_SCHEDULE_INTENT_BOOST out of range (0,1], ignoring")
+	}
+	if t.RerankCallContext && !n.RerankCallContext {
+		slog.Warn("search tuning: SEARCH_RERANK_CALL_CONTEXT has no effect with SEARCH_RERANK_INPUT=yaml, ignoring")
+	}
+	if n.GraphWeight > 0 && n.EntityKeywordMode == EntityKeywordsOff {
+		slog.Warn("search tuning: SEARCH_GRAPH_WEIGHT needs SEARCH_ENTITY_KEYWORDS, graph lane will stay empty")
+	}
+	if t.GraphHubDamping && !n.GraphHubDamping {
+		slog.Warn("search tuning: SEARCH_GRAPH_HUB_DAMPING has no effect, ignoring",
+			"requires", "SEARCH_GRAPH_WEIGHT>0")
+	}
+	if t.GraphExpandBoost > 1 {
+		slog.Warn("search tuning: SEARCH_GRAPH_EXPAND_BOOST above 1, clamping",
+			"key", "SEARCH_GRAPH_EXPAND_BOOST", "max", 1)
+	}
+	return n
 }
 
 func envTuningInt(key string) int {

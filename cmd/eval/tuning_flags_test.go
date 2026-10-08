@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/baekenough/second-brain/internal/model"
+	"github.com/baekenough/second-brain/internal/search"
 	"github.com/baekenough/second-brain/internal/sparseq"
 )
 
@@ -19,6 +20,7 @@ func defaultTuningFlags() model.SearchTuning {
 		RecencyAlpha:      model.DefaultRecencyAlpha,
 		ChunkSparse:       model.ChunkSparseFallback,
 		SparseQuery:       model.SparseQueryRaw,
+		CollapseExpandMax: model.DefaultCollapseExpandMax,
 	}
 }
 
@@ -51,6 +53,32 @@ func TestValidateTuningFlags(t *testing.T) {
 		{"--sparse-query=chunk_doc", func(t *model.SearchTuning) { t.SparseQuery = model.SparseQueryChunkDoc }, false},
 		{"--sparse-query 오타", func(t *model.SearchTuning) { t.SparseQuery = "chunkdoc" }, true},
 		{"--sparse-query 빈 값", func(t *model.SearchTuning) { t.SparseQuery = "" }, true},
+		{"--entity-keywords=sparse", func(t *model.SearchTuning) { t.EntityKeywordMode = model.EntityKeywordsSparse }, false},
+		{"--entity-keywords=llm", func(t *model.SearchTuning) { t.EntityKeywordMode = model.EntityKeywordsLLM }, false},
+		{"--entity-keywords 오타", func(t *model.SearchTuning) { t.EntityKeywordMode = "dual" }, true},
+		{"--graph-weight + 키워드", func(t *model.SearchTuning) {
+			t.EntityKeywordMode = model.EntityKeywordsSparse
+			t.GraphWeight = 0.5
+		}, false},
+		{"--graph-weight 인데 키워드 모드 없음", func(t *model.SearchTuning) { t.GraphWeight = 0.5 }, true},
+		{"--graph-weight 음수", func(t *model.SearchTuning) {
+			t.EntityKeywordMode = model.EntityKeywordsSparse
+			t.GraphWeight = -1
+		}, true},
+		{"--high-level-keywords-to-sparse + llm + chunk_doc", func(t *model.SearchTuning) {
+			t.EntityKeywordMode = model.EntityKeywordsLLM
+			t.SparseQuery = model.SparseQueryChunkDoc
+			t.HighLevelKeywordsToSparse = true
+		}, false},
+		{"--high-level-keywords-to-sparse 인데 llm 아님", func(t *model.SearchTuning) {
+			t.EntityKeywordMode = model.EntityKeywordsSparse
+			t.SparseQuery = model.SparseQueryChunkDoc
+			t.HighLevelKeywordsToSparse = true
+		}, true},
+		{"--high-level-keywords-to-sparse 인데 sparse-query raw", func(t *model.SearchTuning) {
+			t.EntityKeywordMode = model.EntityKeywordsLLM
+			t.HighLevelKeywordsToSparse = true
+		}, true},
 		{"--chunk-sparse=fuse_ctx + 유효한 버전", func(t *model.SearchTuning) {
 			t.ChunkSparse = model.ChunkSparseFuseCtx
 			t.ChunkSparseCtxVersion = model.ChunkSparseCtxV1TP
@@ -209,5 +237,61 @@ func TestApplyTuningProfileSearchFollowups(t *testing.T) {
 		if _, ok := profile[tc.key]; !ok {
 			t.Fatalf("실험 노브가 평가 지문에 없음: %s", tc.key)
 		}
+	}
+}
+
+// TestApplyTuningProfile_EntityKeywordsAndGraph 는 엔티티 키워드·그래프 노브가
+// 켜지면 실행 프로필이 갈라지고, 효과 없는 값은 프로필에 들어가지 않는지 본다.
+func TestApplyTuningProfile_EntityKeywordsAndGraph(t *testing.T) {
+	t.Parallel()
+
+	profileOf := func(mutate func(*model.SearchTuning)) map[string]any {
+		tuning := defaultTuningFlags()
+		mutate(&tuning)
+		profile := map[string]any{}
+		applyTuningProfile(profile, tuning.Normalized())
+		return profile
+	}
+
+	sparse := profileOf(func(t *model.SearchTuning) { t.EntityKeywordMode = model.EntityKeywordsSparse })
+	if sparse["entity_keyword_mode"] != model.EntityKeywordsSparse || sparse["sparse_terms_version"] != sparseq.Version {
+		t.Errorf("sparse 프로필: %+v", sparse)
+	}
+	if _, ok := sparse["entity_keyword_prompt_version"]; ok {
+		t.Errorf("LLM 을 쓰지 않는 실행에 프롬프트 판이 들어갔다: %+v", sparse)
+	}
+
+	llmFull := profileOf(func(t *model.SearchTuning) {
+		t.EntityKeywordMode = model.EntityKeywordsLLM
+		t.SparseQuery = model.SparseQueryChunkDoc
+		t.HighLevelKeywordsToSparse = true
+		t.GraphWeight = 0.5
+	})
+	for key, want := range map[string]any{
+		"entity_keyword_mode":           model.EntityKeywordsLLM,
+		"entity_keyword_prompt_version": search.EntityKeywordPromptVersion,
+		"high_level_keywords_to_sparse": true,
+		"graph_weight":                  0.5,
+		"sparse_query":                  model.SparseQueryChunkDoc,
+		"sparse_terms_version":          sparseq.Version,
+	} {
+		if llmFull[key] != want {
+			t.Errorf("profile[%q] = %v, want %v", key, llmFull[key], want)
+		}
+	}
+
+	// 키워드 모드가 꺼진 채 graph 가중치만 있으면 레인이 생기지 않으므로 프로필에도
+	// 넣지 않는다(검증은 이 조합을 거부하지만, 프로필 단에서도 막는다).
+	inert := profileOf(func(t *model.SearchTuning) { t.GraphWeight = 0.5 })
+	if len(inert) != 0 {
+		t.Errorf("효과 없는 graph 가중치가 프로필에 들어갔다: %+v", inert)
+	}
+
+	base := map[string]any{"limit": 10}
+	before := digest(base)
+	llmProfile := map[string]any{"limit": 10}
+	applyTuningProfile(llmProfile, model.SearchTuning{EntityKeywordMode: model.EntityKeywordsLLM}.Normalized())
+	if digest(llmProfile) == before {
+		t.Error("키워드 모드를 켰는데 config_hash 가 그대로다")
 	}
 }

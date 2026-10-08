@@ -5,7 +5,7 @@
 			       row_number() OVER (ORDER BY GREATEST(
 			           ts_rank(tsv, plainto_tsquery('simple', $1)),
 			           ts_rank(tsv, plainto_tsquery('english', $1))
-			       ) DESC) AS rank
+			       ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (tsv @@ plainto_tsquery('simple', $1)
 			   OR tsv @@ plainto_tsquery('english', $1))
@@ -14,18 +14,25 @@
 			
 			
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		vec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE embedding IS NOT NULL
-			AND status = 'active'
-			
-			
-			
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, embedding <=> $2 AS dist
+				FROM documents
+				WHERE embedding IS NOT NULL
+				AND status = 'active'
+				
+				
+				
+				
+				ORDER BY embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		bigm AS (
@@ -35,7 +42,7 @@
 			               bigm_similarity(content, $1),
 			               bigm_similarity(title,   $1),
 			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
-			           ) DESC, id ASC) AS rank
+			           ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (content LIKE '%%' || $1 || '%%'
 			    OR title   LIKE '%%' || $1 || '%%'
@@ -45,23 +52,30 @@
 			
 			
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		summvec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE summary_embedding IS NOT NULL
-			AND status = 'active'
-			
-			
-			
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, summary_embedding <=> $2 AS dist
+				FROM documents
+				WHERE summary_embedding IS NOT NULL
+				AND status = 'active'
+				
+				
+				
+				
+				ORDER BY summary_embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		entity AS (
 			SELECT de.document_id AS id,
-			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			       row_number() OVER (ORDER BY COUNT(*) DESC, d.occurred_at DESC NULLS LAST, de.document_id ASC) AS rank
 			FROM document_entities de
 			JOIN entities e ON e.id = de.entity_id
 			JOIN documents d ON d.id = de.document_id
@@ -71,7 +85,8 @@
 			
 			
 			
-			GROUP BY de.document_id
+			GROUP BY de.document_id, d.occurred_at
+			ORDER BY rank
 			LIMIT $3
 		),
 		rrf AS (
@@ -94,7 +109,7 @@
 		       rrf.score
 		FROM rrf
 		JOIN documents d ON d.id = rrf.id
-		ORDER BY score DESC
+		ORDER BY score DESC, d.occurred_at DESC NULLS LAST, d.id ASC
 		LIMIT $3
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -108,7 +123,7 @@ $4 = string "이번 주 회의 일정 알려줘"
 			       row_number() OVER (ORDER BY GREATEST(
 			           ts_rank(tsv, plainto_tsquery('simple', $1)),
 			           ts_rank(tsv, plainto_tsquery('english', $1))
-			       ) DESC) AS rank
+			       ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (tsv @@ plainto_tsquery('simple', $1)
 			   OR tsv @@ plainto_tsquery('english', $1))
@@ -117,18 +132,25 @@ $4 = string "이번 주 회의 일정 알려줘"
 			
 			
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		vec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE embedding IS NOT NULL
-			AND status = 'active'
-			
-			
-			
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, embedding <=> $2 AS dist
+				FROM documents
+				WHERE embedding IS NOT NULL
+				AND status = 'active'
+				
+				
+				
+				
+				ORDER BY embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		bigm AS (
@@ -138,7 +160,7 @@ $4 = string "이번 주 회의 일정 알려줘"
 			               bigm_similarity(content, $1),
 			               bigm_similarity(title,   $1),
 			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
-			           ) DESC, id ASC) AS rank
+			           ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (content LIKE '%%' || $1 || '%%'
 			    OR title   LIKE '%%' || $1 || '%%'
@@ -148,18 +170,25 @@ $4 = string "이번 주 회의 일정 알려줘"
 			
 			
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		summvec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE summary_embedding IS NOT NULL
-			AND status = 'active'
-			
-			
-			
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, summary_embedding <=> $2 AS dist
+				FROM documents
+				WHERE summary_embedding IS NOT NULL
+				AND status = 'active'
+				
+				
+				
+				
+				ORDER BY summary_embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false),
@@ -183,7 +212,7 @@ $4 = string "이번 주 회의 일정 알려줘"
 		       rrf.score
 		FROM rrf
 		JOIN documents d ON d.id = rrf.id
-		ORDER BY score DESC
+		ORDER BY score DESC, d.occurred_at DESC NULLS LAST, d.id ASC
 		LIMIT $3
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -209,7 +238,7 @@ $3 = int 20
 		
 		
 		
-		ORDER BY score DESC
+		ORDER BY score DESC, occurred_at DESC NULLS LAST, id ASC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -238,7 +267,7 @@ $2 = int 10
 		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
 		   OR c.content LIKE '%%' || $1 || '%%')
 		  AND d.status = 'active'   
-		ORDER BY rank DESC
+		ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -265,7 +294,7 @@ $2 = int 30
 			  AND sc.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
 			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
 			  AND d.status = 'active'   
-			ORDER BY rank DESC
+			ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 			LIMIT $2
 		),
 		raw AS (
@@ -291,13 +320,13 @@ $2 = int 30
 			)
 			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
 			AND d.status = 'active'   
-			ORDER BY rank DESC
+			ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 			LIMIT $2
 		)
 		SELECT * FROM fresh
 		UNION ALL
 		SELECT * FROM raw
-		ORDER BY rank DESC
+		ORDER BY rank DESC, document_occurred_at DESC NULLS LAST, id ASC
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
@@ -309,7 +338,7 @@ $3 = string "v1-tp"
 			       row_number() OVER (ORDER BY GREATEST(
 			           ts_rank(tsv, plainto_tsquery('simple', $1)),
 			           ts_rank(tsv, plainto_tsquery('english', $1))
-			       ) DESC) AS rank
+			       ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (tsv @@ plainto_tsquery('simple', $1)
 			   OR tsv @@ plainto_tsquery('english', $1))
@@ -318,18 +347,25 @@ $3 = string "v1-tp"
 			
 			
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		vec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE embedding IS NOT NULL
-			AND status = 'active'
-			AND source_type = ANY($4)
-			
-			
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, embedding <=> $2 AS dist
+				FROM documents
+				WHERE embedding IS NOT NULL
+				AND status = 'active'
+				AND source_type = ANY($4)
+				
+				
+				
+				ORDER BY embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		bigm AS (
@@ -339,7 +375,7 @@ $3 = string "v1-tp"
 			               bigm_similarity(content, $1),
 			               bigm_similarity(title,   $1),
 			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
-			           ) DESC, id ASC) AS rank
+			           ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (content LIKE '%%' || $1 || '%%'
 			    OR title   LIKE '%%' || $1 || '%%'
@@ -349,23 +385,30 @@ $3 = string "v1-tp"
 			
 			
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		summvec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE summary_embedding IS NOT NULL
-			AND status = 'active'
-			AND source_type = ANY($4)
-			
-			
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, summary_embedding <=> $2 AS dist
+				FROM documents
+				WHERE summary_embedding IS NOT NULL
+				AND status = 'active'
+				AND source_type = ANY($4)
+				
+				
+				
+				ORDER BY summary_embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		entity AS (
 			SELECT de.document_id AS id,
-			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			       row_number() OVER (ORDER BY COUNT(*) DESC, d.occurred_at DESC NULLS LAST, de.document_id ASC) AS rank
 			FROM document_entities de
 			JOIN entities e ON e.id = de.entity_id
 			JOIN documents d ON d.id = de.document_id
@@ -375,7 +418,8 @@ $3 = string "v1-tp"
 			
 			
 			
-			GROUP BY de.document_id
+			GROUP BY de.document_id, d.occurred_at
+			ORDER BY rank
 			LIMIT $3
 		),
 		rrf AS (
@@ -398,7 +442,7 @@ $3 = string "v1-tp"
 		       rrf.score
 		FROM rrf
 		JOIN documents d ON d.id = rrf.id
-		ORDER BY score DESC
+		ORDER BY score DESC, d.occurred_at DESC NULLS LAST, d.id ASC
 		LIMIT $3
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -413,7 +457,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 			       row_number() OVER (ORDER BY GREATEST(
 			           ts_rank(tsv, plainto_tsquery('simple', $1)),
 			           ts_rank(tsv, plainto_tsquery('english', $1))
-			       ) DESC) AS rank
+			       ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (tsv @@ plainto_tsquery('simple', $1)
 			   OR tsv @@ plainto_tsquery('english', $1))
@@ -422,18 +466,25 @@ $5 = string "이번 주 회의 일정 알려줘"
 			
 			
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		vec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE embedding IS NOT NULL
-			AND status = 'active'
-			AND source_type = ANY($4)
-			
-			
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, embedding <=> $2 AS dist
+				FROM documents
+				WHERE embedding IS NOT NULL
+				AND status = 'active'
+				AND source_type = ANY($4)
+				
+				
+				
+				ORDER BY embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		bigm AS (
@@ -443,7 +494,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 			               bigm_similarity(content, $1),
 			               bigm_similarity(title,   $1),
 			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
-			           ) DESC, id ASC) AS rank
+			           ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (content LIKE '%%' || $1 || '%%'
 			    OR title   LIKE '%%' || $1 || '%%'
@@ -453,18 +504,25 @@ $5 = string "이번 주 회의 일정 알려줘"
 			
 			
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		summvec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE summary_embedding IS NOT NULL
-			AND status = 'active'
-			AND source_type = ANY($4)
-			
-			
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, summary_embedding <=> $2 AS dist
+				FROM documents
+				WHERE summary_embedding IS NOT NULL
+				AND status = 'active'
+				AND source_type = ANY($4)
+				
+				
+				
+				ORDER BY summary_embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false),
@@ -488,7 +546,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 		       rrf.score
 		FROM rrf
 		JOIN documents d ON d.id = rrf.id
-		ORDER BY score DESC
+		ORDER BY score DESC, d.occurred_at DESC NULLS LAST, d.id ASC
 		LIMIT $3
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -515,7 +573,7 @@ $4 = []model.SourceType []model.SourceType{"calendar"}
 		
 		
 		
-		ORDER BY score DESC
+		ORDER BY score DESC, occurred_at DESC NULLS LAST, id ASC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -545,7 +603,7 @@ $3 = []model.SourceType []model.SourceType{"calendar"}
 		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
 		   OR c.content LIKE '%%' || $1 || '%%')
 		  AND d.status = 'active'  AND d.source_type = ANY($3)  
-		ORDER BY rank DESC
+		ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -573,7 +631,7 @@ $3 = []model.SourceType []model.SourceType{"calendar"}
 			  AND sc.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
 			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
 			  AND d.status = 'active'  AND d.source_type = ANY($4)  
-			ORDER BY rank DESC
+			ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 			LIMIT $2
 		),
 		raw AS (
@@ -599,13 +657,13 @@ $3 = []model.SourceType []model.SourceType{"calendar"}
 			)
 			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
 			AND d.status = 'active'  AND d.source_type = ANY($4)  
-			ORDER BY rank DESC
+			ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 			LIMIT $2
 		)
 		SELECT * FROM fresh
 		UNION ALL
 		SELECT * FROM raw
-		ORDER BY rank DESC
+		ORDER BY rank DESC, document_occurred_at DESC NULLS LAST, id ASC
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
@@ -618,7 +676,7 @@ $4 = []model.SourceType []model.SourceType{"calendar"}
 			       row_number() OVER (ORDER BY GREATEST(
 			           ts_rank(tsv, plainto_tsquery('simple', $1)),
 			           ts_rank(tsv, plainto_tsquery('english', $1))
-			       ) DESC) AS rank
+			       ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (tsv @@ plainto_tsquery('simple', $1)
 			   OR tsv @@ plainto_tsquery('english', $1))
@@ -627,18 +685,25 @@ $4 = []model.SourceType []model.SourceType{"calendar"}
 			AND source_type <> ALL($4)
 			
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		vec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE embedding IS NOT NULL
-			AND status = 'active'
-			
-			AND source_type <> ALL($4)
-			
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, embedding <=> $2 AS dist
+				FROM documents
+				WHERE embedding IS NOT NULL
+				AND status = 'active'
+				
+				AND source_type <> ALL($4)
+				
+				
+				ORDER BY embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		bigm AS (
@@ -648,7 +713,7 @@ $4 = []model.SourceType []model.SourceType{"calendar"}
 			               bigm_similarity(content, $1),
 			               bigm_similarity(title,   $1),
 			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
-			           ) DESC, id ASC) AS rank
+			           ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (content LIKE '%%' || $1 || '%%'
 			    OR title   LIKE '%%' || $1 || '%%'
@@ -658,23 +723,30 @@ $4 = []model.SourceType []model.SourceType{"calendar"}
 			AND source_type <> ALL($4)
 			
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		summvec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE summary_embedding IS NOT NULL
-			AND status = 'active'
-			
-			AND source_type <> ALL($4)
-			
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, summary_embedding <=> $2 AS dist
+				FROM documents
+				WHERE summary_embedding IS NOT NULL
+				AND status = 'active'
+				
+				AND source_type <> ALL($4)
+				
+				
+				ORDER BY summary_embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		entity AS (
 			SELECT de.document_id AS id,
-			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			       row_number() OVER (ORDER BY COUNT(*) DESC, d.occurred_at DESC NULLS LAST, de.document_id ASC) AS rank
 			FROM document_entities de
 			JOIN entities e ON e.id = de.entity_id
 			JOIN documents d ON d.id = de.document_id
@@ -684,7 +756,8 @@ $4 = []model.SourceType []model.SourceType{"calendar"}
 			AND d.source_type <> ALL($4)
 			
 			
-			GROUP BY de.document_id
+			GROUP BY de.document_id, d.occurred_at
+			ORDER BY rank
 			LIMIT $3
 		),
 		rrf AS (
@@ -707,7 +780,7 @@ $4 = []model.SourceType []model.SourceType{"calendar"}
 		       rrf.score
 		FROM rrf
 		JOIN documents d ON d.id = rrf.id
-		ORDER BY score DESC
+		ORDER BY score DESC, d.occurred_at DESC NULLS LAST, d.id ASC
 		LIMIT $3
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -722,7 +795,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 			       row_number() OVER (ORDER BY GREATEST(
 			           ts_rank(tsv, plainto_tsquery('simple', $1)),
 			           ts_rank(tsv, plainto_tsquery('english', $1))
-			       ) DESC) AS rank
+			       ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (tsv @@ plainto_tsquery('simple', $1)
 			   OR tsv @@ plainto_tsquery('english', $1))
@@ -731,18 +804,25 @@ $5 = string "이번 주 회의 일정 알려줘"
 			AND source_type <> ALL($4)
 			
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		vec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE embedding IS NOT NULL
-			AND status = 'active'
-			
-			AND source_type <> ALL($4)
-			
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, embedding <=> $2 AS dist
+				FROM documents
+				WHERE embedding IS NOT NULL
+				AND status = 'active'
+				
+				AND source_type <> ALL($4)
+				
+				
+				ORDER BY embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		bigm AS (
@@ -752,7 +832,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 			               bigm_similarity(content, $1),
 			               bigm_similarity(title,   $1),
 			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
-			           ) DESC, id ASC) AS rank
+			           ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (content LIKE '%%' || $1 || '%%'
 			    OR title   LIKE '%%' || $1 || '%%'
@@ -762,18 +842,25 @@ $5 = string "이번 주 회의 일정 알려줘"
 			AND source_type <> ALL($4)
 			
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		summvec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE summary_embedding IS NOT NULL
-			AND status = 'active'
-			
-			AND source_type <> ALL($4)
-			
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, summary_embedding <=> $2 AS dist
+				FROM documents
+				WHERE summary_embedding IS NOT NULL
+				AND status = 'active'
+				
+				AND source_type <> ALL($4)
+				
+				
+				ORDER BY summary_embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false),
@@ -797,7 +884,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 		       rrf.score
 		FROM rrf
 		JOIN documents d ON d.id = rrf.id
-		ORDER BY score DESC
+		ORDER BY score DESC, d.occurred_at DESC NULLS LAST, d.id ASC
 		LIMIT $3
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -824,7 +911,7 @@ $4 = []model.SourceType []model.SourceType{"insight", "gmail"}
 		AND source_type <> ALL($3)
 		
 		
-		ORDER BY score DESC
+		ORDER BY score DESC, occurred_at DESC NULLS LAST, id ASC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -854,7 +941,7 @@ $3 = []model.SourceType []model.SourceType{"insight", "gmail"}
 		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
 		   OR c.content LIKE '%%' || $1 || '%%')
 		  AND d.status = 'active'  AND d.source_type <> ALL($3)  
-		ORDER BY rank DESC
+		ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -882,7 +969,7 @@ $3 = []model.SourceType []model.SourceType{"insight", "gmail"}
 			  AND sc.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
 			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
 			  AND d.status = 'active'  AND d.source_type <> ALL($4)  
-			ORDER BY rank DESC
+			ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 			LIMIT $2
 		),
 		raw AS (
@@ -908,13 +995,13 @@ $3 = []model.SourceType []model.SourceType{"insight", "gmail"}
 			)
 			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
 			AND d.status = 'active'  AND d.source_type <> ALL($4)  
-			ORDER BY rank DESC
+			ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 			LIMIT $2
 		)
 		SELECT * FROM fresh
 		UNION ALL
 		SELECT * FROM raw
-		ORDER BY rank DESC
+		ORDER BY rank DESC, document_occurred_at DESC NULLS LAST, id ASC
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
@@ -927,7 +1014,7 @@ $4 = []model.SourceType []model.SourceType{"insight", "gmail"}
 			       row_number() OVER (ORDER BY GREATEST(
 			           ts_rank(tsv, plainto_tsquery('simple', $1)),
 			           ts_rank(tsv, plainto_tsquery('english', $1))
-			       ) DESC) AS rank
+			       ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (tsv @@ plainto_tsquery('simple', $1)
 			   OR tsv @@ plainto_tsquery('english', $1))
@@ -936,18 +1023,25 @@ $4 = []model.SourceType []model.SourceType{"insight", "gmail"}
 			
 			AND COALESCE(metadata->>'retention', '') <> ALL($4)
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		vec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE embedding IS NOT NULL
-			AND status = 'active'
-			
-			
-			AND COALESCE(metadata->>'retention', '') <> ALL($4)
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, embedding <=> $2 AS dist
+				FROM documents
+				WHERE embedding IS NOT NULL
+				AND status = 'active'
+				
+				
+				AND COALESCE(metadata->>'retention', '') <> ALL($4)
+				
+				ORDER BY embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		bigm AS (
@@ -957,7 +1051,7 @@ $4 = []model.SourceType []model.SourceType{"insight", "gmail"}
 			               bigm_similarity(content, $1),
 			               bigm_similarity(title,   $1),
 			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
-			           ) DESC, id ASC) AS rank
+			           ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (content LIKE '%%' || $1 || '%%'
 			    OR title   LIKE '%%' || $1 || '%%'
@@ -967,23 +1061,30 @@ $4 = []model.SourceType []model.SourceType{"insight", "gmail"}
 			
 			AND COALESCE(metadata->>'retention', '') <> ALL($4)
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		summvec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE summary_embedding IS NOT NULL
-			AND status = 'active'
-			
-			
-			AND COALESCE(metadata->>'retention', '') <> ALL($4)
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, summary_embedding <=> $2 AS dist
+				FROM documents
+				WHERE summary_embedding IS NOT NULL
+				AND status = 'active'
+				
+				
+				AND COALESCE(metadata->>'retention', '') <> ALL($4)
+				
+				ORDER BY summary_embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		entity AS (
 			SELECT de.document_id AS id,
-			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			       row_number() OVER (ORDER BY COUNT(*) DESC, d.occurred_at DESC NULLS LAST, de.document_id ASC) AS rank
 			FROM document_entities de
 			JOIN entities e ON e.id = de.entity_id
 			JOIN documents d ON d.id = de.document_id
@@ -993,7 +1094,8 @@ $4 = []model.SourceType []model.SourceType{"insight", "gmail"}
 			
 			AND COALESCE(d.metadata->>'retention', '') <> ALL($4)
 			
-			GROUP BY de.document_id
+			GROUP BY de.document_id, d.occurred_at
+			ORDER BY rank
 			LIMIT $3
 		),
 		rrf AS (
@@ -1016,7 +1118,7 @@ $4 = []model.SourceType []model.SourceType{"insight", "gmail"}
 		       rrf.score
 		FROM rrf
 		JOIN documents d ON d.id = rrf.id
-		ORDER BY score DESC
+		ORDER BY score DESC, d.occurred_at DESC NULLS LAST, d.id ASC
 		LIMIT $3
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -1031,7 +1133,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 			       row_number() OVER (ORDER BY GREATEST(
 			           ts_rank(tsv, plainto_tsquery('simple', $1)),
 			           ts_rank(tsv, plainto_tsquery('english', $1))
-			       ) DESC) AS rank
+			       ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (tsv @@ plainto_tsquery('simple', $1)
 			   OR tsv @@ plainto_tsquery('english', $1))
@@ -1040,18 +1142,25 @@ $5 = string "이번 주 회의 일정 알려줘"
 			
 			AND COALESCE(metadata->>'retention', '') <> ALL($4)
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		vec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE embedding IS NOT NULL
-			AND status = 'active'
-			
-			
-			AND COALESCE(metadata->>'retention', '') <> ALL($4)
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, embedding <=> $2 AS dist
+				FROM documents
+				WHERE embedding IS NOT NULL
+				AND status = 'active'
+				
+				
+				AND COALESCE(metadata->>'retention', '') <> ALL($4)
+				
+				ORDER BY embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		bigm AS (
@@ -1061,7 +1170,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 			               bigm_similarity(content, $1),
 			               bigm_similarity(title,   $1),
 			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
-			           ) DESC, id ASC) AS rank
+			           ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (content LIKE '%%' || $1 || '%%'
 			    OR title   LIKE '%%' || $1 || '%%'
@@ -1071,18 +1180,25 @@ $5 = string "이번 주 회의 일정 알려줘"
 			
 			AND COALESCE(metadata->>'retention', '') <> ALL($4)
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		summvec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE summary_embedding IS NOT NULL
-			AND status = 'active'
-			
-			
-			AND COALESCE(metadata->>'retention', '') <> ALL($4)
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, summary_embedding <=> $2 AS dist
+				FROM documents
+				WHERE summary_embedding IS NOT NULL
+				AND status = 'active'
+				
+				
+				AND COALESCE(metadata->>'retention', '') <> ALL($4)
+				
+				ORDER BY summary_embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false),
@@ -1106,7 +1222,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 		       rrf.score
 		FROM rrf
 		JOIN documents d ON d.id = rrf.id
-		ORDER BY score DESC
+		ORDER BY score DESC, d.occurred_at DESC NULLS LAST, d.id ASC
 		LIMIT $3
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -1133,7 +1249,7 @@ $4 = []string []string{"disposable"}
 		
 		AND COALESCE(metadata->>'retention', '') <> ALL($3)
 		
-		ORDER BY score DESC
+		ORDER BY score DESC, occurred_at DESC NULLS LAST, id ASC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -1163,7 +1279,7 @@ $3 = []string []string{"disposable"}
 		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
 		   OR c.content LIKE '%%' || $1 || '%%')
 		  AND d.status = 'active'   AND COALESCE(d.metadata->>'retention', '') <> ALL($3)
-		ORDER BY rank DESC
+		ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -1191,7 +1307,7 @@ $3 = []string []string{"disposable"}
 			  AND sc.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
 			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
 			  AND d.status = 'active'   AND COALESCE(d.metadata->>'retention', '') <> ALL($4)
-			ORDER BY rank DESC
+			ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 			LIMIT $2
 		),
 		raw AS (
@@ -1217,13 +1333,13 @@ $3 = []string []string{"disposable"}
 			)
 			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
 			AND d.status = 'active'   AND COALESCE(d.metadata->>'retention', '') <> ALL($4)
-			ORDER BY rank DESC
+			ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 			LIMIT $2
 		)
 		SELECT * FROM fresh
 		UNION ALL
 		SELECT * FROM raw
-		ORDER BY rank DESC
+		ORDER BY rank DESC, document_occurred_at DESC NULLS LAST, id ASC
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
@@ -1236,7 +1352,7 @@ $4 = []string []string{"disposable"}
 			       row_number() OVER (ORDER BY GREATEST(
 			           ts_rank(tsv, plainto_tsquery('simple', $1)),
 			           ts_rank(tsv, plainto_tsquery('english', $1))
-			       ) DESC) AS rank
+			       ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (tsv @@ plainto_tsquery('simple', $1)
 			   OR tsv @@ plainto_tsquery('english', $1))
@@ -1246,19 +1362,26 @@ $4 = []string []string{"disposable"}
 			
 			AND occurred_at >= $4
 			AND occurred_at < $5
+			ORDER BY rank
 			LIMIT $3
 		),
 		vec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE embedding IS NOT NULL
-			AND status = 'active'
-			
-			
-			
-			AND occurred_at >= $4
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, embedding <=> $2 AS dist
+				FROM documents
+				WHERE embedding IS NOT NULL
+				AND status = 'active'
+				
+				
+				
+				AND occurred_at >= $4
 			AND occurred_at < $5
+				ORDER BY embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		bigm AS (
@@ -1268,7 +1391,7 @@ $4 = []string []string{"disposable"}
 			               bigm_similarity(content, $1),
 			               bigm_similarity(title,   $1),
 			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
-			           ) DESC, id ASC) AS rank
+			           ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (content LIKE '%%' || $1 || '%%'
 			    OR title   LIKE '%%' || $1 || '%%'
@@ -1279,24 +1402,31 @@ $4 = []string []string{"disposable"}
 			
 			AND occurred_at >= $4
 			AND occurred_at < $5
+			ORDER BY rank
 			LIMIT $3
 		),
 		summvec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE summary_embedding IS NOT NULL
-			AND status = 'active'
-			
-			
-			
-			AND occurred_at >= $4
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, summary_embedding <=> $2 AS dist
+				FROM documents
+				WHERE summary_embedding IS NOT NULL
+				AND status = 'active'
+				
+				
+				
+				AND occurred_at >= $4
 			AND occurred_at < $5
+				ORDER BY summary_embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		entity AS (
 			SELECT de.document_id AS id,
-			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			       row_number() OVER (ORDER BY COUNT(*) DESC, d.occurred_at DESC NULLS LAST, de.document_id ASC) AS rank
 			FROM document_entities de
 			JOIN entities e ON e.id = de.entity_id
 			JOIN documents d ON d.id = de.document_id
@@ -1307,7 +1437,8 @@ $4 = []string []string{"disposable"}
 			
 			AND d.occurred_at >= $4
 			AND d.occurred_at < $5
-			GROUP BY de.document_id
+			GROUP BY de.document_id, d.occurred_at
+			ORDER BY rank
 			LIMIT $3
 		),
 		rrf AS (
@@ -1330,7 +1461,7 @@ $4 = []string []string{"disposable"}
 		       rrf.score
 		FROM rrf
 		JOIN documents d ON d.id = rrf.id
-		ORDER BY score DESC
+		ORDER BY score DESC, d.occurred_at DESC NULLS LAST, d.id ASC
 		LIMIT $3
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -1346,7 +1477,7 @@ $6 = string "이번 주 회의 일정 알려줘"
 			       row_number() OVER (ORDER BY GREATEST(
 			           ts_rank(tsv, plainto_tsquery('simple', $1)),
 			           ts_rank(tsv, plainto_tsquery('english', $1))
-			       ) DESC) AS rank
+			       ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (tsv @@ plainto_tsquery('simple', $1)
 			   OR tsv @@ plainto_tsquery('english', $1))
@@ -1356,19 +1487,26 @@ $6 = string "이번 주 회의 일정 알려줘"
 			
 			AND occurred_at >= $4
 			AND occurred_at < $5
+			ORDER BY rank
 			LIMIT $3
 		),
 		vec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE embedding IS NOT NULL
-			AND status = 'active'
-			
-			
-			
-			AND occurred_at >= $4
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, embedding <=> $2 AS dist
+				FROM documents
+				WHERE embedding IS NOT NULL
+				AND status = 'active'
+				
+				
+				
+				AND occurred_at >= $4
 			AND occurred_at < $5
+				ORDER BY embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		bigm AS (
@@ -1378,7 +1516,7 @@ $6 = string "이번 주 회의 일정 알려줘"
 			               bigm_similarity(content, $1),
 			               bigm_similarity(title,   $1),
 			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
-			           ) DESC, id ASC) AS rank
+			           ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (content LIKE '%%' || $1 || '%%'
 			    OR title   LIKE '%%' || $1 || '%%'
@@ -1389,19 +1527,26 @@ $6 = string "이번 주 회의 일정 알려줘"
 			
 			AND occurred_at >= $4
 			AND occurred_at < $5
+			ORDER BY rank
 			LIMIT $3
 		),
 		summvec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE summary_embedding IS NOT NULL
-			AND status = 'active'
-			
-			
-			
-			AND occurred_at >= $4
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, summary_embedding <=> $2 AS dist
+				FROM documents
+				WHERE summary_embedding IS NOT NULL
+				AND status = 'active'
+				
+				
+				
+				AND occurred_at >= $4
 			AND occurred_at < $5
+				ORDER BY summary_embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false),
@@ -1425,7 +1570,7 @@ $6 = string "이번 주 회의 일정 알려줘"
 		       rrf.score
 		FROM rrf
 		JOIN documents d ON d.id = rrf.id
-		ORDER BY score DESC
+		ORDER BY score DESC, d.occurred_at DESC NULLS LAST, d.id ASC
 		LIMIT $3
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -1454,7 +1599,7 @@ $5 = 2026-08-24T00:00:00Z
 		
 		AND occurred_at >= $3
 			AND occurred_at < $4
-		ORDER BY score DESC
+		ORDER BY score DESC, occurred_at DESC NULLS LAST, id ASC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -1486,7 +1631,7 @@ $4 = 2026-08-24T00:00:00Z
 		   OR c.content LIKE '%%' || $1 || '%%')
 		  AND d.status = 'active'  AND d.occurred_at >= $3
 			AND d.occurred_at < $4 
-		ORDER BY rank DESC
+		ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -1516,7 +1661,7 @@ $4 = 2026-08-24T00:00:00Z
 			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
 			  AND d.status = 'active'  AND d.occurred_at >= $4
 			AND d.occurred_at < $5 
-			ORDER BY rank DESC
+			ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 			LIMIT $2
 		),
 		raw AS (
@@ -1543,13 +1688,13 @@ $4 = 2026-08-24T00:00:00Z
 			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
 			AND d.status = 'active'  AND d.occurred_at >= $4
 			AND d.occurred_at < $5 
-			ORDER BY rank DESC
+			ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 			LIMIT $2
 		)
 		SELECT * FROM fresh
 		UNION ALL
 		SELECT * FROM raw
-		ORDER BY rank DESC
+		ORDER BY rank DESC, document_occurred_at DESC NULLS LAST, id ASC
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
@@ -1563,7 +1708,7 @@ $5 = 2026-08-24T00:00:00Z
 			       row_number() OVER (ORDER BY GREATEST(
 			           ts_rank(tsv, plainto_tsquery('simple', $1)),
 			           ts_rank(tsv, plainto_tsquery('english', $1))
-			       ) DESC) AS rank
+			       ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (tsv @@ plainto_tsquery('simple', $1)
 			   OR tsv @@ plainto_tsquery('english', $1))
@@ -1573,19 +1718,26 @@ $5 = 2026-08-24T00:00:00Z
 			AND COALESCE(metadata->>'retention', '') <> ALL($6)
 			AND occurred_at >= $7
 			AND occurred_at < $8
+			ORDER BY rank
 			LIMIT $3
 		),
 		vec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE embedding IS NOT NULL
-			AND status = 'active'
-			AND source_type = ANY($4)
-			AND source_type <> ALL($5)
-			AND COALESCE(metadata->>'retention', '') <> ALL($6)
-			AND occurred_at >= $7
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, embedding <=> $2 AS dist
+				FROM documents
+				WHERE embedding IS NOT NULL
+				AND status = 'active'
+				AND source_type = ANY($4)
+				AND source_type <> ALL($5)
+				AND COALESCE(metadata->>'retention', '') <> ALL($6)
+				AND occurred_at >= $7
 			AND occurred_at < $8
+				ORDER BY embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		bigm AS (
@@ -1595,7 +1747,7 @@ $5 = 2026-08-24T00:00:00Z
 			               bigm_similarity(content, $1),
 			               bigm_similarity(title,   $1),
 			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
-			           ) DESC, id ASC) AS rank
+			           ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (content LIKE '%%' || $1 || '%%'
 			    OR title   LIKE '%%' || $1 || '%%'
@@ -1606,24 +1758,31 @@ $5 = 2026-08-24T00:00:00Z
 			AND COALESCE(metadata->>'retention', '') <> ALL($6)
 			AND occurred_at >= $7
 			AND occurred_at < $8
+			ORDER BY rank
 			LIMIT $3
 		),
 		summvec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE summary_embedding IS NOT NULL
-			AND status = 'active'
-			AND source_type = ANY($4)
-			AND source_type <> ALL($5)
-			AND COALESCE(metadata->>'retention', '') <> ALL($6)
-			AND occurred_at >= $7
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, summary_embedding <=> $2 AS dist
+				FROM documents
+				WHERE summary_embedding IS NOT NULL
+				AND status = 'active'
+				AND source_type = ANY($4)
+				AND source_type <> ALL($5)
+				AND COALESCE(metadata->>'retention', '') <> ALL($6)
+				AND occurred_at >= $7
 			AND occurred_at < $8
+				ORDER BY summary_embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		entity AS (
 			SELECT de.document_id AS id,
-			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			       row_number() OVER (ORDER BY COUNT(*) DESC, d.occurred_at DESC NULLS LAST, de.document_id ASC) AS rank
 			FROM document_entities de
 			JOIN entities e ON e.id = de.entity_id
 			JOIN documents d ON d.id = de.document_id
@@ -1634,7 +1793,8 @@ $5 = 2026-08-24T00:00:00Z
 			AND COALESCE(d.metadata->>'retention', '') <> ALL($6)
 			AND d.occurred_at >= $7
 			AND d.occurred_at < $8
-			GROUP BY de.document_id
+			GROUP BY de.document_id, d.occurred_at
+			ORDER BY rank
 			LIMIT $3
 		),
 		rrf AS (
@@ -1657,7 +1817,7 @@ $5 = 2026-08-24T00:00:00Z
 		       rrf.score
 		FROM rrf
 		JOIN documents d ON d.id = rrf.id
-		ORDER BY score DESC
+		ORDER BY score DESC, d.occurred_at DESC NULLS LAST, d.id ASC
 		LIMIT $3
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -1676,7 +1836,7 @@ $9 = string "이번 주 회의 일정 알려줘"
 			       row_number() OVER (ORDER BY GREATEST(
 			           ts_rank(tsv, plainto_tsquery('simple', $1)),
 			           ts_rank(tsv, plainto_tsquery('english', $1))
-			       ) DESC) AS rank
+			       ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (tsv @@ plainto_tsquery('simple', $1)
 			   OR tsv @@ plainto_tsquery('english', $1))
@@ -1686,19 +1846,26 @@ $9 = string "이번 주 회의 일정 알려줘"
 			AND COALESCE(metadata->>'retention', '') <> ALL($6)
 			AND occurred_at >= $7
 			AND occurred_at < $8
+			ORDER BY rank
 			LIMIT $3
 		),
 		vec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE embedding IS NOT NULL
-			AND status = 'active'
-			AND source_type = ANY($4)
-			AND source_type <> ALL($5)
-			AND COALESCE(metadata->>'retention', '') <> ALL($6)
-			AND occurred_at >= $7
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, embedding <=> $2 AS dist
+				FROM documents
+				WHERE embedding IS NOT NULL
+				AND status = 'active'
+				AND source_type = ANY($4)
+				AND source_type <> ALL($5)
+				AND COALESCE(metadata->>'retention', '') <> ALL($6)
+				AND occurred_at >= $7
 			AND occurred_at < $8
+				ORDER BY embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		bigm AS (
@@ -1708,7 +1875,7 @@ $9 = string "이번 주 회의 일정 알려줘"
 			               bigm_similarity(content, $1),
 			               bigm_similarity(title,   $1),
 			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
-			           ) DESC, id ASC) AS rank
+			           ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (content LIKE '%%' || $1 || '%%'
 			    OR title   LIKE '%%' || $1 || '%%'
@@ -1719,19 +1886,26 @@ $9 = string "이번 주 회의 일정 알려줘"
 			AND COALESCE(metadata->>'retention', '') <> ALL($6)
 			AND occurred_at >= $7
 			AND occurred_at < $8
+			ORDER BY rank
 			LIMIT $3
 		),
 		summvec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE summary_embedding IS NOT NULL
-			AND status = 'active'
-			AND source_type = ANY($4)
-			AND source_type <> ALL($5)
-			AND COALESCE(metadata->>'retention', '') <> ALL($6)
-			AND occurred_at >= $7
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, summary_embedding <=> $2 AS dist
+				FROM documents
+				WHERE summary_embedding IS NOT NULL
+				AND status = 'active'
+				AND source_type = ANY($4)
+				AND source_type <> ALL($5)
+				AND COALESCE(metadata->>'retention', '') <> ALL($6)
+				AND occurred_at >= $7
 			AND occurred_at < $8
+				ORDER BY summary_embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false),
@@ -1755,7 +1929,7 @@ $9 = string "이번 주 회의 일정 알려줘"
 		       rrf.score
 		FROM rrf
 		JOIN documents d ON d.id = rrf.id
-		ORDER BY score DESC
+		ORDER BY score DESC, d.occurred_at DESC NULLS LAST, d.id ASC
 		LIMIT $3
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -1787,7 +1961,7 @@ $8 = 2026-08-24T00:00:00Z
 		AND COALESCE(metadata->>'retention', '') <> ALL($5)
 		AND occurred_at >= $6
 			AND occurred_at < $7
-		ORDER BY score DESC
+		ORDER BY score DESC, occurred_at DESC NULLS LAST, id ASC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -1822,7 +1996,7 @@ $7 = 2026-08-24T00:00:00Z
 		   OR c.content LIKE '%%' || $1 || '%%')
 		  AND d.status = 'active'  AND d.source_type = ANY($3) AND d.source_type <> ALL($4) AND d.occurred_at >= $5
 			AND d.occurred_at < $6 AND COALESCE(d.metadata->>'retention', '') <> ALL($7)
-		ORDER BY rank DESC
+		ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -1855,7 +2029,7 @@ $7 = []string []string{"disposable"}
 			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
 			  AND d.status = 'active'  AND d.source_type = ANY($4) AND d.source_type <> ALL($5) AND d.occurred_at >= $6
 			AND d.occurred_at < $7 AND COALESCE(d.metadata->>'retention', '') <> ALL($8)
-			ORDER BY rank DESC
+			ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 			LIMIT $2
 		),
 		raw AS (
@@ -1882,13 +2056,13 @@ $7 = []string []string{"disposable"}
 			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
 			AND d.status = 'active'  AND d.source_type = ANY($4) AND d.source_type <> ALL($5) AND d.occurred_at >= $6
 			AND d.occurred_at < $7 AND COALESCE(d.metadata->>'retention', '') <> ALL($8)
-			ORDER BY rank DESC
+			ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 			LIMIT $2
 		)
 		SELECT * FROM fresh
 		UNION ALL
 		SELECT * FROM raw
-		ORDER BY rank DESC
+		ORDER BY rank DESC, document_occurred_at DESC NULLS LAST, id ASC
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
@@ -1905,7 +2079,7 @@ $8 = []string []string{"disposable"}
 			       row_number() OVER (ORDER BY GREATEST(
 			           ts_rank(tsv, plainto_tsquery('simple', $1)),
 			           ts_rank(tsv, plainto_tsquery('english', $1))
-			       ) DESC) AS rank
+			       ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (tsv @@ plainto_tsquery('simple', $1)
 			   OR tsv @@ plainto_tsquery('english', $1))
@@ -1914,18 +2088,25 @@ $8 = []string []string{"disposable"}
 			
 			
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		vec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE embedding IS NOT NULL
-			
-			
-			
-			
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, embedding <=> $2 AS dist
+				FROM documents
+				WHERE embedding IS NOT NULL
+				
+				
+				
+				
+				
+				ORDER BY embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		bigm AS (
@@ -1935,7 +2116,7 @@ $8 = []string []string{"disposable"}
 			               bigm_similarity(content, $1),
 			               bigm_similarity(title,   $1),
 			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
-			           ) DESC, id ASC) AS rank
+			           ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (content LIKE '%%' || $1 || '%%'
 			    OR title   LIKE '%%' || $1 || '%%'
@@ -1945,23 +2126,30 @@ $8 = []string []string{"disposable"}
 			
 			
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		summvec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE summary_embedding IS NOT NULL
-			
-			
-			
-			
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, summary_embedding <=> $2 AS dist
+				FROM documents
+				WHERE summary_embedding IS NOT NULL
+				
+				
+				
+				
+				
+				ORDER BY summary_embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		entity AS (
 			SELECT de.document_id AS id,
-			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			       row_number() OVER (ORDER BY COUNT(*) DESC, d.occurred_at DESC NULLS LAST, de.document_id ASC) AS rank
 			FROM document_entities de
 			JOIN entities e ON e.id = de.entity_id
 			JOIN documents d ON d.id = de.document_id
@@ -1971,7 +2159,8 @@ $8 = []string []string{"disposable"}
 			
 			
 			
-			GROUP BY de.document_id
+			GROUP BY de.document_id, d.occurred_at
+			ORDER BY rank
 			LIMIT $3
 		),
 		rrf AS (
@@ -1994,7 +2183,7 @@ $8 = []string []string{"disposable"}
 		       rrf.score
 		FROM rrf
 		JOIN documents d ON d.id = rrf.id
-		ORDER BY score DESC
+		ORDER BY score DESC, d.occurred_at DESC NULLS LAST, d.id ASC
 		LIMIT $3
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -2008,7 +2197,7 @@ $4 = string "이번 주 회의 일정 알려줘"
 			       row_number() OVER (ORDER BY GREATEST(
 			           ts_rank(tsv, plainto_tsquery('simple', $1)),
 			           ts_rank(tsv, plainto_tsquery('english', $1))
-			       ) DESC) AS rank
+			       ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (tsv @@ plainto_tsquery('simple', $1)
 			   OR tsv @@ plainto_tsquery('english', $1))
@@ -2017,18 +2206,25 @@ $4 = string "이번 주 회의 일정 알려줘"
 			
 			
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		vec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE embedding IS NOT NULL
-			
-			
-			
-			
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, embedding <=> $2 AS dist
+				FROM documents
+				WHERE embedding IS NOT NULL
+				
+				
+				
+				
+				
+				ORDER BY embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		bigm AS (
@@ -2038,7 +2234,7 @@ $4 = string "이번 주 회의 일정 알려줘"
 			               bigm_similarity(content, $1),
 			               bigm_similarity(title,   $1),
 			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
-			           ) DESC, id ASC) AS rank
+			           ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (content LIKE '%%' || $1 || '%%'
 			    OR title   LIKE '%%' || $1 || '%%'
@@ -2048,18 +2244,25 @@ $4 = string "이번 주 회의 일정 알려줘"
 			
 			
 			
+			ORDER BY rank
 			LIMIT $3
 		),
 		summvec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE summary_embedding IS NOT NULL
-			
-			
-			
-			
-			
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, summary_embedding <=> $2 AS dist
+				FROM documents
+				WHERE summary_embedding IS NOT NULL
+				
+				
+				
+				
+				
+				ORDER BY summary_embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false),
@@ -2083,7 +2286,7 @@ $4 = string "이번 주 회의 일정 알려줘"
 		       rrf.score
 		FROM rrf
 		JOIN documents d ON d.id = rrf.id
-		ORDER BY score DESC
+		ORDER BY score DESC, d.occurred_at DESC NULLS LAST, d.id ASC
 		LIMIT $3
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -2109,7 +2312,7 @@ $3 = int 20
 		
 		
 		
-		ORDER BY score DESC
+		ORDER BY score DESC, occurred_at DESC NULLS LAST, id ASC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -2138,7 +2341,7 @@ $2 = int 10
 		WHERE (c.content_tsv @@ plainto_tsquery('simple', $1)
 		   OR c.content LIKE '%%' || $1 || '%%')
 		  AND d.status = 'active'   
-		ORDER BY rank DESC
+		ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -2165,7 +2368,7 @@ $2 = int 30
 			  AND sc.fingerprint = md5(d.source_type || E'\x1f' || coalesce(d.title, '') || E'\x1f' || coalesce(d.occurred_at::text, '') || E'\x1f' || coalesce(d.metadata::text, ''))
 			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
 			  AND d.status = 'active'   
-			ORDER BY rank DESC
+			ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 			LIMIT $2
 		),
 		raw AS (
@@ -2191,13 +2394,13 @@ $2 = int 30
 			)
 			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
 			AND d.status = 'active'   
-			ORDER BY rank DESC
+			ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 			LIMIT $2
 		)
 		SELECT * FROM fresh
 		UNION ALL
 		SELECT * FROM raw
-		ORDER BY rank DESC
+		ORDER BY rank DESC, document_occurred_at DESC NULLS LAST, id ASC
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
@@ -2209,7 +2412,7 @@ $3 = string "v1-tp"
 			       row_number() OVER (ORDER BY GREATEST(
 			           ts_rank(tsv, plainto_tsquery('simple', $1)),
 			           ts_rank(tsv, plainto_tsquery('english', $1))
-			       ) DESC) AS rank
+			       ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (tsv @@ plainto_tsquery('simple', $1)
 			   OR tsv @@ plainto_tsquery('english', $1))
@@ -2219,19 +2422,26 @@ $3 = string "v1-tp"
 			AND COALESCE(metadata->>'retention', '') <> ALL($6)
 			AND occurred_at >= $7
 			AND occurred_at < $8
+			ORDER BY rank
 			LIMIT $3
 		),
 		vec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE embedding IS NOT NULL
-			AND status = 'active'
-			AND source_type = ANY($4)
-			AND source_type <> ALL($5)
-			AND COALESCE(metadata->>'retention', '') <> ALL($6)
-			AND occurred_at >= $7
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, embedding <=> $2 AS dist
+				FROM documents
+				WHERE embedding IS NOT NULL
+				AND status = 'active'
+				AND source_type = ANY($4)
+				AND source_type <> ALL($5)
+				AND COALESCE(metadata->>'retention', '') <> ALL($6)
+				AND occurred_at >= $7
 			AND occurred_at < $8
+				ORDER BY embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		bigm AS (
@@ -2241,7 +2451,7 @@ $3 = string "v1-tp"
 			               bigm_similarity(content, $1),
 			               bigm_similarity(title,   $1),
 			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
-			           ) DESC, id ASC) AS rank
+			           ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (content LIKE '%%' || $1 || '%%'
 			    OR title   LIKE '%%' || $1 || '%%'
@@ -2252,24 +2462,31 @@ $3 = string "v1-tp"
 			AND COALESCE(metadata->>'retention', '') <> ALL($6)
 			AND occurred_at >= $7
 			AND occurred_at < $8
+			ORDER BY rank
 			LIMIT $3
 		),
 		summvec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE summary_embedding IS NOT NULL
-			AND status = 'active'
-			AND source_type = ANY($4)
-			AND source_type <> ALL($5)
-			AND COALESCE(metadata->>'retention', '') <> ALL($6)
-			AND occurred_at >= $7
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, summary_embedding <=> $2 AS dist
+				FROM documents
+				WHERE summary_embedding IS NOT NULL
+				AND status = 'active'
+				AND source_type = ANY($4)
+				AND source_type <> ALL($5)
+				AND COALESCE(metadata->>'retention', '') <> ALL($6)
+				AND occurred_at >= $7
 			AND occurred_at < $8
+				ORDER BY summary_embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		entity AS (
 			SELECT de.document_id AS id,
-			       row_number() OVER (ORDER BY COUNT(*) DESC, de.document_id ASC) AS rank
+			       row_number() OVER (ORDER BY COUNT(*) DESC, d.occurred_at DESC NULLS LAST, de.document_id ASC) AS rank
 			FROM document_entities de
 			JOIN entities e ON e.id = de.entity_id
 			JOIN documents d ON d.id = de.document_id
@@ -2280,7 +2497,8 @@ $3 = string "v1-tp"
 			AND COALESCE(d.metadata->>'retention', '') <> ALL($6)
 			AND d.occurred_at >= $7
 			AND d.occurred_at < $8
-			GROUP BY de.document_id
+			GROUP BY de.document_id, d.occurred_at
+			ORDER BY rank
 			LIMIT $3
 		),
 		rrf AS (
@@ -2303,7 +2521,7 @@ $3 = string "v1-tp"
 		       rrf.score
 		FROM rrf
 		JOIN documents d ON d.id = rrf.id
-		ORDER BY COALESCE(d.occurred_at, d.collected_at) DESC
+		ORDER BY COALESCE(d.occurred_at, d.collected_at) DESC, d.id ASC
 		LIMIT $3
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -2322,7 +2540,7 @@ $9 = string "이번 주 회의 일정 알려줘"
 			       row_number() OVER (ORDER BY GREATEST(
 			           ts_rank(tsv, plainto_tsquery('simple', $1)),
 			           ts_rank(tsv, plainto_tsquery('english', $1))
-			       ) DESC) AS rank
+			       ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (tsv @@ plainto_tsquery('simple', $1)
 			   OR tsv @@ plainto_tsquery('english', $1))
@@ -2332,19 +2550,26 @@ $9 = string "이번 주 회의 일정 알려줘"
 			AND COALESCE(metadata->>'retention', '') <> ALL($6)
 			AND occurred_at >= $7
 			AND occurred_at < $8
+			ORDER BY rank
 			LIMIT $3
 		),
 		vec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE embedding IS NOT NULL
-			AND status = 'active'
-			AND source_type = ANY($4)
-			AND source_type <> ALL($5)
-			AND COALESCE(metadata->>'retention', '') <> ALL($6)
-			AND occurred_at >= $7
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, embedding <=> $2 AS dist
+				FROM documents
+				WHERE embedding IS NOT NULL
+				AND status = 'active'
+				AND source_type = ANY($4)
+				AND source_type <> ALL($5)
+				AND COALESCE(metadata->>'retention', '') <> ALL($6)
+				AND occurred_at >= $7
 			AND occurred_at < $8
+				ORDER BY embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		bigm AS (
@@ -2354,7 +2579,7 @@ $9 = string "이번 주 회의 일정 알려줘"
 			               bigm_similarity(content, $1),
 			               bigm_similarity(title,   $1),
 			               CASE WHEN source_type = 'call' THEN bigm_similarity(coalesce(metadata->>'contact_name', ''), $1) ELSE 0 END
-			           ) DESC, id ASC) AS rank
+			           ) DESC, occurred_at DESC NULLS LAST, id ASC) AS rank
 			FROM documents
 			WHERE (content LIKE '%%' || $1 || '%%'
 			    OR title   LIKE '%%' || $1 || '%%'
@@ -2365,19 +2590,26 @@ $9 = string "이번 주 회의 일정 알려줘"
 			AND COALESCE(metadata->>'retention', '') <> ALL($6)
 			AND occurred_at >= $7
 			AND occurred_at < $8
+			ORDER BY rank
 			LIMIT $3
 		),
 		summvec AS (
 			SELECT id,
-			       row_number() OVER (ORDER BY summary_embedding <=> $2 ASC) AS rank
-			FROM documents
-			WHERE summary_embedding IS NOT NULL
-			AND status = 'active'
-			AND source_type = ANY($4)
-			AND source_type <> ALL($5)
-			AND COALESCE(metadata->>'retention', '') <> ALL($6)
-			AND occurred_at >= $7
+			       row_number() OVER (ORDER BY dist ASC, occurred_at DESC NULLS LAST, id ASC) AS rank
+			FROM (
+				SELECT id, occurred_at, summary_embedding <=> $2 AS dist
+				FROM documents
+				WHERE summary_embedding IS NOT NULL
+				AND status = 'active'
+				AND source_type = ANY($4)
+				AND source_type <> ALL($5)
+				AND COALESCE(metadata->>'retention', '') <> ALL($6)
+				AND occurred_at >= $7
 			AND occurred_at < $8
+				ORDER BY summary_embedding <=> $2 ASC
+				LIMIT $3
+			) ann
+			ORDER BY rank
 			LIMIT $3
 		),
 		entity AS (SELECT NULL::uuid AS id, NULL::bigint AS rank WHERE false),
@@ -2401,7 +2633,7 @@ $9 = string "이번 주 회의 일정 알려줘"
 		       rrf.score
 		FROM rrf
 		JOIN documents d ON d.id = rrf.id
-		ORDER BY COALESCE(d.occurred_at, d.collected_at) DESC
+		ORDER BY COALESCE(d.occurred_at, d.collected_at) DESC, d.id ASC
 		LIMIT $3
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -2433,7 +2665,7 @@ $8 = 2026-08-24T00:00:00Z
 		AND COALESCE(metadata->>'retention', '') <> ALL($5)
 		AND occurred_at >= $6
 			AND occurred_at < $7
-		ORDER BY COALESCE(occurred_at, collected_at) DESC
+		ORDER BY COALESCE(occurred_at, collected_at) DESC, id ASC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -2468,7 +2700,7 @@ $7 = 2026-08-24T00:00:00Z
 		   OR c.content LIKE '%%' || $1 || '%%')
 		  AND d.status = 'active'  AND d.source_type = ANY($3) AND d.source_type <> ALL($4) AND d.occurred_at >= $5
 			AND d.occurred_at < $6 AND COALESCE(d.metadata->>'retention', '') <> ALL($7)
-		ORDER BY rank DESC
+		ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 		LIMIT $2
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
@@ -2501,7 +2733,7 @@ $7 = []string []string{"disposable"}
 			  AND (sc.sparse_tsv @@ plainto_tsquery('simple', $1) OR sc.sparse_text LIKE '%%' || $1 || '%%')
 			  AND d.status = 'active'  AND d.source_type = ANY($4) AND d.source_type <> ALL($5) AND d.occurred_at >= $6
 			AND d.occurred_at < $7 AND COALESCE(d.metadata->>'retention', '') <> ALL($8)
-			ORDER BY rank DESC
+			ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 			LIMIT $2
 		),
 		raw AS (
@@ -2528,13 +2760,13 @@ $7 = []string []string{"disposable"}
 			AND (c.content_tsv @@ plainto_tsquery('simple', $1) OR c.content LIKE '%%' || $1 || '%%')
 			AND d.status = 'active'  AND d.source_type = ANY($4) AND d.source_type <> ALL($5) AND d.occurred_at >= $6
 			AND d.occurred_at < $7 AND COALESCE(d.metadata->>'retention', '') <> ALL($8)
-			ORDER BY rank DESC
+			ORDER BY rank DESC, d.occurred_at DESC NULLS LAST, c.id ASC
 			LIMIT $2
 		)
 		SELECT * FROM fresh
 		UNION ALL
 		SELECT * FROM raw
-		ORDER BY rank DESC
+		ORDER BY rank DESC, document_occurred_at DESC NULLS LAST, id ASC
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30

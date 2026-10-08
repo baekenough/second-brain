@@ -538,6 +538,10 @@ func TestGoldenStore_ExportEvalPairs_OnlyRelevantJudgments(t *testing.T) {
 
 	queryText := goldenTestSentinel + "export query"
 	queryID := seedGoldenQuery(t, pg, queryText, "manual", "open")
+	wantAskedAt := time.Date(2026, 9, 20, 14, 0, 0, 0, time.UTC)
+	if _, err := pg.pool.Exec(ctx, `UPDATE golden_queries SET asked_at=$2 WHERE id=$1`, queryID, wantAskedAt); err != nil {
+		t.Fatalf("set asked_at: %v", err)
+	}
 	relevantDoc := seedGoldenDocument(t, pg, nil)
 	irrelevantDoc := seedGoldenDocument(t, pg, nil)
 	noiseDoc := seedGoldenDocument(t, pg, nil)
@@ -567,6 +571,10 @@ func TestGoldenStore_ExportEvalPairs_OnlyRelevantJudgments(t *testing.T) {
 	}
 	if found.Source != "golden" {
 		t.Errorf("Source = %q, want 'golden'", found.Source)
+	}
+	// cmd/eval --window=plan 이 질의별 기준 시각으로 읽는 값이다.
+	if !found.AskedAt.Equal(wantAskedAt) {
+		t.Errorf("AskedAt = %v, want %v", found.AskedAt, wantAskedAt)
 	}
 	if len(found.RelevantDocIDs) != 1 || found.RelevantDocIDs[0] != relevantDoc.String() {
 		t.Errorf("RelevantDocIDs = %v, want exactly [%s] (only the relevant judgment)", found.RelevantDocIDs, relevantDoc)

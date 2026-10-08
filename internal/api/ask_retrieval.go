@@ -96,6 +96,10 @@ func assembleRetrieval(ctx context.Context, searcher documentSearcher, params in
 	base.OccurredFrom = plan.OccurredFrom
 	base.OccurredTo = plan.OccurredTo
 	base.SourceTypes = plan.SourceTypes
+	// 포함 집합을 사용자가 아니라 플래너가 골랐다는 표시. 기본 꺼진
+	// SEARCH_PLAN_SOURCE_SPILL_K 가 켜졌을 때만 search 가 이 집합 밖 상위
+	// K건을 후보에 섞는다(잘못 좁힌 계획 구제). 노브가 꺼져 있으면 효과 없음.
+	base.SourceIncludeFromPlan = len(plan.SourceTypes) > 0
 	if plan.OccurredFrom != nil || plan.OccurredTo != nil {
 		// Secondary preference only: within a window, newest-first (or, for a
 		// window that lies entirely in the future, soonest-first) is the
@@ -224,6 +228,8 @@ func splitInsightLane(base model.SearchQuery, insightM int) (observed model.Sear
 	insight.SourceType = &insightSourceType
 	insight.SourceTypes = nil
 	insight.ExcludeSourceTypes = nil
+	// insight 한정은 코드가 정한 레인 경계다 — 계획 넘침 검색이 넓히면 안 된다.
+	insight.SourceIncludeFromPlan = false
 	insight.Limit = insightM
 
 	return observed, runObserved, insight

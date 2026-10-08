@@ -3,6 +3,7 @@
 package search
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -747,7 +748,16 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 	// 키워드를 싣는다. q.Query 자체는 바꾸지 않으므로 임베딩·리랭커·엔티티
 	// 레인·OpenSearch 는 어느 값에서든 질문 원문을 받는다.
 	q.SparseTerms = model.SparseTerms{}
-	sparseTerms := sparseTermsFor(ctx, q.Query, tune)
+
+	// 엔티티·그래프 레인용 이중 키워드(EntityKeywordMode, LightRAG). 호출자가
+	// 넣은 EntityKeywords 는 먼저 버리고, 노브가 켜졌을 때만 추출 결과를 싣는다.
+	// 꺼져 있으면 kw 는 비어 있어 저장소는 현행 엔티티 레인 SQL 을 그대로 탄다.
+	// 추출은 어떤 실패에도 에러를 내지 않는다(LLM 실패 → sparse 키워드).
+	q.EntityKeywords = nil
+	kw := s.queryKeywordsFor(ctx, q.Query, tune)
+	q.EntityKeywords = kw.Low
+
+	sparseTerms := sparseTermsWithHighLevel(ctx, q.Query, kw.High, tune)
 	chunkSparseQ := q
 	chunkSparseQ.SparseTerms = sparseTerms
 
@@ -812,6 +822,9 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 	if tune.SparseQuery == model.SparseQueryChunkDoc {
 		storeQuery.SparseTerms = sparseTerms
 	}
+	// 융합 이후 노브(postfusion.go): 소스별 보조 검색은 본 검색과 동시에 띄운다.
+	arms := s.startSourceArms(ctx, storeQuery, tune)
+	defer arms.stop() // 일찍 반환하는 경로에서도 보조 검색 질의를 끊는다
 	results, err := s.store.Search(ctx, storeQuery)
 	if err != nil {
 		return nil, fmt.Errorf("search store: %w", err)
@@ -924,13 +937,38 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 			slog.Warn("search: chunk FTS fallback failed",
 				"error", cerr,
 			)
-			return results, nil
+			// 소스별 보조 검색이 돌고 있으면 그 결과까지 버리지 않도록
+			// 아래 합류 지점으로 내려간다(빈 전역 목록 + 보조 검색 결과).
+			if !arms.active() {
+				return results, nil
+			}
+		} else {
+			results = applySourceTypeFilters(q, chunkResults)
+			results = applyRetentionExclusion(q, results)
+			trace.recordLane(LaneChunkFTS, results)
+			chunkFused = true
 		}
-		results = applySourceTypeFilters(q, chunkResults)
-		results = applyRetentionExclusion(q, results)
-		trace.recordLane(LaneChunkFTS, results)
-		chunkFused = true
 	}
+
+	// SEARCH_SOURCE_STRATIFY_K / SEARCH_PLAN_SOURCE_SPILL_K: 보조 검색 결과를
+	// RRF 로 합류(stratify.go).
+	if merged, ok := arms.merge(q, results, trace); ok {
+		results = merged
+		chunkFused = true // 저장소 ORDER BY 가 더는 이 목록의 순서가 아니다
+	}
+
+	// --- graph expand boost (SEARCH_GRAPH_EXPAND_BOOST, default off) ---
+	// 융합이 끝난 후보 풀(문서 스토어 + 청크/OpenSearch + 소스별 보조 검색
+	// 병합)을 보존 페널티·리랭크 전에 그래프 지지로 한 번 재정렬한다. 새 문서는
+	// 더하지 않는다. 꺼져 있거나 최신순 질의면 no-op — graph_expand.go 참고.
+	results = s.applyGraphExpandBoost(ctx, q, results, tune)
+	// --- end graph expand boost ---
+
+	// --- schedule intent boost (SEARCH_SCHEDULE_INTENT_BOOST, default off) ---
+	// 일정 의도 질문에서 캘린더 후보 점수를 (1+boost) 배 해 재정렬한다. 순서만
+	// 바꾼다 — schedule_boost.go 참고.
+	results = applyScheduleIntentBoost(q, results, tune)
+	// --- end schedule intent boost ---
 
 	// Single fusion-time enforcement point for the retention="low" score
 	// penalty (see applyLowRetentionPenalty's doc comment for why it has to
@@ -993,7 +1031,12 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 	// 융합 순서는 리랭크 여부와 무관하게 남긴다. 리랭크를 끈 실행과 켠
 	// 실행을 같은 기준선으로 비교해야 "리랭커가 올렸나 내렸나" 를 셀 수 있다.
 	trace.recordFused(results)
+	results, collapsed := collapseForRanking(q, results, tune)
+	var rerankTail []*model.SearchResult
 	if rerankEnabled && len(results) > 1 {
+		// 보조 검색으로 커진 풀의 리랭커 입력 상한(stratify.go). 꼬리는 버리지
+		// 않고 리랭크된 머리 뒤에 융합 순서대로 다시 붙는다.
+		results, rerankTail = splitRerankInput(results, rerankInputCap(laneLimit, tune))
 		fused := results
 		trace.recordPreRerank(results)
 		s.rerankAttempts.Add(1)
@@ -1011,6 +1054,9 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 			results = reranked
 		}
 	}
+
+	results = joinRerankTail(results, rerankTail)
+	results = applyPostRerank(q, results, collapsed, tune, len(rerankTail) > 0)
 
 	// 페이지 크기로 자르기 직전의 후보 풀. 여기서 기록해야 "회수는 됐으나
 	// 상위 N 밖" 과 "회수 자체가 안 됨" 이 구분된다.
@@ -1429,16 +1475,37 @@ func chunkToSearchResult(r store.ChunkSearchResult) *model.SearchResult {
 	}
 }
 
-// sortByScore sorts results in-place by Score descending.
+// sortByScore sorts results in-place by a TOTAL order: Score descending, then
+// the event time newest first (a result with no occurred_at goes last among
+// equal scores), then ID ascending.
+//
+// It must be total rather than merely stable. Most callers build their input by
+// flattening a map (chunk-lane per-document aggregation, OpenSearch hit
+// de-duplication), so an order left to the input would differ run to run, and
+// equal scores are common — short, near-identical SMS get identical lane
+// scores. The tie-break mirrors the store's lane ORDER BYs (relevance, then
+// occurred_at DESC NULLS LAST, then id) so a result's position does not depend
+// on which layer happened to settle the tie. NaN scores sort last instead of
+// breaking the comparison's transitivity.
 func sortByScore(results []*model.SearchResult) {
-	// Insertion sort is fine for small slices (< 20 results).
-	for i := 1; i < len(results); i++ {
-		key := results[i]
-		j := i - 1
-		for j >= 0 && results[j].Score < key.Score {
-			results[j+1] = results[j]
-			j--
-		}
-		results[j+1] = key
+	sort.SliceStable(results, func(i, j int) bool { return resultBefore(results[i], results[j]) })
+}
+
+// resultBefore is sortByScore's comparison: true when a must precede b.
+func resultBefore(a, b *model.SearchResult) bool {
+	as, bs := a.Score, b.Score
+	aNaN, bNaN := math.IsNaN(as), math.IsNaN(bs)
+	switch {
+	case aNaN != bNaN:
+		return bNaN
+	case !aNaN && as != bs:
+		return as > bs
 	}
+	switch {
+	case (a.OccurredAt == nil) != (b.OccurredAt == nil):
+		return a.OccurredAt != nil
+	case a.OccurredAt != nil && !a.OccurredAt.Equal(*b.OccurredAt):
+		return a.OccurredAt.After(*b.OccurredAt)
+	}
+	return bytes.Compare(a.ID[:], b.ID[:]) < 0
 }
