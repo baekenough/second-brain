@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/google/uuid"
@@ -232,5 +233,142 @@ func TestMergeStratified(t *testing.T) {
 	assertSameIDs(t, pfIDs(swapped), pfIDs(got))
 	if len(mergeStratified(nil, nil)) != 0 {
 		t.Error("empty merge produced results")
+	}
+}
+
+// blockingArmStore 는 보조 검색 호출을 ctx 가 끝날 때까지 붙잡고, 본 검색은
+// mainErr 로 실패시킨다. 끊긴 보조 검색 수를 센다.
+type blockingArmStore struct {
+	mainErr   error
+	started   chan struct{}
+	cancelled chan struct{}
+}
+
+func (s *blockingArmStore) Search(ctx context.Context, q model.SearchQuery) ([]*model.SearchResult, error) {
+	if len(q.IncludeSourceTypes()) == 0 {
+		for range stratifySources { // 보조 검색이 전부 떠 있을 때 본 검색을 실패시킨다
+			<-s.started
+		}
+		return nil, s.mainErr
+	}
+	s.started <- struct{}{}
+	<-ctx.Done()
+	s.cancelled <- struct{}{}
+	return nil, ctx.Err()
+}
+
+// 리뷰 지적(#2): 본 검색이 실패해 일찍 반환하면, context.Background 호출자라도
+// 보조 검색 질의가 요청보다 오래 살아남지 않아야 한다.
+func TestSourceStratify_EarlyReturnCancelsArms(t *testing.T) {
+	t.Parallel()
+	st := &blockingArmStore{
+		mainErr:   errors.New("synthetic store failure"),
+		started:   make(chan struct{}, len(stratifySources)),
+		cancelled: make(chan struct{}, len(stratifySources)),
+	}
+	_, err := NewService(st, disabledEmbedderForTrace{}).Search(context.Background(),
+		model.SearchQuery{Query: "q", Limit: 5, Tuning: model.SearchTuning{SourceStratifyK: 2}})
+	if err == nil {
+		t.Fatal("store failure was swallowed")
+	}
+	for i := range stratifySources {
+		select {
+		case <-st.cancelled:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d/%d arm queries were cancelled after the early return", i, len(stratifySources))
+		}
+	}
+}
+
+// 리뷰 지적(#2): 청크 FTS 폴백이 실패하는 경로가 보조 검색 결과까지 버리면
+// 안 된다. 노브가 꺼져 있으면 예전처럼 빈 결과다.
+func TestSourceStratify_ChunkFTSFailureStillMergesArms(t *testing.T) {
+	t.Parallel()
+	run := func(k int) []*model.SearchResult {
+		st := armFixture()
+		st.global = nil // 1차 경로 0건 → 청크 FTS 폴백
+		svc := NewService(st, disabledEmbedderForTrace{}).
+			WithChunkStore(&mockChunkSearcher{ftsErr: errors.New("synthetic chunk fts failure")})
+		got, err := svc.Search(context.Background(),
+			model.SearchQuery{Query: "q", Limit: 5, Tuning: model.SearchTuning{SourceStratifyK: k}})
+		if err != nil {
+			t.Fatalf("k=%d: %v", k, err)
+		}
+		return got
+	}
+	if got := run(0); len(got) != 0 {
+		t.Fatalf("knob off changed the failure path: %d results", len(got))
+	}
+	got := run(2)
+	if len(got) == 0 || !slices.Contains(pfIDs(got), pfID(10)) {
+		t.Fatalf("arm results were discarded on the chunk-FTS failure path: %v", pfIDs(got))
+	}
+}
+
+func TestRerankInputCap(t *testing.T) {
+	t.Parallel()
+	if got := rerankInputCap(20, model.SearchTuning{}); got != 0 {
+		t.Errorf("stratify off must not cap: %d", got)
+	}
+	if got := rerankInputCap(20, model.SearchTuning{SourceStratifyK: 5}); got != 20+5*len(stratifySources) {
+		t.Errorf("cap = %d", got)
+	}
+	if got := rerankInputCap(200, model.SearchTuning{SourceStratifyK: 10}); got != overfetchLimitCap {
+		t.Errorf("cap above overfetchLimitCap: %d", got)
+	}
+	in := []*model.SearchResult{pfDoc(1, "", 3, nil), pfDoc(2, "", 2, nil), pfDoc(3, "", 1, nil)}
+	head, tail := splitRerankInput(in, 2)
+	assertSameIDs(t, pfIDs(joinRerankTail(append(head, pfDoc(9, "", 0, nil)), tail)), // append 가 꼬리를 덮어쓰면 안 된다
+		[]uuid.UUID{pfID(1), pfID(2), pfID(9), pfID(3)})
+	if h, tl := splitRerankInput(in, 0); len(h) != 3 || tl != nil {
+		t.Error("limit 0 must not split")
+	}
+}
+
+// countingReranker 는 받은 문서 수를 기록하고 순서를 그대로 돌려준다.
+type countingReranker struct {
+	mu  sync.Mutex
+	got int
+}
+
+func (r *countingReranker) Enabled() bool { return true }
+func (r *countingReranker) Rerank(_ context.Context, _ string, docs []string) ([]RerankResult, error) {
+	r.mu.Lock()
+	r.got = len(docs)
+	r.mu.Unlock()
+	out := make([]RerankResult, len(docs))
+	for i := range docs {
+		out[i] = RerankResult{Index: i, Score: 1 - float64(i)/float64(len(docs)+1)}
+	}
+	return out, nil
+}
+
+// 리뷰 지적(#3): 보조 검색 합류가 풀을 overfetchLimitCap 너머로 키워도
+// 리랭커 입력은 상한을 지키고, 넘친 후보는 버려지지 않고 뒤에 남는다.
+func TestSourceStratify_RerankInputCappedTailKept(t *testing.T) {
+	t.Parallel()
+	st := &armStore{bySrc: map[model.SourceType][]*model.SearchResult{}}
+	for i := 0; i < overfetchLimitCap; i++ {
+		st.global = append(st.global, pfDoc(1000+i, model.SourceGmail, float64(1000-i), nil))
+	}
+	for i := 0; i < 2; i++ {
+		st.bySrc[model.SourceCalendar] = append(st.bySrc[model.SourceCalendar], pfDoc(10+i, model.SourceCalendar, 1, nil))
+		st.bySrc[model.SourceNote] = append(st.bySrc[model.SourceNote], pfDoc(20+i, model.SourceNote, 1, nil))
+	}
+	rr := &countingReranker{}
+	svc := NewService(st, disabledEmbedderForTrace{}).WithReranker(rr)
+	_, trace, err := svc.SearchTraced(context.Background(), model.SearchQuery{Query: "q", Limit: 100, UseRerank: true,
+		Tuning: model.SearchTuning{SourceStratifyK: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rr.got != overfetchLimitCap {
+		t.Fatalf("reranker received %d docs, want cap %d", rr.got, overfetchLimitCap)
+	}
+	if len(trace.PoolIDs) != overfetchLimitCap+4 {
+		t.Fatalf("pool = %d, want %d (tail must be kept)", len(trace.PoolIDs), overfetchLimitCap+4)
+	}
+	if !slices.Equal(trace.PoolIDs[:overfetchLimitCap], trace.PreRerankIDs) {
+		t.Fatal("reranked head is not ahead of the un-reranked tail")
 	}
 }

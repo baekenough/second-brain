@@ -99,32 +99,42 @@ func rerankYAMLDoc(r *model.SearchResult, body string) string {
 }
 
 // rerankCounterpart 는 연락처 표시 이름(metadata.contact_name)만 돌려준다.
-// 공백을 정리하고 120 rune 으로 자른다. 전화번호처럼 보이는 값은 버린다 —
-// 연락처 이름 칸에 번호가 저장된 경우가 있을 수 있고, 이 노브는 번호를
-// 리랭커로 새로 내보내지 않는다는 약속을 지켜야 한다.
+// 공백을 정리하고 120 rune 으로 자른다. 이름 안에 전화번호처럼 보이는 숫자
+// 덩어리가 있으면("엄마 010-1234-5678") 칸 전체를 생략한다 — 이름만 떼어
+// 내려다 번호 일부가 남는 것보다, 이 노브가 번호를 리랭커로 새로 내보내지
+// 않는다는 약속을 지키는 쪽이 낫다.
 func rerankCounterpart(r *model.SearchResult) string {
 	name, _ := r.Metadata["contact_name"].(string)
 	name = oneLine(name)
-	if name == "" || looksLikePhoneNumber(name) {
+	if name == "" || containsPhoneLikeNumber(name) {
 		return ""
 	}
 	return truncateRunes(name, 120)
 }
 
-// looksLikePhoneNumber 는 숫자와 전화번호 구분 기호(+ - ( ) . 공백)로만
-// 이뤄지고 숫자가 3개 이상인 문자열이면 true 다.
-func looksLikePhoneNumber(s string) bool {
-	digits := 0
+// phoneDigitRun 은 전화번호로 보는 연속 숫자 수의 하한이다. 국내 지역번호 없는
+// 일반전화(7자리)부터 휴대전화(10~11자리)·국제 표기까지 걸린다.
+const phoneDigitRun = 7
+
+// containsPhoneLikeNumber 는 구분 기호(공백 - . ( ) +)를 무시하고 이어 붙였을
+// 때 숫자가 phoneDigitRun 개 이상 연속되는 구간이 있으면 true 다. 다른 문자
+// (한글·영문 등)는 구간을 끊는다.
+func containsPhoneLikeNumber(s string) bool {
+	run := 0
 	for _, c := range s {
 		switch {
 		case unicode.IsDigit(c):
-			digits++
-		case strings.ContainsRune("+-(). ", c):
+			run++
+			if run >= phoneDigitRun {
+				return true
+			}
+		case strings.ContainsRune(" -.()+", c):
+			// 구분 기호는 구간을 끊지 않는다.
 		default:
-			return false
+			run = 0
 		}
 	}
-	return digits >= 3
+	return false
 }
 
 // oneLine 은 줄바꿈·연속 공백을 공백 하나로 접는다.

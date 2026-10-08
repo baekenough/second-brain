@@ -3,6 +3,7 @@ package search
 import (
 	"encoding/json"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -47,6 +48,8 @@ import (
 //   - 입력 슬라이스의 순서가 곧 "현재 순위" 다. 파이프라인에서 이 변환들에
 //     들어오는 목록은 sortByScore(총순서) 또는 리랭크 순위로 이미 정렬돼 있다.
 //     맵 순회 순서에 의존하는 곳은 없다 — 같은 입력이면 항상 같은 출력이다.
+//   - 재배치가 하나라도 일어나면 응답 Score 는 최종 순서를 따라 비증가가
+//     되도록 내려 깎인다(clampNonIncreasing). 노브가 꺼져 있으면 점수는 그대로다.
 //   - 어떤 후보도 버리지 않는다. 위치만 바꾼다(보조 검색 합류는 후보를 더할
 //     뿐이다).
 //   - Sort="recent" 질의에서는 순서 변환(접기·MMR·날짜 버킷)을 하지 않는다.
@@ -72,11 +75,14 @@ type collapsedGroup struct {
 }
 
 // collapsedSet 은 접기 결과다. groups 는 대표가 처음 나타난 순위 순서라
-// 결정론적이고, byRep 은 대표 ID 로 groups 를 찾는 색인이다.
+// 결정론적이고, byRep 은 대표 ID 로 groups 를 찾는 색인이다. pre 는 접기
+// 직전의 순위(입력 순서)로, 펼침 상한을 넘은 멤버를 원래 자리 근처로 되돌릴
+// 때 쓴다(expandCollapsed).
 type collapsedSet struct {
 	groups []collapsedGroup
 	byRep  map[uuid.UUID]int
 	max    int
+	pre    []*model.SearchResult
 }
 
 // collapseForRanking 은 노브·질의 조건을 확인한 뒤 collapseContactDay 를
@@ -100,8 +106,8 @@ func collapseForRanking(q model.SearchQuery, results []*model.SearchResult, tune
 //     멤버는 순위 목록에서 빠져 collapsedSet 에 점수 순으로 보관된다.
 //   - 그 결과 같은 상대·같은 날 문서 여러 건이 차지하던 자리가 다른 후보에게
 //     열린다. 리랭커도 대표만 본다.
-//   - 문서는 하나도 버려지지 않는다. expandCollapsed 가 최종 순서 뒤에 모든
-//     멤버를 다시 넣는다.
+//   - 문서는 하나도 버려지지 않는다. expandCollapsed 가 최종 순서가 정해진
+//     뒤 모든 멤버를 다시 넣는다.
 //
 // 접을 그룹이 하나도 없으면 입력을 그대로 돌려주고 두 번째 값은 nil 이다.
 func collapseContactDay(results []*model.SearchResult, expandMax int) ([]*model.SearchResult, *collapsedSet) {
@@ -133,7 +139,7 @@ func collapseContactDay(results []*model.SearchResult, expandMax int) ([]*model.
 		return results, nil
 	}
 
-	set := &collapsedSet{byRep: make(map[uuid.UUID]int), max: expandMax}
+	set := &collapsedSet{byRep: make(map[uuid.UUID]int), max: expandMax, pre: slices.Clone(results)}
 	groupIdx := make(map[string]int)
 	// 1회차: 대표가 나타나는 순위 순서대로 그룹을 만든다(결정론적 순서).
 	for i, r := range results {
@@ -168,47 +174,140 @@ func collapseContactDay(results []*model.SearchResult, expandMax int) ([]*model.
 	return ranked, set
 }
 
-// expandCollapsed 는 접힌 멤버를 다시 펼친다.
+// expandCollapsed 는 접힌 멤버를 다시 펼친다. 최종 순위(ranked)의 각 항목을
+// "블록" 의 머리로 보고 다음 규칙으로 멤버를 끼운다.
 //
-//   - 최종 순위의 각 대표 바로 뒤에 그 그룹 멤버를 점수 순으로 최대 set.max
-//     건 끼운다.
-//   - 그 밖의 멤버(max 초과분, 대표가 최종 목록에서 사라진 그룹의 멤버)는
-//     목록 맨 뒤에 점수 순(sortByScore)으로 붙인다. 버리지 않는다.
+//   - 펼침: 대표의 블록에는 대표 바로 뒤에 그 그룹 멤버를 점수 순으로 최대
+//     set.max 건 붙인다.
+//   - 초과분(set.max 를 넘은 멤버, 대표가 최종 목록에 없는 그룹의 멤버 전부):
+//     접기 직전 순위(set.pre)에서 그 멤버 바로 위에 있던 가장 가까운 블록
+//     머리(접히지 않고 순위에 남았던 항목 — 대표 또는 그룹 밖 문서)를 앵커로
+//     삼아, 최종 순위에서 앵커 블록 바로 뒤에 pre 순서대로 붙인다. 따라서
+//     리랭크가 순서를 바꾸지 않았다면 초과분과 그룹 밖 문서의 상대 순서는
+//     접기 전과 같다 — 초과분이 목록 꼬리로 밀려 페이지에서 사라지지 않는다.
+//     리랭크가 순서를 바꿨다면 초과분은 원래 자기 바로 위에 있던 문서를
+//     따라간다. 앵커가 없으면(입력이 점수 순이 아닐 때만 생긴다) 맨 뒤에 붙인다.
+//   - 점수: 끼워 넣은 문서(펼침·초과분)는 얕은 복사본의 Score 를 바로 앞에
+//     놓인 문서의 점수로 맞춘다(동점). 대표는 리랭커 점수, 멤버는 융합 점수라
+//     척도가 달라서, 자기 점수를 그대로 두면 응답의 점수가 순서와 어긋난다.
+//     블록 머리들의 점수가 비증가면 결과 전체도 비증가다.
 //
-// 대표 ID 가 목록에 두 번 나오면 첫 번째에서만 펼친다.
+// 대표 ID 가 목록에 두 번 나오면 첫 번째에서만 펼친다. 어떤 후보도 버리지 않는다.
 func expandCollapsed(ranked []*model.SearchResult, set *collapsedSet) []*model.SearchResult {
 	if set == nil || len(set.groups) == 0 {
 		return ranked
 	}
-	total := len(ranked)
-	for _, g := range set.groups {
-		total += len(g.members)
+
+	// 1) 블록 구성: 머리 + (대표면) 펼침 멤버. 펼치지 못한 멤버는 초과분.
+	type block struct {
+		items    []*model.SearchResult
+		overflow []*model.SearchResult
 	}
-	out := make([]*model.SearchResult, 0, total)
-	var overflow []*model.SearchResult
+	blocks := make([]block, 0, len(ranked))
+	headBlock := make(map[uuid.UUID]int, len(ranked))
 	expanded := make([]bool, len(set.groups))
+	overflow := make(map[*model.SearchResult]bool)
 	for _, r := range ranked {
-		out = append(out, r)
-		if r == nil {
-			continue
+		b := block{items: []*model.SearchResult{r}}
+		if r != nil {
+			if _, seen := headBlock[r.ID]; !seen {
+				headBlock[r.ID] = len(blocks)
+			}
+			if gi, ok := set.byRep[r.ID]; ok && !expanded[gi] {
+				expanded[gi] = true
+				members := set.groups[gi].members
+				n := min(max(set.max, 0), len(members))
+				b.items = append(b.items, members[:n]...)
+				for _, m := range members[n:] {
+					overflow[m] = true
+				}
+			}
 		}
-		gi, ok := set.byRep[r.ID]
-		if !ok || expanded[gi] {
-			continue
-		}
-		expanded[gi] = true
-		members := set.groups[gi].members
-		n := min(max(set.max, 0), len(members))
-		out = append(out, members[:n]...)
-		overflow = append(overflow, members[n:]...)
+		blocks = append(blocks, b)
 	}
 	for gi, g := range set.groups {
 		if !expanded[gi] {
-			overflow = append(overflow, g.members...)
+			for _, m := range g.members {
+				overflow[m] = true
+			}
 		}
 	}
-	sortByScore(overflow)
-	return append(out, overflow...)
+
+	// 2) 초과분을 접기 직전 순위의 앵커 블록에 붙인다(pre 순서 유지).
+	var orphans []*model.SearchResult
+	for i, m := range set.pre {
+		if !overflow[m] {
+			continue
+		}
+		anchor := -1
+		for j := i - 1; j >= 0 && anchor < 0; j-- {
+			p := set.pre[j]
+			if p == nil || overflow[p] {
+				continue
+			}
+			// 리랭크는 얕은 복사본을 돌려주므로 포인터가 아니라 ID 로 찾는다.
+			// 펼친 멤버의 ID 는 블록 머리가 아니라 여기서 걸리지 않는다.
+			if bi, ok := headBlock[p.ID]; ok {
+				anchor = bi
+			}
+		}
+		if anchor < 0 {
+			orphans = append(orphans, m)
+			continue
+		}
+		blocks[anchor].overflow = append(blocks[anchor].overflow, m)
+	}
+
+	// 3) 내보내기. 끼워 넣은 문서는 바로 앞 문서의 점수를 이어받는다.
+	out := make([]*model.SearchResult, 0, len(set.pre))
+	inherit := func(r *model.SearchResult) {
+		if len(out) > 0 && out[len(out)-1] != nil && !isBadScore(out[len(out)-1].Score) {
+			cp := *r // 얕은 복사 — 호출자의 결과를 변형하지 않는다
+			cp.Score = out[len(out)-1].Score
+			r = &cp
+		}
+		out = append(out, r)
+	}
+	for _, b := range blocks {
+		out = append(out, b.items[0])
+		for _, r := range b.items[1:] {
+			inherit(r)
+		}
+		for _, r := range b.overflow {
+			inherit(r)
+		}
+	}
+	for _, r := range orphans {
+		inherit(r)
+	}
+	return out
+}
+
+func isBadScore(f float64) bool { return math.IsNaN(f) || math.IsInf(f, 0) }
+
+// clampNonIncreasing 은 응답의 Score 가 최종 순서를 따라 비증가가 되도록,
+// 앞 문서보다 점수가 높은 문서의 점수를 앞 문서 점수로 낮춘다(얕은 복사).
+// 순서는 바꾸지 않는다. 융합 이후 재배치(MMR·날짜 버킷·펼치기·리랭크 입력
+// 상한 뒤의 꼬리)가 실제로 켜졌을 때만 부른다 — 재배치는 점수를 바꾸지 않고
+// 순서만 바꾸므로, 그대로 두면 응답의 점수가 순서와 어긋난다. 점수를 올리지는
+// 않는다(승격된 문서에 없던 관련도를 붙이지 않는다). NaN·무한대 점수는 그대로
+// 두고 기준선 갱신에도 쓰지 않는다.
+func clampNonIncreasing(results []*model.SearchResult) []*model.SearchResult {
+	out := slices.Clone(results)
+	floor := math.Inf(1)
+	for i, r := range out {
+		if r == nil || isBadScore(r.Score) {
+			continue
+		}
+		if r.Score > floor {
+			cp := *r
+			cp.Score = floor
+			out[i] = &cp
+			continue
+		}
+		floor = r.Score
+	}
+	return out
 }
 
 // contactDayKey 는 접기 그룹 키 "(소스)|(상대)|(KST 날짜)" 를 만든다. 문자·
@@ -287,17 +386,30 @@ func metaScalar(meta map[string]any, key string) string {
 }
 
 // applyPostRerank 는 리랭크(합산) 뒤의 변환을 파일 머리 주석의 순서대로
-// 적용한다: MMR → 날짜 버킷 다변화 → 접힌 문서 펼치기.
-func applyPostRerank(q model.SearchQuery, results []*model.SearchResult, collapsed *collapsedSet, tune model.SearchTuning) []*model.SearchResult {
+// 적용한다: MMR → 날짜 버킷 다변화 → 접힌 문서 펼치기 → 점수 비증가 보정.
+// rerankTail 은 리랭크 입력 상한(rerankInputCap) 때문에 리랭크되지 않고 뒤에
+// 붙은 꼬리가 있었는지다. 어느 재배치도 일어나지 않았으면 입력을 그대로
+// 돌려준다(점수 보정도 하지 않는다).
+func applyPostRerank(q model.SearchQuery, results []*model.SearchResult, collapsed *collapsedSet, tune model.SearchTuning, rerankTail bool) []*model.SearchResult {
+	reordered := rerankTail
 	if !q.SortsByRecency() {
 		if tune.MMRLambda > 0 {
 			results = applyMMR(results, tune.MMRLambda)
+			reordered = true
 		}
 		if tune.WindowBucketDiversify && windowSpansMultipleDays(q) {
 			results = diversifyByDay(results)
+			reordered = true
 		}
 	}
-	return expandCollapsed(results, collapsed)
+	if collapsed != nil {
+		results = expandCollapsed(results, collapsed)
+		reordered = true
+	}
+	if !reordered {
+		return results
+	}
+	return clampNonIncreasing(results)
 }
 
 // windowSpansMultipleDays 는 질의에 KST 로 하루를 넘는 occurred 시간창이
@@ -371,7 +483,8 @@ func diversifyByDay(results []*model.SearchResult) []*model.SearchResult {
 //     차지하던 자리 안에서만 일어난다. 차원이 다른 두 벡터의 유사도는 0 이다.
 //   - λ=1 이면 순수 관련도(= 현재 순위)라 순서가 바뀌지 않는다.
 //
-// 창 밖 문서와 결과 크기는 바뀌지 않는다. 점수(Score)도 바꾸지 않는다.
+// 창 밖 문서와 결과 크기는 바뀌지 않는다. 점수(Score)는 여기서 바꾸지 않고,
+// applyPostRerank 가 마지막에 비증가로 보정한다(clampNonIncreasing).
 func applyMMR(results []*model.SearchResult, lambda float64) []*model.SearchResult {
 	if lambda <= 0 || lambda > 1 || math.IsNaN(lambda) || len(results) < 2 {
 		return results

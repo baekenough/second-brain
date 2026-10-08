@@ -89,13 +89,13 @@ func TestCollapseContactDay_GroupsAndExpands(t *testing.T) {
 	assertSameIDs(t, pfIDs(ranked), []uuid.UUID{pfID(1), pfID(2), pfID(4)})
 	assertSameIDs(t, pfIDs(expandCollapsed(ranked, set)), []uuid.UUID{pfID(1), pfID(3), pfID(5), pfID(2), pfID(4)})
 
-	// 펼침 상한 1: 초과분(a3)은 버리지 않고 맨 뒤로.
+	// 펼침 상한 1: 초과분(a3)은 접기 전 바로 위에 있던 블록 머리(c) 뒤로.
 	ranked, set = collapseContactDay(in, 1)
 	assertSameIDs(t, pfIDs(expandCollapsed(ranked, set)), []uuid.UUID{pfID(1), pfID(3), pfID(2), pfID(4), pfID(5)})
 
-	// 리랭커가 대표 순서를 뒤집어도 멤버는 자기 대표를 따라간다.
+	// 리랭커가 순서를 뒤집어도 펼친 멤버는 대표를, 초과분은 앵커(c)를 따라간다.
 	reversed := []*model.SearchResult{ranked[2], ranked[1], ranked[0]}
-	assertSameIDs(t, pfIDs(expandCollapsed(reversed, set)), []uuid.UUID{pfID(4), pfID(2), pfID(1), pfID(3), pfID(5)})
+	assertSameIDs(t, pfIDs(expandCollapsed(reversed, set)), []uuid.UUID{pfID(4), pfID(5), pfID(2), pfID(1), pfID(3)})
 }
 
 func TestCollapseContactDay_RepresentativeIsBestScored(t *testing.T) {
@@ -308,13 +308,13 @@ func TestApplyPostRerank_BucketNeedsMultiDayWindow(t *testing.T) {
 		pfDoc(3, model.SourceCall, 1, pfAt(2, 9)),
 	}
 	on := model.SearchTuning{WindowBucketDiversify: true}.Normalized()
-	assertSameIDs(t, pfIDs(applyPostRerank(model.SearchQuery{}, in, nil, on)), pfIDs(in))
+	assertSameIDs(t, pfIDs(applyPostRerank(model.SearchQuery{}, in, nil, on, false)), pfIDs(in))
 	oneDay := model.SearchQuery{OccurredFrom: pfAt(1, 0), OccurredTo: pfAt(2, 0)}
-	assertSameIDs(t, pfIDs(applyPostRerank(oneDay, in, nil, on)), pfIDs(in))
+	assertSameIDs(t, pfIDs(applyPostRerank(oneDay, in, nil, on, false)), pfIDs(in))
 	month := model.SearchQuery{OccurredFrom: pfAt(1, 0), OccurredTo: pfAt(30, 0)}
-	assertSameIDs(t, pfIDs(applyPostRerank(month, in, nil, on)), []uuid.UUID{pfID(1), pfID(3), pfID(2)})
+	assertSameIDs(t, pfIDs(applyPostRerank(month, in, nil, on, false)), []uuid.UUID{pfID(1), pfID(3), pfID(2)})
 	month.Sort = model.SortRecent
-	assertSameIDs(t, pfIDs(applyPostRerank(month, in, nil, on)), pfIDs(in))
+	assertSameIDs(t, pfIDs(applyPostRerank(month, in, nil, on, false)), pfIDs(in))
 }
 
 // --- MMR ---
@@ -445,8 +445,27 @@ func TestRerankYAMLDoc(t *testing.T) {
 	if got := rerankYAMLDoc(bare, " \n"); got != "source: document\ntext: \"\"" {
 		t.Fatalf("bare yaml doc = %q", got)
 	}
-	if looksLikePhoneNumber("홍길동") || !looksLikePhoneNumber("010.1234.5678") || looksLikePhoneNumber("12") {
-		t.Fatal("looksLikePhoneNumber misclassified")
+	for in, want := range map[string]bool{
+		"홍길동":                   false,
+		"12":                    false,
+		"김과장 2팀":                false,
+		"A동 101호 박씨":            false,
+		"123456":                false, // 6자리: 번호로 보지 않는다
+		"010.1234.5678":         true,
+		"엄마 010-1234-5678":      true,
+		"Mom(+82 10 1234 5678)": true,
+		"사무실 02)123-4567":       true,
+		"1234567":               true,
+	} {
+		if got := containsPhoneLikeNumber(in); got != want {
+			t.Errorf("containsPhoneLikeNumber(%q) = %v, want %v", in, got, want)
+		}
+	}
+	// 이름+번호가 섞인 표시 이름은 counterpart 칸째 빠지고, 번호는 어디에도 없다.
+	mixed := pfDoc(3, model.SourceSMS, 1, nil)
+	mixed.Metadata = map[string]any{"contact_name": "엄마 010-1234-5678"}
+	if got := rerankYAMLDoc(mixed, "본문"); strings.Contains(got, "counterpart") || strings.Contains(got, "1234") {
+		t.Fatalf("mixed name+number leaked: %q", got)
 	}
 }
 
@@ -625,11 +644,141 @@ func TestPostFusion_CollapseKeepsEveryCandidateInPool(t *testing.T) {
 	if len(trace.PreRerankIDs) != len(all)-5 {
 		t.Fatalf("reranker saw %d docs, want %d", len(trace.PreRerankIDs), len(all)-5)
 	}
-	// traceReranker 는 순서를 뒤집으므로 대표 sms1 이 대표 목록의 마지막이다.
-	// 그 바로 뒤에 펼침 1건(sms2), 맨 끝에 초과분 sms3..sms6 이 점수 순으로 온다.
-	pool := trace.PoolIDs
-	n := len(pool)
-	assertSameIDs(t, pool[n-6:], []uuid.UUID{pfID(1), pfID(2), pfID(3), pfID(4), pfID(5), pfID(6)})
+	// traceReranker 는 블록 머리 순서를 뒤집는다(cal, gm6..gm1, sms1). 펼친
+	// sms2 는 대표 sms1 뒤에, 초과분 sms3..sms6 은 접기 전 바로 위에 있던 메일
+	// (gm1..gm4) 뒤에 붙는다 — 꼬리로 밀려나지 않는다.
+	assertSameIDs(t, trace.PoolIDs, []uuid.UUID{
+		pfID(30), pfID(15), pfID(14), pfID(13), pfID(6), pfID(12), pfID(5),
+		pfID(11), pfID(4), pfID(10), pfID(3), pfID(1), pfID(2),
+	})
+	assertNonIncreasing(t, got)
+}
+
+func assertNonIncreasing(t *testing.T, results []*model.SearchResult) {
+	t.Helper()
+	for i := 1; i < len(results); i++ {
+		if results[i].Score > results[i-1].Score {
+			t.Fatalf("score rises at %d: %v > %v", i, results[i].Score, results[i-1].Score)
+		}
+	}
+}
+
+// 리뷰 지적(#1): 펼침 상한을 넘은 멤버가 꼬리로 가면 접기 전 5·6위였던
+// 문서가 limit 10 페이지에서 사라진다. 리랭크가 순서를 바꾸지 않을 때
+// 초과분과 그룹 밖 문서의 상대 순서는 접기 전과 같아야 한다.
+func TestExpandCollapsed_OverflowKeepsPreCollapseRelativeOrder(t *testing.T) {
+	t.Parallel()
+	// 접기 전: a1 a2 x1 a3 a4 x2 x3 ... (a 는 한 그룹, x 는 다른 메일 14건)
+	in := []*model.SearchResult{pfSMS(1, "aaaa", 100, pfAt(1, 9)), pfSMS(2, "aaaa", 99, pfAt(1, 10))}
+	in = append(in, pfDoc(50, model.SourceGmail, 98, nil))
+	in = append(in, pfSMS(3, "aaaa", 97, pfAt(1, 11)), pfSMS(4, "aaaa", 96, pfAt(1, 12)))
+	for i := 0; i < 14; i++ {
+		in = append(in, pfDoc(60+i, model.SourceGmail, float64(95-i), nil))
+	}
+	ranked, set := collapseContactDay(in, 1)
+	out := expandCollapsed(ranked, set) // 리랭크 없음
+	pos := map[uuid.UUID]int{}
+	for i, r := range out {
+		pos[r.ID] = i
+	}
+	// a3·a4(접기 전 4·5위)는 limit 10 페이지 안에 남는다.
+	for _, id := range []uuid.UUID{pfID(3), pfID(4)} {
+		if pos[id] >= 10 {
+			t.Fatalf("overflow member %v fell to rank %d", id, pos[id]+1)
+		}
+	}
+	assertSameIDs(t, pfIDs(out[:6]), []uuid.UUID{pfID(1), pfID(2), pfID(50), pfID(3), pfID(4), pfID(60)})
+	assertNonIncreasing(t, out)
+
+	// 성질 검사: 무작위 후보·상한에서 리랭크가 없으면, 초과분 m 과 그룹에
+	// 속하지 않은 문서 x 의 상대 순서는 접기 전과 같다.
+	for seed := int64(1); seed <= 60; seed++ {
+		pool := sortedCopy(pfRandomPool(seed, 40))
+		pre := map[uuid.UUID]int{}
+		for i, r := range pool {
+			pre[r.ID] = i
+		}
+		for _, expandMax := range []int{0, 1, 2} {
+			ranked, set := collapseContactDay(pool, expandMax)
+			out := expandCollapsed(ranked, set)
+			if set == nil {
+				continue
+			}
+			grouped := map[uuid.UUID]bool{}
+			overflow := map[uuid.UUID]bool{}
+			for _, g := range set.groups {
+				grouped[g.rep] = true
+				for i, m := range g.members {
+					grouped[m.ID] = true
+					if i >= expandMax {
+						overflow[m.ID] = true
+					}
+				}
+			}
+			post := map[uuid.UUID]int{}
+			for i, r := range out {
+				post[r.ID] = i
+			}
+			for m := range overflow {
+				for _, x := range pool {
+					if grouped[x.ID] {
+						continue
+					}
+					if (pre[m] < pre[x.ID]) != (post[m] < post[x.ID]) {
+						t.Fatalf("seed %d max %d: overflow %v vs %v order changed", seed, expandMax, m, x.ID)
+					}
+				}
+			}
+		}
+	}
+}
+
+// 리뷰 지적(#1): 대표는 리랭커 점수, 멤버는 융합 점수라 그대로 두면 응답
+// 점수가 순서와 어긋난다. 끼워 넣은 문서는 앞 문서 점수를 이어받는다.
+func TestExpandCollapsed_ScoresNonIncreasingAcrossScales(t *testing.T) {
+	t.Parallel()
+	in := []*model.SearchResult{
+		pfSMS(1, "aaaa", 0.033, pfAt(1, 9)), pfSMS(2, "aaaa", 0.032, pfAt(1, 10)),
+		pfDoc(3, model.SourceGmail, 0.031, nil), pfSMS(4, "aaaa", 0.030, pfAt(1, 11)),
+		pfDoc(5, model.SourceGmail, 0.029, nil),
+	}
+	ranked, set := collapseContactDay(in, 1)
+	// 리랭커(replace)가 대표·문서에 0..1 척도 점수를 매겼다.
+	rr := make([]*model.SearchResult, len(ranked))
+	for i, r := range ranked {
+		cp := *r
+		cp.Score = 0.9 - 0.2*float64(i)
+		rr[i] = &cp
+	}
+	out := applyPostRerank(model.SearchQuery{}, rr, set, model.SearchTuning{CollapseContactDay: true}.Normalized(), false)
+	assertSameIDs(t, pfIDs(out), []uuid.UUID{pfID(1), pfID(2), pfID(3), pfID(4), pfID(5)})
+	assertNonIncreasing(t, out)
+	if out[1].Score != out[0].Score || in[1].Score != 0.032 {
+		t.Fatalf("expanded member should tie with its rep without mutating input: %v / %v", out[1].Score, in[1].Score)
+	}
+}
+
+func TestClampNonIncreasing(t *testing.T) {
+	t.Parallel()
+	in := []*model.SearchResult{
+		pfDoc(1, model.SourceGmail, 0.5, nil), pfDoc(2, model.SourceGmail, 0.9, nil),
+		pfDoc(3, model.SourceGmail, math.NaN(), nil), pfDoc(4, model.SourceGmail, 0.7, nil),
+		pfDoc(5, model.SourceGmail, 0.1, nil),
+	}
+	out := clampNonIncreasing(in)
+	want := []float64{0.5, 0.5, math.NaN(), 0.5, 0.1}
+	for i, w := range want {
+		if (math.IsNaN(w) && !math.IsNaN(out[i].Score)) || (!math.IsNaN(w) && out[i].Score != w) {
+			t.Fatalf("score[%d] = %v, want %v", i, out[i].Score, w)
+		}
+	}
+	if in[1].Score != 0.9 {
+		t.Fatal("input mutated")
+	}
+	assertSameIDs(t, pfIDs(out), pfIDs(in))
+	if len(clampNonIncreasing(nil)) != 0 {
+		t.Fatal("empty")
+	}
 }
 
 // 리랭크 없는 실행에서 보조 검색 합류 결과가 저장소 정렬과 무관하게
