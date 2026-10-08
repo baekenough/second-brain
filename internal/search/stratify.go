@@ -54,6 +54,8 @@ func stratifyArmSources(q model.SearchQuery, k int) []model.SourceType {
 // 모든 메서드가 nil 수신자를 받는다.
 type sourceArms struct {
 	wg      sync.WaitGroup
+	ctx     context.Context
+	cancel  context.CancelFunc
 	sources []model.SourceType
 	lists   [][]*model.SearchResult // 인덱스별로 한 고루틴만 쓴다
 	k       int
@@ -77,7 +79,12 @@ func (s *Service) startSourceArms(ctx context.Context, storeQuery model.SearchQu
 	if len(sources) == 0 {
 		return nil
 	}
+	// 보조 검색 전용 ctx. 호출자 ctx 가 context.Background 여도 Search 가
+	// 일찍 반환하는 경로(저장소 오류 등)에서 stop 이 남은 질의를 끊는다.
+	armCtx, cancel := context.WithCancel(ctx)
 	a := &sourceArms{
+		ctx:     armCtx,
+		cancel:  cancel,
 		sources: sources,
 		lists:   make([][]*model.SearchResult, len(sources)),
 		k:       k,
@@ -91,8 +98,12 @@ func (s *Service) startSourceArms(ctx context.Context, storeQuery model.SearchQu
 		a.wg.Add(1)
 		go func() {
 			defer a.wg.Done()
-			res, err := s.store.Search(ctx, armQ)
+			res, err := s.store.Search(armCtx, armQ)
 			if err != nil {
+				if armCtx.Err() != nil {
+					// stop 이 끊었거나 요청이 취소됐다: 실패가 아니라 중단이다.
+					return
+				}
 				// 질의 텍스트는 싣지 않는다. 소스 이름은 개인 데이터가 아니다.
 				slog.Warn("search: source stratify arm failed, skipping",
 					"source_type", string(st), "error", err)
@@ -102,6 +113,19 @@ func (s *Service) startSourceArms(ctx context.Context, storeQuery model.SearchQu
 		}()
 	}
 	return a
+}
+
+// active 는 보조 검색이 시작됐는지 알린다(nil 수신자 허용).
+func (a *sourceArms) active() bool { return a != nil }
+
+// stop 은 아직 도는 보조 검색을 취소한다. Search 가 반환할 때 항상(defer)
+// 부른다 — merge 뒤라면 이미 끝난 질의라 무해하고, merge 전에 일찍 반환하는
+// 경로라면 최대 소스 수만큼의 DB 질의가 요청보다 오래 살아남지 않게 한다.
+// 기다리지는 않는다: 고루틴은 취소된 ctx 로 곧 끝나고 결과는 버려진다.
+func (a *sourceArms) stop() {
+	if a != nil {
+		a.cancel()
+	}
 }
 
 // merge 는 보조 검색이 끝나기를 기다린 뒤 전역 융합 목록과 합친다. 두 번째
@@ -202,4 +226,39 @@ func mergeStratified(global []*model.SearchResult, arms [][]*model.SearchResult)
 	}
 	sortByScore(out)
 	return out
+}
+
+// rerankInputCap 은 보조 검색이 켜졌을 때 리랭커에 보내는 후보 수의 상한이다.
+//
+// 보조 검색 합류는 후보 풀을 laneLimit(이미 rerankPoolLimit 이 적용된 값)보다
+// 최대 소스 수 × K 건 키운다. 그 증가분까지는 리랭커에 보내되(그게 이 노브의
+// 목적이다), 어떤 경우에도 overfetchLimitCap 을 넘기지 않는다 — 실험 노브가
+// 외부 리랭커 호출 크기를 무한정 키울 수 없어야 한다.
+//
+// 보조 검색이 꺼져 있으면 0(상한 없음)을 돌려준다. 이때 후보 풀은 지금처럼
+// laneLimit 이하이므로, 상한을 걸지 않는 것이 노브 도입 전과 같은 동작이다.
+func rerankInputCap(laneLimit int, tune model.SearchTuning) int {
+	if tune.SourceStratifyK <= 0 {
+		return 0
+	}
+	return min(laneLimit+tune.SourceStratifyK*len(stratifySources), overfetchLimitCap)
+}
+
+// splitRerankInput 은 후보를 리랭커에 보낼 머리와 보내지 않을 꼬리로 나눈다.
+// 꼬리는 버리지 않는다 — joinRerankTail 이 리랭크된 머리 뒤에 융합 순서
+// 그대로 다시 붙인다. limit<=0 이거나 후보가 그 이하이면 꼬리는 nil 이다.
+func splitRerankInput(results []*model.SearchResult, limit int) (head, tail []*model.SearchResult) {
+	if limit <= 0 || len(results) <= limit {
+		return results, nil
+	}
+	return results[:limit:limit], results[limit:]
+}
+
+// joinRerankTail 은 리랭크된 머리 뒤에 꼬리를 붙인 새 슬라이스를 만든다.
+func joinRerankTail(head, tail []*model.SearchResult) []*model.SearchResult {
+	if len(tail) == 0 {
+		return head
+	}
+	out := make([]*model.SearchResult, 0, len(head)+len(tail))
+	return append(append(out, head...), tail...)
 }

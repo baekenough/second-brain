@@ -824,6 +824,7 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 	}
 	// 융합 이후 노브(postfusion.go): 소스별 보조 검색은 본 검색과 동시에 띄운다.
 	arms := s.startSourceArms(ctx, storeQuery, tune.SourceStratifyK)
+	defer arms.stop() // 일찍 반환하는 경로에서도 보조 검색 질의를 끊는다
 	results, err := s.store.Search(ctx, storeQuery)
 	if err != nil {
 		return nil, fmt.Errorf("search store: %w", err)
@@ -936,12 +937,17 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 			slog.Warn("search: chunk FTS fallback failed",
 				"error", cerr,
 			)
-			return results, nil
+			// 소스별 보조 검색이 돌고 있으면 그 결과까지 버리지 않도록
+			// 아래 합류 지점으로 내려간다(빈 전역 목록 + 보조 검색 결과).
+			if !arms.active() {
+				return results, nil
+			}
+		} else {
+			results = applySourceTypeFilters(q, chunkResults)
+			results = applyRetentionExclusion(q, results)
+			trace.recordLane(LaneChunkFTS, results)
+			chunkFused = true
 		}
-		results = applySourceTypeFilters(q, chunkResults)
-		results = applyRetentionExclusion(q, results)
-		trace.recordLane(LaneChunkFTS, results)
-		chunkFused = true
 	}
 
 	// SEARCH_SOURCE_STRATIFY_K: 소스별 보조 검색 결과를 RRF 로 합류(stratify.go).
@@ -1019,7 +1025,11 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 	// 실행을 같은 기준선으로 비교해야 "리랭커가 올렸나 내렸나" 를 셀 수 있다.
 	trace.recordFused(results)
 	results, collapsed := collapseForRanking(q, results, tune)
+	var rerankTail []*model.SearchResult
 	if rerankEnabled && len(results) > 1 {
+		// 보조 검색으로 커진 풀의 리랭커 입력 상한(stratify.go). 꼬리는 버리지
+		// 않고 리랭크된 머리 뒤에 융합 순서대로 다시 붙는다.
+		results, rerankTail = splitRerankInput(results, rerankInputCap(laneLimit, tune))
 		fused := results
 		trace.recordPreRerank(results)
 		s.rerankAttempts.Add(1)
@@ -1038,7 +1048,8 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 		}
 	}
 
-	results = applyPostRerank(q, results, collapsed, tune)
+	results = joinRerankTail(results, rerankTail)
+	results = applyPostRerank(q, results, collapsed, tune, len(rerankTail) > 0)
 
 	// 페이지 크기로 자르기 직전의 후보 풀. 여기서 기록해야 "회수는 됐으나
 	// 상위 N 밖" 과 "회수 자체가 안 됨" 이 구분된다.
