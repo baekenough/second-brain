@@ -189,8 +189,8 @@ func TestHybridGraphLane_FiltersInsideLane(t *testing.T) {
 			"AND d.occurred_at < $",
 			"JOIN documents d ON d.id = er.evidence_document_id",
 			"SUM(er.confidence) DESC, d.occurred_at DESC NULLS LAST, er.evidence_document_id ASC",
-			"er.from_entity_id IN (SELECT id FROM graph_seed)",
-			"er.to_entity_id   IN (SELECT id FROM graph_seed)",
+			"FROM graph_rel er",
+			"WHERE true",
 		} {
 			if !strings.Contains(g, frag) {
 				t.Errorf("entity=%v: graph 레인에 %q 가 없다\n%s", entity, frag, g)

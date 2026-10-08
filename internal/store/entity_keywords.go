@@ -129,8 +129,9 @@ func buildKeywordEntityCTE(kwParam, prefixParam, statusFilter, sourceFilter, exc
 // 꺼진 호출자는 이 함수를 부르지 않아 SQL 이 한 글자도 달라지지 않는다.
 //
 //	graph_seed: 키워드와 이름이 맞는 엔티티(시드).
-//	graph:      시드가 from 또는 to 인 관계의 evidence_document_id 를
-//	            SUM(confidence) 내림차순, 문서 id 오름차순으로 순위 매긴다.
+//	graph_rel:  시드가 from 또는 to 인 관계(graphRelCTE 참고 — 인덱스 두 번, 관계 id 로 중복 제거).
+//	graph:      그 관계의 evidence_document_id 를 SUM(confidence) 내림차순,
+//	            최신 사건 시각, 문서 id 오름차순으로 순위 매긴다.
 //
 // 상태·소스 포함/제외·retention·occurred 필터는 엔티티 레인과 똑같이 d. 한정형으로
 // 레인 안에 넣는다. 레인이 LIMIT $3 으로 잘리므로 바깥에서 거르면 범위 밖
@@ -147,13 +148,13 @@ func buildGraphCTEs(kwParam, prefixParam, statusFilter, sourceFilter, excludeFil
 			FROM entities e
 			WHERE %s
 		),
+		%s,
 		graph AS (
 			SELECT er.evidence_document_id AS id,
 			       row_number() OVER (ORDER BY SUM(er.confidence) DESC, d.occurred_at DESC NULLS LAST, er.evidence_document_id ASC) AS rank
-			FROM entity_relations er
+			FROM graph_rel er
 			JOIN documents d ON d.id = er.evidence_document_id
-			WHERE (er.from_entity_id IN (SELECT id FROM graph_seed)
-			    OR er.to_entity_id   IN (SELECT id FROM graph_seed))
+			WHERE true
 			%s
 			%s
 			%s
@@ -162,9 +163,38 @@ func buildGraphCTEs(kwParam, prefixParam, statusFilter, sourceFilter, excludeFil
 			GROUP BY er.evidence_document_id, d.occurred_at
 			ORDER BY rank
 			LIMIT $3
-		)`, entityKeywordMatch("e", kwParam, prefixParam),
+		)`, entityKeywordMatch("e", kwParam, prefixParam), graphRelCTE,
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredRangeFilter)
 }
+
+// graphRelCTE 는 시드에 닿는 관계를 고른다. 예전 형태
+//
+//	WHERE er.from_entity_id IN (SELECT id FROM graph_seed)
+//	   OR er.to_entity_id   IN (SELECT id FROM graph_seed)
+//
+// 는 OR 로 묶인 두 해시 서브플랜이라 시드가 둘뿐이어도 entity_relations 를 전부
+// 읽었다(EXPLAIN 실측: Seq Scan on entity_relations). 여기서는 from 쪽·to 쪽을
+// 따로 조인해 idx_entity_relations_from / _to 를 각각 타게 하고, UNION ALL 뒤에
+// 관계 id 로 중복을 없앤다 — 양 끝점이 모두 시드인 관계(자기 루프 포함)는 두
+// 가지에서 한 번씩 나오지만 집계에는 한 번만 들어가야 예전 OR 형태와 같은 합이
+// 된다. 중복된 두 행은 같은 관계 행의 복사본이라 DISTINCT ON 이 어느 쪽을 남겨도
+// 값이 같다.
+//
+// 바로 뒤의 graph CTE 는 필터 조각이 모두 "AND ..." 로 시작하므로 WHERE true 로
+// 시작한다(삭제 포함 + 필터 없음 조합에서도 문법이 깨지지 않게).
+const graphRelCTE = `graph_rel AS (
+			SELECT DISTINCT ON (r.id) r.id, r.evidence_document_id, r.confidence, r.from_entity_id, r.to_entity_id
+			FROM (
+				SELECT er.id, er.evidence_document_id, er.confidence, er.from_entity_id, er.to_entity_id
+				FROM graph_seed s
+				JOIN entity_relations er ON er.from_entity_id = s.id
+				UNION ALL
+				SELECT er.id, er.evidence_document_id, er.confidence, er.from_entity_id, er.to_entity_id
+				FROM graph_seed s
+				JOIN entity_relations er ON er.to_entity_id = s.id
+			) r
+			ORDER BY r.id
+		)`
 
 // buildDampedGraphCTEs 는 GraphHubDamping 을 켠 그래프 레인이다(HippoRAG 의 노드
 // 특이성). buildGraphCTEs 와 시드 매칭·WHERE·필터·LIMIT 이 같고, 순위 식만 다르다:
@@ -179,9 +209,9 @@ func buildGraphCTEs(kwParam, prefixParam, statusFilter, sourceFilter, excludeFil
 // (GREATEST 는 NULL 을 건너뛴다) — 관계 하나가 두 번 세지지 않게 하고, 모든 시드의
 // 언급이 0 이면 순위가 감쇠를 끈 레인과 같아지게 하기 위해서다.
 //
-// WHERE 를 감쇠 없는 레인과 글자 그대로 같게 둔 것은 관계를 고르는 계획(from/to
-// 인덱스)을 바꾸지 않기 위해서다. graph_seed 를 두 번 LEFT JOIN 하는 것은 이미
-// 고른 관계 행에 가중치를 붙이는 해시 조회일 뿐이다.
+// 관계 선택(graph_rel)·WHERE 는 감쇠 없는 레인과 글자 그대로 같다. graph_seed 를
+// 두 번 LEFT JOIN 하는 것은 이미 고른(중복 제거된) 관계 행에 가중치를 붙이는
+// 해시 조회일 뿐이다.
 func buildDampedGraphCTEs(kwParam, prefixParam, statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredRangeFilter string) string {
 	return fmt.Sprintf(`,
 		graph_seed AS (
@@ -195,15 +225,15 @@ func buildDampedGraphCTEs(kwParam, prefixParam, statusFilter, sourceFilter, excl
 			) m
 			WHERE %s
 		),
+		%s,
 		graph AS (
 			SELECT er.evidence_document_id AS id,
 			       row_number() OVER (ORDER BY SUM(er.confidence::float8 * GREATEST(gf.w, gt.w)) DESC, d.occurred_at DESC NULLS LAST, er.evidence_document_id ASC) AS rank
-			FROM entity_relations er
+			FROM graph_rel er
 			JOIN documents d ON d.id = er.evidence_document_id
 			LEFT JOIN graph_seed gf ON gf.id = er.from_entity_id
 			LEFT JOIN graph_seed gt ON gt.id = er.to_entity_id
-			WHERE (er.from_entity_id IN (SELECT id FROM graph_seed)
-			    OR er.to_entity_id   IN (SELECT id FROM graph_seed))
+			WHERE true
 			%s
 			%s
 			%s
@@ -212,6 +242,6 @@ func buildDampedGraphCTEs(kwParam, prefixParam, statusFilter, sourceFilter, excl
 			GROUP BY er.evidence_document_id, d.occurred_at
 			ORDER BY rank
 			LIMIT $3
-		)`, entityKeywordMatch("e", kwParam, prefixParam),
+		)`, entityKeywordMatch("e", kwParam, prefixParam), graphRelCTE,
 		statusFilter, sourceFilter, excludeFilter, retentionFilter, occurredRangeFilter)
 }

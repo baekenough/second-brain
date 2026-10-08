@@ -78,8 +78,8 @@ func TestHybridGraphLane_HubDamping(t *testing.T) {
 			"SUM(er.confidence::float8 * GREATEST(gf.w, gt.w)) DESC, d.occurred_at DESC NULLS LAST, er.evidence_document_id ASC",
 			"LEFT JOIN graph_seed gf ON gf.id = er.from_entity_id",
 			"LEFT JOIN graph_seed gt ON gt.id = er.to_entity_id",
-			"er.from_entity_id IN (SELECT id FROM graph_seed)",
-			"er.to_entity_id   IN (SELECT id FROM graph_seed)",
+			"FROM graph_rel er",
+			"WHERE true",
 			"AND d.status = 'active'",
 			"AND d.source_type = ANY($",
 			"AND d.source_type <> ALL($",
@@ -250,5 +250,38 @@ func TestGraphSupportQuery_FiltersAndBounds(t *testing.T) {
 	}
 	if seeds, isSlice := args[0].([]uuid.UUID); !isSlice || seeds == nil {
 		t.Errorf("시드 문서 인자 = %#v, want 빈 []uuid.UUID", args[0])
+	}
+}
+
+// TestHybridGraphLane_RelationsViaIndexedUnion 은 그래프 레인이 관계를 from 쪽·to
+// 쪽 등치 조인 두 개(UNION ALL)로 고르고 관계 id 로 중복을 없애는지, 예전의
+// "IN (SELECT ...) OR IN (SELECT ...)" 형태(entity_relations 전체 스캔)가 감쇠
+// 여부와 무관하게 남아 있지 않은지 본다.
+func TestHybridGraphLane_RelationsViaIndexedUnion(t *testing.T) {
+	t.Parallel()
+	for _, damping := range []bool{false, true} {
+		q := sparseSnapshotCases()[0].q
+		q.EntityKeywords = []string{"alice"}
+		q.Tuning.GraphWeight = 0.5
+		q.Tuning.GraphHubDamping = damping
+		sql, args := buildHybridSearchQuery(q, hybridKeywordWeights(model.DefaultEntityWeight))
+		assertPlaceholdersDense(t, "graph-union", sql, args)
+		for _, frag := range []string{
+			"graph_rel AS (",
+			"SELECT DISTINCT ON (r.id) r.id, r.evidence_document_id, r.confidence, r.from_entity_id, r.to_entity_id",
+			"JOIN entity_relations er ON er.from_entity_id = s.id\n\t\t\t\tUNION ALL",
+			"JOIN entity_relations er ON er.to_entity_id = s.id",
+			"ORDER BY r.id",
+		} {
+			if !strings.Contains(sql, frag) {
+				t.Errorf("damping=%v: %q 가 없다", damping, frag)
+			}
+		}
+		if strings.Contains(sql, "IN (SELECT id FROM graph_seed)") || strings.Contains(sql, "FROM entity_relations er\n") {
+			t.Errorf("damping=%v: 예전 OR-IN 형태가 남았다", damping)
+		}
+		if i, j := strings.Index(sql, "graph_rel AS ("), strings.Index(sql, "graph AS ("); i < 0 || j < i {
+			t.Errorf("damping=%v: graph_rel 이 graph 앞에 없다", damping)
+		}
 	}
 }
