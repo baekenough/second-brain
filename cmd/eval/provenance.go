@@ -214,9 +214,9 @@ func validateTuningFlags(t model.SearchTuning) error {
 		return fmt.Errorf("eval: invalid --rerank-blend %q (want %q or %q)",
 			t.RerankBlend, model.RerankBlendReplace, model.RerankBlendRRF)
 	}
-	if t.RerankInput != model.RerankInputHead && t.RerankInput != model.RerankInputBestChunk {
-		return fmt.Errorf("eval: invalid --rerank-input %q (want %q or %q)",
-			t.RerankInput, model.RerankInputHead, model.RerankInputBestChunk)
+	if t.RerankInput != model.RerankInputHead && t.RerankInput != model.RerankInputBestChunk && t.RerankInput != model.RerankInputYAML {
+		return fmt.Errorf("eval: invalid --rerank-input %q (want %q, %q or %q)",
+			t.RerankInput, model.RerankInputHead, model.RerankInputBestChunk, model.RerankInputYAML)
 	}
 	if t.RerankBlendWeight <= 0 || math.IsNaN(t.RerankBlendWeight) || math.IsInf(t.RerankBlendWeight, 0) {
 		return fmt.Errorf("eval: --rerank-blend-weight must be > 0, got %v", t.RerankBlendWeight)
@@ -269,6 +269,43 @@ func validateTuningFlags(t model.SearchTuning) error {
 		return fmt.Errorf("eval: invalid --rrf-missing-rank %q (want \"\" or %q)",
 			t.RRFMissingRank, model.RRFMissingRankCutoff)
 	}
+	return validatePostFusionFlags(t)
+}
+
+// validatePostFusionFlags 는 융합 이후 노브(internal/search/postfusion.go)를
+// 검사한다. 범위 밖 값과 효과가 없는 조합은 거부한다 — validateTuningFlags 와
+// 같은 이유다.
+func validatePostFusionFlags(t model.SearchTuning) error {
+	if t.SourceStratifyK < 0 || t.SourceStratifyK > model.MaxSourceStratifyK {
+		return fmt.Errorf("eval: --source-stratify-k must be in [0, %d], got %d",
+			model.MaxSourceStratifyK, t.SourceStratifyK)
+	}
+	if t.CollapseExpandMax < 1 || t.CollapseExpandMax > model.MaxCollapseExpandMax {
+		return fmt.Errorf("eval: --collapse-expand-max must be in [1, %d], got %d",
+			model.MaxCollapseExpandMax, t.CollapseExpandMax)
+	}
+	if !t.CollapseContactDay && t.CollapseExpandMax != model.DefaultCollapseExpandMax {
+		return errors.New("eval: --collapse-expand-max needs --collapse-contact-day")
+	}
+	if t.MMRLambda < 0 || t.MMRLambda > 1 || math.IsNaN(t.MMRLambda) {
+		return fmt.Errorf("eval: --mmr-lambda must be 0 (off) or in (0, 1], got %v", t.MMRLambda)
+	}
+	if t.RerankInput == model.RerankInputYAML && t.RerankCallContext {
+		return errors.New("eval: --rerank-call-context has no effect with --rerank-input=yaml (counterpart is already a field)")
+	}
+	return nil
+}
+
+// validateRerankTuning 은 리랭크가 실제로 켜졌는지(--rerank, 생략 시
+// SEARCH_RERANK_DEFAULT)에 따라 효과가 없는 노브를 거부한다. 리랭크 설정은
+// config 를 읽은 뒤에야 확정되므로 validateTuningFlags 와 따로 둔다.
+//
+// best_chunk 는 이 검사 이전부터 있던 값이라 기존 실행 명령을 깨지 않도록
+// 검사하지 않는다. 새 값(yaml)부터 거부한다.
+func validateRerankTuning(t model.SearchTuning, rerank bool) error {
+	if t.RerankInput == model.RerankInputYAML && !rerank {
+		return errors.New("eval: --rerank-input=yaml needs --rerank=true (the reranker is the only consumer of this input)")
+	}
 	return nil
 }
 
@@ -301,6 +338,10 @@ func applyTuningProfile(profile map[string]any, t model.SearchTuning) {
 	}
 	if t.RerankInput == model.RerankInputBestChunk {
 		profile["rerank_input"] = t.RerankInput
+	}
+	if t.RerankInput == model.RerankInputYAML {
+		profile["rerank_input"] = t.RerankInput
+		profile["rerank_yaml_version"] = search.RerankYAMLVersion
 	}
 	if t.RecencyHalfLifeDays > 0 {
 		// alpha 도 마찬가지 — 반감기가 0 이면 alpha 는 아무 효과가 없다.
@@ -349,6 +390,27 @@ func applyTuningProfile(profile map[string]any, t model.SearchTuning) {
 	}
 	if t.RRFMissingRank == model.RRFMissingRankCutoff {
 		profile["rrf_missing_rank"] = t.RRFMissingRank
+	}
+	applyPostFusionProfile(profile, t)
+}
+
+// applyPostFusionProfile 은 융합 이후 노브 중 켜진 것만 프로필에 넣는다.
+// 종속 값(펼침 수, MMR 창)은 부모 노브가 켜졌을 때만 넣는다.
+func applyPostFusionProfile(profile map[string]any, t model.SearchTuning) {
+	if t.SourceStratifyK > 0 {
+		profile["source_stratify_k"] = t.SourceStratifyK
+	}
+	if t.CollapseContactDay {
+		profile["collapse_contact_day"] = true
+		profile["collapse_expand_max"] = t.CollapseExpandMax
+	}
+	if t.WindowBucketDiversify {
+		profile["window_bucket_diversify"] = true
+	}
+	if t.MMRLambda > 0 {
+		profile["mmr_lambda"] = t.MMRLambda
+		profile["mmr_window"] = search.MMRWindow
+		profile["mmr_rank_k"] = search.MMRRankK
 	}
 }
 

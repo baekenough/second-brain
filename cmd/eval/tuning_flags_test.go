@@ -20,6 +20,7 @@ func defaultTuningFlags() model.SearchTuning {
 		RecencyAlpha:      model.DefaultRecencyAlpha,
 		ChunkSparse:       model.ChunkSparseFallback,
 		SparseQuery:       model.SparseQueryRaw,
+		CollapseExpandMax: model.DefaultCollapseExpandMax,
 	}
 }
 

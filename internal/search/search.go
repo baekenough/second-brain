@@ -822,6 +822,8 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 	if tune.SparseQuery == model.SparseQueryChunkDoc {
 		storeQuery.SparseTerms = sparseTerms
 	}
+	// 융합 이후 노브(postfusion.go): 소스별 보조 검색은 본 검색과 동시에 띄운다.
+	arms := s.startSourceArms(ctx, storeQuery, tune.SourceStratifyK)
 	results, err := s.store.Search(ctx, storeQuery)
 	if err != nil {
 		return nil, fmt.Errorf("search store: %w", err)
@@ -942,10 +944,16 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 		chunkFused = true
 	}
 
+	// SEARCH_SOURCE_STRATIFY_K: 소스별 보조 검색 결과를 RRF 로 합류(stratify.go).
+	if merged, ok := arms.merge(q, results, trace); ok {
+		results = merged
+		chunkFused = true // 저장소 ORDER BY 가 더는 이 목록의 순서가 아니다
+	}
+
 	// --- graph expand boost (SEARCH_GRAPH_EXPAND_BOOST, default off) ---
-	// 융합이 끝난 후보 풀(문서 스토어 + 청크/OpenSearch 병합)을 리랭크 전에
-	// 그래프 지지로 한 번 재정렬한다. 새 문서는 더하지 않는다. 꺼져 있거나
-	// 최신순 질의면 no-op — graph_expand.go 참고.
+	// 융합이 끝난 후보 풀(문서 스토어 + 청크/OpenSearch + 소스별 보조 검색
+	// 병합)을 보존 페널티·리랭크 전에 그래프 지지로 한 번 재정렬한다. 새 문서는
+	// 더하지 않는다. 꺼져 있거나 최신순 질의면 no-op — graph_expand.go 참고.
 	results = s.applyGraphExpandBoost(ctx, q, results, tune)
 	// --- end graph expand boost ---
 
@@ -1010,6 +1018,7 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 	// 융합 순서는 리랭크 여부와 무관하게 남긴다. 리랭크를 끈 실행과 켠
 	// 실행을 같은 기준선으로 비교해야 "리랭커가 올렸나 내렸나" 를 셀 수 있다.
 	trace.recordFused(results)
+	results, collapsed := collapseForRanking(q, results, tune)
 	if rerankEnabled && len(results) > 1 {
 		fused := results
 		trace.recordPreRerank(results)
@@ -1028,6 +1037,8 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 			results = reranked
 		}
 	}
+
+	results = applyPostRerank(q, results, collapsed, tune)
 
 	// 페이지 크기로 자르기 직전의 후보 풀. 여기서 기록해야 "회수는 됐으나
 	// 상위 N 밖" 과 "회수 자체가 안 됨" 이 구분된다.

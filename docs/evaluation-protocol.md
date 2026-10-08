@@ -295,7 +295,7 @@ the matching `cmd/eval` flag.
 | `SEARCH_MERGE_MODE` | `--merge=asymmetric\|symmetric` | `asymmetric` | `symmetric` lets chunk/OpenSearch-only hits compete on RRF score instead of only filling slots the document store left open. |
 | `SEARCH_RERANK_BLEND` | `--rerank-blend=replace\|rrf` | `replace` | `rrf` orders results by `1/(60+fused_rank) + w*1/(60+rerank_rank)` instead of replacing the fused order with the reranker's. |
 | `SEARCH_RERANK_BLEND_WEIGHT` | `--rerank-blend-weight=W` | `1.0` | Weight `w` of the reranker term in `rrf` blending. |
-| `SEARCH_RERANK_INPUT` | `--rerank-input=head\|best_chunk` | `head` | `best_chunk` sends `[source · date · title]` plus the chunk closest to the query instead of the document head. |
+| `SEARCH_RERANK_INPUT` | `--rerank-input=head\|best_chunk\|yaml` | `head` | `best_chunk` sends `[source · date · title]` plus the chunk closest to the query instead of the document head. `yaml` sends the same body as YAML fields — see the post-fusion section below. |
 | `SEARCH_RECENCY_HALFLIFE_DAYS` | `--recency-halflife-days=D` | `0` (off) | Multiplies fused scores by `(1-α)+α*2^(-age/D)` on queries that carry no event-time window. |
 | `SEARCH_RECENCY_ALPHA` | `--recency-alpha=A` | `0.3` | Maximum strength `α` of the recency decay. |
 | `SEARCH_CHUNK_SPARSE` | `--chunk-sparse=fallback\|fuse\|fuse_ctx` | `fallback` | 청크 FTS/bigm 레인을 RRF 융합에 상시 참여시킨다(#270). 자세한 내용은 `docs/chunk-sparse-context.md`. |
@@ -307,6 +307,11 @@ the matching `cmd/eval` flag.
 | `SEARCH_GRAPH_HUB_DAMPING` | `--graph-hub-damping` | `false` | 그래프 레인 순위를 `SUM(confidence × 1/ln(e + 시드 엔티티 문서 언급 수))` 로 바꿔 허브 엔티티를 누른다(HippoRAG). `SEARCH_GRAPH_WEIGHT>0` 필요. |
 | `SEARCH_GRAPH_EXPAND_BOOST` | `--graph-expand-boost=B` | `0` (off) | 융합 후·리랭크 전, 상위 10건의 엔티티 ∪ 키워드 엔티티와 관계로 이어진 기존 후보만 `score × (1 + B·s)` 로 올린다(재정렬만, 0≤B≤1). |
 | `SEARCH_RRF_MISSING_RANK` | `--rrf-missing-rank=cutoff` | off (빈 값) | 결과가 있는 레인에 없는 문서가 0 대신 `w/(k + 레인 상한 + 1)` 을 받는다(R2R 가중 RRF). |
+| `SEARCH_SOURCE_STRATIFY_K` | `--source-stratify-k=K` | `0` (off) | 소스별 보조 검색(최대 10). 아래 "융합 이후 노브" 절 참고. |
+| `SEARCH_COLLAPSE_CONTACT_DAY` | `--collapse-contact-day` | `false` | 통화·문자 상대-날짜 접기/펼치기. |
+| `SEARCH_COLLAPSE_EXPAND_MAX` | `--collapse-expand-max=N` | `3` | 대표 뒤에 펼칠 같은 그룹 문서 수(1~20). `--collapse-contact-day` 필요. |
+| `SEARCH_WINDOW_BUCKET_DIVERSIFY` | `--window-bucket-diversify` | `false` | 하루를 넘는 시간창에서 날짜별 최상위 문서를 먼저 세운다. |
+| `SEARCH_MMR_LAMBDA` | `--mmr-lambda=λ` | `0` (off) | 리랭크 뒤 상위 30건 MMR, λ∈(0,1]. |
 | `SEARCH_RERANK_CALL_CONTEXT` | `--rerank-call-context` | `false` | 통화 리랭커 입력에 `contact_name`을 추가한다. `best_chunk`의 문서 결과에는 본문 앞 250자도 보탠다. 청크 결과는 참여자만 추가하며 전체 1,000자 예산을 유지한다. |
 
 Only non-default knob values are written into the config-hash profile, so a run
@@ -371,7 +376,7 @@ go run ./cmd/evalcompare --baseline=/tmp/base.jsonl --candidate=/tmp/kw-sparse.j
   쓴다. 언급 0 이면 `w=1` 이라 순위가 감쇠 없는 레인과 같고, 1000 건이면 약 0.145 다.
   WHERE·필터·LIMIT 은 감쇠 없는 레인과 같다. `--graph-weight>0` 없이 켜면 eval 이 거부한다.
 - **결과 시드 확장**(Graphiti edge_search / Hindsight): 문서 저장소·청크·OpenSearch 융합이
-  끝난 후보 풀(보존 페널티·최신성 감쇠·리랭크 전)에서 상위 10건의 엔티티 ∪ 키워드로 찾은
+  끝난 후보 풀(소스별 보조 검색 합류 뒤, 보존 페널티·최신성 감쇠·리랭크 전)에서 상위 10건의 엔티티 ∪ 키워드로 찾은
   엔티티를 시드로 삼는다. 저장소(`DocumentStore.GraphSupportCounts`)가 후보마다 시드와
   이어진 서로 다른 관계 수 `n` 을 센다 — 관계의 `evidence_document_id` 가 후보이고 from/to 중
   한쪽이 시드인 관계다. 후보 자신의 엔티티만으로 이어진 관계는 세지 않는다(상위 문서가 자기
@@ -429,6 +434,67 @@ go run ./cmd/evalcompare --baseline=/tmp/graph.jsonl --candidate=/tmp/graph-damp
 go run ./cmd/eval --golden --no-persist --window=plan --chunk-sparse=fuse --dump=/tmp/c1.jsonl
 go run ./cmd/eval --golden --no-persist --window=plan --chunk-sparse=fuse --sparse-query=chunk --dump=/tmp/t1.jsonl
 go run ./cmd/evalcompare --baseline=/tmp/c1.jsonl --candidate=/tmp/t1.jsonl
+```
+
+### 융합 이후 노브 (`--source-stratify-k`, `--collapse-contact-day`, `--window-bucket-diversify`, `--rerank-input=yaml`, `--mmr-lambda`)
+
+골든셋 실패 유형 넷을 겨냥한 실험 노브다. 전부 기본 꺼짐이며, 꺼진 상태에서는
+저장소 SQL·호출 횟수·결과 순서가 노브 도입 전과 같다(`TestPostFusion_KnobsOffIdentity`).
+구현은 `internal/search/postfusion.go`·`stratify.go`·`rerank_yaml.go`.
+
+파이프라인 안의 적용 순서:
+
+```
+레인 융합 → [보조 검색 합류] → [그래프 지지 승수(--graph-expand-boost)] → 보존 페널티 → 최신성 감쇠 → recent 재정렬 → (FusedIDs)
+→ [상대-날짜 접기] → 리랭크/합산 → [MMR] → [날짜 버킷] → [접힌 문서 펼치기] → (PoolIDs) → limit 절단
+```
+
+- **소스별 보조 검색** (`--source-stratify-k=K`, 실패 유형: 다른 소스 문서에 밀려
+  후보 풀에 못 든 정답, 일정 질문에서 빠진 캘린더). 질의에 소스 포함 집합이 없을 때만,
+  일정·통화·문자·메일·노트 중 질의가 제외하지 않은 소스마다 본 저장소 검색과 같은 질의
+  (시간창·제외 소스·retention 제외·가중치·키워드 동일)를 소스 하나로 제한해 `Limit=K` 로
+  동시에 돌린다. 본 검색과 병렬이며 같은 ctx 를 쓴다. 실패한 소스는 경고 로그만 남기고
+  빠진다. 각 소스 상위 K건은 전역 목록과 `Σ 1/(60+rank)` RRF 로 합쳐지고(두 목록에 다
+  있으면 두 항 모두), 결과는 합집합이라 후보 풀이 최대 `소스 수 × K` 건 커진다. 리랭크를
+  켜면 리랭커 입력도 그만큼 늘어난다. 저장소 질의가 최대 5회 더 나가므로 지연시간은
+  `slog.Debug("search: source stratify arms done", elapsed_ms)` 와 eval 의 p50/p95 로 본다.
+  보조 검색 후보는 `--dump` 의 레인 이름 `source_stratify` 로 남는다.
+- **상대-날짜 접기** (`--collapse-contact-day`, `--collapse-expand-max=N`, 실패 유형: 월
+  단위 창에서 같은 상대 통화·문자가 상위를 독식해 정답이 11~14위). 문자·통화 문서를
+  (소스, 상대, KST 날짜)로 묶는다. 상대는 `metadata.number_hash` → `metadata.thread_id` →
+  SourceID 의 번호 해시 구간(`sms:{ms}:{hash}:…`, `call-log:{ms}:{hash}:…`) 순으로 찾고,
+  없거나 occurred_at 이 없으면 묶지 않는다. 리랭크 전에 그룹마다 점수 최상위 대표만 순위에
+  남겨 리랭커 예산과 상위 자리를 연다. 최종 순서가 정해진 뒤 대표 바로 뒤에 같은 그룹을 점수
+  순으로 N건(기본 3) 다시 펴고, 나머지는 목록 맨 뒤에 점수 순으로 붙인다. 후보는 하나도
+  버리지 않는다(PoolIDs 에 모두 남는다). 그룹 키는 로그·덤프에 싣지 않는다.
+- **날짜 버킷 다변화** (`--window-bucket-diversify`). occurred 창이 KST 로 하루를 넘을 때만
+  (한쪽 경계만 있는 열린 창 포함), 후보 풀 전체에서 날짜마다 순위 최상위 문서 하나씩을 현재
+  순위 순으로 먼저 세우고 나머지를 그 뒤에 둔다. occurred_at 없는 문서는 첫 바퀴에서 빠진다.
+- **리랭커 YAML 입력** (`--rerank-input=yaml`, 실패 유형: 리랭커가 맥락 없이 정답을 내림).
+  best_chunk 와 같은 본문을 `source`/`date`(KST 일 단위)/`title`/`counterpart`(연락처 표시
+  이름만, 번호처럼 보이면 생략)/`text`(literal block) YAML 로 보낸다. 문서당 1,000 rune
+  예산은 같다. 전화번호·number_hash·SourceID 는 싣지 않는다. `--rerank=true` 가 필요하고
+  `--rerank-call-context` 와는 같이 쓸 수 없다. 프로필에 `rerank_yaml_version` 이 들어간다.
+- **MMR** (`--mmr-lambda=λ`). 리랭크·합산 뒤 상위 30건에서
+  `λ·rel − (1−λ)·max cos(같은 소스로 이미 뽑힌 문서)` 를 탐욕적으로 고른다. rel 은 원점수가
+  아니라 창 안 순위로 정한다: `rel = 11/(10+rank)`(1위 1.0, k=10). 리랭커가 상위 N건만
+  돌려주면 나머지는 점수 0 으로 채워지는데, 리랭커 점수가 음수일 때 점수 정규화를 쓰면 그
+  꼬리가 위로 올라오기 때문이다. k 는 RRF 의 60 대신 10 — 60 이면 30건 창 안 관련도가
+  1.0→0.68 로 거의 평평해 유사도 벌점만 남는다. 문서 임베딩이 없는 후보는 자기 자리를 지키고, 재배치는 임베딩이
+  있는 후보들의 자리 안에서만 일어난다. 점수는 바꾸지 않는다.
+- `Sort=recent` 질의에는 접기·날짜 버킷·MMR 이 적용되지 않는다(순서는 시간이 정한다).
+- 효과 없는 조합은 eval 이 거부한다: `--collapse-expand-max` 만 단독, `--rerank-input=yaml`
+  인데 리랭크 꺼짐, 범위 밖 `--source-stratify-k`/`--mmr-lambda`.
+- 프로필에는 켠 노브만 들어간다: `source_stratify_k`, `collapse_contact_day`+`collapse_expand_max`,
+  `window_bucket_diversify`, `rerank_input`+`rerank_yaml_version`, `mmr_lambda`+`mmr_window`+`mmr_rank_k`.
+
+```sh
+go run ./cmd/eval --golden --no-persist --window=plan --rerank=true --dump=/tmp/base.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --rerank=true --source-stratify-k=5 --dump=/tmp/strat.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --rerank=true --collapse-contact-day --window-bucket-diversify --dump=/tmp/collapse.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --rerank=true --rerank-input=yaml --rerank-blend=rrf --dump=/tmp/yaml.jsonl
+go run ./cmd/eval --golden --no-persist --window=plan --rerank=true --mmr-lambda=0.7 --dump=/tmp/mmr.jsonl
+go run ./cmd/evalcompare --baseline=/tmp/base.jsonl --candidate=/tmp/strat.jsonl
 ```
 
 ## Read-only comparisons

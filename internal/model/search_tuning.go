@@ -39,6 +39,10 @@ const (
 	// 본문을 보낸다. 통화 전사·긴 메일처럼 근거가 앞부분에 없는 문서를
 	// 겨냥한다.
 	RerankInputBestChunk = "best_chunk"
+	// RerankInputYAML 은 best_chunk 와 같은 본문을 Cohere 의 구조화 문서
+	// 권고대로 YAML 필드(source·date·title·counterpart·text)로 감싸 보낸다.
+	// 전화번호·number_hash 는 절대 넣지 않는다 — 연락처 표시 이름만.
+	RerankInputYAML = "yaml"
 
 	// ChunkSparseFallback 은 현행 동작이다(#270). 청크 FTS/bigm 레인은
 	// 1차 경로(문서 하이브리드 + 청크 벡터 + OpenSearch)가 결과를 하나도
@@ -111,6 +115,16 @@ const (
 	// DefaultRecencyAlpha 는 최신성 감쇠의 최대 강도다. 0.3 이면 아무리
 	// 오래된 문서라도 점수가 원래의 70% 밑으로는 내려가지 않는다.
 	DefaultRecencyAlpha = 0.3
+
+	// MaxSourceStratifyK 는 소스별 보조 검색(SourceStratifyK)이 소스당 가져오는
+	// 후보 수의 상한이다. 보조 검색은 소스 수만큼 저장소 질의를 더 하므로,
+	// 실험 노브가 후보 풀과 DB 부하를 무한정 키울 수 없게 막는다.
+	MaxSourceStratifyK = 10
+	// DefaultCollapseExpandMax 는 CollapseContactDay 에서 대표 문서 바로 뒤에
+	// 다시 펼쳐 놓는 같은 그룹 문서 수의 기본값이다.
+	DefaultCollapseExpandMax = 3
+	// MaxCollapseExpandMax 는 CollapseExpandMax 의 상한이다.
+	MaxCollapseExpandMax = 20
 )
 
 // SearchTuning 은 검색 실험용 노브 묶음이다.
@@ -206,6 +220,33 @@ type SearchTuning struct {
 	GraphExpandBoost float64
 	// RRFMissingRank 는 RRFMissingRankZero(기본) 또는 RRFMissingRankCutoff.
 	RRFMissingRank string
+
+	// --- 융합 이후(post-fusion) 노브. 전부 기본 꺼짐이며, 꺼져 있으면 저장소
+	// SQL·결과 순서가 이 필드들이 생기기 전과 완전히 같다. 구현과 파이프라인
+	// 내 적용 순서는 internal/search/postfusion.go 참고. ---
+
+	// SourceStratifyK 가 0 보다 크면, 질의에 소스 포함 집합이 없을 때 주요
+	// 소스(일정·통화·문자·메일·노트)별로 저장소 하이브리드 검색을 한 번씩 더
+	// 돌려 각 소스 상위 K건을 전역 융합 목록과 RRF 로 합친다(LightRAG
+	// round-robin / Hindsight per-arm). 상한 MaxSourceStratifyK.
+	SourceStratifyK int
+	// CollapseContactDay 가 true 이면 문자·통화 문서를 (소스, 상대, KST 날짜)
+	// 그룹으로 접어 대표 하나만 리랭크·순위 경쟁에 남기고, 최종 순서가 정해진
+	// 뒤 대표 바로 뒤에 같은 그룹 문서를 CollapseExpandMax 건까지 다시 편다.
+	// 어떤 후보도 버리지 않는다 — 위치만 바뀐다.
+	CollapseContactDay bool
+	// CollapseExpandMax 는 CollapseContactDay 에서만 쓰인다. 0 이면
+	// DefaultCollapseExpandMax. CollapseContactDay 가 꺼져 있으면 Normalized 가
+	// 0 으로 비운다.
+	CollapseExpandMax int
+	// WindowBucketDiversify 가 true 이면 하루를 넘는 occurred 시간창이 있는
+	// 질의에서, 날짜(KST)별 최상위 문서를 먼저 순위 순으로 세우고 나머지를
+	// 뒤에 둔다. 순서만 바꾼다.
+	WindowBucketDiversify bool
+	// MMRLambda 가 (0,1] 이면 리랭크(합산) 뒤 상위 문서에 MMR 을 적용한다.
+	// 유사도 벌점은 같은 소스 문서끼리만 준다. 0(기본)이면 끈다. 범위 밖
+	// 값은 Normalized 가 0 으로 되돌린다.
+	MMRLambda float64
 }
 
 // IsZero 는 노브가 하나도 설정되지 않았는지 — 즉 "현행 동작" 인지 — 알린다.
@@ -229,8 +270,13 @@ func (t SearchTuning) Normalized() SearchTuning {
 	if t.RerankBlendWeight <= 0 || isBadFloat(t.RerankBlendWeight) {
 		t.RerankBlendWeight = DefaultRerankBlendWeight
 	}
-	if t.RerankInput != RerankInputBestChunk {
+	if t.RerankInput != RerankInputBestChunk && t.RerankInput != RerankInputYAML {
 		t.RerankInput = RerankInputHead
+	}
+	// yaml 입력은 counterpart 필드로 참여자를 이미 싣는다. 통화 문맥 노브를
+	// 함께 켜면 같은 정보가 두 번 들어가거나(무의미) 형식이 깨지므로 끈다.
+	if t.RerankInput == RerankInputYAML {
+		t.RerankCallContext = false
 	}
 	if t.RecencyHalfLifeDays < 0 || isBadFloat(t.RecencyHalfLifeDays) {
 		t.RecencyHalfLifeDays = 0
@@ -282,6 +328,23 @@ func (t SearchTuning) Normalized() SearchTuning {
 	if t.RRFMissingRank != RRFMissingRankCutoff {
 		t.RRFMissingRank = RRFMissingRankZero
 	}
+	if t.SourceStratifyK < 0 {
+		t.SourceStratifyK = 0
+	}
+	if t.SourceStratifyK > MaxSourceStratifyK {
+		t.SourceStratifyK = MaxSourceStratifyK
+	}
+	switch {
+	case !t.CollapseContactDay:
+		t.CollapseExpandMax = 0
+	case t.CollapseExpandMax <= 0:
+		t.CollapseExpandMax = DefaultCollapseExpandMax
+	case t.CollapseExpandMax > MaxCollapseExpandMax:
+		t.CollapseExpandMax = MaxCollapseExpandMax
+	}
+	if t.MMRLambda <= 0 || t.MMRLambda > 1 || isBadFloat(t.MMRLambda) {
+		t.MMRLambda = 0
+	}
 	return t
 }
 
@@ -302,7 +365,7 @@ func EnvSearchTuning() SearchTuning {
 		MergeMode:               envTuningChoice("SEARCH_MERGE_MODE", MergeAsymmetric, MergeSymmetric),
 		RerankBlend:             envTuningChoice("SEARCH_RERANK_BLEND", RerankBlendReplace, RerankBlendRRF),
 		RerankBlendWeight:       envTuningFloat("SEARCH_RERANK_BLEND_WEIGHT"),
-		RerankInput:             envTuningChoice("SEARCH_RERANK_INPUT", RerankInputHead, RerankInputBestChunk),
+		RerankInput:             envTuningChoice("SEARCH_RERANK_INPUT", RerankInputHead, RerankInputBestChunk, RerankInputYAML),
 		RecencyHalfLifeDays:     envTuningFloat("SEARCH_RECENCY_HALFLIFE_DAYS"),
 		RecencyAlpha:            envTuningFloat("SEARCH_RECENCY_ALPHA"),
 		ChunkSparse:             envTuningChoice("SEARCH_CHUNK_SPARSE", ChunkSparseFallback, ChunkSparseFuse, ChunkSparseFuseCtx),
@@ -316,11 +379,23 @@ func EnvSearchTuning() SearchTuning {
 		GraphHubDamping:  envTuningChoice("SEARCH_GRAPH_HUB_DAMPING", "false", "true") == "true",
 		GraphExpandBoost: envTuningFloat("SEARCH_GRAPH_EXPAND_BOOST"),
 		RRFMissingRank:   envTuningChoice("SEARCH_RRF_MISSING_RANK", RRFMissingRankZero, RRFMissingRankCutoff),
+
+		SourceStratifyK:       envTuningInt("SEARCH_SOURCE_STRATIFY_K"),
+		CollapseContactDay:    envTuningChoice("SEARCH_COLLAPSE_CONTACT_DAY", "false", "true") == "true",
+		CollapseExpandMax:     envTuningInt("SEARCH_COLLAPSE_EXPAND_MAX"),
+		WindowBucketDiversify: envTuningChoice("SEARCH_WINDOW_BUCKET_DIVERSIFY", "false", "true") == "true",
+		MMRLambda:             envTuningFloat("SEARCH_MMR_LAMBDA"),
 	}
 	n := t.Normalized()
 	if t.HighLevelKeywordsToSparse && !n.HighLevelKeywordsToSparse {
 		slog.Warn("search tuning: SEARCH_HIGH_LEVEL_KEYWORDS_TO_SPARSE has no effect, ignoring",
 			"requires", "SEARCH_ENTITY_KEYWORDS=llm and SEARCH_SPARSE_QUERY=chunk|chunk_doc")
+	}
+	if t.MMRLambda > 0 && n.MMRLambda == 0 {
+		slog.Warn("search tuning: SEARCH_MMR_LAMBDA out of range (0,1], ignoring")
+	}
+	if t.RerankCallContext && !n.RerankCallContext {
+		slog.Warn("search tuning: SEARCH_RERANK_CALL_CONTEXT has no effect with SEARCH_RERANK_INPUT=yaml, ignoring")
 	}
 	if n.GraphWeight > 0 && n.EntityKeywordMode == EntityKeywordsOff {
 		slog.Warn("search tuning: SEARCH_GRAPH_WEIGHT needs SEARCH_ENTITY_KEYWORDS, graph lane will stay empty")
