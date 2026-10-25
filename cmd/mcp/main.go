@@ -336,6 +336,20 @@ func metadataString(m map[string]any, key string) *string {
 	return &s
 }
 
+// readOnlyToolAnnotation 은 지식베이스를 읽기만 하는 도구의 힌트다. 생략하면
+// mcp-go NewTool 이 스펙의 비관적 기본값(readOnlyHint=false, destructiveHint=true,
+// openWorldHint=true)을 그대로 직렬화해서, ChatGPT 가 읽기 도구를 매 호출 확인이
+// 필요한 "Write" 액션으로 분류한다. 힌트는 표시용이고 권한 경계는 toolScopes 다.
+func readOnlyToolAnnotation(title string) mcp.ToolOption {
+	return mcp.WithToolAnnotation(mcp.ToolAnnotation{
+		Title:           title,
+		ReadOnlyHint:    mcp.ToBoolPtr(true),
+		DestructiveHint: mcp.ToBoolPtr(false),
+		IdempotentHint:  mcp.ToBoolPtr(true),
+		OpenWorldHint:   mcp.ToBoolPtr(false),
+	})
+}
+
 // registerSearchTool 은 MCP search 도구를 등록한다. timeout 은 검색 서비스
 // 호출 하나에 거는 상한(SEARCH_REQUEST_TIMEOUT_SECONDS, #282)이며, 0 이하이면
 // config.DefaultSearchRequestTimeout 을 쓴다.
@@ -353,6 +367,7 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service, rerankDefault 
 				"retention=low/disposable results are lower-confidence evidence — "+
 				"see the retention field on each result.",
 		),
+		readOnlyToolAnnotation("Search knowledge base"),
 		mcp.WithString("query",
 			mcp.Required(),
 			mcp.Description("The search query text."),
@@ -603,6 +618,7 @@ func registerGetDocumentTool(s *server.MCPServer, docs DocumentGetter) {
 			"Retrieve a single document by its UUID. "+
 				"Returns the full document including title, content, source type, and metadata.",
 		),
+		readOnlyToolAnnotation("Get document"),
 		mcp.WithString("id",
 			mcp.Required(),
 			mcp.Description("The document UUID (e.g. 123e4567-e89b-12d3-a456-426614174000)."),
@@ -674,6 +690,7 @@ func registerStatsTool(s *server.MCPServer, docs StatsProvider) {
 			"Return document and chunk statistics for the second-brain knowledge base. "+
 				"Shows per-source document counts and overall chunk metrics.",
 		),
+		readOnlyToolAnnotation("Knowledge base stats"),
 	)
 
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -741,6 +758,15 @@ func registerAddNoteTool(
 				"chunks. Re-using the same source_id updates the existing note (upsert). "+
 				"Requires Bearer token authentication when API_KEY is configured.",
 		),
+		// source_id 를 재사용하면 기존 노트를 덮어쓰므로 destructive, 생략 시 매번 새
+		// UUID 라 idempotent 아님. 외부 시스템과는 무관하다.
+		mcp.WithToolAnnotation(mcp.ToolAnnotation{
+			Title:           "Add note",
+			ReadOnlyHint:    mcp.ToBoolPtr(false),
+			DestructiveHint: mcp.ToBoolPtr(true),
+			IdempotentHint:  mcp.ToBoolPtr(false),
+			OpenWorldHint:   mcp.ToBoolPtr(false),
+		}),
 		mcp.WithString("title",
 			mcp.Required(),
 			mcp.Description("Short title for the note (non-empty)."),

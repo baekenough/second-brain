@@ -678,6 +678,38 @@ func TestRequiredScope_TableCoversRegisteredTools(t *testing.T) {
 	}
 }
 
+// 힌트가 toolScopes 와 어긋나면 ChatGPT 가 읽기 도구를 "Write" 로 보여 매 호출
+// 확인을 받거나, 쓰기 도구를 확인 없이 실행한다. 힌트를 생략해도 mcp-go 가 비관적
+// 기본값(readOnly=false, destructive=true)을 내보내므로 명시 여부까지 본다.
+func TestToolAnnotations_MatchScopes(t *testing.T) {
+	t.Parallel()
+	s := mcpserver.NewMCPServer("t", "0")
+	registerSearchTool(s, search.NewService(&fakeOccurredDocSearcher{}, disabledEmbeddingEngine{}), false, 0)
+	registerGetDocumentTool(s, &fakeDocGetter{})
+	registerStatsTool(s, &fakeStatsProvider{})
+	registerAddNoteTool(s, &fakeMCPDocUpserter{}, &fakeMCPChunkWriter{}, &fakeMCPEmbedder{}, "")
+	for name, st := range s.ListTools() {
+		a := st.Tool.Annotations
+		if a.Title == "" {
+			t.Errorf("%s: missing title annotation", name)
+		}
+		if a.ReadOnlyHint == nil || a.DestructiveHint == nil || a.IdempotentHint == nil || a.OpenWorldHint == nil {
+			t.Errorf("%s: hints must be explicit, got %+v", name, a)
+			continue
+		}
+		read := requiredScope(name) == mcpauth.ScopeRead
+		if *a.ReadOnlyHint != read {
+			t.Errorf("%s: readOnlyHint=%v but scope read=%v", name, *a.ReadOnlyHint, read)
+		}
+		if read && *a.DestructiveHint {
+			t.Errorf("%s: read tool marked destructive", name)
+		}
+		if *a.OpenWorldHint {
+			t.Errorf("%s: openWorldHint=true, but every tool only touches the local knowledge base", name)
+		}
+	}
+}
+
 func TestAddNoteHandler_RejectsOAuthPrincipalDirectly(t *testing.T) {
 	t.Parallel()
 	up := &fakeMCPDocUpserter{}
