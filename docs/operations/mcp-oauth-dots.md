@@ -63,7 +63,7 @@ openssl rand -base64 48
 
 | 변수 | 필수 | 설명 |
 | --- | --- | --- |
-| `MCP_PUBLIC_BASE_URL` | 예 | `https://brain-mcp.baekenough.com` (경로 없이 origin만) |
+| `MCP_PUBLIC_BASE_URL` | 예 | `https://sb.baekenough.com` (경로 없이 origin만) |
 | `MCP_OAUTH_OWNER_KEY_SHA256` | 예 | 1단계의 SHA-256 hex |
 | `MCP_OAUTH_SIGNING_KEY` | 예 | 1단계의 서명 키. 32바이트 이상. base64/hex 처럼 보이면 **디코딩한 길이**가 32바이트 이상이어야 함(32자 base64 는 24바이트라 거절). `openssl rand -base64 48` 로 만들 것. base64/hex 가 아니면 엔트로피를 확인할 수 없다는 경고를 로그에 남김 |
 | `API_KEY` | 예 | 이미 있는 정적 키. OAuth를 켜면서 비어 있으면 기동을 거부함 |
@@ -90,13 +90,17 @@ docker compose --env-file .env.local -f docker-compose.ubuntu1.yml logs mcp | gr
 기동 로그에 `MCP OAuth enabled` 가 보여야 합니다(issuer·resource·client_id만 출력되고 비밀은 출력되지 않음). 서명 키 엔트로피 경고가 있으면 함께 출력됩니다. 확인:
 
 ```bash
-curl -s https://brain-mcp.baekenough.com/.well-known/oauth-protected-resource/mcp
-curl -s https://brain-mcp.baekenough.com/.well-known/oauth-authorization-server
+curl -s https://sb.baekenough.com/.well-known/oauth-protected-resource/mcp
+curl -s https://sb.baekenough.com/.well-known/oauth-authorization-server
 # 잘못된 토큰은 401 + invalid_token
-curl -si https://brain-mcp.baekenough.com/mcp -X POST -H 'authorization: Bearer x' -H 'content-type: application/json' -d '{}' | head -5
+curl -si https://sb.baekenough.com/mcp -X POST -H 'authorization: Bearer x' -H 'content-type: application/json' -d '{}' | head -5
 ```
 
-Cloudflare 쪽 점검: `brain-mcp.baekenough.com` 의 `/mcp`, `/authorize`, `/token`, `/.well-known/*` 가 Cloudflare Access 나 봇 차단 없이 터널을 통해 `localhost:8090` 으로 도달해야 합니다(ChatGPT 서버가 직접 호출합니다). 서버가 `chatgpt.com` 의 CIMD 문서를 가져오므로 mcp 컨테이너에서 `chatgpt.com:443` 으로 나가는 연결도 열려 있어야 합니다(ubuntu1 의 app 네트워크에서 200 확인됨).
+Cloudflare 쪽 설정(`sb.baekenough.com` 은 웹 UI 와 같은 호스트이고 Cloudflare Access 뒤에 있다):
+
+1. 터널 ingress: `deploy/ubuntu1-stack/cloudflared/config-second-brain.yml` 처럼 `sb.baekenough.com` 의 `path` 규칙으로 `/mcp`, `/authorize`, `/token`, `/.well-known/oauth-*`, `/.well-known/openid-configuration` 만 `localhost:8090` 으로 보낸다(웹 규칙보다 위). 운영 파일은 `~/.cloudflared/config-second-brain.yml`, 적용은 `cloudflared tunnel --config <파일> ingress validate` 후 `sudo systemctl restart cloudflared-second-brain` (SIGHUP 금지 — 터널이 종료된다).
+2. Cloudflare Access: Zero Trust → Access → Applications 에 self-hosted 앱을 하나 더 만들고 목적지로 `sb.baekenough.com/mcp`, `sb.baekenough.com/authorize`, `sb.baekenough.com/token`, `sb.baekenough.com/.well-known` 을 넣는다. 정책은 Action **Bypass**, Include **Everyone**. 더 구체적인 경로 앱이 호스트 전체 앱보다 우선하므로 나머지 웹 UI 는 계속 Google 로그인 뒤에 있다. ChatGPT 서버가 이 경로들을 직접 호출하므로 봇 차단(Bot Fight Mode 등)도 이 경로에는 걸리면 안 된다.
+3. 서버가 `chatgpt.com` 의 CIMD 문서를 가져오므로 mcp 컨테이너에서 `chatgpt.com:443` 으로 나가는 연결이 열려 있어야 한다(ubuntu1 app 네트워크에서 200 확인됨).
 
 네트워크 사실(ubuntu1): docker 네트워크는 app `172.24.0.0/16`, postgres `172.22.0.0/16` 이고 둘 다 기본 신뢰 프록시 대역 `172.16.0.0/12` 안입니다. 그래서 cloudflared → docker-proxy 경로의 연결 주소가 신뢰 대역으로 보이고 `CF-Connecting-IP` 가 클라이언트 IP로 쓰입니다. Tailnet 피어도 docker-proxy 를 거쳐 들어오므로 신뢰 프록시처럼 보입니다(= 그들이 `CF-Connecting-IP` 를 위조해 IP별 제한을 비껴갈 수 있음). Tailnet 기기는 모두 본인 소유라 허용 가능한 한계이며, 이 헤더는 속도 제한 키에만 쓰이고 인증에는 쓰이지 않습니다.
 
@@ -109,7 +113,7 @@ Cloudflare 쪽 점검: `brain-mcp.baekenough.com` 의 `/mcp`, `/authorize`, `/to
 
 | 칸 | 값 |
 | --- | --- |
-| 서버 URL | `https://brain-mcp.baekenough.com/mcp` |
+| 서버 URL | `https://sb.baekenough.com/mcp` |
 | 인증 | **OAuth** (`OAuth 또는 인증 없음`도 동작하지만 이 서버는 인증 없이 쓸 수 있는 도구가 없으므로 OAuth를 권장) |
 
 ### 옵션 A. CIMD (권장)
@@ -125,8 +129,8 @@ Cloudflare 쪽 점검: `brain-mcp.baekenough.com` 의 `/mcp`, `/authorize`, `/to
 | Client ID | `dots` (`MCP_OAUTH_CLIENT_ID` 와 같은 값) |
 | Client secret | 비움 |
 | Token endpoint auth method | `none` |
-| Authorization URL | `https://brain-mcp.baekenough.com/authorize` |
-| Token URL | `https://brain-mcp.baekenough.com/token` |
+| Authorization URL | `https://sb.baekenough.com/authorize` |
+| Token URL | `https://sb.baekenough.com/token` |
 | Scope | `brain:read` |
 
 콜백 URL은 기본값 `https://chatgpt.com/connector_platform_oauth_redirect` 가 이미 허용되어 있습니다. 등록 화면이 다른 콜백(예: `https://chatgpt.com/connector/oauth/{callback_id}`)을 보여 주면 그 값을 `MCP_OAUTH_REDIRECT_URIS` 에 추가하고(기본값도 쓰려면 둘 다 쉼표로 적음) mcp 컨테이너를 다시 만듭니다. 와일드카드는 지원하지 않습니다.
@@ -134,7 +138,7 @@ Cloudflare 쪽 점검: `brain-mcp.baekenough.com` 의 `/mcp`, `/authorize`, `/to
 ### 연결 마무리
 
 3. **Create as a plugin** 을 눌러 플러그인으로 만들고 **설치(install)** 합니다. ChatGPT 서버가 로그인을 시작해 이 서버의 동의 화면(`/authorize`)이 열립니다.
-4. **내가 방금 시작한 연결에서만** 동의 화면을 엽니다. 소유자 키가 이 서버의 유일한 방어선이라, 누군가 보낸 링크나 예상치 못한 팝업의 동의 화면에는 절대 키를 입력하지 마세요(동의 화면의 URL이 `https://brain-mcp.baekenough.com/authorize` 인지 확인). 동의 화면에서 **소유자 키**(1단계에서 만든 키 원문)를 붙여 넣고 **승인**합니다. 요청 스코프는 `brain:read`(읽기 전용)로 표시됩니다. 키가 틀리면 다시 입력하고, 한도(아래)에 닿으면 잠시 잠깁니다.
+4. **내가 방금 시작한 연결에서만** 동의 화면을 엽니다. 소유자 키가 이 서버의 유일한 방어선이라, 누군가 보낸 링크나 예상치 못한 팝업의 동의 화면에는 절대 키를 입력하지 마세요(동의 화면의 URL이 `https://sb.baekenough.com/authorize` 인지 확인). 동의 화면에서 **소유자 키**(1단계에서 만든 키 원문)를 붙여 넣고 **승인**합니다. 요청 스코프는 `brain:read`(읽기 전용)로 표시됩니다. 키가 틀리면 다시 입력하고, 한도(아래)에 닿으면 잠시 잠깁니다.
 5. 설치된 플러그인은 dots에서 사용할 수 있습니다(dots는 사용자가 설치한 플러그인과 그 권한을 그대로 씁니다).
 
 스코프: ChatGPT는 기본으로 OIDC 스코프(`openid`, `email` 등)도 요청합니다. 이 서버는 OIDC를 구현하지 않으므로 `brain:read` 만 광고하고(PRM·AS 메타데이터의 `scopes_supported`), 요청에 섞인 알 수 없는 스코프는 거절하지 않고 조용히 버립니다. 그래서 연결이 `brain:read` 로 성공합니다. 남는 스코프가 없으면 `brain:read` 를 발급하며, 실제 발급 스코프는 동의 화면과 토큰 응답의 `scope` 에 나옵니다. 쓰기 스코프는 요청해도 얻을 수 없습니다.

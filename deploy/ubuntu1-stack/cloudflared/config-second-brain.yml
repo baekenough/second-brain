@@ -14,9 +14,13 @@ ingress:
   - hostname: brain.baekenough.com
     service: http://localhost:8081
 
-  # MCP 서버 — 현재 미기동. macmini 에서도 8090 에 리스너가 없어
-  # 이미 죽어 있던 ingress 다. mcp 컨테이너를 띄우면 즉시 복구되도록 항목만 유지한다.
-  - hostname: brain-mcp.baekenough.com
+  # MCP 서버 (second-brain-ubuntu1-mcp-1) — sb.baekenough.com 의 MCP·OAuth 경로만
+  # 8090 으로 보낸다. ChatGPT/dots 가 직접 호출하는 경로라 Cloudflare Access 에서
+  # 이 경로들만 bypass 앱으로 뺐다(docs/operations/mcp-oauth-dots.md). 동의 화면은
+  # 소유자 키로 보호된다. 예전 brain-mcp.baekenough.com 항목은 2026-10-25 에 닫았다.
+  # 이 규칙은 아래 sb 웹 규칙보다 먼저 와야 한다(ingress 는 위에서부터 첫 일치).
+  - hostname: sb.baekenough.com
+    path: '^/(mcp(/.*)?|authorize|token|\.well-known/(oauth-protected-resource(/.*)?|oauth-authorization-server(/.*)?|openid-configuration))$'
     service: http://localhost:8090
 
   # Next.js 웹 UI (second-brain-ubuntu1-web-1) — Cloudflare Access 뒤에 있다.
