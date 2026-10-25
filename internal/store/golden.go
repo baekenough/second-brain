@@ -35,26 +35,21 @@ const goldenMinQueryRunes = 6
 
 // goldenSeedQueries are hand-written candidates for
 // GenerateQueries(source="seed"). They are chosen to span every source type
-// this system actually collects (SMS, call, mail, calendar, notes/actions)
+// this system actually collects (SMS, call, notes/actions)
 // rather than clustering on one — a golden set skewed toward a single
 // source type would not catch a regression in the others.
 var goldenSeedQueries = []string{
 	"지난주에 누구랑 통화했지",
 	"이번 달 카드 결제 내역",
-	"다음 주 일정 알려줘",
 	"최근 받은 택배 문자",
 	"정코치와 나눈 대화",
-	"회사 메일 중 답장 안 한 것",
 	"어제 온 문자 중 중요한 것",
 	"최근 인프런 결제",
 	"지난달 병원 예약",
-	"GitHub PR 리뷰 요청 메일",
-	"이번 주에 잡힌 회의 몇 개야",
 	"최근에 받은 스팸 문자 있어",
 	"지난주 통화 녹음 요약해줘",
 	"이번 달 구독료 얼마나 나갔어",
 	"최근에 저장한 메모 보여줘",
-	"답장해야 할 이메일 있어",
 	"다음 주 병원 예약 있어",
 	"최근 받은 청첩장 문자",
 	"지난주에 배송된 물건 뭐 있어",
@@ -388,7 +383,7 @@ func (s *GoldenStore) Progress(ctx context.Context) (GoldenProgress, error) {
 // document retention=disposable, a "relevant" judgment tags it
 // retention=keep (see internal/model/retention.go), both with
 // classifier="user" so a later audit can tell a human label apart from the
-// automated gmail segmentation pass. "irrelevant" means "not an answer to
+// automated segmentation pass. "irrelevant" means "not an answer to
 // THIS query" — it says nothing about the document's general retention
 // value, so it leaves the tag untouched regardless of judge.
 //

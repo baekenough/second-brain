@@ -40,7 +40,7 @@ func TestSplitInsightLane_StripsInsightFromObserved(t *testing.T) {
 	base := model.SearchQuery{
 		Query:       "회의 인사이트",
 		Limit:       8,
-		SourceTypes: []model.SourceType{model.SourceGmail, model.SourceInsight},
+		SourceTypes: []model.SourceType{model.SourceSMS, model.SourceInsight},
 	}
 
 	observed, runObserved, inferred := splitInsightLane(base, 3)
@@ -49,8 +49,8 @@ func TestSplitInsightLane_StripsInsightFromObserved(t *testing.T) {
 		t.Fatal("observed lane was skipped although the plan named a non-insight source")
 	}
 	got := observed.IncludeSourceTypes()
-	if len(got) != 1 || got[0] != model.SourceGmail {
-		t.Errorf("observed include set = %v, want [gmail] (insight removed)", got)
+	if len(got) != 1 || got[0] != model.SourceSMS {
+		t.Errorf("observed include set = %v, want [sms] (insight removed)", got)
 	}
 	if len(observed.ExcludeSourceTypes) != 1 || observed.ExcludeSourceTypes[0] != model.SourceInsight {
 		t.Errorf("observed ExcludeSourceTypes = %v, want [insight]", observed.ExcludeSourceTypes)
@@ -172,7 +172,7 @@ func TestAssembleRetrieval_UsesTheReconciledLanes(t *testing.T) {
 	t.Parallel()
 
 	searcher := &recordingSearcher{results: [][]*model.SearchResult{
-		{mustDoc(model.SourceGmail)},
+		{mustDoc(model.SourceSMS)},
 		{mustDoc(model.SourceInsight)},
 	}}
 	params := intent.Params{RawQuery: "q", Kind: intent.KindGeneral}

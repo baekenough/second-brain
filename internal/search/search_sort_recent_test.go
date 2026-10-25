@@ -84,8 +84,8 @@ func newRecencySetup(t *testing.T, first, second *model.SearchResult, from, to *
 	chunkOnly := uuid.New()
 	docs := &recordingDocSearcher{results: []*model.SearchResult{first, second}}
 	chunks := &mockChunkSearcher{vectorResults: []store.ChunkSearchResult{
-		chunkResult(second.ID, model.SourceCalendar, 0.99),
-		chunkResult(chunkOnly, model.SourceCalendar, 0.98),
+		chunkResult(second.ID, model.SourceCall, 0.99),
+		chunkResult(chunkOnly, model.SourceCall, 0.98),
 	}}
 
 	all := map[uuid.UUID]time.Time{}
@@ -377,7 +377,7 @@ func TestSearch_SortRecent_DirectionFollowsTheSharedRule(t *testing.T) {
 
 			docs := &recordingDocSearcher{results: []*model.SearchResult{earlier, late}}
 			chunks := &mockChunkSearcher{vectorResults: []store.ChunkSearchResult{
-				chunkResult(late.ID, model.SourceCalendar, 0.99),
+				chunkResult(late.ID, model.SourceCall, 0.99),
 			}}
 			checker := &fakeOccurredChecker{occurredAt: map[uuid.UUID]time.Time{
 				earlier.ID: now.Add(tc.earlier),

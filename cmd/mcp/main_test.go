@@ -787,8 +787,6 @@ func TestAllowedSourceTypes_AllDeclaredTypesAccepted(t *testing.T) {
 		model.SourceTelegram,
 		model.SourceSecretary,
 		model.SourceLLMMemory,
-		model.SourceGmail,
-		model.SourceCalendar,
 		model.SourceSMS,
 		model.SourceCall,
 		model.SourceCallLog,
@@ -808,8 +806,8 @@ func TestAllowedSourceTypes_AllDeclaredTypesAccepted(t *testing.T) {
 	}
 }
 
-// TestSearchTool_NewSourceTypes_Accepted verifies that the 7 source types added
-// in this fix (gmail, calendar, sms, call, call-log, call-transcript, upload) are
+// TestSearchTool_NewSourceTypes_Accepted verifies that the 5 source types added
+// in this fix (sms, call, call-log, call-transcript, upload) are
 // accepted by the search tool's source filter and do not produce an error result.
 // call-log/call-transcript are the deprecated pre-migration-033 aliases of call
 // (see model.SourceCallLog's doc comment) — still accepted so legacy searches
@@ -817,7 +815,7 @@ func TestAllowedSourceTypes_AllDeclaredTypesAccepted(t *testing.T) {
 func TestSearchTool_NewSourceTypes_Accepted(t *testing.T) {
 	t.Parallel()
 
-	newTypes := []string{"gmail", "calendar", "sms", "call", "call-log", "call-transcript", "upload"}
+	newTypes := []string{"sms", "call", "call-log", "call-transcript", "upload"}
 
 	// Build a search server with a fake search service that returns no results.
 	svc := &fakeSearchSvc{}
@@ -843,8 +841,12 @@ func TestSearchTool_NewSourceTypes_Accepted(t *testing.T) {
 func TestSearchTool_UnknownSourceType_Rejected(t *testing.T) {
 	t.Parallel()
 
-	if _, ok := allowedSourceTypes[model.SourceType("unknown-source")]; ok {
-		t.Error("source type \"unknown-source\" should not be in allowedSourceTypes")
+	// gmail·calendar 를 일부러 넣었다. 수집기가 제거됐으므로 알 수 없는 다른
+	// 소스와 똑같이 거절돼야 한다.
+	for _, src := range []string{"unknown-source", "gmail", "calendar"} {
+		if _, ok := allowedSourceTypes[model.SourceType(src)]; ok {
+			t.Errorf("source type %q should not be in allowedSourceTypes", src)
+		}
 	}
 }
 
@@ -1136,7 +1138,7 @@ func TestSearchTool_ResponseFields_PopulatedFromMetadata(t *testing.T) {
 			{
 				Document: model.Document{
 					ID:         docID,
-					SourceType: model.SourceGmail,
+					SourceType: model.SourceSMS,
 					Title:      "뉴스레터",
 					Content:    "내용",
 					Metadata:   map[string]any{"retention": "low", "segment": "newsletter"},
@@ -1166,8 +1168,8 @@ func TestSearchTool_ResponseFields_PopulatedFromMetadata(t *testing.T) {
 	if r.DocumentID != docID.String() {
 		t.Errorf("document_id = %q, want %q", r.DocumentID, docID.String())
 	}
-	if r.SourceType != string(model.SourceGmail) {
-		t.Errorf("source_type = %q, want %q", r.SourceType, model.SourceGmail)
+	if r.SourceType != string(model.SourceSMS) {
+		t.Errorf("source_type = %q, want %q", r.SourceType, model.SourceSMS)
 	}
 	if r.Score <= 0 {
 		t.Errorf("score = %v, want > 0", r.Score)

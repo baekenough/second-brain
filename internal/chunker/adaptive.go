@@ -106,7 +106,6 @@ func SelectOptions(doc model.Document) Options {
 			MaxSize:      longFormMaxSize,
 			Overlap:      longFormOverlap,
 			HeadingAware: headingAware,
-			SourceType:   string(doc.SourceType),
 		}
 
 	// --- Short chat / messaging sources ---
@@ -118,7 +117,6 @@ func SelectOptions(doc model.Document) Options {
 			MaxSize:      chatMaxSize,
 			Overlap:      chatOverlap,
 			HeadingAware: false, // BI: chat has no heading structure
-			SourceType:   string(doc.SourceType),
 		}
 
 	// --- Memory / agent sources ---
@@ -130,7 +128,6 @@ func SelectOptions(doc model.Document) Options {
 			MaxSize:      memMaxSize,
 			Overlap:      memOverlap,
 			HeadingAware: false, // BI: structured headings not expected
-			SourceType:   string(doc.SourceType),
 		}
 
 	// --- Unknown / future source types ---
@@ -142,7 +139,6 @@ func SelectOptions(doc model.Document) Options {
 			MaxSize:      longFormMaxSize,
 			Overlap:      longFormOverlap,
 			HeadingAware: true,
-			SourceType:   string(doc.SourceType),
 		}
 	}
 }

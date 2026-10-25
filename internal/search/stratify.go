@@ -16,15 +16,12 @@ import (
 const LaneSourceStratify = "source_stratify"
 
 // stratifySources 는 보조 검색을 따로 돌리는 주요 소스다. 골든셋 실패 사례
-// (다른 소스 문서에 밀려 20건 후보 풀에 못 든 정답, 일정 질문에서 빠진
-// 캘린더 문서)가 이 다섯 소스에 몰려 있다. 순서는 결과에 영향이 없다 —
+// (다른 소스 문서에 밀려 20건 후보 풀에 못 든 정답)가 이 소스들에 몰려 있다. 순서는 결과에 영향이 없다 —
 // 병합은 소스 순서와 무관한 RRF 합이고 마지막에 sortByScore 로 총순서를
 // 다시 세운다. 다만 로그·trace 순서를 고정하기 위해 슬라이스로 둔다.
 var stratifySources = []model.SourceType{
-	model.SourceCalendar,
 	model.SourceCall,
 	model.SourceSMS,
-	model.SourceGmail,
 	model.SourceNote,
 }
 
@@ -148,7 +145,7 @@ func (s *Service) startSourceArms(ctx context.Context, storeQuery model.SearchQu
 // planSpillArm 은 계획 소스 넘침 검색을 만든다(PlanSourceSpillK).
 //
 // 질의 계획(intent 플래너)이 소스를 잘못 좁히면(문자로 계획했는데 정답은
-// 메일) 포함 집합이 하드 필터라 정답에 아예 도달할 수 없다. 이 보조 검색은
+// 통화) 포함 집합이 하드 필터라 정답에 아예 도달할 수 없다. 이 보조 검색은
 // 포함 집합 밖의 상위 K 건을 후보에 섞어 그 경우를 구제한다. 조건:
 //
 //   - k>0 이고, 포함 집합이 비어 있지 않고, q.SourceIncludeFromPlan 이 true

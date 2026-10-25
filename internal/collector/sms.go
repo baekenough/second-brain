@@ -97,7 +97,7 @@ const smsStreamBatchSize = 500
 //
 // Partial-result contract: if the SMS file parse fails, already-parsed call-log
 // docs (and vice-versa) are still returned. Per-file failures are logged as
-// slog.Warn. This matches the gmail/calendar/whisper partial-result pattern.
+// slog.Warn. This matches the whisper partial-result pattern.
 func (c *SMSCollector) Collect(ctx context.Context, since time.Time) ([]model.Document, error) {
 	var docs []model.Document
 

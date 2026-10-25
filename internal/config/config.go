@@ -124,13 +124,8 @@ type Config struct {
 	TelegramChatIDs  []int64
 
 	// UserEmailAddresses lists the account owner's own email addresses
-	// (comma-separated in USER_EMAIL_ADDRESSES). Used by Part A's structural
-	// "awaiting my reply" signal (spec §7.1) and by the extraction worker's
-	// counterpart resolution for the same kind: gmail carries no `direction`
-	// metadata key (unlike sms/call), only a `from` address, so direction
-	// must be inferred by comparing `from` against the account's own
-	// address(es). A list (not a single string) accommodates aliases on the
-	// same Gmail account.
+	// (콤마 구분, USER_EMAIL_ADDRESSES). 추출 워커의 LLM 프롬프트에 소유자
+	// 식별 앵커로만 전달된다. 이 설정을 만든 메일 수집기는 제거됐다.
 	UserEmailAddresses []string
 
 	// Reranker (optional — cross-encoder post-retrieval reranking disabled when empty)
@@ -212,36 +207,6 @@ type Config struct {
 
 	// LLM Memory SQLite (optional — disabled when empty)
 	LLMMemoryDBPath string // LLM_MEMORY_DB_PATH — path to llm-memory.sqlite (e.g. /data/llm-memory.sqlite)
-
-	// Gmail (optional — disabled when both credential fields are empty)
-	// GMAIL_CREDENTIALS_JSON: OAuth2 client credentials JSON string (from Google Cloud Console)
-	// GMAIL_TOKEN_JSON: OAuth2 access/refresh token JSON string
-	// GMAIL_QUERY: Gmail search query (default: "-in:spam -in:trash")
-	// GMAIL_MAX_MESSAGES: per-Collect cap on total message IDs fetched (default: 50000).
-	// Set 0 to disable the cap entirely (no limit). Invalid values use the default.
-	GmailCredentialsJSON string
-	GmailTokenJSON       string
-	GmailQuery           string
-	GmailMaxMessages     int
-
-	// Calendar (optional — disabled when both credential fields are empty)
-	// CALENDAR_CREDENTIALS_JSON: OAuth2 client credentials JSON string
-	// CALENDAR_TOKEN_JSON: OAuth2 access/refresh token JSON string
-	// CALENDAR_ID: comma-separated calendar identifiers to collect from
-	// (e.g. "primary,team@example.com"). A single value behaves exactly as
-	// before — this field was extended rather than adding a new env var to
-	// keep deploy config changes minimal. Whitespace is trimmed, empty
-	// entries and duplicates are dropped (see collector.parseCalendarIDs).
-	// The first entry keeps the pre-multi-calendar source_id scheme so
-	// existing documents are never re-keyed on upgrade; see
-	// internal/collector/calendar.go calendarEventToDocument.
-	// CALENDAR_LOOKAHEAD_DAYS: days into the future to collect (default: 90)
-	// CALENDAR_LOOKBEHIND_DAYS: days into the past to collect (default: 365)
-	CalendarCredentialsJSON string
-	CalendarTokenJSON       string
-	CalendarID              string
-	CalendarLookaheadDays   int
-	CalendarLookbehindDays  int
 
 	// SMS + Call Log (optional — disabled when SMSSourceDir is empty)
 	// SMS_SOURCE_DIR: directory containing SMS Backup & Restore XML exports
@@ -933,17 +898,6 @@ func Load() (*Config, error) {
 		SecretaryDBPath: os.Getenv("SECRETARY_DB_PATH"),
 		LLMMemoryDBPath: os.Getenv("LLM_MEMORY_DB_PATH"),
 
-		GmailCredentialsJSON: os.Getenv("GMAIL_CREDENTIALS_JSON"),
-		GmailTokenJSON:       os.Getenv("GMAIL_TOKEN_JSON"),
-		GmailQuery:           getenv("GMAIL_QUERY", "-in:spam -in:trash"),
-		GmailMaxMessages:     gmailMaxMessages(),
-
-		CalendarCredentialsJSON: os.Getenv("CALENDAR_CREDENTIALS_JSON"),
-		CalendarTokenJSON:       os.Getenv("CALENDAR_TOKEN_JSON"),
-		CalendarID:              getenv("CALENDAR_ID", "primary"),
-		CalendarLookaheadDays:   calendarLookaheadDays(),
-		CalendarLookbehindDays:  calendarLookbehindDays(),
-
 		SMSSourceDir:    os.Getenv("SMS_SOURCE_DIR"),
 		SMSMaxFileBytes: smsMaxFileBytes(),
 
@@ -1121,24 +1075,6 @@ func envFlag(key string) bool {
 	}
 }
 
-func calendarLookaheadDays() int {
-	if v := os.Getenv("CALENDAR_LOOKAHEAD_DAYS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return 90
-}
-
-func calendarLookbehindDays() int {
-	if v := os.Getenv("CALENDAR_LOOKBEHIND_DAYS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return 365
-}
-
 // smsMaxFileBytes parses SMS_MAX_FILE_BYTES from the environment.
 // Default is 1 GiB (generous for multi-year XML exports).
 // Set SMS_MAX_FILE_BYTES=0 to disable the cap entirely (no limit).
@@ -1158,27 +1094,6 @@ func smsMaxFileBytes() int64 {
 		return defaultCap
 	}
 	return n // 0 means no limit (caller checks maxFileBytes <= 0)
-}
-
-// gmailMaxMessages parses GMAIL_MAX_MESSAGES from the environment.
-// Default is 50000 (generous enough to match a large secretary export).
-// Set GMAIL_MAX_MESSAGES=0 to disable the cap entirely (no limit).
-// Invalid values are ignored and the default is used.
-func gmailMaxMessages() int {
-	const defaultCap = 50000
-	v := os.Getenv("GMAIL_MAX_MESSAGES")
-	if v == "" {
-		return defaultCap
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n < 0 {
-		slog.Warn("config: GMAIL_MAX_MESSAGES is invalid; using default 50000",
-			"value", v,
-			"error", err,
-		)
-		return defaultCap
-	}
-	return n // 0 means no limit (caller checks maxMessages <= 0)
 }
 
 // whisperMaxFileBytes parses WHISPER_MAX_FILE_BYTES from the environment.
@@ -1588,7 +1503,7 @@ func collectorCutover() time.Time {
 //   - COLLECT_INTERVAL_WHISPER    → "whisper"
 //   - COLLECT_INTERVAL_FILESYSTEM → "filesystem"
 //   - COLLECT_INTERVAL_SMS        → "sms"
-//   - COLLECT_INTERVAL_GMAIL      → "gmail"
+//   - COLLECT_INTERVAL_GDRIVE     → "gdrive"
 //
 // Only positive, parseable durations are stored; missing or invalid values are
 // silently ignored so unrelated collectors fall back to the global COLLECT_INTERVAL.
@@ -1598,8 +1513,6 @@ func collectIntervalPerSource() map[string]time.Duration {
 		"whisper",
 		"filesystem",
 		"sms",
-		"gmail",
-		"calendar",
 		"slack",
 		"discord",
 		"github",

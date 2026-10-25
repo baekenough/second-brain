@@ -410,7 +410,7 @@ func TestTick_Unclassified_CallNoRecording_RealPipeline_NoSignalLow(t *testing.T
 func TestTick_MaxCallsPerTick_SharedAcrossQueues(t *testing.T) {
 	docA := classDoc("sms-a", model.SourceSMS, nil)
 	docB := classDoc("sms-b", model.SourceSMS, nil)
-	legacyDoc := classDoc("gmail-legacy", model.SourceGmail, map[string]any{
+	legacyDoc := classDoc("call-legacy", model.SourceCall, map[string]any{
 		"retention": model.RetentionKeep, "classifier": "ox-alpha",
 	})
 
@@ -419,9 +419,9 @@ func TestTick_MaxCallsPerTick_SharedAcrossQueues(t *testing.T) {
 		legacy:       []*model.Document{legacyDoc},
 	}
 	evaluator := &fakeGateEvaluator{gates: map[string]classify.Gate{
-		"sms-a":        {},                 // needs Jev
-		"sms-b":        {},                 // needs Jev
-		"gmail-legacy": {BulkSender: true}, // contradicts keep -> needs Jev
+		"sms-a":       {},                 // needs Jev
+		"sms-b":       {},                 // needs Jev
+		"call-legacy": {BulkSender: true}, // contradicts keep -> needs Jev
 	}}
 	classifier := &fakeClassifier{
 		jevEnabled: true,
@@ -475,11 +475,11 @@ func TestTick_Legacy_PersonSignalContradiction_FixedWithoutJev(t *testing.T) {
 }
 
 func TestTick_Legacy_BulkSenderContradiction_CallsJev(t *testing.T) {
-	doc := classDoc("gmail-legacy-1", model.SourceGmail, map[string]any{
+	doc := classDoc("call-legacy-1", model.SourceCall, map[string]any{
 		"retention": model.RetentionKeep, "classifier": "ox-alpha",
 	})
 	store := &fakeClassificationStore{legacy: []*model.Document{doc}}
-	evaluator := &fakeGateEvaluator{gates: map[string]classify.Gate{"gmail-legacy-1": {BulkSender: true}}}
+	evaluator := &fakeGateEvaluator{gates: map[string]classify.Gate{"call-legacy-1": {BulkSender: true}}}
 	classifier := &fakeClassifier{
 		jevEnabled: true,
 		jevResult:  &classify.Result{Segment: "newsletter", Retention: model.RetentionLow, Classifier: "jev-latest"},
@@ -501,11 +501,11 @@ func TestTick_Legacy_BulkSenderContradiction_CallsJev(t *testing.T) {
 }
 
 func TestTick_Legacy_NoContradiction_MarksGateCheckedWithoutRetagging(t *testing.T) {
-	doc := classDoc("gmail-legacy-2", model.SourceGmail, map[string]any{
+	doc := classDoc("call-legacy-2", model.SourceCall, map[string]any{
 		"retention": model.RetentionKeep, "classifier": "ox-alpha", "segment": "work_comm",
 	})
 	store := &fakeClassificationStore{legacy: []*model.Document{doc}}
-	evaluator := &fakeGateEvaluator{gates: map[string]classify.Gate{"gmail-legacy-2": {}}}
+	evaluator := &fakeGateEvaluator{gates: map[string]classify.Gate{"call-legacy-2": {}}}
 	classifier := &fakeClassifier{jevEnabled: true}
 	w := newTestClassificationWorker(store, classifier, evaluator, true, 200)
 
@@ -549,7 +549,7 @@ func TestTick_Legacy_GateDecided_OverridesRegardlessOfCurrentTag(t *testing.T) {
 }
 
 func TestTick_RecheckLegacyDisabled_NeverListsLegacyQueue(t *testing.T) {
-	doc := classDoc("gmail-legacy-3", model.SourceGmail, map[string]any{"retention": model.RetentionKeep, "classifier": "ox-alpha"})
+	doc := classDoc("call-legacy-3", model.SourceCall, map[string]any{"retention": model.RetentionKeep, "classifier": "ox-alpha"})
 	store := &fakeClassificationStore{legacy: []*model.Document{doc}}
 	evaluator := &fakeGateEvaluator{gates: map[string]classify.Gate{}}
 	classifier := &fakeClassifier{jevEnabled: true}
@@ -567,12 +567,12 @@ func TestTick_RecheckLegacyDisabled_NeverListsLegacyQueue(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestTick_ListUnclassifiedError_DoesNotPanicAndStillRunsLegacyQueue(t *testing.T) {
-	legacyDoc := classDoc("gmail-legacy-4", model.SourceGmail, map[string]any{"retention": model.RetentionKeep, "classifier": "ox-alpha"})
+	legacyDoc := classDoc("call-legacy-4", model.SourceCall, map[string]any{"retention": model.RetentionKeep, "classifier": "ox-alpha"})
 	store := &fakeClassificationStore{
 		listUnclassifiedErr: errors.New("db: connection reset"),
 		legacy:              []*model.Document{legacyDoc},
 	}
-	evaluator := &fakeGateEvaluator{gates: map[string]classify.Gate{"gmail-legacy-4": {}}}
+	evaluator := &fakeGateEvaluator{gates: map[string]classify.Gate{"call-legacy-4": {}}}
 	classifier := &fakeClassifier{jevEnabled: true}
 	w := newTestClassificationWorker(store, classifier, evaluator, true, 200)
 

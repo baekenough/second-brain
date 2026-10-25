@@ -368,9 +368,9 @@ func (w *ExtractionWorker) persistAction(ctx context.Context, doc *model.Documen
 	var counterpartName string
 	var counterpartType model.EntityType
 	if a.Kind == string(model.KindAwaitingMyReply) {
-		identity, ok := action.CounterpartIdentity(doc, func(addr string) bool { return action.IsUserAddress(w.userAddrs, addr) })
+		identity, ok := action.CounterpartIdentity(doc)
 		if !ok {
-			return nil // e.g. gmail "from" is the user's own address — not awaiting a reply
+			return nil // unsupported source type — no counterpart identity to derive
 		}
 		counterpartIdentity = identity
 		// The counterpart of an awaiting_my_reply action is fixed by the
@@ -418,12 +418,6 @@ func (w *ExtractionWorker) persistAction(ctx context.Context, doc *model.Documen
 // SAME thread_key component of identity_key.
 func threadKeyForDocument(doc *model.Document) (string, bool) {
 	switch doc.SourceType {
-	case model.SourceGmail:
-		threadID, _ := doc.Metadata["thread_id"].(string)
-		if threadID == "" {
-			return "", false
-		}
-		return action.ThreadKeyGmail(threadID), true
 	case model.SourceSMS:
 		return action.ThreadKeySMS(smsCallContactKey(doc)), true
 	case model.SourceCall, model.SourceCallLog, model.SourceCallTranscript:

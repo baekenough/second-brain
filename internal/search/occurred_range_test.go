@@ -85,7 +85,7 @@ func TestServiceSearch_WindowedQuery_ChunkVectorLaneDoesNotFill(t *testing.T) {
 	outOfWindowID := uuid.New()
 
 	docs := &recordingDocSearcher{results: []*model.SearchResult{
-		makeSearchResult(inWindowID, "in-window calendar entry", 0.5),
+		makeSearchResult(inWindowID, "in-window call entry", 0.5),
 	}}
 	chunks := &mockChunkSearcher{vectorResults: []store.ChunkSearchResult{
 		{

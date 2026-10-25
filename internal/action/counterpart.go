@@ -1,7 +1,6 @@
 package action
 
 import (
-	"net/mail"
 	"strings"
 
 	"github.com/baekenough/second-brain/internal/model"
@@ -12,7 +11,7 @@ import (
 //
 // This is deliberately NOT the same string as CounterpartIdentity: that one
 // feeds identity_key and must therefore stay byte-stable forever (it is the
-// raw From header, the contact_name, or a phone-number hash). This one is
+// contact_name or a phone-number hash). This one is
 // rendered on an action card and stored in entities.name, so it prefers the
 // display name over the address and never returns a hash — a hash is not
 // something a user can act on.
@@ -34,12 +33,6 @@ func CounterpartDisplay(doc *model.Document) (name string, entityType model.Enti
 		return "", "", false
 	}
 	switch doc.SourceType {
-	case model.SourceGmail:
-		display := displayNameFromAddressHeader(metadataString(doc, "from"))
-		if display == "" {
-			return "", "", false
-		}
-		return display, model.EntityTypePerson, true
 	case model.SourceSMS, model.SourceCall, model.SourceCallLog, model.SourceCallTranscript:
 		if contact := strings.TrimSpace(metadataString(doc, "contact_name")); contact != "" {
 			return contact, model.EntityTypePerson, true
@@ -64,34 +57,4 @@ func metadataString(doc *model.Document, key string) string {
 	}
 	s, _ := doc.Metadata[key].(string)
 	return s
-}
-
-// displayNameFromAddressHeader extracts the human-facing part of an RFC 5322
-// From header: the display name when present, the bare address otherwise.
-// Returns "" for a blank or unusable header.
-//
-// mail.ParseAddress handles the quoted and RFC 2047-encoded forms; the manual
-// fallback covers headers it rejects outright (multiple mailboxes, unquoted
-// commas, mangled encodings), which are common enough in a real mailbox that
-// giving up on them would put the address-less "" label back on the card.
-func displayNameFromAddressHeader(from string) string {
-	from = strings.TrimSpace(from)
-	if from == "" {
-		return ""
-	}
-	if addr, err := mail.ParseAddress(from); err == nil {
-		if name := strings.TrimSpace(addr.Name); name != "" {
-			return name
-		}
-		return strings.TrimSpace(addr.Address)
-	}
-	if open := strings.LastIndex(from, "<"); open >= 0 {
-		if end := strings.Index(from[open:], ">"); end > 1 {
-			if name := strings.Trim(strings.TrimSpace(from[:open]), `"'`); name != "" {
-				return strings.TrimSpace(name)
-			}
-			return strings.TrimSpace(from[open+1 : open+end])
-		}
-	}
-	return strings.Trim(from, `"'`)
 }

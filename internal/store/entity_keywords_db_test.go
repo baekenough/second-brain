@@ -31,7 +31,7 @@ type graphFixture struct {
 	// bobby -> alice 관계의 근거 문서(0.5). 둘 다 그래프 레인 적중, 순서는 out > in.
 	outEv, inEv uuid.UUID
 	// 아래는 관계의 근거 문서이지만 필터에 걸려야 하는 문서들.
-	outsideEv, disposableEv, gmailEv, deletedEv uuid.UUID
+	outsideEv, disposableEv, uploadEv, deletedEv uuid.UUID
 	// unrelatedEv 는 시드와 무관한 엔티티 사이 관계의 근거 문서.
 	unrelatedEv uuid.UUID
 	// plain 은 어떤 엔티티·관계에도 연결되지 않은 문서.
@@ -54,15 +54,15 @@ func newGraphFixture(t *testing.T) graphFixture {
 	seed := func(src model.SourceType, at time.Time, title, meta string) uuid.UUID {
 		return seedSparseDoc(t, pg, src, at, title, "zz 가상 본문 "+title, meta)
 	}
-	f.seedDoc = seed(model.SourceCalendar, in, "zz 시드 문서", `{}`)
-	f.outEv = seed(model.SourceCalendar, in, "zz 근거 나가는 관계", `{}`)
-	f.inEv = seed(model.SourceCalendar, in, "zz 근거 들어오는 관계", `{}`)
-	f.outsideEv = seed(model.SourceCalendar, graphWinTo.Add(time.Hour), "zz 창 밖", `{}`)
-	f.disposableEv = seed(model.SourceCalendar, in, "zz 광고", `{"retention":"disposable"}`)
-	f.gmailEv = seed(model.SourceGmail, in, "zz 메일", `{}`)
-	f.deletedEv = seed(model.SourceCalendar, in, "zz 삭제됨", `{}`)
-	f.unrelatedEv = seed(model.SourceCalendar, in, "zz 무관", `{}`)
-	f.plain = seed(model.SourceCalendar, in, "zz 평범", `{}`)
+	f.seedDoc = seed(model.SourceNote, in, "zz 시드 문서", `{}`)
+	f.outEv = seed(model.SourceNote, in, "zz 근거 나가는 관계", `{}`)
+	f.inEv = seed(model.SourceNote, in, "zz 근거 들어오는 관계", `{}`)
+	f.outsideEv = seed(model.SourceNote, graphWinTo.Add(time.Hour), "zz 창 밖", `{}`)
+	f.disposableEv = seed(model.SourceNote, in, "zz 광고", `{"retention":"disposable"}`)
+	f.uploadEv = seed(model.SourceUpload, in, "zz 메일", `{}`)
+	f.deletedEv = seed(model.SourceNote, in, "zz 삭제됨", `{}`)
+	f.unrelatedEv = seed(model.SourceNote, in, "zz 무관", `{}`)
+	f.plain = seed(model.SourceNote, in, "zz 평범", `{}`)
 	if _, err := pg.pool.Exec(ctx,
 		`UPDATE documents SET status = 'deleted', deleted_at = now() WHERE id = $1`, f.deletedEv); err != nil {
 		t.Fatalf("soft-delete fixture doc: %v", err)
@@ -92,7 +92,7 @@ func newGraphFixture(t *testing.T) graphFixture {
 		rel(bobby, alice, f.inEv, 0.5),
 		rel(alice, acme, f.outsideEv, 0.9),
 		rel(alice, acme, f.disposableEv, 0.9),
-		rel(alice, acme, f.gmailEv, 0.9),
+		rel(alice, acme, f.uploadEv, 0.9),
 		rel(alice, acme, f.deletedEv, 0.9),
 		rel(carol, dave, f.unrelatedEv, 1.0),
 	}
@@ -111,7 +111,7 @@ func graphDBQuery(question string, keywords []string, graphWeight float64) model
 		Query:            question,
 		Limit:            50,
 		Embedding:        testEmbedding(),
-		SourceTypes:      []model.SourceType{model.SourceCalendar},
+		SourceTypes:      []model.SourceType{model.SourceNote},
 		ExcludeRetention: []string{model.RetentionDisposable},
 		OccurredFrom:     &from,
 		OccurredTo:       &to,
@@ -167,7 +167,7 @@ func TestDB_GraphLane_OneHopNeighbours(t *testing.T) {
 		t.Errorf("SUM(confidence) 순서가 아니다: out(0.9)=%v in(0.5)=%v", exact[f.outEv], exact[f.inEv])
 	}
 	for name, id := range map[string]uuid.UUID{
-		"outsideEv": f.outsideEv, "disposableEv": f.disposableEv, "gmailEv": f.gmailEv,
+		"outsideEv": f.outsideEv, "disposableEv": f.disposableEv, "uploadEv": f.uploadEv,
 		"deletedEv": f.deletedEv, "unrelatedEv": f.unrelatedEv, "plain": f.plain,
 	} {
 		if hit(exact, id) {

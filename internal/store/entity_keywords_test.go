@@ -167,7 +167,7 @@ func TestHybridGraphLane_FiltersInsideLane(t *testing.T) {
 		Query:              "Alice 와 ACME 계약",
 		Limit:              10,
 		Embedding:          []float32{0.1, 0.2},
-		SourceTypes:        []model.SourceType{model.SourceCalendar, model.SourceCall},
+		SourceTypes:        []model.SourceType{model.SourceNote, model.SourceCall},
 		ExcludeSourceTypes: []model.SourceType{model.SourceInsight},
 		ExcludeRetention:   []string{model.RetentionDisposable},
 		OccurredFrom:       &from,

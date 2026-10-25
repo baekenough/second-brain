@@ -140,16 +140,16 @@ real-DB test). Consequences:
 
 `--window=plan` alone reproduces only the window. Production `/ask` also applies
 the source include set of the deterministic plan (`intent.DeterministicPlan`,
-shared with `LLMPlanner`): an explicit record word (메일/문자/통화/슬랙/노션/노트)
-selects that source, a calendar keyword (일정/스케줄/캘린더/약속) or a window that
-starts after the anchor's today selects `calendar` only. Without it, calendar
-questions compete with sms/call documents for the 20-slot candidate pool and
-miss in-window calendar documents.
+shared with `LLMPlanner`): an explicit record word (문자/통화/슬랙/노션/노트)
+selects that source. Gmail and Google Calendar were removed as sources in
+2026-10, so a schedule keyword (일정/스케줄/캘린더/약속) no longer selects a
+source; it only makes the deterministic plan decline record questions whose
+event date and message date could be confused.
 
 `--plan-sources` (requires `--window=plan`, default off) applies that set per
 query, using the same per-query anchor as the window. No LLM is called. When the
 deterministic plan declines a question (e.g. a record question that also names a
-calendar topic, such as "내일 일정에 관한 메일") or the question has no period
+schedule topic, such as "내일 약속 얘기한 문자") or the question has no period
 phrase, the query keeps today's behaviour: the window from
 `DeterministicWindow` alone and no source constraint. Enabling it adds
 `plan_sources: true` to the config hash (a separate baseline family; the key is
@@ -333,7 +333,6 @@ the matching `cmd/eval` flag.
 | `SEARCH_COLLAPSE_EXPAND_MAX` | `--collapse-expand-max=N` | `3` | 대표 뒤에 펼칠 같은 그룹 문서 수(1~20). `--collapse-contact-day` 필요. |
 | `SEARCH_WINDOW_BUCKET_DIVERSIFY` | `--window-bucket-diversify` | `false` | 하루를 넘는 시간창에서 날짜별 최상위 문서를 먼저 세운다. |
 | `SEARCH_MMR_LAMBDA` | `--mmr-lambda=λ` | `0` (off) | 리랭크 뒤 상위 30건 MMR, λ∈(0,1]. |
-| `SEARCH_SCHEDULE_INTENT_BOOST` | `--schedule-intent-boost=B` | `0` (off) | 일정 의도 질문에서 캘린더 후보 점수 ×(1+B), B∈(0,1]. 아래 "계획 인지 노브" 절 참고. |
 | `SEARCH_PLAN_SOURCE_SPILL_K` | `--plan-source-spill-k=K` | `0` (off) | 계획이 고른 소스 포함 집합 밖 상위 K건(최대 10)을 후보에 섞는다. `--plan-sources` 필요. |
 | `SEARCH_RERANK_CALL_CONTEXT` | `--rerank-call-context` | `false` | 통화 리랭커 입력에 `contact_name`을 추가한다. `best_chunk`의 문서 결과에는 본문 앞 250자도 보탠다. 청크 결과는 참여자만 추가하며 전체 1,000자 예산을 유지한다. |
 
@@ -477,8 +476,8 @@ go run ./cmd/evalcompare --baseline=/tmp/c1.jsonl --candidate=/tmp/t1.jsonl
 ```
 
 - **소스별 보조 검색** (`--source-stratify-k=K`, 실패 유형: 다른 소스 문서에 밀려
-  후보 풀에 못 든 정답, 일정 질문에서 빠진 캘린더). 질의에 소스 포함 집합이 없을 때만,
-  일정·통화·문자·메일·노트 중 질의가 제외하지 않은 소스마다 본 저장소 검색과 같은 질의
+  후보 풀에 못 든 정답). 질의에 소스 포함 집합이 없을 때만,
+  통화·문자·노트 중 질의가 제외하지 않은 소스마다 본 저장소 검색과 같은 질의
   (시간창·제외 소스·retention 제외·가중치·키워드 동일)를 소스 하나로 제한해 `Limit=K` 로
   동시에 돌린다. 본 검색과 병렬이며 요청 ctx 에서 파생한 취소 가능 ctx 를 쓴다 — 본 검색이
   실패해 일찍 반환하면 남은 보조 질의도 끊긴다. 실패한 소스는 경고 로그만 남기고 빠지고,
@@ -535,22 +534,14 @@ go run ./cmd/eval --golden --no-persist --window=plan --rerank=true --mmr-lambda
 go run ./cmd/evalcompare --baseline=/tmp/base.jsonl --candidate=/tmp/strat.jsonl
 ```
 
-### 계획 인지 노브 (`--schedule-intent-boost`, `--plan-source-spill-k`)
+### 계획 인지 노브 (`--plan-source-spill-k`)
 
-`--plan-sources` 실행의 잔여 손실 둘을 겨냥한다. 둘 다 기본 꺼짐이고, 꺼져 있으면 저장소
-호출 수·결과가 노브 도입 전과 같다.
+`--plan-sources` 실행의 잔여 손실을 겨냥한다. 기본 꺼짐이고, 꺼져 있으면 저장소
+호출 수·결과가 노브 도입 전과 같다. (일정 의도 캘린더 가산 `--schedule-intent-boost` 는
+2026-10 캘린더 소스 제거와 함께 없어졌다.)
 
-- **일정 의도 캘린더 가산** (`--schedule-intent-boost=B`, 실패 유형: 계획이 캘린더로 좁히지
-  않은 일정 질문에서 통화·메일이 관련 캘린더 문서 위를 차지). `intent.HasScheduleIntent` 가
-  일정 질문으로 판정하면 — 기록 단어(메일·문자·통화·노트·기록·대화 등)가 있으면 항상 아니고,
-  그 밖에는 일정·스케줄·캘린더·약속 또는 보수적 단서 `미팅|회의|예정|계획|뭐 해|뭐 하|언제|몇 시|가야|만나`
-  (`회의록`·`계획서` 는 단서에서 제외) — 캘린더 후보의 양수 융합 점수에 `(1+B)` 를 곱하고
-  `sortByScore` 로 재정렬한다. 소스 포함 집합이 있거나 `Sort=recent` 이면 하지 않는다. 후보를
-  더하거나 빼지 않고, 움직이는 것은 캘린더 문서가 위로 올라가는 것뿐이다. 적용 지점은 보조 검색
-  합류·그래프 가산 뒤, 보존 페널티 앞(`search.go` 의 schedule intent boost 블록). 프로필에
-  `schedule_intent_boost` 와 판정 규칙 판 `schedule_cue_version`(`intent.ScheduleCueVersion`)이 들어간다.
 - **계획 소스 넘침 검색** (`--plan-source-spill-k=K`, 실패 유형: 계획이 소스를 잘못 좁혀(문자로
-  계획, 정답은 메일) 하드 필터 때문에 정답에 도달 불가 — 운영 /ask 도 같다). `model.SearchQuery.SourceIncludeFromPlan`
+  계획, 정답은 통화) 하드 필터 때문에 정답에 도달 불가 — 운영 /ask 도 같다). `model.SearchQuery.SourceIncludeFromPlan`
   (json 비노출, 서버만 채움)이 true 인 질의 — 운영 /ask 의 `assembleRetrieval` 이 플래너의 소스를
   걸 때, eval 의 `--plan-sources` 가 비어 있지 않은 집합을 걸 때 — 에서만, 본 검색과 같은
   질의(시간창·retention·제외 소스·가중치·키워드 동일)를 포함 제한 없이 한 번 더 돌려 포함 집합
@@ -563,7 +554,7 @@ go run ./cmd/evalcompare --baseline=/tmp/base.jsonl --candidate=/tmp/strat.jsonl
 
 ```sh
 go run ./cmd/eval --golden --no-persist --window=plan --plan-sources --entity-keywords=sparse --graph-weight=1.0 \
-  --source-stratify-k=8 --window-bucket-diversify --schedule-intent-boost=0.5 --plan-source-spill-k=5 --dump=/tmp/plan-aware.jsonl
+  --source-stratify-k=8 --window-bucket-diversify --plan-source-spill-k=5 --dump=/tmp/plan-aware.jsonl
 ```
 
 ## Read-only comparisons

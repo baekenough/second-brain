@@ -1,5 +1,5 @@
 // Package classify implements the retention/segment classification pipeline
-// for SMS, Gmail, and call documents: a deterministic Gate that
+// for SMS and call documents: a deterministic Gate that
 // short-circuits obvious cases and asymmetrically bounds the Jev-based
 // Classifier's output, plus the Classifier itself (see classifier.go).
 //
@@ -61,8 +61,7 @@ var (
 	// smsAdPattern matches advertising/marketing disclosure text mandated by
 	// Korean telecom regulation. Scoped to SMS: it decides the SMS-specific
 	// "ad" segment directly (see classifier.go's segment criteria), which
-	// has no exact equivalent segment name for Gmail (there it is
-	// "newsletter", left to the Jev score/segment call) or calls.
+	// has no exact equivalent segment name for calls.
 	smsAdPattern = regexp.MustCompile(`(\(광고\)|\[광고\]|무료수신거부|무료 수신거부|수신거부|무료거부)`)
 
 	// smsWebSenderPattern flags the "[Web발신]" marker Korean carriers add to
@@ -76,24 +75,7 @@ var (
 	// senders: 15xx-18xx short-code-style numbers (e.g. "1588-1234"),
 	// 080/0800 toll-free numbers, and bare 4-digit shortcodes.
 	smsBulkNumberPattern = regexp.MustCompile(`^(1[5-8]\d{2}-?\d{4}|0800?-?\d+|\d{4})$`)
-
-	// mailBulkLocalPartPattern matches the local part (before '@') of
-	// addresses that never expect a human reply.
-	mailBulkLocalPartPattern = regexp.MustCompile(`(?i)^(noreply|no-reply|notifications?|mailer)`)
 )
-
-// mailBulkLabelIDs are Gmail category labels applied only to automated bulk
-// mail (promotions/updates/forums/social), never to 1:1 human conversation.
-var mailBulkLabelIDs = map[string]bool{
-	"CATEGORY_PROMOTIONS": true,
-	"CATEGORY_UPDATES":    true,
-	"CATEGORY_FORUMS":     true,
-	"CATEGORY_SOCIAL":     true,
-}
-
-// mailPersonalLabelID is the Gmail category label Google itself applies to
-// 1:1 personal correspondence.
-const mailPersonalLabelID = "CATEGORY_PERSONAL"
 
 // shortCallMinLength is the transcript-length threshold below which a call
 // recording is treated as content-free (too short to classify meaningfully)
@@ -125,8 +107,8 @@ func NewEvaluator(lookup SenderLookup) *Evaluator {
 	return &Evaluator{lookup: lookup, cache: make(map[string]bool)}
 }
 
-// Evaluate computes the Gate for doc. Only SourceSMS, SourceGmail, and
-// SourceCall documents produce a non-empty Gate; any other source type
+// Evaluate computes the Gate for doc. Only SourceSMS and SourceCall
+// documents produce a non-empty Gate; any other source type
 // returns the zero Gate (no signal, no decision).
 func (e *Evaluator) Evaluate(ctx context.Context, doc *model.Document) (Gate, error) {
 	if authPattern.MatchString(doc.Content) {
@@ -136,8 +118,6 @@ func (e *Evaluator) Evaluate(ctx context.Context, doc *model.Document) (Gate, er
 	switch doc.SourceType {
 	case model.SourceSMS:
 		return e.evaluateSMS(ctx, doc)
-	case model.SourceGmail:
-		return evaluateMail(doc), nil
 	case model.SourceCall:
 		return evaluateCall(doc), nil
 	default:
@@ -183,16 +163,6 @@ func (e *Evaluator) evaluateSMS(ctx context.Context, doc *model.Document) (Gate,
 	}
 	g.PersonSignal = has
 	return g, nil
-}
-
-func evaluateMail(doc *model.Document) Gate {
-	from := metaString(doc.Metadata, "from", "sender")
-	labelIDs := metaStringSlice(doc.Metadata, "label_ids")
-
-	return Gate{
-		BulkSender:   mailBulkLocalPartPattern.MatchString(localPart(from)) || anyLabelIn(labelIDs, mailBulkLabelIDs),
-		PersonSignal: containsString(labelIDs, mailPersonalLabelID),
-	}
 }
 
 // callLogSegment is the rule-only segment assigned to unrecorded calls
@@ -291,16 +261,6 @@ func normalizeNumber(s string) string {
 	return strings.TrimPrefix(s, "+82")
 }
 
-// localPart returns the portion of an email address before '@', or the
-// whole string when no '@' is present (defensive — metadata is
-// collector-provided, not schema-validated).
-func localPart(addr string) string {
-	if i := strings.IndexByte(addr, '@'); i >= 0 {
-		return addr[:i]
-	}
-	return addr
-}
-
 // metaString returns the first non-empty string value found in doc metadata
 // under any of keys, or "" if none is present or none is a string.
 func metaString(meta map[string]any, keys ...string) string {
@@ -312,45 +272,4 @@ func metaString(meta map[string]any, keys ...string) string {
 		}
 	}
 	return ""
-}
-
-// metaStringSlice reads a []string-shaped metadata value, tolerating the
-// []any shape produced by JSON-decoded metadata.
-func metaStringSlice(meta map[string]any, key string) []string {
-	v, ok := meta[key]
-	if !ok {
-		return nil
-	}
-	switch vv := v.(type) {
-	case []string:
-		return vv
-	case []any:
-		out := make([]string, 0, len(vv))
-		for _, item := range vv {
-			if s, ok := item.(string); ok {
-				out = append(out, s)
-			}
-		}
-		return out
-	default:
-		return nil
-	}
-}
-
-func containsString(list []string, target string) bool {
-	for _, s := range list {
-		if s == target {
-			return true
-		}
-	}
-	return false
-}
-
-func anyLabelIn(labels []string, set map[string]bool) bool {
-	for _, l := range labels {
-		if set[l] {
-			return true
-		}
-	}
-	return false
 }

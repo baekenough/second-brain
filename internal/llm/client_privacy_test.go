@@ -17,7 +17,7 @@ import (
 
 // Both returned errors and observability sinks must omit echoed source/token data.
 func TestProviderErrorsDoNotExposeSecrets(t *testing.T) {
-	const secret = "private-calendar-source-and-token"
+	const secret = "private-source-and-token"
 	for _, streaming := range []bool{false, true} {
 		for _, status := range []int{400, 500, 200} {
 			t.Run(fmt.Sprintf("stream=%v/status=%d", streaming, status), func(t *testing.T) {

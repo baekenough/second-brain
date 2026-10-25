@@ -250,11 +250,6 @@ type SearchTuning struct {
 	// 값은 Normalized 가 0 으로 되돌린다.
 	MMRLambda float64
 
-	// ScheduleIntentBoost 가 (0,1] 이면, 소스 포함 집합이 없고 Sort 가 recent
-	// 가 아닌 질의에서 질문에 일정 의도(intent.HasScheduleIntent)가 있을 때
-	// 캘린더 후보의 융합 점수에 (1+boost) 를 곱하고 다시 정렬한다. 순서만
-	// 바꾼다. 0(기본)이면 끈다. 범위 밖 값은 Normalized 가 0 으로 되돌린다.
-	ScheduleIntentBoost float64
 	// PlanSourceSpillK 가 0 보다 크면, 질의 계획이 고른 소스 포함 집합
 	// (SearchQuery.SourceIncludeFromPlan)이 있을 때 포함 집합 밖에서 상위 K 건을
 	// 보조 검색해 후보에 RRF 로 섞는다. 사용자가 지정한 포함 집합은 넓히지
@@ -358,9 +353,6 @@ func (t SearchTuning) Normalized() SearchTuning {
 	if t.MMRLambda <= 0 || t.MMRLambda > 1 || isBadFloat(t.MMRLambda) {
 		t.MMRLambda = 0
 	}
-	if t.ScheduleIntentBoost <= 0 || t.ScheduleIntentBoost > 1 || isBadFloat(t.ScheduleIntentBoost) {
-		t.ScheduleIntentBoost = 0
-	}
 	if t.PlanSourceSpillK < 0 {
 		t.PlanSourceSpillK = 0
 	}
@@ -407,7 +399,6 @@ func EnvSearchTuning() SearchTuning {
 		CollapseExpandMax:     envTuningInt("SEARCH_COLLAPSE_EXPAND_MAX"),
 		WindowBucketDiversify: envTuningChoice("SEARCH_WINDOW_BUCKET_DIVERSIFY", "false", "true") == "true",
 		MMRLambda:             envTuningFloat("SEARCH_MMR_LAMBDA"),
-		ScheduleIntentBoost:   envTuningFloat("SEARCH_SCHEDULE_INTENT_BOOST"),
 		PlanSourceSpillK:      envTuningInt("SEARCH_PLAN_SOURCE_SPILL_K"),
 	}
 	n := t.Normalized()
@@ -417,9 +408,6 @@ func EnvSearchTuning() SearchTuning {
 	}
 	if t.MMRLambda > 0 && n.MMRLambda == 0 {
 		slog.Warn("search tuning: SEARCH_MMR_LAMBDA out of range (0,1], ignoring")
-	}
-	if t.ScheduleIntentBoost > 0 && n.ScheduleIntentBoost == 0 {
-		slog.Warn("search tuning: SEARCH_SCHEDULE_INTENT_BOOST out of range (0,1], ignoring")
 	}
 	if t.RerankCallContext && !n.RerankCallContext {
 		slog.Warn("search tuning: SEARCH_RERANK_CALL_CONTEXT has no effect with SEARCH_RERANK_INPUT=yaml, ignoring")

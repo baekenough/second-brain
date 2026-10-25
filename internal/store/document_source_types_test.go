@@ -33,7 +33,7 @@ func multiSourceQuery() model.SearchQuery {
 		Query:       "회의 일정",
 		Limit:       20,
 		Embedding:   []float32{0.1, 0.2, 0.3},
-		SourceTypes: []model.SourceType{model.SourceGmail, model.SourceSMS},
+		SourceTypes: []model.SourceType{model.SourceUpload, model.SourceSMS},
 	}
 }
 
@@ -88,7 +88,7 @@ func TestBuildHybridSearchQuery_SourceTypes_BindsParameters(t *testing.T) {
 
 	q, args := buildHybridSearchQuery(multiSourceQuery(), entityWeights())
 
-	for _, literal := range []string{"'gmail'", "'sms'", "ANY('", "ANY(ARRAY"} {
+	for _, literal := range []string{"'upload'", "'sms'", "ANY('", "ANY(ARRAY"} {
 		if strings.Contains(q, literal) {
 			t.Errorf("statement interpolates the source list (%q):\n%s", literal, q)
 		}
@@ -111,8 +111,8 @@ func TestBuildHybridSearchQuery_SourceTypes_BindsParameters(t *testing.T) {
 	if !ok {
 		t.Fatalf("args[%d] = %T, want []model.SourceType", want-1, args[want-1])
 	}
-	if len(list) != 2 || list[0] != model.SourceGmail || list[1] != model.SourceSMS {
-		t.Errorf("bound include list = %v, want [gmail sms]", list)
+	if len(list) != 2 || list[0] != model.SourceUpload || list[1] != model.SourceSMS {
+		t.Errorf("bound include list = %v, want [upload sms]", list)
 	}
 }
 
@@ -123,7 +123,7 @@ func TestBuildHybridSearchQuery_SourceTypes_BindsParameters(t *testing.T) {
 func TestBuildHybridSearchQuery_SingularSourceType_StillFilters(t *testing.T) {
 	t.Parallel()
 
-	st := model.SourceCalendar
+	st := model.SourceNote
 	query := model.SearchQuery{Query: "일정", Limit: 20, Embedding: []float32{0.1}, SourceType: &st}
 
 	q, args := buildHybridSearchQuery(query, entityWeights())
@@ -140,8 +140,8 @@ func TestBuildHybridSearchQuery_SingularSourceType_StillFilters(t *testing.T) {
 
 	p := placeholderNum(t, findPredicate(t, bodies["fts"], "source_type = ANY($", "fts"))
 	list, ok := args[p-1].([]model.SourceType)
-	if !ok || len(list) != 1 || list[0] != model.SourceCalendar {
-		t.Errorf("bound include list = %#v, want [calendar]", args[p-1])
+	if !ok || len(list) != 1 || list[0] != model.SourceNote {
+		t.Errorf("bound include list = %#v, want [note]", args[p-1])
 	}
 }
 
@@ -169,7 +169,7 @@ func TestBuildFulltextSearchQuery_SourceTypes(t *testing.T) {
 	if !strings.Contains(q, "source_type = ANY($") {
 		t.Fatalf("fulltext statement does not apply the include filter:\n%s", q)
 	}
-	for _, literal := range []string{"'gmail'", "'sms'"} {
+	for _, literal := range []string{"'upload'", "'sms'"} {
 		if strings.Contains(q, literal) {
 			t.Errorf("fulltext statement interpolates the source list (%q):\n%s", literal, q)
 		}

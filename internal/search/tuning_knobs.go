@@ -163,15 +163,13 @@ func applyRecencyDecay(q model.SearchQuery, results []*model.SearchResult, tune 
 }
 
 // sourceLabelKO 는 리랭커 입력 머리글에 쓰는 소스 한글 라벨이다.
-// 리랭커가 받는 것은 잘린 본문뿐이라 "이게 통화인지 메일인지" 를 알 방법이
+// 리랭커가 받는 것은 잘린 본문뿐이라 "이게 통화인지 문자인지" 를 알 방법이
 // 없다. 한 줄짜리 머리글이 그 맥락을 준다. 모르는 소스는 원래 값을 그대로 쓴다.
 var sourceLabelKO = map[model.SourceType]string{
 	model.SourceCall:           "통화",
 	model.SourceCallLog:        "통화기록",
 	model.SourceCallTranscript: "통화전사",
 	model.SourceSMS:            "문자",
-	model.SourceGmail:          "메일",
-	model.SourceCalendar:       "일정",
 	model.SourceNote:           "노트",
 	model.SourceAgentNote:      "에이전트노트",
 	model.SourceInsight:        "인사이트",

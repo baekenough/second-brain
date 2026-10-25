@@ -68,7 +68,7 @@ func batchFixture() ([]*model.SearchResult, map[uuid.UUID][]store.Chunk) {
 	call.OccurredAt = &occurred
 
 	tie := tuneResult(uuidN(2), "동점 메일", "메일 앞부분", 0.9)
-	tie.SourceType = model.SourceGmail
+	tie.SourceType = model.SourceUpload
 
 	noChunks := tuneResult(uuidN(3), "청크 없는 노트", "노트 본문 그대로", 0.8)
 	noChunks.SourceType = model.SourceNote
@@ -137,7 +137,7 @@ func TestBuildRerankDocs_BatchMatchesPerDocument(t *testing.T) {
 		got := (&Service{chunkStore: batch}).buildRerankDocs(context.Background(), "예산", results, tune)
 		for i, want := range []string{
 			"[통화 · 2026-09-01 · 9월 정기 회의]\n예산 승인 건은 다음 주에 처리하기로 했습니다",
-			"[메일 · 동점 메일]\n예산 첫 번째 청크",   // 동점이면 chunk_index 가 작은 쪽
+			"[업로드 · 동점 메일]\n예산 첫 번째 청크",  // 동점이면 chunk_index 가 작은 쪽
 			"[노트 · 청크 없는 노트]\n노트 본문 그대로", // 청크 없음 → head 본문
 			"[문서 · 긴 메일]\n이미 고른 청크 본문",   // 청크 레인 결과는 그대로
 		} {

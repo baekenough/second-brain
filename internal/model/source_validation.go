@@ -1,8 +1,8 @@
 package model
 
 // KnownSourceTypes lists the source types that this corpus actually contains
-// as of 2026-09-19 (see migration 033 background): gmail, sms, call,
-// calendar, insight, note, and upload.
+// as of 2026-10 (gmail·calendar 는 수집기와 함께 제거됐다):
+// sms, call, insight, note, upload, and agent-note.
 //
 // This list is DELIBERATELY narrower than the full SourceType const block
 // above. Several of those consts (SourceSlack, SourceGitHub, SourceGDrive,
@@ -30,10 +30,8 @@ package model
 // real, ongoing write path, not a legacy or container type.
 func KnownSourceTypes() []SourceType {
 	return []SourceType{
-		SourceGmail,
 		SourceSMS,
 		SourceCall,
-		SourceCalendar,
 		SourceInsight,
 		SourceNote,
 		SourceUpload,
@@ -55,7 +53,8 @@ func IsKnownSourceType(st SourceType) bool {
 // multiple, unrelated real sources under one bucket rather than naming a
 // single origin. SourceSecretary is the motivating (and, as of migration 027,
 // historical) example: it mixed gmail/sms/call-log/call-transcript/calendar
-// content, which made source-type filtering and query-planner routing unable
+// content (gmail·calendar 는 이후 소스에서 제거됐다), which made
+// source-type filtering and query-planner routing unable
 // to distinguish them (see migrations/027_secretary_source_normalization.sql).
 //
 // No new document should ever be written with a container source_type — the

@@ -262,8 +262,6 @@ var allowedSourceTypes = map[model.SourceType]struct{}{
 	model.SourceTelegram:       {},
 	model.SourceSecretary:      {},
 	model.SourceLLMMemory:      {}, // deprecated (see model.SourceLLMMemory doc comment); kept so legacy rows remain searchable
-	model.SourceGmail:          {},
-	model.SourceCalendar:       {},
 	model.SourceSMS:            {},
 	model.SourceCall:           {},
 	model.SourceCallLog:        {}, // deprecated (see model.SourceCallLog doc comment); kept so legacy rows remain searchable
@@ -327,7 +325,7 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service, rerankDefault 
 			"Hybrid full-text and semantic search over the second-brain knowledge base. "+
 				"Returns matching documents ordered by relevance score. "+
 				"Use occurred_from/occurred_to to restrict results to an event-time window "+
-				"(e.g. \"next week's calendar\", \"messages from yesterday\"). "+
+				"(e.g. \"messages from yesterday\", \"calls last week\"). "+
 				"retention=low/disposable results are lower-confidence evidence — "+
 				"see the retention field on each result.",
 		),
@@ -342,7 +340,7 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service, rerankDefault 
 			mcp.Description(
 				"Optional source type filter. One of: slack, github, gdrive, notion, "+
 					"filesystem, discord, telegram, secretary, llm-memory (deprecated), "+
-					"gmail, calendar, sms, call, call-log (deprecated), call-transcript (deprecated), "+
+					"sms, call, call-log (deprecated), call-transcript (deprecated), "+
 					"upload, agent-note. call-log/call-transcript were unified into a single "+
 					"'call' source type (one document per phone call, recorded or not).",
 			),
@@ -378,7 +376,7 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service, rerankDefault 
 		mcp.WithBoolean("include_retention",
 			mcp.Description(
 				"When true, disables the default exclusion of retention=disposable documents "+
-					"(gmail newsletters/notifications/transactional noise tagged by the segmentation "+
+					"(SMS/call noise tagged by the segmentation "+
 					"pass). Default false — most callers want that noise filtered out.",
 			),
 		),
@@ -428,7 +426,7 @@ func registerSearchTool(s *server.MCPServer, svc *search.Service, rerankDefault 
 			st := model.SourceType(strings.TrimSpace(src))
 			if _, ok := allowedSourceTypes[st]; !ok {
 				return mcp.NewToolResultError(fmt.Sprintf(
-					"unknown source type %q; allowed: slack, github, gdrive, notion, filesystem, discord, telegram, secretary, llm-memory, gmail, calendar, sms, call, call-log (deprecated), call-transcript (deprecated), upload, agent-note",
+					"unknown source type %q; allowed: slack, github, gdrive, notion, filesystem, discord, telegram, secretary, llm-memory, sms, call, call-log (deprecated), call-transcript (deprecated), upload, agent-note",
 					src,
 				)), nil
 			}
@@ -563,8 +561,8 @@ type documentResult struct {
 	Content    string         `json:"content"`
 	Metadata   map[string]any `json:"metadata"`
 	Status     string         `json:"status"`
-	// OccurredAt is the original event time (email sent date, calendar start,
-	// SMS/call time, etc.). Empty string when not available.
+	// OccurredAt is the original event time (SMS/call time, note date,
+	// etc.). Empty string when not available.
 	OccurredAt  string `json:"occurred_at,omitempty"`
 	CollectedAt string `json:"collected_at"`
 }

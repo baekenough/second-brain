@@ -602,7 +602,7 @@ func TestComputeMetrics_CitationWithinSupportGatesPass(t *testing.T) {
 		ID: "scratch", Category: "single_turn", AsOf: "2026-06-10T09:00:00+09:00",
 		Corpus: []CorpusDoc{
 			{Alias: "call-1", SourceType: "call", Title: "t1", Content: "content1"},
-			{Alias: "mail-other", SourceType: "gmail", Title: "t2", Content: "content2"},
+			{Alias: "sms-other", SourceType: "sms", Title: "t2", Content: "content2"},
 		},
 		Question: "q?",
 		Gold: Gold{
@@ -624,9 +624,9 @@ func TestComputeMetrics_CitationWithinSupportGatesPass(t *testing.T) {
 	if !ok {
 		t.Fatal("resolveAlias(call-1) failed")
 	}
-	nonSupportID, ok := cp.resolveAlias("mail-other")
+	nonSupportID, ok := cp.resolveAlias("sms-other")
 	if !ok {
-		t.Fatal("resolveAlias(mail-other) failed")
+		t.Fatal("resolveAlias(sms-other) failed")
 	}
 	baseRes := CaseResult{
 		RawAnswer:    "5천만원",

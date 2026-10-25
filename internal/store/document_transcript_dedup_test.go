@@ -99,7 +99,6 @@ func TestUpsertDedupGuard_SourceTypeScope(t *testing.T) {
 	guardType := model.SourceCall
 	unaffectedTypes := []model.SourceType{
 		model.SourceSlack,
-		model.SourceGmail,
 		model.SourceSMS,
 		model.SourceFilesystem,
 		model.SourceUpload,
@@ -213,9 +212,7 @@ func TestCallDedupGuard_NonCallSourceType(t *testing.T) {
 	t.Parallel()
 
 	otherTypes := []model.SourceType{
-		model.SourceGmail,
 		model.SourceSMS,
-		model.SourceCalendar,
 		model.SourceFilesystem,
 		model.SourceSlack,
 		model.SourceGitHub,

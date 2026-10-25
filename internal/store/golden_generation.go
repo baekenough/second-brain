@@ -41,7 +41,7 @@ func (s *GoldenStore) beginGeneration(ctx context.Context) (pgx.Tx, error) {
 }
 
 const goldenGenerationEligibility = `d.status = 'active'
-    AND d.source_type IN ('gmail', 'sms', 'call', 'calendar', 'note')
+    AND d.source_type IN ('sms', 'call', 'note')
     AND d.occurred_at >= now() - interval '14 days' AND d.occurred_at <= now()
     AND d.metadata->>'retention' = 'keep'
     AND (d.source_type <> 'call' OR d.metadata->>'transcription' = 'done')
@@ -49,7 +49,7 @@ const goldenGenerationEligibility = `d.status = 'active'
     AND NOT EXISTS (SELECT 1 FROM golden_queries q WHERE q.source_document_id = d.id)`
 
 // CandidateGenerationDocuments interleaves random eligible samples per source.
-// This balances high-volume mail against other sources and lets a later explicit
+// This balances high-volume sources against others and lets a later explicit
 // request move beyond documents whose generated questions were all duplicates.
 func (s *GoldenStore) CandidateGenerationDocuments(ctx context.Context, limit int) ([]GoldenGenerationDocument, error) {
 	if limit <= 0 {

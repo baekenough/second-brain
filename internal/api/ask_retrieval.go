@@ -188,7 +188,7 @@ func assembleRetrieval(ctx context.Context, searcher documentSearcher, params in
 //     does not get to re-open it.
 //   - 인사이트검색 is a FIXED lane: insight only, ignoring the caller's include
 //     and exclude sets. Inheriting either would let a plan that names, say,
-//     gmail turn the inference lane into a second gmail search, or let the
+//     sms turn the inference lane into a second sms search, or let the
 //     injected exclusion empty it.
 //
 // The case that must not be silent is an include set of exactly [insight].

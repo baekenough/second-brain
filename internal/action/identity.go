@@ -68,10 +68,6 @@ func BuildIdentityKey(threadKey, kind, counterpart, summary string) string {
 	return fmt.Sprintf("action:%x", h[:8])
 }
 
-// ThreadKeyGmail returns the thread_key for a gmail document (spec §7.1
-// table).
-func ThreadKeyGmail(threadID string) string { return "gmail:" + threadID }
-
 // ThreadKeySMS returns the thread_key for an sms document. contactName may
 // be empty — callers must fall back to HashPhoneNumber (spec §7.1:
 // "contact_name이 null이면... 전화번호 해시를 스레드 키로").
@@ -89,23 +85,6 @@ func HashPhoneNumber(number string) string {
 	return fmt.Sprintf("%x", h[:8])
 }
 
-// IsUserAddress reports whether candidate matches one of addresses
-// (case-insensitive, trimmed). addresses is config.UserEmailAddresses
-// (Task 7's new USER_EMAIL_ADDRESSES env var) — a list, not a single value,
-// to accommodate aliases on the same Gmail account.
-func IsUserAddress(addresses []string, candidate string) bool {
-	c := strings.ToLower(strings.TrimSpace(candidate))
-	if c == "" {
-		return false
-	}
-	for _, a := range addresses {
-		if strings.ToLower(strings.TrimSpace(a)) == c {
-			return true
-		}
-	}
-	return false
-}
-
 // CounterpartIdentity derives the thread-scoped counterpart identity string
 // used for kind == awaiting_my_reply, from doc.Metadata directly (NOT from
 // an LLM-named entity). This is deliberate: for awaiting_my_reply, BOTH the
@@ -117,17 +96,10 @@ func IsUserAddress(addresses []string, candidate string) bool {
 // kinds (LLM-only, no convergence requirement), callers use the LLM-named
 // entity's normalized_name instead; this function is not used there.
 //
-// Returns ok=false when doc's source type is not gmail/sms/call-log/
-// call-transcript, or (gmail only) when "from" is the user's own address —
-// a message the user themself sent cannot be "awaiting my reply".
-func CounterpartIdentity(doc *model.Document, isUserAddress func(string) bool) (identity string, ok bool) {
+// Returns ok=false when doc's source type is not sms/call/call-log/
+// call-transcript.
+func CounterpartIdentity(doc *model.Document) (identity string, ok bool) {
 	switch doc.SourceType {
-	case model.SourceGmail:
-		from, _ := doc.Metadata["from"].(string)
-		if from == "" || isUserAddress(from) {
-			return "", false
-		}
-		return from, true
 	case model.SourceSMS, model.SourceCall, model.SourceCallLog, model.SourceCallTranscript:
 		if cn, ok := doc.Metadata["contact_name"].(string); ok && cn != "" {
 			return cn, true

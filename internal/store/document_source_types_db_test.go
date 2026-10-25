@@ -72,14 +72,14 @@ func TestDB_FulltextSearch_MultiSourceInclude(t *testing.T) {
 	pg := srcTestDB(t)
 	store := NewDocumentStore(pg)
 
-	gmailID := seedSrcDoc(t, pg, model.SourceGmail, nil)
+	uploadID := seedSrcDoc(t, pg, model.SourceUpload, nil)
 	smsID := seedSrcDoc(t, pg, model.SourceSMS, nil)
 	slackID := seedSrcDoc(t, pg, model.SourceSlack, nil)
 
 	got, err := store.Search(context.Background(), model.SearchQuery{
 		Query:       "zzdummy",
 		Limit:       50,
-		SourceTypes: []model.SourceType{model.SourceGmail, model.SourceSMS},
+		SourceTypes: []model.SourceType{model.SourceUpload, model.SourceSMS},
 	})
 	if err != nil {
 		t.Fatalf("fulltext Search with a multi-source include filter failed: %v", err)
@@ -89,8 +89,8 @@ func TestDB_FulltextSearch_MultiSourceInclude(t *testing.T) {
 	for _, r := range got {
 		seen[r.ID] = true
 	}
-	if !seen[gmailID] || !seen[smsID] {
-		t.Errorf("include set [gmail sms] did not return both seeded documents: %v", seen)
+	if !seen[uploadID] || !seen[smsID] {
+		t.Errorf("include set [upload sms] did not return both seeded documents: %v", seen)
 	}
 	if seen[slackID] {
 		t.Errorf("document %s (slack) survived an include set that does not contain slack", slackID)
@@ -103,14 +103,14 @@ func TestDB_HybridSearch_MultiSourceInclude(t *testing.T) {
 	pg := srcTestDB(t)
 	store := NewDocumentStore(pg)
 
-	gmailID := seedSrcDoc(t, pg, model.SourceGmail, nil)
+	uploadID := seedSrcDoc(t, pg, model.SourceUpload, nil)
 	slackID := seedSrcDoc(t, pg, model.SourceSlack, nil)
 
 	got, err := store.Search(context.Background(), model.SearchQuery{
 		Query:       "zzdummy",
 		Limit:       50,
 		Embedding:   testEmbedding(),
-		SourceTypes: []model.SourceType{model.SourceGmail},
+		SourceTypes: []model.SourceType{model.SourceUpload},
 	})
 	if err != nil {
 		t.Fatalf("hybrid Search with a multi-source include filter failed: %v", err)
@@ -120,11 +120,11 @@ func TestDB_HybridSearch_MultiSourceInclude(t *testing.T) {
 	for _, r := range got {
 		seen[r.ID] = true
 	}
-	if !seen[gmailID] {
-		t.Errorf("include set [gmail] did not return the seeded gmail document")
+	if !seen[uploadID] {
+		t.Errorf("include set [upload] did not return the seeded upload document")
 	}
 	if seen[slackID] {
-		t.Errorf("document %s (slack) survived an include set of [gmail]", slackID)
+		t.Errorf("document %s (slack) survived an include set of [upload]", slackID)
 	}
 }
 
@@ -134,10 +134,10 @@ func TestDB_SingularSourceType_StillFilters(t *testing.T) {
 	pg := srcTestDB(t)
 	store := NewDocumentStore(pg)
 
-	calID := seedSrcDoc(t, pg, model.SourceCalendar, nil)
+	noteID := seedSrcDoc(t, pg, model.SourceNote, nil)
 	smsID := seedSrcDoc(t, pg, model.SourceSMS, nil)
 
-	src := model.SourceCalendar
+	src := model.SourceNote
 	got, err := store.Search(context.Background(), model.SearchQuery{
 		Query:      "zzdummy",
 		Limit:      50,
@@ -151,8 +151,8 @@ func TestDB_SingularSourceType_StillFilters(t *testing.T) {
 	for _, r := range got {
 		seen[r.ID] = true
 	}
-	if !seen[calID] || seen[smsID] {
-		t.Errorf("singular include filter [calendar] returned %v, want only %s", seen, calID)
+	if !seen[noteID] || seen[smsID] {
+		t.Errorf("singular include filter [note] returned %v, want only %s", seen, noteID)
 	}
 }
 

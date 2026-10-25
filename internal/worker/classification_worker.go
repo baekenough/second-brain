@@ -13,7 +13,7 @@ import (
 // ClassificationDocumentStore is the document-store dependency of
 // ClassificationWorker. *store.DocumentStore satisfies it.
 type ClassificationDocumentStore interface {
-	// ListUnclassified returns up to limit active documents (sms/gmail/call)
+	// ListUnclassified returns up to limit active documents (sms/call)
 	// that have never been tagged with retention.
 	ListUnclassified(ctx context.Context, limit int, backfillDays int) ([]*model.Document, error)
 	// ListLegacyForRecheck returns up to limit already retention-tagged
@@ -88,7 +88,7 @@ type classificationTickStats struct {
 	inputTokens int
 }
 
-// ClassificationWorker is a background worker that tags SMS/Gmail/call
+// ClassificationWorker is a background worker that tags SMS/call
 // documents with a segment/retention classification (rule-based where
 // possible, Jev-based otherwise), and separately re-audits legacy
 // (pre-worker) tags against the deterministic Gate.

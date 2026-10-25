@@ -56,7 +56,7 @@ func TestHybridGraphLane_HubDamping(t *testing.T) {
 		Query:              "Alice 와 ACME 계약",
 		Limit:              10,
 		Embedding:          []float32{0.1, 0.2},
-		SourceTypes:        []model.SourceType{model.SourceCalendar, model.SourceCall},
+		SourceTypes:        []model.SourceType{model.SourceNote, model.SourceCall},
 		ExcludeSourceTypes: []model.SourceType{model.SourceInsight},
 		ExcludeRetention:   []string{model.RetentionDisposable},
 		OccurredFrom:       &from,
@@ -181,7 +181,7 @@ func TestGraphSupportQuery_FiltersAndBounds(t *testing.T) {
 	from := time.Date(2026, 8, 17, 0, 0, 0, 0, time.UTC)
 	to := from.Add(24 * time.Hour)
 	full := model.SearchQuery{
-		SourceTypes:        []model.SourceType{model.SourceCalendar},
+		SourceTypes:        []model.SourceType{model.SourceNote},
 		ExcludeSourceTypes: []model.SourceType{model.SourceInsight},
 		ExcludeRetention:   []string{model.RetentionDisposable},
 		OccurredFrom:       &from,

@@ -440,10 +440,10 @@ func TestRerankHeader(t *testing.T) {
 			name: "사건 시각이 없으면 날짜를 생략한다",
 			in: func() *model.SearchResult {
 				r := tuneResult(uuidN(1), "제목", "", 0)
-				r.SourceType = model.SourceGmail
+				r.SourceType = model.SourceUpload
 				return r
 			}(),
-			want: "[메일 · 제목]",
+			want: "[업로드 · 제목]",
 		},
 		{
 			name: "모르는 소스는 원래 값을 쓴다",

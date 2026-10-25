@@ -9,12 +9,12 @@ import (
 
 func TestBuildSparseText(t *testing.T) {
 	doc := model.Document{
-		SourceType: model.SourceGmail,
+		SourceType: model.SourceSMS,
 		Title:      "9월 정산 견적서 회신",
 		OccurredAt: kstTime(t, "2026-09-21T01:30:00Z"), // KST 10:30
 		Metadata: map[string]any{
-			"from": `"홍길동" <hong@example.com>`,
-			"to":   "baek@example.com",
+			"contact_name": "홍길동",
+			"direction":    "수신",
 		},
 	}
 
@@ -26,12 +26,12 @@ func TestBuildSparseText(t *testing.T) {
 		{
 			name:   "RecipeTP: 날짜·소스 라벨 없이 제목+참여자만",
 			recipe: RecipeTP,
-			want:   "제목: 9월 정산 견적서 회신 · 보낸사람: 홍길동 <hong@example.com> · 받는사람: baek@example.com\n\n청크 본문",
+			want:   "제목: 9월 정산 견적서 회신 · 상대: 홍길동 · 방향: 수신\n\n청크 본문",
 		},
 		{
 			name:   "RecipeFull: BuildChunkContextHeader 와 동일",
 			recipe: RecipeFull,
-			want:   "[메일] 2026-09-21(월) · 제목: 9월 정산 견적서 회신 · 보낸사람: 홍길동 <hong@example.com> · 받는사람: baek@example.com\n\n청크 본문",
+			want:   "[문자] 2026-09-21(월) · 제목: 9월 정산 견적서 회신 · 상대: 홍길동 · 방향: 수신\n\n청크 본문",
 		},
 	}
 

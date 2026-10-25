@@ -16,7 +16,7 @@ func (d traceDocSearcher) Search(_ context.Context, _ model.SearchQuery) ([]*mod
 	out := make([]*model.SearchResult, 0, len(d.ids))
 	for i, id := range d.ids {
 		out = append(out, &model.SearchResult{
-			Document: model.Document{ID: id, SourceType: model.SourceGmail},
+			Document: model.Document{ID: id, SourceType: model.SourceUpload},
 			Score:    float64(len(d.ids) - i),
 		})
 	}

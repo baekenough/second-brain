@@ -86,7 +86,7 @@ func TestSearch_Windowed_ChunkVectorLane_RunsAndIsVerified(t *testing.T) {
 	unknownTime := uuid.New() // occurred_at IS NULL
 
 	docs := &recordingDocSearcher{results: []*model.SearchResult{
-		makeSearchResult(storeDoc, "in-window calendar entry", 0.5),
+		makeSearchResult(storeDoc, "in-window call entry", 0.5),
 	}}
 	chunks := &mockChunkSearcher{vectorResults: []store.ChunkSearchResult{
 		chunkResult(inWindow, model.SourceSMS, 0.99),

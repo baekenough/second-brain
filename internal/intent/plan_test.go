@@ -60,12 +60,12 @@ type planGoldenCase struct {
 // planGolden is spec §8's 14-row table, verbatim. The questions use only the
 // synthetic identifiers the spec itself fixes (홍길동, 010-0000-0000).
 var planGolden = []planGoldenCase{
-	{1, "오늘 일정 알려줘", "2026-08-19", "2026-08-20", []model.SourceType{model.SourceCalendar}, true},
+	{1, "오늘 일정 알려줘", "2026-08-19", "2026-08-20", nil, true},
 	{2, "어제 뭐 했지", "2026-08-18", "2026-08-19", nil, true},
-	{3, "내일 일정 알려줘", "2026-08-20", "2026-08-21", []model.SourceType{model.SourceCalendar}, true},
-	{4, "모레 회의 있나", "2026-08-21", "2026-08-22", []model.SourceType{model.SourceCalendar}, true},
-	{5, "이번 주말에 뭐 하지", "2026-08-22", "2026-08-24", []model.SourceType{model.SourceCalendar}, true},
-	{6, "다음 주 일정 정리해줘", "2026-08-24", "2026-08-31", []model.SourceType{model.SourceCalendar}, true},
+	{3, "내일 일정 알려줘", "2026-08-20", "2026-08-21", nil, true},
+	{4, "모레 회의 있나", "2026-08-21", "2026-08-22", nil, true},
+	{5, "이번 주말에 뭐 하지", "2026-08-22", "2026-08-24", nil, true},
+	{6, "다음 주 일정 정리해줘", "2026-08-24", "2026-08-31", nil, true},
 	{7, "이번 주 요약해줘", "2026-08-17", "2026-08-24", nil, true},
 	{8, "지난달에 뭐 있었어", "2026-07-01", "2026-08-01", nil, true},
 	{9, "2026년 6월 요약", "2026-06-01", "2026-07-01", nil, true},
@@ -79,7 +79,7 @@ var planGolden = []planGoldenCase{
 	// model.SourceCall value the LLM is now actually asked to choose from.
 	{11, "홍길동이랑 통화한 내용", "", "", []model.SourceType{model.SourceCall}, false},
 	{12, "프로젝트 진행 상황 어때", "", "", nil, false},
-	{13, "최근에 받은 메일 정리", "", "", []model.SourceType{model.SourceGmail}, false},
+	{13, "최근에 받은 문자 정리", "", "", []model.SourceType{model.SourceSMS}, false},
 	{14, "010-0000-0000 누구야", "", "", nil, false},
 }
 
@@ -326,7 +326,7 @@ func TestPlanner_LLMPrompt_CarriesKSTNow(t *testing.T) {
 	if strings.Contains(oracle.lastSystem, "2026-08-19") {
 		t.Errorf("system prompt states the UTC date 2026-08-19, which is not today in KST; got:\n%s", oracle.lastSystem)
 	}
-	if !strings.Contains(oracle.lastSystem, "calendar") || !strings.Contains(oracle.lastSystem, "call") {
+	if !strings.Contains(oracle.lastSystem, "sms") || !strings.Contains(oracle.lastSystem, "call") {
 		t.Errorf("system prompt does not enumerate the allowed source types; got:\n%s", oracle.lastSystem)
 	}
 }
@@ -463,8 +463,8 @@ func TestPlanner_NeverPlansInsightOnly(t *testing.T) {
 		},
 		{
 			name:        "insight is stripped from a mixed set",
-			answer:      `{"source_types":["insight","gmail"],"reason":"추론+메일"}`,
-			wantSources: []model.SourceType{model.SourceGmail},
+			answer:      `{"source_types":["insight","sms"],"reason":"추론+문자"}`,
+			wantSources: []model.SourceType{model.SourceSMS},
 		},
 	}
 
@@ -593,8 +593,8 @@ func TestPlanner_FutureWindowsAreNotClamped(t *testing.T) {
 func TestPlanner_NoTimePhrase_NoSilentWindow(t *testing.T) {
 	t.Parallel()
 
-	fake := &fakeCompleter{response: `{"occurred_from":"","occurred_to":"","source_types":["gmail"],"reason":"메일 전체"}`}
-	got := newPlanner(t, fake, planNowUTC).Plan(context.Background(), "최근에 받은 메일 정리")
+	fake := &fakeCompleter{response: `{"occurred_from":"","occurred_to":"","source_types":["sms"],"reason":"문자 전체"}`}
+	got := newPlanner(t, fake, planNowUTC).Plan(context.Background(), "최근에 받은 문자 정리")
 	if got.OccurredFrom != nil || got.OccurredTo != nil {
 		t.Errorf("window = [%v, %v), want none", got.OccurredFrom, got.OccurredTo)
 	}

@@ -56,10 +56,9 @@ func NewPgStructuralSignalLister(pool *pgxpool.Pool) *PgStructuralSignalLister {
 	return &PgStructuralSignalLister{pool: pool}
 }
 
-// listLatestPerThreadQuery groups gmail/sms/call documents into threads and
+// listLatestPerThreadQuery groups sms/call documents into threads and
 // returns only the single most recent document per thread (spec §7.1: "각
-// 스레드에서 occurred_at 최대인 문서"). gmail threads are grouped by
-// metadata->>'thread_id'; sms by metadata->>'contact_name'; call is grouped
+// 스레드에서 occurred_at 최대인 문서"). sms is grouped by metadata->>'contact_name'; call is grouped
 // by metadata->>'contact_name' under the same "call:" thread_key prefix
 // (spec §7.1 table). Pre-migration-033, this was call-log AND
 // call-transcript grouped TOGETHER (both mapped to "call:" since they were
@@ -76,7 +75,6 @@ const listLatestPerThreadQuery = `
 		       row_number() OVER (
 		           PARTITION BY
 		               CASE
-		                   WHEN source_type = 'gmail' THEN 'gmail:' || (metadata->>'thread_id')
 		                   WHEN source_type = 'sms'   THEN 'sms:'   || COALESCE(metadata->>'contact_name', '')
 		                   ELSE 'call:' || COALESCE(metadata->>'contact_name', '')
 		               END
@@ -84,7 +82,7 @@ const listLatestPerThreadQuery = `
 		       ) AS rn
 		FROM documents
 		WHERE status = 'active'
-		  AND source_type IN ('gmail', 'sms', 'call', 'call-log', 'call-transcript')
+		  AND source_type IN ('sms', 'call', 'call-log', 'call-transcript')
 		  AND occurred_at >= now() - interval '30 days'
 		  AND (source_type <> 'sms' OR COALESCE((metadata->>'is_auth_like')::boolean, false) = false)
 	)
@@ -127,7 +125,7 @@ type StructuralSignalWorkerConfig struct {
 	// Actions is the write side of the actions table (reused from Task 11).
 	Actions ActionWriter
 	// UserAddresses is config.UserEmailAddresses. Unused now that Tick no
-	// longer infers gmail direction, but kept so cmd/collector/main.go's
+	// longer infers direction, but kept so cmd/collector/main.go's
 	// existing wiring does not need to change.
 	UserAddresses []string
 	// Interval controls how often the worker polls. Defaults to 10 minutes.

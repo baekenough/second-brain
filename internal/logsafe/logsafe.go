@@ -299,16 +299,10 @@ var (
 	// discord 자릿수 하한 17: 전화번호는 국가번호를 포함해도 최대 15자리다
 	// (ITU-T E.164). snowflake 는 (2015-01-01 이후 ms) << 22 라서 2015년 2월 이후
 	// 만든 ID 는 모두 17자리 이상이다 — 두 모양이 겹치지 않는다.
-	// gmail 은 isSafeGmailID 가 따로 본다(글자 조건 때문에 정규식 하나로 못 쓴다).
 	reSafeSourceIDs = []*regexp.Regexp{
 		regexp.MustCompile(`^discord:\d{17,20}(:\d{17,20}){2,3}(:att:\d{17,20})?$`),
 		regexp.MustCompile(`^insight:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\d{1,6}$`),
 	}
-
-	// reGmailID 는 Gmail 메시지 ID(소문자 hex) 모양이다. 숫자만으로 된 값은
-	// 국가번호를 붙인 전화번호(예: 821012345678)와 구분할 수 없으므로
-	// isSafeGmailID 가 a-f 글자를 하나 이상 요구한다.
-	reGmailID = regexp.MustCompile(`^gmail:[0-9a-f]{12,32}$`)
 
 	// sms:{dateMs}:{번호 해시}:{방향}, call-log:{dateMs}:{번호 해시}:{통화시간 해시},
 	// call-log:voice-memo:{파일명 해시}. 번호 해시는 키 없는 SHA-256 이라 되돌릴
@@ -325,7 +319,7 @@ var (
 // SafeSourceID 는 source_id 를 로그에 남길 수 있는 모양으로 바꾼다.
 //
 //   - 빈 값은 "".
-//   - 모양을 확인한 것(gmail·discord·insight·UUID)은 그대로.
+//   - 모양을 확인한 것(discord·insight·UUID)은 그대로.
 //   - sms·call-log 는 "{접두사}:{시각}:ref={FileRef(나머지)}".
 //   - "transcript:{relPath}" 를 포함한 그 밖의 "{접두사}:{나머지}" 는
 //     "{접두사}:ref={FileRef(나머지)}". transcript 의 ref 는 whisper 로그의
@@ -340,9 +334,6 @@ func SafeSourceID(id string) string {
 	if reUUID.MatchString(id) {
 		return id
 	}
-	if isSafeGmailID(id) {
-		return id
-	}
 	for _, re := range reSafeSourceIDs {
 		if re.MatchString(id) {
 			return id
@@ -355,12 +346,6 @@ func SafeSourceID(id string) string {
 		return m[1] + ":ref=" + FileRef(m[2])
 	}
 	return "ref=" + FileRef(id)
-}
-
-// isSafeGmailID 는 id 가 Gmail 메시지 ID 모양이고 a-f 글자를 하나 이상
-// 담았는지 본다.
-func isSafeGmailID(id string) bool {
-	return reGmailID.MatchString(id) && strings.ContainsAny(id[len("gmail:"):], "abcdef")
 }
 
 // dateMs 로 인정하는 범위: 2000-01-01T00:00:00Z ~ 2100-01-01T00:00:00Z (ms).

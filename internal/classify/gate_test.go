@@ -27,10 +27,6 @@ func smsDoc(content string, meta map[string]any) *model.Document {
 	return &model.Document{SourceType: model.SourceSMS, Content: content, Metadata: meta}
 }
 
-func mailDoc(content string, meta map[string]any) *model.Document {
-	return &model.Document{SourceType: model.SourceGmail, Content: content, Metadata: meta}
-}
-
 func callDoc(content string, meta map[string]any) *model.Document {
 	return &model.Document{SourceType: model.SourceCall, Content: content, Metadata: meta}
 }
@@ -49,7 +45,6 @@ func TestEvaluate_UniversalAuthRule(t *testing.T) {
 		doc  *model.Document
 	}{
 		{"sms", smsDoc("[Web발신] 인증번호는 1234입니다", map[string]any{"sender": "010-1234-5678", "contact_name": "친구"})},
-		{"mail", mailDoc("본인확인을 위해 아래 코드를 입력하세요", nil)},
 		{"call", callDocDone("네 본인확인 절차를 위해 인증번호를 불러드리겠습니다 이상입니다 감사합니다 좋은 하루 되세요 안녕히계세요")},
 	}
 	e := NewEvaluator(nil)
@@ -198,64 +193,6 @@ func TestEvaluate_SMS_SenderLookupError_Propagates(t *testing.T) {
 	_, err := e.Evaluate(context.Background(), smsDoc("저녁에 시간 되나요", map[string]any{"sender": "010-1111-2222"}))
 	if err == nil {
 		t.Fatal("Evaluate() error = nil, want propagated SenderLookup error")
-	}
-}
-
-func TestEvaluate_Mail_BulkSender_NoreplyLocalPart(t *testing.T) {
-	e := NewEvaluator(nil)
-	g, err := e.Evaluate(context.Background(), mailDoc("결제가 완료되었습니다", map[string]any{"from": "noreply@shop.example.com"}))
-	if err != nil {
-		t.Fatalf("Evaluate() error = %v", err)
-	}
-	if !g.BulkSender {
-		t.Error("BulkSender = false, want true for a noreply@ sender")
-	}
-}
-
-func TestEvaluate_Mail_BulkSender_CategoryLabels(t *testing.T) {
-	cases := []string{"CATEGORY_PROMOTIONS", "CATEGORY_UPDATES", "CATEGORY_FORUMS", "CATEGORY_SOCIAL"}
-	e := NewEvaluator(nil)
-	for _, label := range cases {
-		t.Run(label, func(t *testing.T) {
-			g, err := e.Evaluate(context.Background(), mailDoc("본문", map[string]any{
-				"from":      "person@example.com",
-				"label_ids": []any{label},
-			}))
-			if err != nil {
-				t.Fatalf("Evaluate() error = %v", err)
-			}
-			if !g.BulkSender {
-				t.Errorf("BulkSender = false, want true for label %q", label)
-			}
-		})
-	}
-}
-
-func TestEvaluate_Mail_PersonSignal_CategoryPersonal(t *testing.T) {
-	e := NewEvaluator(nil)
-	g, err := e.Evaluate(context.Background(), mailDoc("본문", map[string]any{
-		"from":      "friend@example.com",
-		"label_ids": []any{"CATEGORY_PERSONAL"},
-	}))
-	if err != nil {
-		t.Fatalf("Evaluate() error = %v", err)
-	}
-	if !g.PersonSignal {
-		t.Error("PersonSignal = false, want true for CATEGORY_PERSONAL label")
-	}
-	if g.BulkSender {
-		t.Error("BulkSender = true, want false — CATEGORY_PERSONAL is not a bulk label")
-	}
-}
-
-func TestEvaluate_Mail_NoSignals(t *testing.T) {
-	e := NewEvaluator(nil)
-	g, err := e.Evaluate(context.Background(), mailDoc("본문", map[string]any{"from": "colleague@example.com"}))
-	if err != nil {
-		t.Fatalf("Evaluate() error = %v", err)
-	}
-	if g.BulkSender || g.PersonSignal || g.Decided != nil {
-		t.Errorf("Gate = %+v, want zero-value gate for a plain 1:1 sender with no labels", g)
 	}
 }
 

@@ -29,23 +29,23 @@ func TestIncludeSourceTypes_Empty(t *testing.T) {
 func TestIncludeSourceTypes_SingularOnly(t *testing.T) {
 	t.Parallel()
 
-	st := SourceCalendar
+	st := SourceNote
 	q := SearchQuery{Query: "q", SourceType: &st}
 
 	got := q.IncludeSourceTypes()
-	if len(got) != 1 || got[0] != SourceCalendar {
-		t.Errorf("IncludeSourceTypes() = %v, want [calendar]", got)
+	if len(got) != 1 || got[0] != SourceNote {
+		t.Errorf("IncludeSourceTypes() = %v, want [note]", got)
 	}
 }
 
 func TestIncludeSourceTypes_PluralOnly(t *testing.T) {
 	t.Parallel()
 
-	q := SearchQuery{Query: "q", SourceTypes: []SourceType{SourceGmail, SourceSMS}}
+	q := SearchQuery{Query: "q", SourceTypes: []SourceType{SourceUpload, SourceSMS}}
 
 	got := q.IncludeSourceTypes()
-	if len(got) != 2 || got[0] != SourceGmail || got[1] != SourceSMS {
-		t.Errorf("IncludeSourceTypes() = %v, want [gmail sms] in order", got)
+	if len(got) != 2 || got[0] != SourceUpload || got[1] != SourceSMS {
+		t.Errorf("IncludeSourceTypes() = %v, want [upload sms] in order", got)
 	}
 }
 
@@ -61,8 +61,8 @@ func TestIncludeSourceTypes_PluralOnly(t *testing.T) {
 func TestIncludeSourceTypes_BothAreUnioned(t *testing.T) {
 	t.Parallel()
 
-	st := SourceCalendar
-	q := SearchQuery{Query: "q", SourceType: &st, SourceTypes: []SourceType{SourceGmail}}
+	st := SourceNote
+	q := SearchQuery{Query: "q", SourceType: &st, SourceTypes: []SourceType{SourceUpload}}
 
 	got := q.IncludeSourceTypes()
 	if len(got) != 2 {
@@ -72,8 +72,8 @@ func TestIncludeSourceTypes_BothAreUnioned(t *testing.T) {
 	for _, s := range got {
 		seen[s] = true
 	}
-	if !seen[SourceCalendar] || !seen[SourceGmail] {
-		t.Errorf("IncludeSourceTypes() = %v, want the union {calendar, gmail}", got)
+	if !seen[SourceNote] || !seen[SourceUpload] {
+		t.Errorf("IncludeSourceTypes() = %v, want the union {note, upload}", got)
 	}
 }
 
@@ -83,11 +83,11 @@ func TestIncludeSourceTypes_BothAreUnioned(t *testing.T) {
 func TestIncludeSourceTypes_Deduplicates(t *testing.T) {
 	t.Parallel()
 
-	st := SourceGmail
+	st := SourceUpload
 	q := SearchQuery{
 		Query:       "q",
 		SourceType:  &st,
-		SourceTypes: []SourceType{SourceGmail, SourceSMS, SourceGmail},
+		SourceTypes: []SourceType{SourceUpload, SourceSMS, SourceUpload},
 	}
 
 	got := q.IncludeSourceTypes()
@@ -124,7 +124,7 @@ func TestIncludeSourceTypes_NormalizesLegacyCallAlias_Singular(t *testing.T) {
 func TestIncludeSourceTypes_NormalizesLegacyCallAlias_Plural(t *testing.T) {
 	t.Parallel()
 
-	q := SearchQuery{Query: "q", SourceTypes: []SourceType{SourceCallTranscript, SourceGmail}}
+	q := SearchQuery{Query: "q", SourceTypes: []SourceType{SourceCallTranscript, SourceUpload}}
 
 	got := q.IncludeSourceTypes()
 	if len(got) != 2 {
@@ -134,8 +134,8 @@ func TestIncludeSourceTypes_NormalizesLegacyCallAlias_Plural(t *testing.T) {
 	for _, s := range got {
 		seen[s] = true
 	}
-	if !seen[SourceCall] || !seen[SourceGmail] {
-		t.Errorf("IncludeSourceTypes() = %v, want {call, gmail} (call-transcript normalized to call)", got)
+	if !seen[SourceCall] || !seen[SourceUpload] {
+		t.Errorf("IncludeSourceTypes() = %v, want {call, upload} (call-transcript normalized to call)", got)
 	}
 	if seen[SourceCallTranscript] {
 		t.Errorf("IncludeSourceTypes() = %v, still contains the un-normalized alias call-transcript", got)
@@ -164,7 +164,7 @@ func TestIncludeSourceTypes_NormalizedAliasesDeduplicate(t *testing.T) {
 func TestIncludeSourceTypes_DoesNotAliasCallerSlice(t *testing.T) {
 	t.Parallel()
 
-	orig := []SourceType{SourceGmail, SourceSMS}
+	orig := []SourceType{SourceUpload, SourceSMS}
 	q := SearchQuery{Query: "q", SourceTypes: orig}
 
 	got := q.IncludeSourceTypes()
@@ -172,7 +172,7 @@ func TestIncludeSourceTypes_DoesNotAliasCallerSlice(t *testing.T) {
 		t.Fatal("IncludeSourceTypes() returned nothing")
 	}
 	got[0] = SourceSlack
-	if orig[0] != SourceGmail {
+	if orig[0] != SourceUpload {
 		t.Errorf("mutating the returned slice changed the caller's SourceTypes: %v", orig)
 	}
 }

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -195,44 +194,6 @@ func TestClassifyWithJev_SMS_PersonalSegment_Keep(t *testing.T) {
 	}
 	if tokens != 55 {
 		t.Errorf("tokens = %d, want 55", tokens)
-	}
-}
-
-func TestClassifyWithJev_Mail_UsesTitleAndDomainInState(t *testing.T) {
-	var gotState string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]any
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		gotState, _ = body["state"].(string)
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"answers": map[string]any{
-				"segment":   map[string]any{"choice": "newsletter", "confidence": 0.6},
-				"retention": map[string]any{"score": 0},
-			},
-			"usage": map[string]any{"input_tokens": 10},
-		})
-	}))
-	t.Cleanup(srv.Close)
-	c := &Classifier{Jev: jev.NewForTest(srv.URL, "test-key", srv.Client())}
-
-	doc := &model.Document{
-		SourceType: model.SourceGmail,
-		Title:      "이번주 특가 안내",
-		Content:    "다양한 상품을 만나보세요",
-		Metadata:   map[string]any{"from": "sale@shop.example.com"},
-	}
-	result, _, err := c.ClassifyWithJev(context.Background(), doc, Gate{})
-	if err != nil {
-		t.Fatalf("ClassifyWithJev() error = %v", err)
-	}
-	if result.Segment != "newsletter" || result.Retention != model.RetentionLow {
-		t.Errorf("result = %+v, want newsletter/low", result)
-	}
-	for _, want := range []string{"이번주 특가 안내", "shop.example.com", "다양한 상품을"} {
-		if !strings.Contains(gotState, want) {
-			t.Errorf("state %q does not contain %q", gotState, want)
-		}
 	}
 }
 

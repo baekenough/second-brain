@@ -288,13 +288,12 @@ func (f *fakeActionWriter) EnsureOpenStatus(_ context.Context, identityKey strin
 func newExtractionDoc(id uuid.UUID, attempts int) *model.Document {
 	return &model.Document{
 		ID:         id,
-		SourceType: model.SourceGmail,
-		SourceID:   "gmail-source",
+		SourceType: model.SourceSMS,
+		SourceID:   "sms-source",
 		Title:      "Re: Budget",
 		Content:    "Let's discuss the Q3 budget.",
 		Metadata: map[string]any{
-			"thread_id":           "thread-1",
-			"from":                "counterpart@example.com",
+			"contact_name":        "counterpart",
 			"extraction_attempts": float64(attempts),
 		},
 	}
@@ -422,42 +421,6 @@ func TestExtractionWorker_ThirdFailure_MarksTerminal(t *testing.T) {
 	}
 	if len(lister.attemptFailedCalls) != 0 {
 		t.Errorf("MarkExtractionAttemptFailed called %d times, want 0 when hitting the terminal attempt", len(lister.attemptFailedCalls))
-	}
-}
-
-// TestExtractionWorker_AwaitingMyReply_UserOwnAddress_Dropped exercises
-// action.CounterpartIdentity's ok=false path end-to-end through the worker: a
-// (test-only, prompt-violating) extractFn returns kind=awaiting_my_reply for
-// a document whose "from" metadata IS the configured user address — the
-// worker must silently drop it (a message the user sent themselves cannot be
-// "awaiting my reply").
-func TestExtractionWorker_AwaitingMyReply_UserOwnAddress_Dropped(t *testing.T) {
-	t.Parallel()
-
-	docID := uuid.New()
-	doc := newExtractionDoc(docID, 0)
-	doc.Metadata["from"] = "me@example.com" // matches newTestExtractionWorker's userAddrs
-	lister := &fakeExtractionLister{docs: []*model.Document{doc}}
-	entities := &fakeRelationEntityResolver{}
-	relations := &fakeRelationWriter{}
-	actions := &fakeActionWriter{}
-
-	w := newTestExtractionWorker(lister, entities, relations, actions,
-		func(_ context.Context, _ llm.Completer, _ *model.Document, _ []string) (*ExtractionResult, error) {
-			return &ExtractionResult{
-				Actions: []rawAction{
-					{Kind: string(model.KindAwaitingMyReply), Summary: "should be ignored"},
-				},
-			}, nil
-		},
-	)
-	w.tick(context.Background())
-
-	if len(actions.upsertedActions) != 0 {
-		t.Errorf("UpsertAction called %d times, want 0 (own-address awaiting_my_reply must be dropped)", len(actions.upsertedActions))
-	}
-	if len(lister.markExtractedCalls) != 1 {
-		t.Errorf("MarkRelationsExtracted calls = %d, want 1 (dropping one action must not fail the tick)", len(lister.markExtractedCalls))
 	}
 }
 
@@ -589,7 +552,7 @@ func TestExtractionWorker_AwaitingMyReply_CarriesCounterpartLabel(t *testing.T) 
 
 	docID := uuid.New()
 	doc := newExtractionDoc(docID, 0)
-	doc.Metadata["from"] = `"테스트발신자" <counterpart@example.com>`
+	doc.Metadata["contact_name"] = "테스트발신자"
 	lister := &fakeExtractionLister{docs: []*model.Document{doc}}
 	actions := &fakeActionWriter{}
 
@@ -611,9 +574,9 @@ func TestExtractionWorker_AwaitingMyReply_CarriesCounterpartLabel(t *testing.T) 
 	if got.CounterpartName != "테스트발신자" || got.CounterpartType != model.EntityTypePerson {
 		t.Errorf("counterpart label = (%q, %q), want (%q, %q)", got.CounterpartName, got.CounterpartType, "테스트발신자", model.EntityTypePerson)
 	}
-	wantKey := action.BuildIdentityKey("gmail:thread-1", string(model.KindAwaitingMyReply), `"테스트발신자" <counterpart@example.com>`, "")
+	wantKey := action.BuildIdentityKey("sms:테스트발신자", string(model.KindAwaitingMyReply), "테스트발신자", "")
 	if got.IdentityKey != wantKey {
-		t.Errorf("IdentityKey = %q, want %q (the raw From header, not the display label, is hashed)", got.IdentityKey, wantKey)
+		t.Errorf("IdentityKey = %q, want %q (the contact_name identity is hashed)", got.IdentityKey, wantKey)
 	}
 }
 

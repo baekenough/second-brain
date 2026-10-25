@@ -15,7 +15,6 @@ import (
 // only need a representative sample of the content.
 const (
 	smsStateContentChars  = 600
-	mailStateContentChars = 300
 	callStateContentChars = 700
 )
 
@@ -61,25 +60,6 @@ var smsRetentionCriteria = []string{
 	"일회성·즉시 폐기 가능",
 	"참고용, 가끔 필요",
 	"보관 필요, 사람과의 대화·결정·약속이 담김",
-}
-
-// mailSegmentCriteria mirrors jev_validate.py's SEGMENT_CRITERIA.
-var mailSegmentCriteria = map[string]string{
-	"notification":   "서비스·시스템 자동 알림 (GitHub, 배송, 로그인, 계정 상태 등)",
-	"newsletter":     "뉴스레터·마케팅·프로모션·구독 메일",
-	"transaction":    "결제·영수증·주문·청구 등 금전 거래",
-	"auth_transient": "인증번호·OTP·비밀번호 재설정 등 일회성 코드",
-	"calendar_event": "일정 초대·수락·리마인더",
-	"work_comm":      "업무 관련 사람 간 소통 (동료, 고객, 채용, 제안)",
-	"personal_comm":  "지인·가족과의 개인 대화",
-	"other":          "위 어느 것도 아님",
-}
-
-// mailRetentionCriteria mirrors jev_validate.py's RETENTION_CRITERIA.
-var mailRetentionCriteria = []string{
-	"즉시 폐기 가능 (인증코드, 프로모션, 반복 알림)",
-	"참고용, 가끔 필요 (영수증, 일반 알림)",
-	"보관 필요 (사람과의 대화·결정·약속·계약)",
 }
 
 // callSegmentCriteria mirrors calls_backfill.py's JEV_SEGMENT_CRITERIA.
@@ -290,11 +270,6 @@ func stateAndCriteria(doc *model.Document) (state string, segmentCriteria map[st
 	case model.SourceSMS:
 		return fmt.Sprintf("문자 내용: %s", truncate(doc.Content, smsStateContentChars)),
 			smsSegmentCriteria, smsRetentionCriteria, nil
-	case model.SourceGmail:
-		from := metaString(doc.Metadata, "from", "sender")
-		state := fmt.Sprintf("제목: %s\n발신 도메인: %s\n본문: %s",
-			doc.Title, localPart2domain(from), truncate(doc.Content, mailStateContentChars))
-		return state, mailSegmentCriteria, mailRetentionCriteria, nil
 	case model.SourceCall:
 		return fmt.Sprintf("통화 전사(앞부분): %s", truncate(doc.Content, callStateContentChars)),
 			callSegmentCriteria, callRetentionCriteria, nil
@@ -305,25 +280,11 @@ func stateAndCriteria(doc *model.Document) (state string, segmentCriteria map[st
 
 func segmentInstructions(src model.SourceType) string {
 	switch src {
-	case model.SourceGmail:
-		return "이 이메일의 종류를 제목과 발신 도메인, 본문으로 판단하세요"
 	case model.SourceCall:
 		return "이 통화 녹음의 종류를 고르세요"
 	default:
 		return "이 문자 메시지의 종류를 고르세요"
 	}
-}
-
-// localPart2domain extracts the domain portion of an email address (the part
-// after '@'), matching jev_validate.py's from_domain field. Returns addr
-// unchanged when no '@' is present.
-func localPart2domain(addr string) string {
-	for i := 0; i < len(addr); i++ {
-		if addr[i] == '@' {
-			return addr[i+1:]
-		}
-	}
-	return addr
 }
 
 // truncate returns the first n runes of s (Korean text is multi-byte; a

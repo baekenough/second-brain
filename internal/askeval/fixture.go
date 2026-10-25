@@ -109,8 +109,8 @@ type CorpusDoc struct {
 	// (required for Gold.SupportDocs references and report.go's baseline
 	// diff to stay meaningful across runs).
 	Alias string `json:"alias"`
-	// SourceType is a model.SourceType string value (e.g. "gmail",
-	// "call", "calendar"). Kept as a plain string here — this file does
+	// SourceType is a model.SourceType string value (e.g. "sms",
+	// "call", "note"). Kept as a plain string here — this file does
 	// not import internal/model — and converted in corpus.go.
 	SourceType string `json:"source_type"`
 	Title      string `json:"title"`

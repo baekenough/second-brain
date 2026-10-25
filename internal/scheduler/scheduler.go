@@ -166,8 +166,8 @@ type Scheduler struct {
 
 	// runningPerCollector holds one try-lock per collector, keyed by Name().
 	// Each cron tick for a specific collector performs a CompareAndSwap on its
-	// own flag only, so a slow collector (e.g. a gmail backfill) cannot block
-	// an unrelated collector (calendar, whisper, sms) from running.
+	// own flag only, so a slow collector (e.g. a filesystem backfill) cannot block
+	// an unrelated collector (whisper, sms) from running.
 	//
 	// Pre-populated in New() and never mutated after construction — safe for
 	// concurrent reads without additional locking.
@@ -324,8 +324,8 @@ type IntervalPreferrer interface {
 // concurrently. A given collector still skips its own overlapping tick via a
 // per-collector try-lock (runningPerCollector). This eliminates the
 // head-of-line blocking that occurred when a single global job ran all
-// collectors sequentially: a slow gmail backfill (~60 min) no longer prevents
-// calendar, whisper, or SMS collectors from running on their scheduled ticks.
+// collectors sequentially: a slow backfill (~60 min) no longer prevents
+// whisper or SMS collectors from running on their scheduled ticks.
 //
 // The old single-job / single-lock design that fixed the starvation bug is
 // preserved in runAll, which is still used by TriggerAll.
@@ -513,8 +513,8 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 		return
 	}
 
-	// Cutover floor for date-watermark collectors (gmail, calendar, secretary,
-	// llm-memory): if since is before the cutover, advance it to the cutover so
+	// Cutover floor for date-watermark collectors (llm-memory and any
+	// other since-based collector): if since is before the cutover, advance it to the cutover so
 	// that these collectors only fetch data from after the cutover date.
 	if !s.cutover.IsZero() && since.Before(s.cutover) {
 		since = s.cutover

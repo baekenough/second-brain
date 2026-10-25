@@ -297,8 +297,9 @@ func TestSafeSourceID(t *testing.T) {
 		{"sms:1767268800000:abcdef0123456789:in", "sms:1767268800000:ref=" + FileRef("abcdef0123456789:in")},
 		{"call-log:1767268800000:abcdef0123456789:0a1b2c3d", "call-log:1767268800000:ref=" + FileRef("abcdef0123456789:0a1b2c3d")},
 		{"call-log:voice-memo:0a1b2c3d", "call-log:voice-memo:ref=" + FileRef("0a1b2c3d")},
-		{"gmail:18c2f3a4b5d6e7f8", "gmail:18c2f3a4b5d6e7f8"},
-		// 숫자만 있는 gmail ID 는 국가번호 붙은 번호와 구분이 안 되므로 ref.
+		// gmail 수집기는 없어졌다. 남아 있는 옛 행의 ID 도 이제 안전 목록 밖이라
+		// 일반 접두사 규칙으로 가려진다(허용 목록 방식의 기본값).
+		{"gmail:18c2f3a4b5d6e7f8", "gmail:ref=" + FileRef("18c2f3a4b5d6e7f8")},
 		{"gmail:821012345678", "gmail:ref=" + FileRef("821012345678")},
 		// 둘째 칸이 dateMs 가 아니면(번호 모양) 통째로 ref.
 		{"sms:01012345678:abcd:in", "sms:ref=" + FileRef("01012345678:abcd:in")},
@@ -313,7 +314,7 @@ func TestSafeSourceID(t *testing.T) {
 		{"discord:1:1:" + sentinelNum, "discord:ref=" + FileRef("1:1:"+sentinelNum)},
 		{"0b7c2f0e-6a57-4d1a-9d52-3f1f5c1b2a90", "0b7c2f0e-6a57-4d1a-9d52-3f1f5c1b2a90"},
 		{"insight:0b7c2f0e-6a57-4d1a-9d52-3f1f5c1b2a90:3", "insight:0b7c2f0e-6a57-4d1a-9d52-3f1f5c1b2a90:3"},
-		{"calendar:me@example.com:evt1", "calendar:ref=" + FileRef("me@example.com:evt1")},
+		{"owner:me@example.com:evt1", "owner:ref=" + FileRef("me@example.com:evt1")},
 		{"docs/" + sentinelFile, "ref=" + FileRef("docs/"+sentinelFile)},
 		{"Transcript:" + sentinelFile, "ref=" + FileRef("Transcript:"+sentinelFile)},
 	}
@@ -324,7 +325,7 @@ func TestSafeSourceID(t *testing.T) {
 		}
 		assertNoSentinel(t, "SafeSourceID("+tc.in+")", got)
 		if strings.Contains(got, "me@example.com") {
-			t.Errorf("SafeSourceID leaked calendar owner: %q", got)
+			t.Errorf("SafeSourceID leaked email owner: %q", got)
 		}
 	}
 

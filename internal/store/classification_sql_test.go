@@ -15,7 +15,7 @@ import (
 func TestListUnclassifiedQuery_ScopesToActiveClassifiableSources(t *testing.T) {
 	for _, want := range []string{
 		"status = 'active'",
-		"source_type IN ('sms', 'gmail', 'call')",
+		"source_type IN ('sms', 'call')",
 		"NOT (metadata ? 'retention')",
 	} {
 		if !strings.Contains(listUnclassifiedQuery, want) {
@@ -51,8 +51,8 @@ func TestListUnclassifiedQuery_RespectsAttemptCapAndBackfillWindow(t *testing.T)
 // TestListLegacyForRecheckQuery_ScopesToRetentionTaggedNonUserRows pins the
 // fix for the "worker sat idle since 12:57" bug: the queue must select on
 // `metadata ? 'retention'` (any retention-tagged row), not a bare
-// `metadata ? 'classifier'` requirement — the ox-alpha mail segmentation
-// pass tags 11,965 legacy gmail documents with retention/segment but never
+// `metadata ? 'classifier'` requirement — the (retired) ox-alpha segmentation
+// pass tagged 11,965 legacy documents with retention/segment but never
 // writes a classifier key at all, so the old predicate silently excluded
 // all of them, leaving the queue permanently empty. The classifier
 // exclusion is narrowed to "not user" (golden-set) rather than

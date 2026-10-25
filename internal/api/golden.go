@@ -805,7 +805,7 @@ func goldenRetentionTag(doc model.Document) string {
 }
 
 // goldenSegment reads the free-form metadata["segment"] classification key
-// (e.g. the in-progress mail segmentation pass). No producer writes this key
+// (e.g. the classification worker). No producer writes this key
 // yet for most sources, so absence is the common case and simply yields "".
 func goldenSegment(doc model.Document) string {
 	if doc.Metadata == nil {

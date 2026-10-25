@@ -234,7 +234,7 @@ func TestBuildHybridSearchQuery_OccurredRange_BindsParameters(t *testing.T) {
 func TestBuildHybridSearchQuery_OccurredRange_ParametersSurviveOtherFilters(t *testing.T) {
 	t.Parallel()
 
-	src := model.SourceCalendar
+	src := model.SourceNote
 	query := rangeQuery()
 	query.SourceType = &src
 	query.ExcludeSourceTypes = []model.SourceType{model.SourceInsight}

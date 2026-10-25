@@ -95,7 +95,7 @@ const classificationProtectedMetadataKeys = `'segment', 'retention', 'classifier
 //
 // Collector re-upserts (Upsert/UpsertTracked) treat metadata as a FULL
 // REPLACEMENT snapshot for every key the collector itself owns (sender,
-// content, direction, label_ids, ...) — a re-synced SMS/Gmail/call document's
+// content, direction, label_ids, ...) — a re-synced SMS/call document's
 // metadata should reflect exactly what the collector observed this time, not
 // an accumulation of every value ever seen. A plain `metadata =
 // EXCLUDED.metadata` therefore used to also silently discard whatever this
@@ -551,7 +551,7 @@ func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
 		embeddingVersionArg = doc.EmbeddingVersion
 	}
 
-	// occurred_at is the original event time (email date, calendar start, etc.).
+	// occurred_at is the original event time (SMS/call time, note date, etc.).
 	// NULL is stored when the collector has no event-time concept; COALESCE
 	// in ORDER BY clauses falls back to collected_at for those rows.
 	// On conflict we update occurred_at only when the incoming value is non-NULL
@@ -855,7 +855,7 @@ func (s *DocumentStore) ListBySource(ctx context.Context, src model.SourceType, 
 // ListRecent returns active documents ordered by the original event time
 // (occurred_at) when available, falling back to collected_at for rows that
 // have no event-time concept. This ensures "most recent" reflects when the
-// underlying event actually happened (email sent, call placed, etc.) rather
+// underlying event actually happened (message sent, call placed, etc.) rather
 // than when second-brain ingested the document.
 //
 // When includeSrc is non-empty, only documents of that source type are returned.
@@ -945,8 +945,8 @@ func (s *DocumentStore) Search(ctx context.Context, query model.SearchQuery) ([]
 // distinguishes them.
 //
 // The historical DESC branch keeps its COALESCE onto collected_at — the same
-// strategy as ListRecent / ListBySource, so "latest gmail" returns the most
-// recently sent email rather than the most recently ingested one.
+// strategy as ListRecent / ListBySource, so "latest sms" returns the most
+// recently sent message rather than the most recently ingested one.
 //
 // The ASC branch does not COALESCE. Whenever either bound is set the lanes
 // already exclude occurred_at IS NULL (see appendOccurredRangeFilters), so on
@@ -1134,8 +1134,8 @@ func appendOccurredRangeFilters(args []interface{}, from, to *time.Time) (newArg
 //
 //   - The predicate coalesces a NULL retention tag to an empty string before
 //     comparing, which is NULL-safe. A large majority of documents.metadata
-//     rows have no "retention" key at all (only gmail has been segmented so
-//     far, per model.RetentionTag's doc comment) — `metadata->>'retention'`
+//     rows have no "retention" key at all (only some SMS/call documents have
+//     been segmented, per model.RetentionTag's doc comment) — `metadata->>'retention'`
 //     on such a row is SQL NULL, and NULL compared against anything with <>
 //     is never true, which would silently EXCLUDE every untagged document.
 //     The coalesced empty string is never itself one of
@@ -1827,30 +1827,6 @@ func (s *DocumentStore) MarkDeleted(ctx context.Context, sourceType model.Source
 	return int(tag.RowsAffected()), nil
 }
 
-// SoftDeleteBySourceID soft-deletes the active document identified by
-// (source_type, source_id), if one exists, and reports whether a row was
-// affected.
-//
-// Unlike Upsert/UpsertTracked, this method NEVER inserts: when no row with
-// the given (source_type, source_id) exists, it is a pure no-op (false, nil).
-// This is deliberate — it lets a collector that only observes a partial
-// event stream (e.g. a calendar collector that receives a cancellation for
-// an event it may never have fetched while active) signal a deletion
-// without ever manufacturing a new document out of a tombstone event. It is
-// idempotent: calling it again for an already-deleted or never-existing
-// document is a harmless no-op (0 rows affected, no error).
-func (s *DocumentStore) SoftDeleteBySourceID(ctx context.Context, sourceType model.SourceType, sourceID string) (bool, error) {
-	const q = `
-		UPDATE documents
-		SET status = 'deleted', deleted_at = now(), deleted_by = 'system'
-		WHERE source_type = $1 AND source_id = $2 AND status = 'active'`
-	tag, err := s.pg.pool.Exec(ctx, q, sourceType, sourceID)
-	if err != nil {
-		return false, fmt.Errorf("soft delete %s/%s: %w", sourceType, sourceID, err)
-	}
-	return tag.RowsAffected() > 0, nil
-}
-
 // CountActiveDocuments returns the total number of active (non-deleted) documents
 // for the given source type. It is used by the scheduler's deletion-ratio sanity
 // check (issue #135) to detect a suspicious bulk-deletion before calling MarkDeleted.
@@ -1873,8 +1849,7 @@ func (s *DocumentStore) CountActiveDocuments(ctx context.Context, sourceType mod
 // Deleted documents are excluded. The returned map is keyed by logical source string.
 //
 // Legacy documents stored under source_type='secretary' are re-bucketed by their
-// metadata 'kind' field (e.g. "sms", "gmail", "call-log", "call-transcript",
-// "calendar"). This means historical SMS documents count toward the "sms" bucket
+// metadata 'kind' field (e.g. "sms", "call-log", "call-transcript"). This means historical SMS documents count toward the "sms" bucket
 // alongside post-cutover documents — there is no double-counting because the two
 // sets are date-disjoint. All other source_type values are reported as-is.
 func (s *DocumentStore) CountBySource(ctx context.Context) (map[string]int, error) {
@@ -2299,8 +2274,8 @@ func (s *DocumentStore) MarkEntitiesProcessed(ctx context.Context, documentID uu
 	return nil
 }
 
-// ListPendingForExtraction returns up to limit active documents from the 4
-// active sources (gmail, sms, call-log, call-transcript) whose occurred_at
+// ListPendingForExtraction returns up to limit active documents from the
+// active sources (sms, call-log, call-transcript) whose occurred_at
 // falls within the last 30 days AND whose relations_extracted_at is NULL
 // AND whose extraction backoff (if any) has elapsed (spec §5.1, migration
 // 023). The 30-day bound is evaluated live at every call — NOT a one-time
@@ -2321,7 +2296,7 @@ func (s *DocumentStore) ListPendingForExtraction(ctx context.Context, limit int)
 		FROM documents
 		WHERE status = 'active'
 		  AND relations_extracted_at IS NULL
-		  AND source_type IN ('gmail', 'sms', 'call-log', 'call-transcript')
+		  AND source_type IN ('sms', 'call-log', 'call-transcript')
 		  AND occurred_at >= now() - interval '30 days'
 		  AND (metadata->>'extraction_next_retry_at' IS NULL
 		       OR (metadata->>'extraction_next_retry_at')::timestamptz <= now())

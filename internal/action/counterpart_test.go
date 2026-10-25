@@ -12,53 +12,6 @@ import (
 // assignable Korean number) — no real contact of the user's ever appears in
 // this repository.
 
-// TestCounterpartDisplay_GmailEncodedDisplayName pins the gmail path: the
-// From header is an RFC 5322 mailbox, and the part a human recognises is the
-// display name, not the address. Without this, every gmail action card would
-// be labelled with a raw address.
-func TestCounterpartDisplay_GmailEncodedDisplayName(t *testing.T) {
-	t.Parallel()
-	doc := &model.Document{
-		SourceType: model.SourceGmail,
-		Metadata:   map[string]any{"from": `"테스트발신자" <dummy@example.test>`},
-	}
-	name, typ, ok := action.CounterpartDisplay(doc)
-	if !ok {
-		t.Fatal("ok = false, want true (a From header with a display name is resolvable)")
-	}
-	if name != "테스트발신자" {
-		t.Errorf("name = %q, want %q (display name preferred over the address)", name, "테스트발신자")
-	}
-	if typ != model.EntityTypePerson {
-		t.Errorf("type = %q, want %q", typ, model.EntityTypePerson)
-	}
-}
-
-// TestCounterpartDisplay_GmailBareAddress covers the common case of a From
-// header carrying no display name: the address itself is the only label
-// available, and it is still far better than nothing on the card.
-func TestCounterpartDisplay_GmailBareAddress(t *testing.T) {
-	t.Parallel()
-	doc := &model.Document{
-		SourceType: model.SourceGmail,
-		Metadata:   map[string]any{"from": "dummy@example.test"},
-	}
-	name, typ, ok := action.CounterpartDisplay(doc)
-	if !ok || name != "dummy@example.test" || typ != model.EntityTypePerson {
-		t.Errorf("got (%q, %q, %v), want (%q, %q, true)", name, typ, ok, "dummy@example.test", model.EntityTypePerson)
-	}
-}
-
-// TestCounterpartDisplay_GmailEmptyFrom_NotResolvable guards the degenerate
-// header: an empty From must not create an entity named "".
-func TestCounterpartDisplay_GmailEmptyFrom_NotResolvable(t *testing.T) {
-	t.Parallel()
-	doc := &model.Document{SourceType: model.SourceGmail, Metadata: map[string]any{"from": "  "}}
-	if name, _, ok := action.CounterpartDisplay(doc); ok {
-		t.Errorf("ok = true (name %q), want false for a blank From header", name)
-	}
-}
-
 // TestCounterpartDisplay_SMSContactName is the highest-volume path: the phone
 // already resolved the number to a contact, so that name is what the user
 // recognises and what must dedup against LLM-extracted PERSON entities.

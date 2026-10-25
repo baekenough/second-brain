@@ -1,6 +1,6 @@
 // Package jev provides a client for the TypeSafe "Jev" classification API
 // (POST https://api.typesafe.ai/v1/systemone). It is used by
-// internal/classify to classify documents (SMS, Gmail, call transcripts)
+// internal/classify to classify documents (SMS, call transcripts)
 // into a segment (choice question) and a retention score (score question).
 //
 // The client never logs request or response bodies — both may contain

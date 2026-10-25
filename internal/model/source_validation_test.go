@@ -10,10 +10,8 @@ func TestKnownSourceTypes_MatchesTaskSpec(t *testing.T) {
 	t.Parallel()
 
 	want := map[SourceType]bool{
-		SourceGmail:     true,
 		SourceSMS:       true,
 		SourceCall:      true,
-		SourceCalendar:  true,
 		SourceInsight:   true,
 		SourceNote:      true,
 		SourceUpload:    true,
@@ -54,7 +52,7 @@ func TestIsKnownSourceType_ExcludesContainerAndDeprecated(t *testing.T) {
 func TestIsKnownSourceType_Positive(t *testing.T) {
 	t.Parallel()
 
-	for _, st := range []SourceType{SourceGmail, SourceSMS, SourceAgentNote, SourceUpload} {
+	for _, st := range []SourceType{SourceSMS, SourceCall, SourceAgentNote, SourceUpload} {
 		if !IsKnownSourceType(st) {
 			t.Errorf("IsKnownSourceType(%q) = false, want true", st)
 		}
@@ -70,7 +68,7 @@ func TestIsContainerSourceType(t *testing.T) {
 	if !IsContainerSourceType(SourceSecretary) {
 		t.Error("IsContainerSourceType(secretary) = false, want true")
 	}
-	for _, st := range []SourceType{SourceGmail, SourceSMS, SourceLLMMemory, SourceAgentNote} {
+	for _, st := range []SourceType{SourceCall, SourceSMS, SourceLLMMemory, SourceAgentNote} {
 		if IsContainerSourceType(st) {
 			t.Errorf("IsContainerSourceType(%q) = true, want false", st)
 		}
@@ -90,7 +88,7 @@ func TestIsDeprecatedSourceType(t *testing.T) {
 			t.Errorf("IsDeprecatedSourceType(%q) = false, want true", st)
 		}
 	}
-	for _, st := range []SourceType{SourceAgentNote, SourceCall, SourceNote, SourceGmail, SourceSecretary} {
+	for _, st := range []SourceType{SourceAgentNote, SourceCall, SourceNote, SourceSMS, SourceSecretary} {
 		if IsDeprecatedSourceType(st) {
 			t.Errorf("IsDeprecatedSourceType(%q) = true, want false", st)
 		}
@@ -146,7 +144,7 @@ func TestNormalizeSourceType_NonAliasesPassThrough(t *testing.T) {
 	t.Parallel()
 
 	for _, st := range []SourceType{
-		SourceCall, SourceGmail, SourceSMS, SourceCalendar, SourceNote,
+		SourceCall, SourceSMS, SourceNote,
 		SourceUpload, SourceAgentNote, SourceInsight, SourceLLMMemory,
 		SourceSecretary, SourceType("unknown-source"),
 	} {
@@ -164,11 +162,31 @@ func TestNormalizeSourceType_NonAliasesPassThrough(t *testing.T) {
 func TestNormalizeSourceType_Idempotent(t *testing.T) {
 	t.Parallel()
 
-	for _, st := range []SourceType{SourceCallLog, SourceCallTranscript, SourceCall, SourceGmail} {
+	for _, st := range []SourceType{SourceCallLog, SourceCallTranscript, SourceCall, SourceSMS} {
 		once := NormalizeSourceType(st)
 		twice := NormalizeSourceType(once)
 		if once != twice {
 			t.Errorf("NormalizeSourceType(%q) = %q, but NormalizeSourceType(that) = %q, want idempotent", st, once, twice)
+		}
+	}
+}
+
+// TestRemovedSourceTypes_AreUnknown 은 gmail·calendar 가 더는 소스로 인정되지
+// 않음을 고정한다. 수집기가 제거됐으므로 이 값을 이름으로 든 요청이나 남아 있는
+// 행은 알 수 없는 다른 source_type 과 똑같이 취급된다(알려진 값도, 폐기 값도,
+// 컨테이너도, 별칭도 아니다).
+func TestRemovedSourceTypes_AreUnknown(t *testing.T) {
+	t.Parallel()
+
+	for _, st := range []SourceType{"gmail", "calendar"} {
+		if IsKnownSourceType(st) {
+			t.Errorf("IsKnownSourceType(%q) = true, want false", st)
+		}
+		if IsDeprecatedSourceType(st) || IsContainerSourceType(st) {
+			t.Errorf("%q must not be classified as deprecated or container", st)
+		}
+		if got := NormalizeSourceType(st); got != st {
+			t.Errorf("NormalizeSourceType(%q) = %q, want unchanged", st, got)
 		}
 	}
 }

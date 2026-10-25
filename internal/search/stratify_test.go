@@ -65,29 +65,28 @@ func (s *armStore) armCalls() []model.SearchQuery {
 
 func armFixture() *armStore {
 	global := []*model.SearchResult{
-		pfDoc(1, model.SourceGmail, 3, pfAt(2, 9)),
-		pfDoc(2, model.SourceGmail, 2, pfAt(3, 9)),
+		pfDoc(1, model.SourceUpload, 3, pfAt(2, 9)),
+		pfDoc(2, model.SourceUpload, 2, pfAt(3, 9)),
 		pfDoc(3, model.SourceSMS, 1, pfAt(4, 9)),
+		pfDoc(6, model.SourceUpload, 0.5, pfAt(4, 11)),
+		pfDoc(7, model.SourceUpload, 0.4, pfAt(4, 12)),
 	}
 	return &armStore{
 		global: global,
 		bySrc: map[model.SourceType][]*model.SearchResult{
-			model.SourceCalendar: {
-				pfDoc(10, model.SourceCalendar, 5, pfAt(5, 9)),
-				pfDoc(11, model.SourceCalendar, 4, pfAt(6, 9)),
-				pfDoc(12, model.SourceCalendar, 3, pfAt(7, 9)),
-			},
-			model.SourceSMS: {
-				pfDoc(3, model.SourceSMS, 9, pfAt(4, 9)), // 전역에도 있는 문서
-				pfDoc(13, model.SourceSMS, 8, pfAt(4, 10)),
+			// 실패하는 보조 검색(아래 failFor).
+			model.SourceNote: {
+				pfDoc(10, model.SourceNote, 5, pfAt(5, 9)),
+				pfDoc(11, model.SourceNote, 4, pfAt(6, 9)),
+				pfDoc(12, model.SourceNote, 3, pfAt(7, 9)),
 			},
 			// 필터를 무시하는 저장소: 다른 소스 문서가 섞여 온다.
-			model.SourceNote: {
-				pfDoc(14, model.SourceGmail, 7, nil),
-				pfDoc(15, model.SourceNote, 6, nil),
+			model.SourceSMS: {
+				pfDoc(3, model.SourceSMS, 9, pfAt(4, 9)), // 전역에도 있는 문서
+				pfDoc(14, model.SourceUpload, 7, nil),
 			},
 		},
-		failFor: map[model.SourceType]bool{model.SourceGmail: true},
+		failFor: map[model.SourceType]bool{model.SourceNote: true},
 	}
 }
 
@@ -136,12 +135,12 @@ func TestSourceStratify_ArmQueriesInheritFilters(t *testing.T) {
 		}
 	}
 	slices.Sort(sources)
-	want := []model.SourceType{model.SourceCalendar, model.SourceGmail, model.SourceNote, model.SourceSMS}
+	want := []model.SourceType{model.SourceNote, model.SourceSMS}
 	if !slices.Equal(sources, want) { // call 은 질의가 제외했다
 		t.Fatalf("arm sources = %v, want %v", sources, want)
 	}
 
-	// 실패한 gmail 보조 검색은 흡수되고, 전역 후보는 후보 풀에서 하나도
+	// 실패한 note 보조 검색은 흡수되고, 전역 후보는 후보 풀에서 하나도
 	// 빠지지 않는다(페이지 절단 전).
 	for _, id := range []uuid.UUID{pfID(1), pfID(2), pfID(3)} {
 		if !slices.Contains(trace.PoolIDs, id) {
@@ -149,7 +148,7 @@ func TestSourceStratify_ArmQueriesInheritFilters(t *testing.T) {
 		}
 	}
 	ids := pfIDs(got)
-	// 필터를 무시한 저장소가 끼워 넣은 다른 소스 문서(14)는 note 보조 검색에서 걸러진다.
+	// 필터를 무시한 저장소가 끼워 넣은 다른 소스 문서(14)는 sms 보조 검색에서 걸러진다.
 	if slices.Contains(trace.PoolIDs, pfID(14)) {
 		t.Error("an arm admitted a document of another source")
 	}
@@ -157,8 +156,8 @@ func TestSourceStratify_ArmQueriesInheritFilters(t *testing.T) {
 	if ids[0] != pfID(3) {
 		t.Errorf("doc in both lists should lead: got %v", ids)
 	}
-	if lanes := trace.LaneHits[pfID(10)]; !slices.Contains(lanes, LaneSourceStratify) {
-		t.Errorf("calendar arm hit not traced: %v", lanes)
+	if lanes := trace.LaneHits[pfID(3)]; !slices.Contains(lanes, LaneSourceStratify) {
+		t.Errorf("sms arm hit not traced: %v", lanes)
 	}
 	if len(got) != 5 {
 		t.Errorf("page size = %d", len(got))
@@ -196,8 +195,8 @@ func TestStratifyArmSources(t *testing.T) {
 		t.Errorf("explicit include: %v", got)
 	}
 	// 레거시 별칭(call-log)도 정규화 후 call 을 제외한다.
-	got := stratifyArmSources(model.SearchQuery{ExcludeSourceTypes: []model.SourceType{model.SourceCallLog, model.SourceGmail}}, 5)
-	want := []model.SourceType{model.SourceCalendar, model.SourceSMS, model.SourceNote}
+	got := stratifyArmSources(model.SearchQuery{ExcludeSourceTypes: []model.SourceType{model.SourceCallLog, model.SourceUpload}}, 5)
+	want := []model.SourceType{model.SourceSMS, model.SourceNote}
 	if !slices.Equal(got, want) {
 		t.Errorf("excluded: got %v, want %v", got, want)
 	}
@@ -206,14 +205,14 @@ func TestStratifyArmSources(t *testing.T) {
 func TestMergeStratified(t *testing.T) {
 	t.Parallel()
 	global := []*model.SearchResult{
-		pfDoc(1, model.SourceGmail, 0.9, nil),
+		pfDoc(1, model.SourceUpload, 0.9, nil),
 		pfDoc(2, model.SourceSMS, math.NaN(), nil),
 		pfDoc(3, model.SourceCall, 0.1, nil),
 	}
 	global[0].Evidence = []model.MatchedEvidence{{Score: 1}}
 	arms := [][]*model.SearchResult{
 		{pfDoc(3, model.SourceCall, 7, nil), pfDoc(4, model.SourceCall, 6, nil)},
-		{pfDoc(5, model.SourceCalendar, 1, nil), pfDoc(5, model.SourceCalendar, 1, nil)}, // 목록 안 중복
+		{pfDoc(5, model.SourceCall, 1, nil), pfDoc(5, model.SourceCall, 1, nil)}, // 목록 안 중복
 		nil,
 	}
 	got := mergeStratified(global, arms)
@@ -300,7 +299,7 @@ func TestSourceStratify_ChunkFTSFailureStillMergesArms(t *testing.T) {
 		t.Fatalf("knob off changed the failure path: %d results", len(got))
 	}
 	got := run(2)
-	if len(got) == 0 || !slices.Contains(pfIDs(got), pfID(10)) {
+	if len(got) == 0 || !slices.Contains(pfIDs(got), pfID(3)) {
 		t.Fatalf("arm results were discarded on the chunk-FTS failure path: %v", pfIDs(got))
 	}
 }
@@ -349,10 +348,10 @@ func TestSourceStratify_RerankInputCappedTailKept(t *testing.T) {
 	t.Parallel()
 	st := &armStore{bySrc: map[model.SourceType][]*model.SearchResult{}}
 	for i := 0; i < overfetchLimitCap; i++ {
-		st.global = append(st.global, pfDoc(1000+i, model.SourceGmail, float64(1000-i), nil))
+		st.global = append(st.global, pfDoc(1000+i, model.SourceUpload, float64(1000-i), nil))
 	}
 	for i := 0; i < 2; i++ {
-		st.bySrc[model.SourceCalendar] = append(st.bySrc[model.SourceCalendar], pfDoc(10+i, model.SourceCalendar, 1, nil))
+		st.bySrc[model.SourceCall] = append(st.bySrc[model.SourceCall], pfDoc(10+i, model.SourceCall, 1, nil))
 		st.bySrc[model.SourceNote] = append(st.bySrc[model.SourceNote], pfDoc(20+i, model.SourceNote, 1, nil))
 	}
 	rr := &countingReranker{}

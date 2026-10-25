@@ -296,10 +296,10 @@ func TestPlanSources_AppliedPerQuery(t *testing.T) {
 	kst := timeutil.KST()
 	anchor := time.Date(2026, 9, 20, 10, 0, 0, 0, kst)
 	pairs := []store.EvalPair{
-		{Query: "내일 일정", CreatedAt: anchor, RelevantDocIDs: []string{labelDocID.String()}},        // 캘린더 키워드·미래 창
+		{Query: "어제 문자 내역", CreatedAt: anchor, RelevantDocIDs: []string{labelDocID.String()}},     // 명시 기록 단어
 		{Query: "어제 통화 내역", CreatedAt: anchor, RelevantDocIDs: []string{labelDocID.String()}},     // 명시 기록 단어
 		{Query: "지난주 회의록", CreatedAt: anchor, RelevantDocIDs: []string{labelDocID.String()}},      // 소스 단서 없음
-		{Query: "내일 일정에 관한 메일", CreatedAt: anchor, RelevantDocIDs: []string{labelDocID.String()}}, // 계획이 거절 → 창만
+		{Query: "내일 일정에 관한 문자", CreatedAt: anchor, RelevantDocIDs: []string{labelDocID.String()}}, // 계획이 거절 → 창만
 		{Query: "보험 약관 정리", CreatedAt: anchor, RelevantDocIDs: []string{labelDocID.String()}},     // 기간 표현 없음
 	}
 	stub := newTracingStub(false)
@@ -321,10 +321,10 @@ func TestPlanSources_AppliedPerQuery(t *testing.T) {
 		return out
 	}
 	want := map[string][]string{
-		"내일 일정":        {string(model.SourceCalendar)},
+		"어제 문자 내역":     {string(model.SourceSMS)},
 		"어제 통화 내역":     {string(model.SourceCall)},
 		"지난주 회의록":      nil,
-		"내일 일정에 관한 메일": nil,
+		"내일 일정에 관한 문자": nil,
 		"보험 약관 정리":     nil,
 	}
 	for text, w := range want {
@@ -333,7 +333,7 @@ func TestPlanSources_AppliedPerQuery(t *testing.T) {
 		}
 	}
 	// 거절된 질의도 창은 DeterministicWindow 로 걸린다(현행 동작 유지).
-	if q := queries["내일 일정에 관한 메일"]; q.OccurredFrom == nil || q.OccurredTo == nil {
+	if q := queries["내일 일정에 관한 문자"]; q.OccurredFrom == nil || q.OccurredTo == nil {
 		t.Error("계획이 거절한 질의에서 창이 사라졌다")
 	}
 	if q := queries["보험 약관 정리"]; q.OccurredFrom != nil || len(q.SourceTypes) != 0 {
@@ -341,7 +341,7 @@ func TestPlanSources_AppliedPerQuery(t *testing.T) {
 	}
 
 	// 덤프 행(입력 순서)에는 실제로 건 집합만 남는다.
-	wantDump := [][]string{{"calendar"}, {"call"}, nil, nil, nil}
+	wantDump := [][]string{{"sms"}, {"call"}, nil, nil, nil}
 	for i, d := range got.Diagnostics {
 		if !reflect.DeepEqual(d.PlanSources, wantDump[i]) {
 			t.Errorf("row %d: plan_sources = %v, want %v", i, d.PlanSources, wantDump[i])

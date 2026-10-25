@@ -36,13 +36,13 @@ func TestAskHandler_SourcesEventCarriesPlanReasonAndOrigin(t *testing.T) {
 
 	from := time.Date(2026, 8, 20, 0, 0, 0, 0, timeutil.KST())
 	to := time.Date(2026, 8, 21, 0, 0, 0, 0, timeutil.KST())
-	searcher := &fixedDocSearcher{observed: []*model.SearchResult{docResult(model.SourceCalendar, "일정")}}
+	searcher := &fixedDocSearcher{observed: []*model.SearchResult{docResult(model.SourceCall, "일정")}}
 	fakeLLM := &fakeAskLLM{enabled: true, chunks: []string{"답변"}}
 	srv := newAskTestServer(searcher, &fakeIntentClassifier{}, fakeLLM)
 	planner := &stubPlanner{plan: intent.QueryPlan{
 		OccurredFrom: &from,
 		OccurredTo:   &to,
-		SourceTypes:  []model.SourceType{model.SourceCalendar},
+		SourceTypes:  []model.SourceType{model.SourceCall},
 		Limit:        8,
 		Reason:       "내일(8/20) 캘린더만 조회",
 		Origin:       intent.OriginDeterministic,
@@ -83,8 +83,8 @@ func TestAskHandler_SourcesEventCarriesPlanReasonAndOrigin(t *testing.T) {
 		t.Errorf("plan window = [%q, %q), want [2026-08-20, 2026-08-21) in KST",
 			payload.Plan.OccurredFrom, payload.Plan.OccurredTo)
 	}
-	if len(payload.Plan.SourceTypes) != 1 || payload.Plan.SourceTypes[0] != "calendar" {
-		t.Errorf("plan.source_types = %v, want [calendar]", payload.Plan.SourceTypes)
+	if len(payload.Plan.SourceTypes) != 1 || payload.Plan.SourceTypes[0] != "call" {
+		t.Errorf("plan.source_types = %v, want [call]", payload.Plan.SourceTypes)
 	}
 
 	// The wire field names are the contract; assert on the raw JSON too so a

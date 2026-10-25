@@ -3,7 +3,6 @@ package search
 import (
 	"context"
 	"errors"
-	"math"
 	"slices"
 	"sync"
 	"testing"
@@ -12,96 +11,6 @@ import (
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/google/uuid"
 )
-
-// --- 일정 의도 캘린더 가산 ---
-
-func scheduleBoostFixture() []*model.SearchResult {
-	return []*model.SearchResult{
-		pfDoc(1, model.SourceCall, 0.040, pfAt(3, 9)),
-		pfDoc(2, model.SourceGmail, 0.035, pfAt(3, 9)),
-		pfDoc(3, model.SourceCalendar, 0.032, pfAt(4, 9)),
-		pfDoc(4, model.SourceSMS, 0.030, pfAt(3, 9)),
-		pfDoc(5, model.SourceCalendar, 0.010, pfAt(5, 9)),
-		pfDoc(6, model.SourceCalendar, -0.5, pfAt(6, 9)), // 음수: 건드리지 않는다
-		pfDoc(7, model.SourceCalendar, math.NaN(), nil),  // NaN: 건드리지 않는다
-	}
-}
-
-func TestScheduleIntentBoost_OnlyCalendarMovesUp(t *testing.T) {
-	t.Parallel()
-	in := scheduleBoostFixture()
-	q := model.SearchQuery{Query: "내일 뭐 해?"}
-	on := model.SearchTuning{ScheduleIntentBoost: 0.5}.Normalized()
-	got := applyScheduleIntentBoost(q, in, on)
-
-	// 0.032*1.5=0.048 > 0.040 → 캘린더 3이 1위, 0.010*1.5=0.015 는 그대로 5위.
-	assertSameIDs(t, pfIDs(got), []uuid.UUID{pfID(3), pfID(1), pfID(2), pfID(4), pfID(5), pfID(6), pfID(7)})
-	assertSameIDs(t, pfSortedIDs(got), pfSortedIDs(in))
-	pre := map[uuid.UUID]int{}
-	for i, r := range in {
-		pre[r.ID] = i
-	}
-	for i, r := range got {
-		if r.SourceType != model.SourceCalendar && i < pre[r.ID] {
-			t.Errorf("non-calendar doc %v moved up (%d → %d)", r.ID, pre[r.ID], i)
-		}
-	}
-	// 비캘린더 문서끼리의 상대 순서는 그대로.
-	var nonCal []uuid.UUID
-	for _, r := range got {
-		if r.SourceType != model.SourceCalendar {
-			nonCal = append(nonCal, r.ID)
-		}
-	}
-	assertSameIDs(t, nonCal, []uuid.UUID{pfID(1), pfID(2), pfID(4)})
-	if got[5].Score != -0.5 || in[2].Score != 0.032 {
-		t.Fatal("negative score boosted or input mutated")
-	}
-}
-
-func TestScheduleIntentBoost_NoOps(t *testing.T) {
-	t.Parallel()
-	in := scheduleBoostFixture()
-	cal := model.SourceCalendar
-	on := model.SearchTuning{ScheduleIntentBoost: 1}.Normalized()
-	for name, tc := range map[string]struct {
-		q    model.SearchQuery
-		tune model.SearchTuning
-	}{
-		"knob off":           {model.SearchQuery{Query: "내일 뭐 해?"}, model.SearchTuning{}},
-		"no schedule intent": {model.SearchQuery{Query: "프로젝트 예산"}, on},
-		"record question":    {model.SearchQuery{Query: "어제 회의 관련 메일"}, on},
-		"include set":        {model.SearchQuery{Query: "내일 뭐 해?", SourceTypes: []model.SourceType{model.SourceCall}}, on},
-		"singular include":   {model.SearchQuery{Query: "내일 뭐 해?", SourceType: &cal}, on},
-		"recent sort":        {model.SearchQuery{Query: "내일 뭐 해?", Sort: model.SortRecent}, on},
-	} {
-		got := applyScheduleIntentBoost(tc.q, in, tc.tune)
-		assertSameIDs(t, pfIDs(got), pfIDs(in))
-		for i := range got {
-			if got[i] != in[i] {
-				t.Errorf("%s: result %d replaced", name, i)
-			}
-		}
-	}
-	if got := applyScheduleIntentBoost(model.SearchQuery{Query: "내일 뭐 해?"}, nil, on); len(got) != 0 {
-		t.Error("empty input grew")
-	}
-}
-
-func TestScheduleIntentBoost_PipelineCallSite(t *testing.T) {
-	t.Parallel()
-	run := func(tune model.SearchTuning) []uuid.UUID {
-		st := &pfStore{results: scheduleBoostFixture()[:5]}
-		got, err := NewService(st, disabledEmbedderForTrace{}).WithTuning(model.SearchTuning{}).
-			Search(context.Background(), model.SearchQuery{Query: "다음 주 미팅 언제야", Limit: 5, Tuning: tune})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return pfIDs(got)
-	}
-	assertSameIDs(t, run(model.SearchTuning{}), []uuid.UUID{pfID(1), pfID(2), pfID(3), pfID(4), pfID(5)})
-	assertSameIDs(t, run(model.SearchTuning{ScheduleIntentBoost: 0.5}), []uuid.UUID{pfID(3), pfID(1), pfID(2), pfID(4), pfID(5)})
-}
 
 // --- 계획 소스 넘침 검색 ---
 
@@ -144,9 +53,9 @@ func spillDocs() []*model.SearchResult {
 	return []*model.SearchResult{
 		pfDoc(1, model.SourceSMS, 9, pfAt(3, 9)),
 		pfDoc(2, model.SourceSMS, 8, pfAt(3, 10)),
-		pfDoc(3, model.SourceGmail, 7, pfAt(3, 11)), // 계획이 놓친 정답
+		pfDoc(3, model.SourceUpload, 7, pfAt(3, 11)), // 계획이 놓친 정답
 		pfDoc(4, model.SourceCall, 6, pfAt(3, 12)),
-		pfDoc(5, model.SourceGmail, 5, pfAt(3, 13)),
+		pfDoc(5, model.SourceUpload, 5, pfAt(3, 13)),
 	}
 }
 

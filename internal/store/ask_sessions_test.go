@@ -37,7 +37,7 @@ func TestAskSource_JSON_OccurredAt(t *testing.T) {
 
 	t.Run("nil marshals to literal null, not an omitted key", func(t *testing.T) {
 		t.Parallel()
-		src := AskSource{ID: "d2", Title: "t", SourceType: "gmail", Score: 0.5}
+		src := AskSource{ID: "d2", Title: "t", SourceType: "sms", Score: 0.5}
 		raw, err := json.Marshal(src)
 		if err != nil {
 			t.Fatalf("marshal: %v", err)

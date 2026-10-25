@@ -14,12 +14,12 @@ import (
 func TestRetrievalRegressionChunkFilterAfterCut(t *testing.T) {
 	valid := uuid.New()
 	chunks := &mockChunkSearcher{vectorResults: []store.ChunkSearchResult{
-		chunkResult(uuid.New(), model.SourceGmail, .99),
-		chunkResult(uuid.New(), model.SourceGmail, .98),
-		chunkResult(valid, model.SourceCalendar, .97),
+		chunkResult(uuid.New(), model.SourceUpload, .99),
+		chunkResult(uuid.New(), model.SourceUpload, .98),
+		chunkResult(valid, model.SourceCall, .97),
 	}}
 	svc := NewService(&mockDocSearcher{}, stubEnabledEmbedder{}).WithChunkStore(chunks)
-	got, err := svc.Search(context.Background(), model.SearchQuery{Query: "dummy", Limit: 1, SourceTypes: []model.SourceType{model.SourceCalendar}})
+	got, err := svc.Search(context.Background(), model.SearchQuery{Query: "dummy", Limit: 1, SourceTypes: []model.SourceType{model.SourceCall}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func TestRetrievalRegressionRerankerSeesOverfetch(t *testing.T) {
 func TestRetrievalRegressionOpenSearchRetention(t *testing.T) {
 	id := uuid.New()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"hits": map[string]any{"hits": []any{map[string]any{"_score": 1, "_source": map[string]any{"document_id": id.String(), "source_type": "gmail", "title": "dummy", "content": "dummy", "status": "deleted", "metadata": map[string]any{"retention": "disposable"}}}}}})
+		json.NewEncoder(w).Encode(map[string]any{"hits": map[string]any{"hits": []any{map[string]any{"_score": 1, "_source": map[string]any{"document_id": id.String(), "source_type": "upload", "title": "dummy", "content": "dummy", "status": "deleted", "metadata": map[string]any{"retention": "disposable"}}}}}})
 	}))
 	defer srv.Close()
 	svc := NewService(&mockDocSearcher{}, disabledEmbedder{}).WithOpenSearch(NewOpenSearchClient(srv.URL, "test", 0))
@@ -84,7 +84,7 @@ func TestExternalHydrationRejectsStaleAndUnverifiable(t *testing.T) {
 	source := &hydratingDocSearcher{mockDocSearcher: &mockDocSearcher{}, documents: map[uuid.UUID]*model.Document{
 		ids[0]: {ID: ids[0], Status: "deleted"},
 		ids[1]: {ID: ids[1], Status: "active", Metadata: map[string]any{"retention": "disposable"}},
-		ids[2]: {ID: ids[2], Status: "active", SourceType: model.SourceGmail, Content: "current DB text"},
+		ids[2]: {ID: ids[2], Status: "active", SourceType: model.SourceUpload, Content: "current DB text"},
 	}}
 	os := &mockOpenSearchSearcher{enabled: true}
 	for _, id := range ids {

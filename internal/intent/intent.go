@@ -187,7 +187,7 @@ func extractJSON(s string) string {
 // collector containers run as Etc/UTC (docker-compose.local.yml sets
 // TZ: Asia/Seoul only on eval-runner), so t.Location() was UTC there and "오늘"
 // meant the UTC day — a window nine hours behind the Korean day the user and
-// the ingested documents live in. A calendar event at 18:00 KST fell outside
+// the ingested documents live in. A message stamped 18:00 KST fell outside
 // the container's "오늘" window and /ask could not retrieve it. Developer
 // machines are KST, so every local test run agreed with the user and only
 // production disagreed.

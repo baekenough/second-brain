@@ -29,7 +29,7 @@ func kstTime(t *testing.T, value string) *time.Time {
 // 곧 "임베딩 입력 바이트가 이전과 동일하다"는 뜻이다(같은 임베딩 버전
 // chunk-ctx-v1 을 유지하는 근거 — 재임베딩을 유발하지 않는다).
 //
-// 대표 문서 조합: 통화(call)·문자(sms)·메일(gmail)·일정(calendar), 각각
+// 대표 문서 조합: 통화(call)·문자(sms)·노트(note), 각각
 // 참여자 있음/없음, 한국어 값 포함.
 func TestBuildChunkContextHeader_Golden(t *testing.T) {
 	tests := []struct {
@@ -38,27 +38,13 @@ func TestBuildChunkContextHeader_Golden(t *testing.T) {
 		want string
 	}{
 		{
-			name: "gmail: 라벨·날짜·제목·발신자·수신자",
+			name: "note: 라벨·날짜·제목, 참여자 메타데이터 없음",
 			doc: model.Document{
-				SourceType: model.SourceGmail,
-				Title:      "9월 정산 견적서 회신",
-				OccurredAt: kstTime(t, "2026-09-21T01:30:00Z"), // KST 10:30
-				Metadata: map[string]any{
-					"from":      `"홍길동" <hong@example.com>`,
-					"to":        "baek@example.com",
-					"thread_id": "t-1",
-				},
-			},
-			want: "[메일] 2026-09-21(월) · 제목: 9월 정산 견적서 회신 · 보낸사람: 홍길동 <hong@example.com> · 받는사람: baek@example.com",
-		},
-		{
-			name: "gmail: 참여자 메타데이터 없음",
-			doc: model.Document{
-				SourceType: model.SourceGmail,
+				SourceType: model.SourceNote,
 				Title:      "안내",
 				OccurredAt: kstTime(t, "2026-09-21T01:30:00Z"), // KST 10:30
 			},
-			want: "[메일] 2026-09-21(월) · 제목: 안내",
+			want: "[노트] 2026-09-21(월) · 제목: 안내",
 		},
 		{
 			name: "sms: 연락처 이름과 방향",
@@ -108,45 +94,6 @@ func TestBuildChunkContextHeader_Golden(t *testing.T) {
 			want: "[통화] 제목: 수신 통화 [REDACTED] · 방향: 수신",
 		},
 		{
-			name: "calendar: 주최자와 참석자 표시명",
-			doc: model.Document{
-				SourceType: model.SourceCalendar,
-				Title:      "주간 스탠드업",
-				OccurredAt: kstTime(t, "2026-09-20T23:00:00Z"), // KST 2026-09-21 08:00
-				Metadata: map[string]any{
-					"organizer": "lead@example.com",
-					"location":  "회의실 A",
-					"attendees": []any{
-						map[string]any{"email": "a@example.com", "display_name": "박철수"},
-						map[string]any{"email": "b@example.com", "display_name": ""},
-					},
-				},
-			},
-			want: "[일정] 2026-09-21(월) · 제목: 주간 스탠드업 · 주최: lead@example.com · 참석: 박철수, b@example.com · 장소: 회의실 A",
-		},
-		{
-			name: "calendar: 참여자 없음",
-			doc: model.Document{
-				SourceType: model.SourceCalendar,
-				Title:      "개인 일정",
-				OccurredAt: kstTime(t, "2026-09-20T23:00:00Z"), // KST 2026-09-21 08:00
-			},
-			want: "[일정] 2026-09-21(월) · 제목: 개인 일정",
-		},
-		{
-			name: "calendar: 수집기가 만든 []map[string]any 형태도 처리",
-			doc: model.Document{
-				SourceType: model.SourceCalendar,
-				Title:      "킥오프",
-				Metadata: map[string]any{
-					"attendees": []map[string]any{
-						{"email": "a@example.com", "display_name": "박철수"},
-					},
-				},
-			},
-			want: "[일정] 제목: 킥오프 · 참석: 박철수",
-		},
-		{
 			name: "알 수 없는 소스: source_type 을 그대로 라벨로 쓴다",
 			doc: model.Document{
 				SourceType: model.SourceType("weird"),
@@ -164,8 +111,8 @@ func TestBuildChunkContextHeader_Golden(t *testing.T) {
 		},
 		{
 			name: "메타데이터가 없어도 라벨은 남는다",
-			doc:  model.Document{SourceType: model.SourceGmail},
-			want: "[메일]",
+			doc:  model.Document{SourceType: model.SourceCall},
+			want: "[통화]",
 		},
 	}
 
@@ -182,11 +129,11 @@ func TestBuildChunkContextHeader_Golden(t *testing.T) {
 // 헤더가 상한을 넘지 않는지, 한글이 깨지지 않는지 확인한다.
 func TestBuildChunkContextHeader_상한(t *testing.T) {
 	doc := model.Document{
-		SourceType: model.SourceGmail,
+		SourceType: model.SourceSMS,
 		Title:      strings.Repeat("가", 500),
 		Metadata: map[string]any{
-			"from": strings.Repeat("나", 500),
-			"to":   strings.Repeat("다", 500),
+			"contact_name": strings.Repeat("나", 500),
+			"direction":    strings.Repeat("다", 500),
 		},
 	}
 
@@ -194,7 +141,7 @@ func TestBuildChunkContextHeader_상한(t *testing.T) {
 	if n := len([]rune(got)); n > chunkHeaderMaxRunes {
 		t.Fatalf("헤더 길이 %d 룬 > 상한 %d", n, chunkHeaderMaxRunes)
 	}
-	if !strings.HasPrefix(got, "[메일] 제목: ") {
+	if !strings.HasPrefix(got, "[문자] 제목: ") {
 		t.Fatalf("상한을 넘겨도 앞부분은 보존돼야 한다: %q", got)
 	}
 	if strings.ContainsRune(got, '�') {
@@ -205,16 +152,12 @@ func TestBuildChunkContextHeader_상한(t *testing.T) {
 // 같은 입력이면 항상 같은 헤더여야 한다(맵 순회 순서에 의존하지 않는다).
 func TestBuildChunkContextHeader_결정론(t *testing.T) {
 	doc := model.Document{
-		SourceType: model.SourceCalendar,
+		SourceType: model.SourceSMS,
 		Title:      "회의",
 		Metadata: map[string]any{
-			"organizer": "lead@example.com",
-			"location":  "회의실",
-			"attendees": []any{
-				map[string]any{"display_name": "가"},
-				map[string]any{"display_name": "나"},
-				map[string]any{"display_name": "다"},
-			},
+			"contact_name": "김영희",
+			"direction":    "수신",
+			"number":       "010-1234-5678",
 		},
 	}
 

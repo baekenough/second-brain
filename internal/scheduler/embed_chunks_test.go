@@ -84,7 +84,7 @@ func TestEmbedChunks_EmptyChunks_NoOp(t *testing.T) {
 	// embedChunks with empty slice must not panic.
 	doc := model.Document{
 		ID:         uuid.MustParse("00000000-0000-0000-0000-000000000001"),
-		SourceType: model.SourceGmail,
+		SourceType: model.SourceSMS,
 	}
 	// Calling directly to exercise the guard.
 	s.embedChunks(context.Background(), doc, []store.Chunk{})
