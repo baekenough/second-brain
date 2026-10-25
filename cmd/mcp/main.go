@@ -10,6 +10,11 @@
 //   - get_document — fetch a single document by UUID
 //   - stats        — per-source document / chunk count statistics
 //   - add_note     — persist a note or memory into the knowledge base
+//
+// Optional OAuth 2.1 (see internal/mcpauth, docs/operations/mcp-oauth-dots.md):
+// when MCP_PUBLIC_BASE_URL and the MCP_OAUTH_* variables are set, the same port
+// also serves the OAuth endpoints and accepts read-only OAuth access tokens in
+// addition to the static API_KEY. Unset, behaviour is unchanged.
 package main
 
 import (
@@ -35,6 +40,7 @@ import (
 
 	"github.com/baekenough/second-brain/internal/config"
 	"github.com/baekenough/second-brain/internal/llm"
+	"github.com/baekenough/second-brain/internal/mcpauth"
 	"github.com/baekenough/second-brain/internal/model"
 	"github.com/baekenough/second-brain/internal/note"
 	"github.com/baekenough/second-brain/internal/search"
@@ -63,6 +69,17 @@ func run() error {
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
+	}
+
+	// --- OAuth (선택) ---
+	// 설정 오류는 DB 연결 전에 바로 드러나게 한다. 일부만 설정했으면 기동을
+	// 중단한다(인증이 조용히 약해지는 것보다 낫다).
+	oauthCfg, err := mcpauth.ConfigFromEnv(os.Getenv)
+	if err != nil {
+		return fmt.Errorf("mcp oauth config: %w", err)
+	}
+	if err := oauthPrereqError(oauthCfg, cfg.APIKey); err != nil {
+		return err
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -115,11 +132,20 @@ func run() error {
 		bindAddr = "127.0.0.1"
 	}
 
-	s := server.NewMCPServer(
-		"second-brain",
-		"1.0.0",
-		server.WithToolCapabilities(false),
-	)
+	serverOpts := []server.ServerOption{server.WithToolCapabilities(false)}
+	var oauthSrv *mcpauth.Server
+	if oauthCfg != nil {
+		oauthSrv, err = mcpauth.NewServer(*oauthCfg, store.NewMCPOAuthStore(pg))
+		if err != nil {
+			return fmt.Errorf("mcp oauth: %w", err)
+		}
+		serverOpts = append(serverOpts, oauthServerOptions(oauthSrv)...)
+		slog.Info("MCP OAuth enabled",
+			"issuer", oauthCfg.Issuer, "resource", oauthCfg.Resource,
+			"client_id", oauthCfg.ClientID, "redirect_uris", len(oauthCfg.RedirectURIs))
+	}
+
+	s := server.NewMCPServer("second-brain", "1.0.0", serverOpts...)
 
 	// Register tools.
 	registerSearchTool(s, searchSvc, cfg.RerankDefault, cfg.SearchRequestTimeout)
@@ -141,19 +167,17 @@ func run() error {
 		IdleTimeout:  2 * time.Minute,
 	}
 
-	// WithHTTPContextFunc injects the Bearer-token validation result into the
-	// request context so tool handlers can check authorisation without direct
-	// access to HTTP headers.
-	// WithStreamableHTTPServer injects the pre-configured *http.Server so that
-	// our timeout settings are applied; Start(addr) will set Addr on it.
-	httpSrv := server.NewStreamableHTTPServer(s,
-		server.WithHTTPContextFunc(mcpAuthContextFunc(cfg.APIKey)),
-		server.WithStreamableHTTPServer(customHTTPSrv),
-	)
+	// buildMCPHTTP wires WithHTTPContextFunc (Bearer-token validation result into
+	// the request context so tool handlers can check authorisation without
+	// direct access to HTTP headers), WithStreamableHTTPServer (injects the
+	// pre-configured *http.Server so our timeout settings are applied; Start(addr)
+	// will set Addr on it), the body cap and, when OAuth is enabled, the OAuth
+	// endpoints plus the 401 gate.
+	httpSrv, handler := buildMCPHTTP(s, cfg.APIKey, oauthSrv, customHTTPSrv)
 	// Wire the handler after httpSrv is constructed; the library uses
 	// customHTTPSrv.Handler as-is when httpServer is pre-set via
 	// WithStreamableHTTPServer (it skips the internal mux setup).
-	customHTTPSrv.Handler = newMCPHTTPHandler(httpSrv)
+	customHTTPSrv.Handler = handler
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -748,6 +772,12 @@ func registerAddNoteTool(
 		// true unconditionally when no key is configured).
 		if !isAuthorized(ctx) {
 			return mcp.NewToolResultError("unauthorized: Bearer token required"), nil
+		}
+		// 쓰기 도구는 OAuth 토큰(읽기 전용)을 거절한다. OAuth 미들웨어가 이미 막지만
+		// 쓰기 경로라 핸들러에서도 한 번 더 확인한다(다층 방어). 주체가 없으면
+		// (OAuth 꺼짐) 기존 동작 그대로다.
+		if p, ok := mcpauth.PrincipalFrom(ctx); ok && !p.HasScope(mcpauth.ScopeWrite) {
+			return mcp.NewToolResultError("forbidden: this tool is not available to OAuth clients"), nil
 		}
 
 		title := req.GetString("title", "")
