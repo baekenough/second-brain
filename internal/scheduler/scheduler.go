@@ -34,7 +34,11 @@ type DocumentUpserter interface {
 	// 임베딩·엔티티 추출을 건너뛴다(#292). 통화 전사 보호로 들어온 요약 대신
 	// 기존 전사가 남은 경우도 "바뀌지 않음" 이다 — store.callTranscriptKeptSQL.
 	UpsertTracked(ctx context.Context, doc *model.Document) (contentChanged bool, err error)
-	LastCollectedAt(ctx context.Context, instanceID string, src model.SourceType, fallback time.Time) time.Time
+	// LastCollectedAt 는 워터마크를 돌려준다. 행이 없으면(첫 실행) fallback 과 nil
+	// 오류를, 조회 자체가 실패하면 오류를 돌려준다. 호출자는 오류일 때 수집을
+	// 시작하면 안 된다 — 워터마크를 모른 채 fallback(영)으로 수집하면 전체 재수집이
+	// 된다.
+	LastCollectedAt(ctx context.Context, instanceID string, src model.SourceType, fallback time.Time) (time.Time, error)
 	UpdateCollectorState(ctx context.Context, instanceID string, src model.SourceType, lastCollectedAt time.Time) error
 	RecordCollectionLog(ctx context.Context, src model.SourceType, started time.Time, count int, err error) error
 	MarkDeleted(ctx context.Context, sourceType model.SourceType, activeIDs []string) (int, error)
@@ -465,6 +469,31 @@ func transcriptLedgerID(doc *model.Document) string {
 	return doc.SourceID
 }
 
+// errBatchNotPersisted 는 whisper 배치의 문서가 하나도 저장되지 못했을 때
+// processBatch 가 돌려주는 오류다. CollectStream 이 이를 전파해 수집을 멈춘다.
+var errBatchNotPersisted = errors.New("scheduler: no document in the batch could be persisted")
+
+// ledgerWriteTimeout 은 전사 원장 기록 한 번의 상한이다.
+const ledgerWriteTimeout = 10 * time.Second
+
+// recordLedger 는 종결된 오디오 식별자를 전사 원장에 남긴다. 한 번의 왕복이며
+// 최선 노력이다: 실패는 기록만 하고 수집을 막지 않는다(최악은 중복 전사다).
+//
+// 문서는 이미 저장했으므로 원장 기록만 빠지면 그 오디오가 다음 사이클에 다시
+// 전사된다. 그래서 종료 신호(ctx 취소)가 와도 마무리할 수 있게 취소를 끊고
+// 짧은 기한만 둔다.
+func (s *Scheduler) recordLedger(ctx context.Context, col collector.Collector, ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ledgerWriteTimeout)
+	defer cancel()
+	if err := s.store.RecordTranscribed(lctx, col.Source(), ids); err != nil {
+		slog.Warn("scheduler: record transcribed ledger failed (non-fatal)",
+			append([]any{"collector", col.Name(), "count", len(ids)}, logsafe.ErrAttrs(err)...)...)
+	}
+}
+
 // runCollector executes a single collection cycle for one collector.
 // It must only be called while the caller holds the collector's per-collector
 // flag (via runningPerCollector[col.Name()]) or the global running flag
@@ -473,7 +502,16 @@ func transcriptLedgerID(doc *model.Document) string {
 func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 	started := time.Now()
 	defaultSince := time.Time{} // zero time = collect all files on first run
-	since := s.store.LastCollectedAt(ctx, s.instanceID, col.Source(), defaultSince)
+	since, err := s.store.LastCollectedAt(ctx, s.instanceID, col.Source(), defaultSince)
+	if err != nil {
+		// Fail closed: 워터마크를 읽지 못한 채 진행하면 since 가 영(zero)이 되어
+		// 전체 재수집이 시작된다(2026-10-22 사고: DB 단절 중 whisper 가 오디오 806건을
+		// 유료 전사 API 로 다시 보냈다). DB 가 끊겨 있으면 어차피 저장도 못 하므로
+		// 모든 수집기에 똑같이 적용한다. 다음 틱에서 다시 시도한다.
+		slog.Warn("scheduler: could not read collector watermark, skipping this cycle",
+			append([]any{"collector", col.Name()}, logsafe.ErrAttrs(err)...)...)
+		return
+	}
 
 	// Cutover floor for date-watermark collectors (gmail, calendar, secretary,
 	// llm-memory): if since is before the cutover, advance it to the cutover so
@@ -511,16 +549,29 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 	//   ledger = TranscribedSourceIDSet (source_ids already transcribed, including
 	//            those rejected as duplicates or whose document was never stored)
 	// Audio is immutable, so a source_id in this union must never be transcribed
-	// again. If EITHER query errors we fall back to WithIndexedIDs(nil)
-	// (mtime-only) so the collector never carries stale data and never blocks.
+	// again. If EITHER query errors:
+	//   - a collector that RequiresAuthoritativeIndex (whisper) skips the cycle: an
+	//     mtime fallback would re-send already-transcribed audio to the paid API
+	//     (2026-10-22 incident: 806 files in one cycle);
+	//   - every other IndexAware collector falls back to WithIndexedIDs(nil)
+	//     (event-time only) so it never carries stale data and never blocks.
 	if iac, ok := col.(collector.IndexAwareCollector); ok {
 		active, activeErr := s.store.ActiveSourceIDSet(ctx, col.Source())
 		ledger, ledgerErr := s.store.TranscribedSourceIDSet(ctx, col.Source())
 		if activeErr != nil || ledgerErr != nil {
-			// Non-fatal: fall back to event-time-only behaviour for this run.
 			// Explicitly clear any stale set so the collector does not silently
 			// carry over stale data from a previous successful run.
 			iac.WithIndexedIDs(nil)
+			if ac, ok := col.(collector.AuthoritativeIndexCollector); ok && ac.RequiresAuthoritativeIndex() {
+				attrs := []any{"collector", col.Name()}
+				attrs = append(attrs, logsafe.PrefixedErrAttrs("active_", activeErr)...)
+				attrs = append(attrs, logsafe.PrefixedErrAttrs("ledger_", ledgerErr)...)
+				slog.Warn("scheduler: could not load indexed/ledger source IDs, skipping this cycle", attrs...)
+				_ = s.store.RecordCollectionLog(ctx, col.Source(), started, 0,
+					fmt.Errorf("index set unavailable (active=%T, ledger=%T)", activeErr, ledgerErr))
+				return
+			}
+			// Non-fatal: fall back to event-time-only behaviour for this run.
 			slog.Warn("scheduler: could not load indexed/ledger source IDs, falling back to event-time-only",
 				"collector", col.Name(),
 				"active_error", activeErr,
@@ -563,11 +614,14 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 
 		// Transcription ledger (infinite re-transcription loop fix):
 		// The collector only returns SUCCESSFULLY-transcribed documents, so every
-		// source_id in this batch has already been transcribed. Record them in the
-		// ledger BEFORE the upsert loop so that even documents rejected as
-		// duplicates (ErrDuplicateTranscript) — whose source_id never enters the
-		// active index — are durably marked as "already transcribed" and are never
-		// re-submitted to the (expensive) whisper API on a later cycle.
+		// source_id in this batch has already been transcribed. Once a document's
+		// outcome is TERMINAL (stored, or rejected as ErrDuplicateTranscript /
+		// ErrDocumentDeleted — rejections never enter the active index) its audio is
+		// durably marked "already transcribed" so it is never re-submitted to the
+		// (expensive) whisper API on a later cycle. The ledger is written AFTER the
+		// upsert loop (see ledgerIDs below): writing it first meant a file whose
+		// upsert then failed transiently was ledgered anyway, never retried, and its
+		// call document stayed transcription=pending forever.
 		//
 		// col.Name() == "whisper" replaces the old col.Source() ==
 		// model.SourceCallTranscript gate: since migration 033 unified
@@ -585,20 +639,12 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 		// re-enter WalkDir's filter as "never transcribed" on the next cycle,
 		// reintroducing the infinite re-transcription loop through the merge
 		// path (see store.TranscribedSourceIDSet's doc comment).
-		//
-		// This is a single batched round-trip and is best-effort: a failure is
-		// logged but never blocks ingestion (worst case is a redundant
-		// re-transcription, which the active-index union still mostly prevents).
-		if col.Name() == "whisper" && len(batch) > 0 {
-			ids := make([]string, len(batch))
-			for i := range batch {
-				ids[i] = transcriptLedgerID(&batch[i])
-			}
-			if err := s.store.RecordTranscribed(ctx, col.Source(), ids); err != nil {
-				slog.Warn("scheduler: record transcribed ledger failed (non-fatal)",
-					"collector", col.Name(), "count", len(ids), "error", err)
-			}
-		}
+		isWhisper := col.Name() == "whisper"
+		var ledgerIDs []string
+		var (
+			failedCount int   // 종결되지 않은 upsert 실패 수
+			lastFailure error // 가장 최근의 종결되지 않은 실패(오류 문구는 로그·반환값에 쓰지 않는다)
+		)
 
 		// Optionally enrich documents with embeddings before upserting.
 		if s.embed.Enabled() && len(batch) > 0 {
@@ -627,15 +673,20 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 					slog.Debug("scheduler: skipped duplicate call content",
 						"collector", col.Name(),
 						"source_id", logsafe.SafeSourceID(batch[i].SourceID))
+					// 종결 결과다: 다시 보내도 결과가 같다.
+					ledgerIDs = append(ledgerIDs, transcriptLedgerID(&batch[i]))
 					continue
 				}
 				slog.Warn("scheduler: upsert failed",
 					"collector", col.Name(),
 					"source_id", logsafe.SafeSourceID(batch[i].SourceID),
 					"error", upsertErr)
+				failedCount++
+				lastFailure = upsertErr
 				continue
 			}
 			count++
+			ledgerIDs = append(ledgerIDs, transcriptLedgerID(&batch[i]))
 
 			// 저장된 content 가 그대로면(같은 내용 재수집, 또는 통화 전사 보호로
 			// 들어온 요약 대신 기존 전사가 남음) 뒤따르는 작업을 모두 건너뛴다
@@ -672,6 +723,19 @@ func (s *Scheduler) runCollector(ctx context.Context, col collector.Collector) {
 			if s.entities != nil && s.llmClient != nil {
 				s.extractEntities(ctx, &batch[i])
 			}
+		}
+
+		if isWhisper {
+			// 배치의 모든 문서가 종결되지 않은 오류(DB 단절 등)로 저장에 실패했다면
+			// 수집을 중단한다. 계속하면 저장되지 않을 전사에 유료 API 호출만 쌓인다
+			// (2026-10-22 사고: DB 단절 중 1,676분 동안 806건 전사, 저장 325건).
+			// 원장에는 아무것도 쓰지 않으므로 이 파일들은 DB 가 돌아오면 다시
+			// 전사된다. 오류에는 문구를 싣지 않고 타입만 싣는다(DB 오류 문구에
+			// 키 값이 들어갈 수 있다).
+			if failedCount > 0 && failedCount == len(batch) {
+				return fmt.Errorf("%w (docs=%d, err_type=%T)", errBatchNotPersisted, len(batch), lastFailure)
+			}
+			s.recordLedger(ctx, col, ledgerIDs)
 		}
 		return nil
 	}

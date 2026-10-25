@@ -44,7 +44,7 @@ func NewDocumentStore(pg *Postgres) *DocumentStore {
 // AttachTranscript to detect call documents that share identical transcript
 // content under a different source_id (issue #134, generalized to
 // source_type='call' by migration 033's call-log/call-transcript unification —
-// see model.SourceCall's doc comment). The query is a SELECT 1 probe
+// see model.SourceCall's doc comment). The query is a single-row probe
 // (LIMIT 1) so it avoids a full scan. 'call-transcript' is matched alongside
 // 'call' defensively for the brief window before migration 033 has run against
 // a given database; every ROW WhisperCollector emits post-unification carries
@@ -57,13 +57,18 @@ func NewDocumentStore(pg *Postgres) *DocumentStore {
 //
 // The query intentionally targets only status='active' rows so that a previously
 // soft-deleted duplicate does not block re-insertion of a renamed recording.
+//
+// 돌려주는 값은 내용이 같은 기존 문서의 id 다. AttachTranscript 가 이것을 대기
+// 문서의 metadata.duplicate_of 로 남긴다(markPendingDuplicate). 여러 건이면 가장
+// 오래된 것(원본)을 고른다.
 const callDupCheckQuery = `
-	SELECT 1
+	SELECT id
 	FROM documents
 	WHERE source_type IN ('call', 'call-transcript')
 	  AND status       = 'active'
 	  AND content      = $1
 	  AND source_id   <> $2
+	ORDER BY created_at, id
 	LIMIT 1`
 
 // ErrDocumentDeleted 는 재수집으로 되살릴 수 없는 삭제 문서를 뜻한다.
@@ -350,11 +355,11 @@ func (s *DocumentStore) preUpsertTrackedChecks(ctx context.Context, doc *model.D
 	// plain call-log summary embeds its own timestamp-to-the-second, so two
 	// distinct real calls essentially cannot produce byte-identical content.
 	if doc.SourceType == model.SourceCall {
-		var exists int
+		var dupID uuid.UUID
 		qErr := s.pg.pool.QueryRow(ctx, callDupCheckQuery,
 			doc.Content,
 			doc.SourceID,
-		).Scan(&exists)
+		).Scan(&dupID)
 		switch {
 		case qErr == nil:
 			slog.Info("store: skipping duplicate call content",
@@ -508,11 +513,11 @@ func (s *DocumentStore) Upsert(ctx context.Context, doc *model.Document) error {
 	// query excludes the document's own source_id; the ON CONFLICT path below
 	// handles them.
 	if doc.SourceType == model.SourceCall {
-		var exists int
+		var dupID uuid.UUID
 		err := s.pg.pool.QueryRow(ctx, callDupCheckQuery,
 			doc.Content,
 			doc.SourceID,
-		).Scan(&exists)
+		).Scan(&dupID)
 		switch {
 		case err == nil:
 			// A duplicate row was found — skip the insert.
@@ -641,7 +646,10 @@ func isNoRows(err error) bool {
 // with byte-identical content already exists under a DIFFERENT source_id,
 // this returns (false, ErrDuplicateTranscript) without writing — this is the
 // guard that protects against the SAME audio being merged under two
-// different SourceIDs (e.g. a duplicate or renamed recording file).
+// different SourceIDs (e.g. a duplicate or renamed recording file). Before
+// returning, a still-pending placeholder at doc's own (source_type, source_id)
+// is moved to transcription='duplicate' via markPendingDuplicate so it does not
+// linger in CountPendingTranscription forever.
 //
 // Returns contentChanged exactly like UpsertTracked, for callers (the
 // scheduler) that skip chunk/embedding regeneration when content did not
@@ -651,17 +659,21 @@ func isNoRows(err error) bool {
 func (s *DocumentStore) AttachTranscript(ctx context.Context, doc *model.Document) (contentChanged bool, err error) {
 	checkSourceTypeGuard(doc)
 
-	var exists int
+	var dupID uuid.UUID
 	qErr := s.pg.pool.QueryRow(ctx, callDupCheckQuery,
 		doc.Content,
 		doc.SourceID,
-	).Scan(&exists)
+	).Scan(&dupID)
 	switch {
 	case qErr == nil:
 		slog.Info("store: skipping duplicate call content (attach-transcript)",
 			"source_id", logsafe.SafeSourceID(doc.SourceID),
 			"content_len", len(doc.Content),
 		)
+		// 이 source_id 에 이미 대기 문서(ingest_recording 의 자리표시자)가 있으면
+		// 영원히 pending 으로 남지 않도록 종결 상태로 옮긴다. 실패해도 호출자에게는
+		// 그대로 ErrDuplicateTranscript 를 돌려준다.
+		s.markPendingDuplicate(ctx, doc.SourceType, doc.SourceID, dupID)
 		return false, ErrDuplicateTranscript
 	case isNoRows(qErr):
 		// No duplicate — proceed with the merge/insert.
@@ -747,6 +759,38 @@ func (s *DocumentStore) AttachTranscript(ctx context.Context, doc *model.Documen
 		contentChanged = true
 	}
 	return contentChanged, nil
+}
+
+// markPendingDuplicateQuery 는 (source_type, source_id) 의 활성 문서가 아직
+// transcription='pending' 일 때만 metadata 를 패치한다. content·embedding·title
+// 은 건드리지 않는다. 대기 문서가 없거나(이미 done/duplicate) 삭제됐으면 0행이다.
+//
+//	$1 — source_type, $2 — source_id, $3 — 내용이 같은 기존 문서의 id (text)
+const markPendingDuplicateQuery = `
+	UPDATE documents
+	SET metadata   = metadata || jsonb_build_object('transcription', 'duplicate', 'duplicate_of', $3::text),
+	    updated_at = now()
+	WHERE source_type = $1
+	  AND source_id   = $2
+	  AND status      = 'active'
+	  AND metadata ->> 'transcription' = 'pending'`
+
+// markPendingDuplicate 는 AttachTranscript 가 ErrDuplicateTranscript 로 돌아가기
+// 직전에 부른다. ingest_recording 이 만든 자리표시자 문서(transcription=pending)
+// 가 이 source_id 에 있으면, 전사가 다른 문서와 같은 내용이라 병합되지 못한다는
+// 사실을 metadata 에 남겨 pending 에서 빼낸다(transcription='duplicate',
+// duplicate_of=기존 문서 id). 전사 원장이 이 오디오를 이미 종결 처리하므로
+// 이 패치가 없으면 대기 문서는 다시는 갱신되지 않고 대시보드의 "전사 대기"에
+// 영구히 남는다.
+//
+// 최선 노력이다: 실패는 기록만 하고 삼킨다. 호출자가 돌려받는 오류는
+// 여전히 ErrDuplicateTranscript 이고, 패치 실패는 다음 사이클에 스스로 고쳐지지
+// 않는다(원장이 재시도를 막는다) — 그래서 Warn 으로 남긴다.
+func (s *DocumentStore) markPendingDuplicate(ctx context.Context, sourceType model.SourceType, sourceID string, duplicateOf uuid.UUID) {
+	if _, err := s.pg.pool.Exec(ctx, markPendingDuplicateQuery, sourceType, sourceID, duplicateOf.String()); err != nil {
+		slog.Warn("store: could not mark pending call document as duplicate",
+			append([]any{"source_id", logsafe.SafeSourceID(sourceID)}, logsafe.ErrAttrs(err)...)...)
+	}
 }
 
 // GetByID retrieves a single document by primary key.
@@ -1704,17 +1748,27 @@ func (s *DocumentStore) RecordCollectionLog(ctx context.Context, sourceType mode
 // Per-instance state decouples collectors that share a source_type (e.g.,
 // filesystem scans on laptop, host1, host2) so one instance's recent scan
 // cannot suppress older files seen by another instance.
-func (s *DocumentStore) LastCollectedAt(ctx context.Context, instanceID string, src model.SourceType, fallback time.Time) time.Time {
+//
+// "행 없음"(첫 실행)과 "조회 실패"는 다르다. 예전에는 모든 오류를 fallback 으로
+// 삼켜서, DB 가 끊긴 동안 워터마크가 영(zero)으로 보였고 스케줄러가 전체
+// 재수집(whisper 는 유료 전사 API 재호출)을 시작했다. pgx.ErrNoRows 만
+// fallback 으로 돌려주고 그 밖의 오류는 호출자에게 알린다 — 워터마크를 모르는
+// 채로 수집하면 안 된다.
+func (s *DocumentStore) LastCollectedAt(ctx context.Context, instanceID string, src model.SourceType, fallback time.Time) (time.Time, error) {
 	var t time.Time
 	err := s.pg.pool.QueryRow(ctx,
 		`SELECT last_collected_at FROM collector_state
 		 WHERE instance_id = $1 AND source_type = $2`,
 		instanceID, src,
 	).Scan(&t)
-	if err != nil || t.IsZero() {
-		return fallback
+	switch {
+	case err == nil && !t.IsZero():
+		return t, nil
+	case err == nil || errors.Is(err, pgx.ErrNoRows):
+		return fallback, nil
+	default:
+		return time.Time{}, fmt.Errorf("last collected at (%s): %w", src, err)
 	}
-	return t
 }
 
 // UpdateCollectorState upserts the watermark for (instance_id, source_type).

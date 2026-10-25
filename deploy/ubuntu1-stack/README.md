@@ -22,8 +22,12 @@
   중 `docker ps`로 확인, 아래 TODO 섹션도 정정.)
 - **postgres는 이 스택에 없다.** 별도 compose 프로젝트(`~/second-brain-postgres`,
   자세한 내용은 [`deploy/postgres-ubuntu1/`](../postgres-ubuntu1/))로 이미 운영
-  중이며, `.env.local`의 `DATABASE_URL`이 Tailscale IP로 그 컨테이너를 직접
-  가리킨다.
+  중이다. DB 접속 서비스(server/collector/mcp/eval-runner)는 compose에서
+  postgres 네트워크(`second-brain-postgres_default`, external)에 추가로 붙고,
+  `.env.local`의 `DATABASE_URL` 호스트는 `second-brain-postgres:5432`
+  (컨테이너명)이다. 예전의 Tailscale IP 경유는 tailscaled 재시작 시 22시간
+  장애(2026-10-22)를 냈다. postgres의 Tailscale 포트 바인딩은 원격 클라이언트용으로
+  유지한다. web은 DB에 직접 접속하지 않으므로 붙이지 않는다.
 - macmini에 남은 역할: **OneDrive 클라이언트 + `com.sangyi.secondbrain.onedrive-bridge`
   LaunchAgent** — 파일 게이트웨이 전용. second-brain 컨테이너 5개는 전부
   `docker stop` 상태이며, 볼륨(`second-brain-local_pgdata` = postgres 이전

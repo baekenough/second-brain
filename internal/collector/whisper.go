@@ -2,6 +2,7 @@ package collector
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -800,6 +801,14 @@ func (c *WhisperCollector) WithIndexedIDs(ids map[string]struct{}) {
 	c.indexedIDs = ids
 }
 
+// RequiresAuthoritativeIndex implements AuthoritativeIndexCollector. Every
+// re-processed audio file is a paid transcription call and audio is immutable,
+// so when the scheduler cannot load the indexed/ledger set it must skip the
+// cycle instead of handing this collector a nil set (mtime-only mode would
+// treat every file newer than the watermark — or all of them, when the
+// watermark is unknown — as new).
+func (c *WhisperCollector) RequiresAuthoritativeIndex() bool { return true }
+
 // WithCutover implements CutoverAwareCollector. When t is non-zero, files
 // whose recording timestamp (parsed from the filename; falls back to mtime)
 // is before t are suppressed even if they were never indexed.
@@ -1195,6 +1204,29 @@ func (c *WhisperCollector) CollectStream(ctx context.Context, since time.Time, o
 		return fmt.Errorf("whisper: walk %q: %w", c.cfg.WhisperAudioDir, err)
 	}
 
+	// 최신 녹음부터 처리한다. 백로그가 쌓였을 때 방금 들어온 녹음이 오래된
+	// 파일들 뒤에서 몇 시간씩 기다리지 않게 하려는 것이다(2026-10-22 사고에서
+	// 신규 녹음이 약 340분 밀렸다). recordingTime 은 파일 이름의 녹음 시각을
+	// 우선하고, 파싱되지 않는 이름은 mtime 으로 대신한다.
+	slices.SortStableFunc(pending, func(a, b pendingTranscription) int {
+		return cmp.Compare(
+			recordingTime(filepath.Base(b.path), b.info.ModTime()).UnixNano(),
+			recordingTime(filepath.Base(a.path), a.info.ModTime()).UnixNano(),
+		)
+	})
+
+	// 사이클당 상한. 색인 집합이 권위 있을 때(c.indexedIDs != nil)만 적용한다:
+	// 미룬 파일은 다음 사이클에 "원장에 없는 파일"로 다시 나타나기 때문이다.
+	// mtime 모드에서는 이 사이클이 끝나면 워터마크가 앞으로 가므로, 미룬 파일은
+	// 영영 다시 보이지 않는다 — 그래서 그때는 상한을 두지 않는다.
+	if limit := c.cfg.WhisperMaxFilesPerCycle; c.indexedIDs != nil && limit > 0 && len(pending) > limit {
+		c.log().Info("whisper: per-cycle cap reached, deferring older recordings to the next cycle",
+			"deferred", len(pending)-limit,
+			"cap", limit,
+		)
+		pending = pending[:limit]
+	}
+
 	// Phase 2 — CONCURRENT transcription + INCREMENTAL emit.
 	//
 	// Up to c.concurrency() files are transcribed in parallel (a load balancer can
@@ -1415,6 +1447,7 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 	// instead of becoming a second, unlinked one — model.SourceCall's doc
 	// comment: "통화 1건 = 문서 1건" (one document per phone call).
 	docSourceID := item.sourceID
+	mergedVoiceMemo := false
 
 	// Merge sidecar metadata when present (written by the ingest-recording
 	// handler alongside the audio file). Missing sidecar = historical file or
@@ -1423,7 +1456,8 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 		for k, v := range sidecarMetaFields(raw) {
 			meta[k] = v
 		}
-		if mergeID, ok := callLogMergeSourceID(raw); ok {
+		if mergeID, ok := sidecarMergeSourceID(raw); ok {
+			mergedVoiceMemo = raw.Kind == "voice-memo"
 			docSourceID = mergeID
 			// transcript_source_id preserves this audio file's own identity on
 			// the merged document. internal/scheduler's runCollector ledgers
@@ -1575,6 +1609,13 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 			c.log().Warn("whisper: name redaction failed; document withheld for retry", "source_id_bytes", len(doc.SourceID))
 			return model.Document{}, false
 		}
+		// ingest_recording 은 이름 비식별화 모드에서 음성메모 자리표시자의 제목을
+		// "음성메모" 로 고정한다. 병합 SQL 은 pii_name_redacted 문서의 제목을 들어온
+		// 값으로 덮어쓰므로, 여기서 파일 이름 줄기(원본 업로드 이름 포함)가 제목이
+		// 되지 않게 같은 값을 쓴다.
+		if mergedVoiceMemo {
+			doc.Title = "음성메모"
+		}
 	}
 	return doc, true
 }
@@ -1589,9 +1630,15 @@ func (c *WhisperCollector) buildDocument(ctx context.Context, item pendingTransc
 // callLogMergeSourceID reproduce smsmap.MapCall's SourceID formula for
 // Kind=="call" recordings, so the eventual transcript can be merged into the
 // SAME document that ingest_recording.go created rather than becoming a
-// second, unlinked one. Voice-memo sidecars (Kind=="voice-memo") have no
-// call-log counterpart to merge into and are left on the standalone
-// transcript:{relPath} identity, same as pre-migration-033 behaviour.
+// second, unlinked one. Voice-memo sidecars written before merge_source_id
+// existed (Kind=="voice-memo") cannot reproduce their placeholder's SourceID
+// and stay on the standalone transcript:{relPath} identity, same as
+// pre-migration-033 behaviour.
+//
+// MergeSourceID 는 ingest_recording 이 이 녹음의 문서를 upsert 할 때 쓴 source_id
+// 그대로다(두 kind 모두). voice-memo 의 source_id 는 사이드카의 다른 필드로
+// 다시 만들 수 없다(원본 업로드 파일 이름의 해시) — 이 필드가 있어야 전사가
+// 그 자리표시자 문서에 병합된다. 이 필드가 없는 옛 사이드카는 이전 동작을 유지한다.
 type recordingSidecarRaw struct {
 	ContactName     string `json:"contact_name"`
 	Number          string `json:"number"`
@@ -1601,6 +1648,7 @@ type recordingSidecarRaw struct {
 	DurationSeconds int    `json:"duration_seconds"`
 	DateMs          int64  `json:"date_ms"`
 	Kind            string `json:"kind"`
+	MergeSourceID   string `json:"merge_source_id"`
 }
 
 // readRecordingSidecarRaw reads and parses {audioPath}.meta.json into a
@@ -1622,6 +1670,27 @@ func readRecordingSidecarRaw(audioPath string) (recordingSidecarRaw, bool) {
 	return raw, true
 }
 
+// sidecarMergeSourceID returns the SourceID of the document this recording's
+// transcript must merge into: the sidecar's explicit merge_source_id when
+// present, otherwise whatever callLogMergeSourceID can reproduce (old sidecars,
+// which only support Kind=="call").
+//
+// merge_source_id must carry the "call-log:" prefix shared by both formulas
+// (call-log:{dateMs}:… and call-log:voice-memo:…). A value without it is
+// ignored rather than trusted: this string selects which stored document the
+// transcript overwrites, so a corrupt sidecar must not be able to point it at
+// an arbitrary source_id.
+func sidecarMergeSourceID(raw recordingSidecarRaw) (string, bool) {
+	if strings.HasPrefix(raw.MergeSourceID, sidecarMergeSourceIDPrefix) {
+		return raw.MergeSourceID, true
+	}
+	return callLogMergeSourceID(raw)
+}
+
+// sidecarMergeSourceIDPrefix is the prefix every ingest_recording document
+// source_id starts with, for both kinds.
+const sidecarMergeSourceIDPrefix = "call-log:"
+
 // callLogMergeSourceID reproduces smsmap.MapCall / ingest_recording.go's
 // call-log SourceID formula (call-log:{dateMs}:{numHash}:{durHash}) from a
 // sidecar, so that a transcript for this recording can be merged into the
@@ -1629,7 +1698,8 @@ func readRecordingSidecarRaw(audioPath string) (recordingSidecarRaw, bool) {
 // second, unlinked call-transcript document.
 //
 // Returns ("", false) when the sidecar cannot reproduce the formula:
-// Kind != "call" (voice-memo — no call-log document exists to merge into),
+// Kind != "call" (voice-memo — its SourceID is not derivable from the sidecar's
+// other fields; sidecarMergeSourceID prefers the explicit merge_source_id),
 // DateMs == 0 (missing/corrupt sidecar field), or neither NumberHash nor
 // Number is present (sidecar written by neither hashing mode — should not
 // happen for a Kind=="call" sidecar, but the collector must never guess).

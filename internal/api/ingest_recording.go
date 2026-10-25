@@ -132,10 +132,10 @@ const (
 //     call summary content as smsmap.MapCall (metadata.transcription="pending"
 //     for kind=call; voice-memo keeps a "[TRANSCRIPTION PENDING]" placeholder,
 //     since it has no summary format of its own) and idempotently upsert it.
-//     WhisperCollector transcribes the audio on its next scheduled run and,
-//     for kind=call recordings, merges the transcript into THIS SAME document
-//     via store.AttachTranscript (see model.SourceCall's doc comment) rather
-//     than creating a second document.
+//     WhisperCollector transcribes the audio on its next scheduled run and
+//     merges the transcript into THIS SAME document (for both kinds, located
+//     through the sidecar's merge_source_id) via store.AttachTranscript (see
+//     model.SourceCall's doc comment) rather than creating a second document.
 //  5. The upsert is idempotent: same inputs → same SourceID.
 //     - call:       call-log:{date_ms}:{numHash}:{durHash}  (mirrors smsmap.MapCall)
 //     - voice-memo: call-log:voice-memo:{hash(originalFilename)}
@@ -469,6 +469,10 @@ func (s *Server) ingestRecordingHandler(w http.ResponseWriter, r *http.Request) 
 		DurationSeconds: durationSec,
 		DateMs:          dateMs,
 		Kind:            kind,
+		// sourceID 는 위 switch 에서 이미 정해졌고, 아래 Upsert 가 쓰는 값과 같다.
+		// 사이드카를 오디오보다 먼저 쓰는 순서(위 주석)는 그대로다 — 이 필드는 그
+		// 순서를 바꾸지 않고 같은 쓰기에 실린다.
+		MergeSourceID: sourceID,
 	}
 	if s.piiNumberHashingEnabled || s.piiNameRedactionEnabled {
 		sidecar.NumberHash = numHash
@@ -665,6 +669,13 @@ type recordingSidecar struct {
 	DurationSeconds int    `json:"duration_seconds,omitempty"`
 	DateMs          int64  `json:"date_ms,omitempty"`
 	Kind            string `json:"kind,omitempty"`
+	// MergeSourceID 는 이 녹음의 문서(통화 요약 또는 음성메모 자리표시자)를
+	// upsert 할 때 쓰는 source_id 그대로다. WhisperCollector 는 전사를 이 문서에
+	// 병합한다. 통화 source_id 는 date_ms·번호 해시·길이로 다시 만들 수 있지만
+	// 음성메모의 것(원본 업로드 파일 이름의 해시)은 사이드카의 다른 필드로 만들
+	// 수 없어서, 이 필드가 없으면 음성메모 전사가 따로 떨어진 문서가 되고
+	// 자리표시자는 영원히 pending 으로 남는다.
+	MergeSourceID string `json:"merge_source_id,omitempty"`
 }
 
 // sanitizeFilename converts an arbitrary string (e.g. a user-supplied audio

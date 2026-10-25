@@ -84,8 +84,8 @@ func (m *mockStore) UpsertTracked(_ context.Context, doc *model.Document) (bool,
 	return !unchanged, nil
 }
 
-func (m *mockStore) LastCollectedAt(_ context.Context, _ string, _ model.SourceType, fallback time.Time) time.Time {
-	return fallback
+func (m *mockStore) LastCollectedAt(_ context.Context, _ string, _ model.SourceType, fallback time.Time) (time.Time, error) {
+	return fallback, nil
 }
 
 func (m *mockStore) UpdateCollectorState(_ context.Context, _ string, _ model.SourceType, _ time.Time) error {
