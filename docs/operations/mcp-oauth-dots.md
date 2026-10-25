@@ -11,7 +11,7 @@ MCP 서버(`cmd/mcp`, 포트 8090)에 OAuth 2.1 인가를 켜서 ChatGPT의 커�
 | 스코프 | `brain:read` 하나. `search`, `get_document`, `stats`만 허용. `add_note`는 OAuth 토큰을 거절하며 정적 `API_KEY`로만 동작(OAuth·인증 없음 세션의 `tools/list`에서는 숨김) |
 | 액세스 토큰 | HS256 JWT, 1시간 |
 | 리프레시 토큰 | 불투명 값, Postgres에 해시로 저장, 30일, 사용할 때마다 회전, 재사용 시 계보 전체 폐기 |
-| 기존 클라이언트(hermes) | `API_KEY` Bearer 그대로 전권. 변경 없음 |
+| 정적 `API_KEY` Bearer | 전권. hermes 에이전트는 2026-10-25 폐기됐고 Tailscale 바인딩도 제거됨. 같은 키가 `/api/v1/*`(폰 ingest, web)도 보호하고 OAuth 기동에도 필요해서 남아 있으며, 이번 폐기로 교체하지 않는다 |
 | OAuth 꺼짐 | 환경 변수를 모두 비우면 지금과 동일. OAuth 엔드포인트도 열리지 않음 |
 
 ### 혼합 모드 (OAuth 또는 인증 없음)

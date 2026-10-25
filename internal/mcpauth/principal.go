@@ -11,7 +11,7 @@ type PrincipalKind int
 const (
 	// PrincipalNone: 유효한 자격이 없다.
 	PrincipalNone PrincipalKind = iota
-	// PrincipalStatic: 정적 API_KEY Bearer. 기존 클라이언트(hermes)이며 전권이다.
+	// PrincipalStatic: 정적 API_KEY Bearer(서버 운영용)이며 전권이다.
 	PrincipalStatic
 	// PrincipalOAuth: 이 서버가 발급한 액세스 토큰. 토큰의 스코프만 허용된다.
 	PrincipalOAuth

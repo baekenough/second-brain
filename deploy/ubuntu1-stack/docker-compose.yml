@@ -115,9 +115,8 @@ services:
   # ---------------------------------------------------------------------------
   # mcp — MCP streamable HTTP 서버 (포트 8090).
   #   마이그레이션은 server가 적용하므로, server가 기동된 뒤 시작한다.
-  #   포트를 두 곳에만 바인딩한다(0.0.0.0 금지, LAN/공인망 노출 방지):
-  #     - 127.0.0.1:8090 — cloudflared 터널용(brain-mcp.baekenough.com ingress)
-  #     - 100.68.237.99:8090 (ubuntu1 Tailscale IP) — macmini hermes-agent 접근 경로
+  #   포트는 127.0.0.1:8090 한 곳에만 바인딩한다(0.0.0.0 금지, LAN/공인망 노출 방지).
+  #   유일한 진입점은 cloudflared 터널(sb.baekenough.com/mcp, OAuth)이 쓰는 로컬 바인딩이다.
   #   postgres는 별도 compose 프로젝트이므로 depends_on을 걸지 않는다.
   #   2026-08-29 배포 때 이 사본에 없어서 프로덕션 파일에서 유실됐던 서비스(2026-09-19 복원).
   # ---------------------------------------------------------------------------
@@ -125,7 +124,6 @@ services:
     image: second-brain-mcp:ubuntu1
     ports:
       - "127.0.0.1:8090:8090"
-      - "100.68.237.99:8090:8090"
     env_file:
       - .env.local
     environment:
