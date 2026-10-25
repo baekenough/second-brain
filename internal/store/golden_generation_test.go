@@ -46,15 +46,18 @@ func TestGoldenGenerationHistoryBeyondSeenPool(t *testing.T) {
 	}
 }
 
-func TestGoldenGenerationReplenishesCompleted35PreservingJudgments(t *testing.T) {
+func TestGoldenGenerationReplenishesCompletedSetPreservingJudgments(t *testing.T) {
 	pg := goldenTestDB(t)
 	s := NewGoldenStore(pg)
 	ctx := context.Background()
 	for i := 0; i < 15; i++ {
 		insertAskSession(t, pg, fmt.Sprintf("Distinct existing history question %02d", i))
 	}
+	// 이력 질문 15건 + 시드 질문 전부. 시드 목록 길이가 바뀌어도(수집기 제거로
+	// 줄었다) 이 테스트가 숫자를 따로 들고 있지 않도록 길이에서 구한다.
+	total := 15 + len(goldenSeedQueries)
 	created, _, err := s.GenerateQueries(ctx)
-	if err != nil || created != 35 {
+	if err != nil || created != total {
 		t.Fatalf("initial generation=%d err=%v", created, err)
 	}
 	if _, err := pg.pool.Exec(ctx, `UPDATE golden_queries SET status='done'`); err != nil {
@@ -93,7 +96,7 @@ func TestGoldenGenerationReplenishesCompleted35PreservingJudgments(t *testing.T)
 	if err := pg.pool.QueryRow(ctx, `SELECT asked_at FROM golden_queries WHERE id=$1`, queryID).Scan(&retainedAskedAt); err != nil {
 		t.Fatal(err)
 	}
-	if done != 35 || judgments != 1 || !retainedAskedAt.Equal(askedAt) {
+	if done != total || judgments != 1 || !retainedAskedAt.Equal(askedAt) {
 		t.Fatalf("existing progress changed: done=%d labels=%d", done, judgments)
 	}
 	var automatic int
@@ -128,20 +131,21 @@ func TestGoldenGenerationCandidateEligibilityAndSourceBalance(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 	for i := 0; i < 15; i++ {
-		seedGenerationDocument(t, pg, "gmail", `{"retention":"keep"}`, now.Add(-time.Duration(i+1)*time.Minute))
+		seedGenerationDocument(t, pg, "sms", `{"retention":"keep"}`, now.Add(-time.Duration(i+1)*time.Minute))
 	}
-	for _, source := range []string{"sms", "calendar", "note"} {
-		seedGenerationDocument(t, pg, source, `{"retention":"keep"}`, now.Add(-time.Hour))
-	}
+	seedGenerationDocument(t, pg, "note", `{"retention":"keep"}`, now.Add(-time.Hour))
 	seedGenerationDocument(t, pg, "call", `{"retention":"keep","transcription":"done"}`, now.Add(-time.Hour))
 	invalid := []uuid.UUID{
-		seedGenerationDocument(t, pg, "gmail", "{}", now.Add(-time.Hour)),
-		seedGenerationDocument(t, pg, "gmail", `{"retention":"low"}`, now.Add(-time.Hour)),
+		seedGenerationDocument(t, pg, "sms", "{}", now.Add(-time.Hour)),
+		seedGenerationDocument(t, pg, "note", `{"retention":"low"}`, now.Add(-time.Hour)),
 		seedGenerationDocument(t, pg, "sms", `{"retention":"disposable"}`, now.Add(-time.Hour)),
 		seedGenerationDocument(t, pg, "call", `{"retention":"keep","transcription":"pending"}`, now.Add(-time.Hour)),
 		seedGenerationDocument(t, pg, "call", `{"retention":"keep","transcription":"none"}`, now.Add(-time.Hour)),
-		seedGenerationDocument(t, pg, "gmail", `{"retention":"keep"}`, now.Add(-15*24*time.Hour)),
-		seedGenerationDocument(t, pg, "calendar", `{"retention":"keep"}`, now.Add(time.Hour)),
+		seedGenerationDocument(t, pg, "sms", `{"retention":"keep"}`, now.Add(-15*24*time.Hour)),
+		seedGenerationDocument(t, pg, "note", `{"retention":"keep"}`, now.Add(time.Hour)),
+		// 제거된 소스: 테이블에 남아 있는 행도 생성 후보가 아니다.
+		seedGenerationDocument(t, pg, "gmail", `{"retention":"keep"}`, now.Add(-time.Hour)),
+		seedGenerationDocument(t, pg, "calendar", `{"retention":"keep"}`, now.Add(-time.Hour)),
 		seedGenerationDocument(t, pg, "filesystem", `{"retention":"keep"}`, now.Add(-time.Hour)),
 	}
 	deleted := seedGenerationDocument(t, pg, "sms", `{"retention":"keep"}`, now.Add(-time.Hour))
@@ -160,7 +164,7 @@ func TestGoldenGenerationCandidateEligibilityAndSourceBalance(t *testing.T) {
 		}
 	}
 	invalid = append(invalid, deleted, short, missingDate)
-	docs, err := s.CandidateGenerationDocuments(ctx, 5)
+	docs, err := s.CandidateGenerationDocuments(ctx, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +172,7 @@ func TestGoldenGenerationCandidateEligibilityAndSourceBalance(t *testing.T) {
 	for _, d := range docs {
 		sources[string(d.Source)] = true
 	}
-	if len(docs) != 5 || len(sources) != 5 {
+	if len(docs) != 3 || len(sources) != 3 {
 		t.Fatalf("unbalanced sources: %+v", sources)
 	}
 	docs, err = s.CandidateGenerationDocuments(ctx, 100)
@@ -197,7 +201,7 @@ func TestGoldenGenerationConcurrentNormalizedDedup(t *testing.T) {
 	s := NewGoldenStore(pg)
 	ctx := context.Background()
 	doc1 := seedGenerationDocument(t, pg, "sms", `{"retention":"keep"}`, time.Now().Add(-time.Hour))
-	doc2 := seedGenerationDocument(t, pg, "gmail", `{"retention":"keep"}`, time.Now().Add(-time.Hour))
+	doc2 := seedGenerationDocument(t, pg, "note", `{"retention":"keep"}`, time.Now().Add(-time.Hour))
 	inputs := []GoldenGeneratedQuery{{Text: "A novel grounded question?", DocumentID: doc1}, {Text: " a NOVEL grounded question? ", DocumentID: doc2}}
 	var wg sync.WaitGroup
 	results := make(chan int, 2)

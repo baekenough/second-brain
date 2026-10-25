@@ -16,7 +16,7 @@ import (
 // time.Now() inside Classify returns an instant whose Location is UTC. The
 // range helpers used to resolve calendar boundaries in that location, which
 // made "오늘" mean "today in UTC" — a window shifted 9 hours behind the day the
-// user (and the ingested data) actually lives in. A calendar event at 18:00 KST
+// user (and the ingested data) actually lives in. A message stamped 18:00 KST
 // fell outside the container's "오늘" window and /ask could not find it.
 //
 // The pre-existing day-boundary tests injected a KST clock, so they asserted

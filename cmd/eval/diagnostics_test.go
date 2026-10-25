@@ -54,7 +54,7 @@ func (s *tracingStub) Search(_ context.Context, q model.SearchQuery) ([]*model.S
 	return []*model.SearchResult{
 		{Document: model.Document{ID: decoyDocID, SourceType: model.SourceSMS, Title: secretTitle, Content: secretContent}},
 		{Document: model.Document{ID: labelDocID, SourceType: model.SourceCall, Title: secretTitle, Content: secretContent}},
-		{Document: model.Document{ID: negativeDoc, SourceType: model.SourceGmail, Title: secretTitle, Content: secretContent}},
+		{Document: model.Document{ID: negativeDoc, SourceType: model.SourceNote, Title: secretTitle, Content: secretContent}},
 	}, nil
 }
 

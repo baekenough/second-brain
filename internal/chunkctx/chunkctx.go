@@ -34,17 +34,15 @@ const (
 	headerPeopleMaxRunes = 60
 )
 
-// 소스 타입별 한글 라벨. 임베딩 모델이 한국어 질의("메일", "통화 녹음")와
+// 소스 타입별 한글 라벨. 임베딩 모델이 한국어 질의("문자", "통화 녹음")와
 // 같은 어휘 공간에서 만나도록 영어 식별자 대신 한글 라벨을 넣는다.
 // 목록에 없는 소스는 source_type 문자열을 그대로 쓴다(라벨 누락이 헤더 자체를
 // 없애지는 않도록).
 var chunkHeaderSourceLabels = map[model.SourceType]string{
-	model.SourceGmail:          "메일",
 	model.SourceSMS:            "문자",
 	model.SourceCall:           "통화",
 	model.SourceCallLog:        "통화",
 	model.SourceCallTranscript: "통화 전사",
-	model.SourceCalendar:       "일정",
 	model.SourceNote:           "노트",
 	model.SourceAgentNote:      "에이전트 노트",
 	model.SourceInsight:        "통찰",
@@ -66,14 +64,14 @@ var koreanWeekdays = [7]string{"일", "월", "화", "수", "목", "금", "토"}
 // 돌려주므로(시계·맵 순회 순서에 의존하지 않는다) 재임베딩 결과가 흔들리지
 // 않는다.
 //
-// 형식: "[메일] 2026-09-21(일) · 제목: ... · 보낸사람: ... · 받는사람: ..."
+// 형식: "[문자] 2026-09-21(일) · 제목: ... · 상대: ... · 방향: ..."
 //
 // 왜 필요한가: 문서 임베딩은 title+content 를 쓰지만 청크 임베딩은 청크 본문만
-// 썼다. 그래서 문서 두 번째 이후 청크는 "누가·언제·무슨 제목" 이라는, 메일·
-// 문자·통화 검색에서 가장 결정적인 단서를 잃은 채로 벡터가 만들어졌다.
+// 썼다. 그래서 문서 두 번째 이후 청크는 "누가·언제·무슨 제목" 이라는, 문자·
+// 통화 검색에서 가장 결정적인 단서를 잃은 채로 벡터가 만들어졌다.
 //
 // 개인정보 취급: 전화번호(metadata["number"])는 절대 넣지 않는다. 사람 식별은
-// 이름/표시명(contact_name, display_name, From/To 헤더)이 있을 때만 하고,
+// 이름/표시명(contact_name)이 있을 때만 하고,
 // 값이 [REDACTED] 이거나 숫자·기호뿐이면(= 이름이 아니라 번호) 버린다.
 //
 // 반환값이 빈 문자열이면 붙일 문맥이 하나도 없다는 뜻이므로 호출 측은 청크
@@ -91,7 +89,7 @@ func BuildChunkContextHeader(doc model.Document) string {
 	}
 	parts = append(parts, chunkHeaderParticipants(doc)...)
 
-	// 소스 라벨은 구분자 없이 맨 앞에 붙인다("[메일] 2026-09-21(월) · 제목: …").
+	// 소스 라벨은 구분자 없이 맨 앞에 붙인다("[문자] 2026-09-21(월) · 제목: …").
 	head := ""
 	if label := chunkHeaderSourceLabel(doc.SourceType); label != "" {
 		head = "[" + label + "]"
@@ -119,8 +117,7 @@ func chunkHeaderSourceLabel(st model.SourceType) string {
 
 // chunkHeaderParticipants 는 소스별 metadata 키에서 사람 정보를 뽑아
 // "라벨: 값" 형태의 조각들을 만든다. 키 이름은 각 수집기가 실제로 쓰는 것과
-// 일치해야 한다(internal/collector/gmail.go, collector/smsmap/smsmap.go,
-// collector/calendar.go 참고). 키가 바뀌면 여기도 함께 고칠 것.
+// 일치해야 한다(collector/smsmap/smsmap.go 참고). 키가 바뀌면 여기도 함께 고칠 것.
 func chunkHeaderParticipants(doc model.Document) []string {
 	meta := doc.Metadata
 	if len(meta) == 0 {
@@ -135,13 +132,6 @@ func chunkHeaderParticipants(doc model.Document) []string {
 	}
 
 	switch doc.SourceType {
-	case model.SourceGmail:
-		// gmail.go: metadata["from"], metadata["to"] 는 원본 헤더 문자열
-		// (예: `"홍길동" <hong@example.com>`). 이름과 주소 모두 검색 단서라
-		// 둘 다 남긴다.
-		add("보낸사람", metaString(meta, "from"))
-		add("받는사람", metaString(meta, "to"))
-
 	case model.SourceSMS, model.SourceCall, model.SourceCallLog, model.SourceCallTranscript:
 		// smsmap.go: metadata["contact_name"] 는 주소록 표시명(없을 수 있다).
 		// metadata["number"] 는 원본 전화번호이므로 의도적으로 쓰지 않는다.
@@ -149,52 +139,9 @@ func chunkHeaderParticipants(doc model.Document) []string {
 		if dir := metaString(meta, "direction"); dir != "" {
 			parts = append(parts, "방향: "+collapseSpaces(dir))
 		}
-
-	case model.SourceCalendar:
-		// calendar.go: metadata["organizer"] 는 이메일 문자열,
-		// metadata["attendees"] 는 {email, display_name, ...} 목록.
-		add("주최", metaString(meta, "organizer"))
-		add("참석", strings.Join(calendarAttendees(meta), ", "))
-		add("장소", metaString(meta, "location"))
 	}
 
 	return parts
-}
-
-// calendarAttendees 는 metadata["attendees"] 에서 표시명(없으면 이메일)을
-// 입력 순서대로 뽑는다. DB 를 거치면 []map[string]any 가 []any 로 바뀌므로
-// 두 형태를 모두 받는다.
-func calendarAttendees(meta map[string]any) []string {
-	raw, ok := meta["attendees"]
-	if !ok {
-		return nil
-	}
-
-	var entries []map[string]any
-	switch v := raw.(type) {
-	case []map[string]any:
-		entries = v
-	case []any:
-		for _, item := range v {
-			if m, ok := item.(map[string]any); ok {
-				entries = append(entries, m)
-			}
-		}
-	default:
-		return nil
-	}
-
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		name := sanitizePerson(metaString(e, "display_name"))
-		if name == "" {
-			name = sanitizePerson(metaString(e, "email"))
-		}
-		if name != "" {
-			names = append(names, name)
-		}
-	}
-	return names
 }
 
 // metaString 은 metadata 값을 문자열로 읽는다. 문자열이 아니면 빈 값.

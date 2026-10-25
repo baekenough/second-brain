@@ -33,9 +33,9 @@ func TestSemanticPlannerDoesNotDiscardSpecificity(t *testing.T) {
 		// TestDeterministicWindow_RelativeAndPastPhrases in
 		// relative_window_test.go.
 
-		{"내일 일정에 대해 어제 받은 메일", "2026-08-18", "2026-08-19", model.SourceGmail},
+		{"내일 일정에 대해 어제 받은 문자", "2026-08-18", "2026-08-19", model.SourceSMS},
 		{"내일 일정에 관한 문자", "", "", model.SourceSMS},
-		{"오늘 일정에 관한 메일", "", "", model.SourceGmail},
+		{"오늘 일정에 관한 통화", "", "", model.SourceCall},
 	}
 	for _, tc := range cases {
 		t.Run(tc.question, func(t *testing.T) {
@@ -65,7 +65,7 @@ func TestAmbiguousPlannerFailureDoesNotInventNarrowWindow(t *testing.T) {
 	// here: matchWeekdayInWeek in plan.go deliberately refuses to pick when a
 	// question names two weekdays, so this still falls through to the LLM
 	// path (and must not invent a window when that path has no completer).
-	for _, q := range []string{"이번주 월요일과 화요일 일정", "지난달과 이번달 비교", "내일 일정에 관한 메일"} {
+	for _, q := range []string{"이번주 월요일과 화요일 일정", "지난달과 이번달 비교", "내일 일정에 관한 문자"} {
 		got := newPlanner(t, nil, planNowUTC).Plan(context.Background(), q)
 		if got.OccurredFrom != nil || got.OccurredTo != nil || len(got.SourceTypes) > 0 {
 			t.Fatalf("unsafe narrowing for %q", q)
@@ -75,8 +75,8 @@ func TestAmbiguousPlannerFailureDoesNotInventNarrowWindow(t *testing.T) {
 
 func TestExactDayAndSimpleSourceFastPath(t *testing.T) {
 	cases := []planGoldenCase{
-		{question: "2026년 8월 21일 일정", wantFrom: "2026-08-21", wantTo: "2026-08-22", wantSources: []model.SourceType{model.SourceCalendar}},
-		{question: "2026-08-21 일정", wantFrom: "2026-08-21", wantTo: "2026-08-22", wantSources: []model.SourceType{model.SourceCalendar}},
+		{question: "2026년 8월 17일 일정", wantFrom: "2026-08-17", wantTo: "2026-08-18"},
+		{question: "2026-08-17 일정", wantFrom: "2026-08-17", wantTo: "2026-08-18"},
 		{question: "어제와 오늘 비교", wantFrom: "2026-08-18", wantTo: "2026-08-20"},
 		{question: "오늘 통화 요약", wantFrom: "2026-08-19", wantTo: "2026-08-20", wantSources: []model.SourceType{model.SourceCall}},
 		{question: "오늘 받은 약속 안내 문자", wantFrom: "2026-08-19", wantTo: "2026-08-20", wantSources: []model.SourceType{model.SourceSMS}},

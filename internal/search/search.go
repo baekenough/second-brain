@@ -418,9 +418,9 @@ func applyInsightExclusionDefault(q model.SearchQuery) model.SearchQuery {
 // reason: every caller of Service.Search (both /api/v1/search handlers,
 // /api/v1/ask's assembleRetrieval, the MCP search tool, the GraphQL resolver,
 // the Discord gateway) inherits the exclusion without having to remember to
-// ask for it. Gmail is the only tagged source so far (11,965 documents,
-// ~77% low/disposable); untagged documents from every other source are never
-// touched by this — see model.Document.RetentionTag.
+// ask for it. Only documents carrying a retention tag (the classification
+// worker tags SMS and call documents) are ever touched by this; untagged
+// documents are never excluded — see model.Document.RetentionTag.
 func applyRetentionExclusionDefault(q model.SearchQuery) model.SearchQuery {
 	if q.IncludeRetention {
 		return q
@@ -445,7 +445,7 @@ func applyRetentionExclusionDefault(q model.SearchQuery) model.SearchQuery {
 //
 // Until #196 this function handled the exclusion only, and the include filter
 // was never applied to the chunk lanes at all. Measured consequence: a
-// source_type=calendar request with limit=20 returned the store's 14 calendar
+// source_type=<X> request with limit=20 returned the store's 14 matching
 // documents plus 6 documents of other source types that the chunk vector lane
 // merged into the free slots. The include filter is not advisory — a caller
 // that names a source and receives four is worse off than one that received
@@ -963,12 +963,6 @@ func (s *Service) search(ctx context.Context, q model.SearchQuery, trace *Search
 	// 더하지 않는다. 꺼져 있거나 최신순 질의면 no-op — graph_expand.go 참고.
 	results = s.applyGraphExpandBoost(ctx, q, results, tune)
 	// --- end graph expand boost ---
-
-	// --- schedule intent boost (SEARCH_SCHEDULE_INTENT_BOOST, default off) ---
-	// 일정 의도 질문에서 캘린더 후보 점수를 (1+boost) 배 해 재정렬한다. 순서만
-	// 바꾼다 — schedule_boost.go 참고.
-	results = applyScheduleIntentBoost(q, results, tune)
-	// --- end schedule intent boost ---
 
 	// Single fusion-time enforcement point for the retention="low" score
 	// penalty (see applyLowRetentionPenalty's doc comment for why it has to

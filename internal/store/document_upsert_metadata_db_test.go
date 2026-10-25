@@ -122,7 +122,7 @@ func TestDB_UpsertTracked_PreservesClassificationMetadataAcrossRecollection(t *t
 
 	sourceID := upsertMetaTestPrefix + uuid.New().String()
 	doc := &model.Document{
-		SourceType: model.SourceGmail,
+		SourceType: model.SourceUpload,
 		SourceID:   sourceID,
 		Title:      "zzdummy mail v1",
 		Content:    "zzdummy sentinel mail body v1",
@@ -141,7 +141,7 @@ func TestDB_UpsertTracked_PreservesClassificationMetadataAcrossRecollection(t *t
 	}
 
 	recollected := &model.Document{
-		SourceType: model.SourceGmail,
+		SourceType: model.SourceUpload,
 		SourceID:   sourceID,
 		Title:      "zzdummy mail v2",
 		Content:    "zzdummy sentinel mail body v2",

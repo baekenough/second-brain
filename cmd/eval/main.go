@@ -231,9 +231,6 @@ func run() error {
 	mmrLambda := flag.Float64("mmr-lambda", 0,
 		"리랭크(합산) 뒤 상위 30건에 MMR 을 적용한다. (0,1] 의 λ, 0(기본)이면 끈다. "+
 			"유사도 벌점은 같은 소스 문서끼리만 준다")
-	scheduleIntentBoost := flag.Float64("schedule-intent-boost", 0,
-		"일정 의도 질문(intent.HasScheduleIntent)에서 소스 포함 집합이 없을 때 캘린더 후보 점수에 "+
-			"(1+boost) 를 곱해 재정렬한다. (0,1], 0(기본)이면 끈다")
 	planSourceSpillK := flag.Int("plan-source-spill-k", 0,
 		"--plan-sources 가 건 소스 포함 집합 밖에서 상위 K건(최대 10)을 보조 검색해 후보에 섞는다. "+
 			"계획이 소스를 잘못 좁힌 질의를 구제한다. 0(기본)이면 끈다. --plan-sources 필요")
@@ -304,7 +301,6 @@ func run() error {
 		CollapseExpandMax:     *collapseExpandMax,
 		WindowBucketDiversify: *windowBucketDiversify,
 		MMRLambda:             *mmrLambda,
-		ScheduleIntentBoost:   *scheduleIntentBoost,
 		PlanSourceSpillK:      *planSourceSpillK,
 	}
 	if err := validateTuningFlags(tuning); err != nil {

@@ -33,7 +33,7 @@ func (s *corpusGoldenStub) NewGeneratedQueries(_ context.Context, q []store.Gold
 func generationFixture() (*Server, *corpusGoldenStub, *fakeAskLLM) {
 	id := uuid.New()
 	content := "오로라 프로젝트 회의에서 검색 품질 개선과 배포 일정을 논의했습니다."
-	g := &corpusGoldenStub{stubGoldenSet: &stubGoldenSet{}, documents: []store.GoldenGenerationDocument{{ID: id, Source: model.SourceGmail, Title: "오로라 회의", Content: content}}}
+	g := &corpusGoldenStub{stubGoldenSet: &stubGoldenSet{}, documents: []store.GoldenGenerationDocument{{ID: id, Source: model.SourceSMS, Title: "오로라 회의", Content: content}}}
 	body, _ := json.Marshal([]goldenGeneratedCandidate{{DocumentID: id.String(), Question: "오로라 프로젝트 회의에서 논의한 검색 개선 내용은 무엇인가요?", Evidence: content}})
 	l := &fakeAskLLM{enabled: true, completeResp: string(body)}
 	s := newGoldenTestServer(g, nil)

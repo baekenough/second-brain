@@ -49,7 +49,7 @@ func seedChunkDoc(t *testing.T, pg *Postgres, occurredAt *time.Time, collectedAt
 	if _, err := pg.pool.Exec(ctx, `
 		INSERT INTO documents (id, source_type, source_id, title, content, embedding, occurred_at, collected_at)
 		VALUES ($1, $2, $3, 'zzdummy chunk title', 'zzdummy chunk body', $4, $5, $6)`,
-		id, string(model.SourceCalendar), chunkTSPrefix+id.String(),
+		id, string(model.SourceNote), chunkTSPrefix+id.String(),
 		pgvector.NewVector(testEmbedding()), occurredAt, collectedAt,
 	); err != nil {
 		t.Fatalf("seed document: %v", err)
@@ -100,9 +100,9 @@ func TestDB_ChunkSearch_ReturnsDocumentTimestamps(t *testing.T) {
 		}
 		// Column-order guard: a mis-ordered Scan list shows up here first,
 		// because these fields sit next to the new ones in the SELECT.
-		if got.DocumentSource != string(model.SourceCalendar) || got.DocumentStatus != "active" {
+		if got.DocumentSource != string(model.SourceNote) || got.DocumentStatus != "active" {
 			t.Errorf("%s: source/status = %q/%q, want %q/active — SELECT and Scan orders disagree",
-				lane, got.DocumentSource, got.DocumentStatus, model.SourceCalendar)
+				lane, got.DocumentSource, got.DocumentStatus, model.SourceNote)
 		}
 
 		none, ok := byDoc[noEvent]

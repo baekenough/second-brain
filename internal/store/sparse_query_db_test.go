@@ -40,7 +40,7 @@ type sparseFixture struct {
 	noMatch     uuid.UUID // 키워드가 없는 문서
 	outside     uuid.UUID // 키워드는 있지만 시간창 밖
 	disposable  uuid.UUID // 키워드는 있지만 retention=disposable
-	otherSource uuid.UUID // 키워드는 있지만 gmail
+	otherSource uuid.UUID // 키워드는 있지만 다른 소스
 }
 
 func sparseDB(t *testing.T) *Postgres {
@@ -94,13 +94,13 @@ func newSparseFixture(t *testing.T) sparseFixture {
 	pg := sparseDB(t)
 	in := sparseWinFrom.Add(3 * time.Hour)
 	f := sparseFixture{pg: pg}
-	f.match = seedSparseDoc(t, pg, model.SourceCalendar, in, "zz 주간 모임", "다음 주 회의를 목요일로 옮겼다. 일정은 추후 공지한다.", `{}`)
-	f.ctxMatch = seedSparseDoc(t, pg, model.SourceCalendar, in, "zz 팀 모임", "장소는 삼층 라운지로 한다.", `{}`)
+	f.match = seedSparseDoc(t, pg, model.SourceNote, in, "zz 주간 모임", "다음 주 회의를 목요일로 옮겼다. 일정은 추후 공지한다.", `{}`)
+	f.ctxMatch = seedSparseDoc(t, pg, model.SourceNote, in, "zz 팀 모임", "장소는 삼층 라운지로 한다.", `{}`)
 	seedSparseCtx(t, pg, f.ctxMatch, model.ChunkSparseCtxV1TP, "zz 팀 회의록\n장소는 삼층 라운지로 한다.")
-	f.noMatch = seedSparseDoc(t, pg, model.SourceCalendar, in, "zz 점심", "점심 메뉴는 국수로 정했다.", `{}`)
-	f.outside = seedSparseDoc(t, pg, model.SourceCalendar, sparseWinTo.Add(time.Hour), "zz 바깥", "회의를 다시 잡자. 일정은 미정.", `{}`)
-	f.disposable = seedSparseDoc(t, pg, model.SourceCalendar, in, "zz 광고", "회의를 위한 할인 일정은 오늘까지", `{"retention":"disposable"}`)
-	f.otherSource = seedSparseDoc(t, pg, model.SourceGmail, in, "zz 메일", "회의를 잡았고 일정은 목요일이다.", `{}`)
+	f.noMatch = seedSparseDoc(t, pg, model.SourceNote, in, "zz 점심", "점심 메뉴는 국수로 정했다.", `{}`)
+	f.outside = seedSparseDoc(t, pg, model.SourceNote, sparseWinTo.Add(time.Hour), "zz 바깥", "회의를 다시 잡자. 일정은 미정.", `{}`)
+	f.disposable = seedSparseDoc(t, pg, model.SourceNote, in, "zz 광고", "회의를 위한 할인 일정은 오늘까지", `{"retention":"disposable"}`)
+	f.otherSource = seedSparseDoc(t, pg, model.SourceUpload, in, "zz 메일", "회의를 잡았고 일정은 목요일이다.", `{}`)
 	return f
 }
 
@@ -111,7 +111,7 @@ func sparseWindowQuery(question string, withTerms bool) model.SearchQuery {
 	q := model.SearchQuery{
 		Query:            question,
 		Limit:            20,
-		SourceTypes:      []model.SourceType{model.SourceCalendar},
+		SourceTypes:      []model.SourceType{model.SourceNote},
 		ExcludeRetention: []string{model.RetentionDisposable},
 		OccurredFrom:     &from,
 		OccurredTo:       &to,

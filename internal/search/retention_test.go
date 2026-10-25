@@ -12,7 +12,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Retention-aware search (gmail segmentation pass: metadata.retention in
+// Retention-aware search (classification pass: metadata.retention in
 // {"keep", "low", "disposable"} for 11,965 tagged documents; SMS to follow).
 //
 // These tests sit at the same seam as insight_exclusion_test.go, for the same

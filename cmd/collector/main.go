@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/baekenough/second-brain/internal/api"
-	"github.com/baekenough/second-brain/internal/calendarauto"
 	"github.com/baekenough/second-brain/internal/classify"
 	"github.com/baekenough/second-brain/internal/collector"
 	"github.com/baekenough/second-brain/internal/collector/extractor"
@@ -405,7 +404,7 @@ func run() error {
 	}()
 
 	// --- Classification worker (retention/segment tagging) ---
-	// Tags newly-collected SMS/Gmail/call-transcript documents with
+	// Tags newly-collected SMS/call documents with
 	// metadata.segment/retention, backfills the remaining untagged
 	// historical corpus, and re-audits pre-existing (e.g. ox-alpha) tags
 	// against the deterministic Gate (internal/classify). Opt-in like
@@ -444,34 +443,6 @@ func run() error {
 		}
 	}
 	jevClient := jev.New(os.Getenv("TYPESAFE_API_KEY"), nil)
-	if v := os.Getenv("CALENDAR_AUTOMATION_ENABLED"); v == "true" || v == "1" {
-		if !jevClient.Enabled() || !llmClient.Enabled() {
-			return fmt.Errorf("calendar automation requires Jev and extraction LLM configuration")
-		}
-		calendarID := os.Getenv("CALENDAR_WRITE_ID")
-		if calendarID == "" {
-			calendarID = "primary"
-		}
-		calendarWriter, err := calendarauto.NewGoogleWriter(ctx,
-			os.Getenv("CALENDAR_WRITE_CREDENTIALS_JSON"), os.Getenv("CALENDAR_WRITE_TOKEN_JSON"), calendarID)
-		if err != nil {
-			return fmt.Errorf("configure calendar automation: %w", err)
-		}
-		calendarStore := store.NewCalendarAutomationStore(pg)
-		cutoff, err := calendarStore.Initialize(ctx)
-		if err != nil {
-			return fmt.Errorf("initialize calendar automation: %w", err)
-		}
-		evaluator := calendarauto.NewEvaluator(jevClient, llmClient)
-		calendarWorker := calendarauto.New(calendarauto.Config{
-			Store: calendarStore, Decider: evaluator, Extractor: evaluator, Writer: calendarWriter,
-			Interval:  envDuration("CALENDAR_AUTOMATION_INTERVAL", time.Minute),
-			BatchSize: envInt("CALENDAR_AUTOMATION_BATCH_SIZE", 10),
-		})
-		slog.Info("calendar automation enabled", "activated_at", cutoff, "mode", "forward-only")
-		wg.Add(1)
-		go func() { defer wg.Done(); calendarWorker.Run(ctx) }()
-	}
 	classifier := &classify.Classifier{
 		Jev:                 jevClient,
 		ConfidenceThreshold: envFloat("CLASSIFIER_CONFIDENCE_THRESHOLD", 0.9),
@@ -549,8 +520,6 @@ func run() error {
 		collector.NewGDriveCollector(cfg.GDriveCredentialsJSON),
 		collector.NewNotionCollector(cfg.NotionToken),
 		collector.NewTelegramCollector(cfg.TelegramBotToken, cfg.TelegramChatIDs),
-		collector.NewGmailCollector(cfg),
-		collector.NewCalendarCollector(cfg).WithCancellationStore(docStore),
 		collector.NewSMSCollector(cfg.SMSSourceDir, cfg.SMSMaxFileBytes).
 			WithNumberHashingEnabled(cfg.PIINumberHashingEnabled).WithNameRedactionEnabled(cfg.PIINameRedactionEnabled),
 		collector.NewWhisperCollector(cfg).WithNameRedactor(nameRedactor),

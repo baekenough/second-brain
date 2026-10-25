@@ -49,7 +49,7 @@ func TestChunkConversion_CarriesDocumentTimestamps(t *testing.T) {
 	occurred := time.Date(2026, 8, 20, 9, 30, 0, 0, time.UTC)
 	collected := time.Date(2026, 8, 19, 1, 0, 0, 0, time.UTC)
 	id := uuid.New()
-	row := chunkResultAt(id, model.SourceCalendar, 0.9, &occurred, collected)
+	row := chunkResultAt(id, model.SourceCall, 0.9, &occurred, collected)
 
 	cases := []struct {
 		name    string
@@ -124,7 +124,7 @@ func TestSearch_SortRecent_FutureWindow_ChunkOnlyHit_RanksFirst(t *testing.T) {
 
 	docs := &recordingDocSearcher{results: []*model.SearchResult{mid, late}}
 	chunks := &mockChunkSearcher{vectorResults: []store.ChunkSearchResult{
-		chunkResultAt(soonestID, model.SourceCalendar, 0.99, &soonestAt, now),
+		chunkResultAt(soonestID, model.SourceCall, 0.99, &soonestAt, now),
 	}}
 	checker := &fakeOccurredChecker{occurredAt: map[uuid.UUID]time.Time{
 		mid.ID:    now.Add(48 * time.Hour),

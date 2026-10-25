@@ -12,7 +12,7 @@ func TestDB_SearchCallContactMetadata(t *testing.T) {
 	ctx := context.Background()
 	match := seedSrcDoc(t, pg, model.SourceCall, nil)
 	deleted := seedSrcDoc(t, pg, model.SourceCall, nil)
-	unrelated := seedSrcDoc(t, pg, model.SourceGmail, nil)
+	unrelated := seedSrcDoc(t, pg, model.SourceUpload, nil)
 	for _, id := range []interface{}{match, deleted, unrelated} {
 		if _, err := pg.pool.Exec(ctx, `UPDATE documents SET metadata = '{"contact_name":"테스트상대방"}', embedding = NULL WHERE id=$1`, id); err != nil {
 			t.Fatal(err)

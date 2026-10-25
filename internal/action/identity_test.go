@@ -59,9 +59,9 @@ func TestNormalizeSummary_OtherKinds_TruncatesAt80Chars(t *testing.T) {
 // detected_by can never become "both".
 func TestBuildIdentityKey_AwaitingMyReply_StructuralAndLLMConverge(t *testing.T) {
 	t.Parallel()
-	structural := BuildIdentityKey("gmail:t1", string(model.KindAwaitingMyReply), "alice@example.com",
+	structural := BuildIdentityKey("sms:t1", string(model.KindAwaitingMyReply), "alice@example.com",
 		"마지막 메시지 이후 응답 없음")
-	llm := BuildIdentityKey("gmail:t1", string(model.KindAwaitingMyReply), "alice@example.com",
+	llm := BuildIdentityKey("sms:t1", string(model.KindAwaitingMyReply), "alice@example.com",
 		"Alice is waiting on a reply from you regarding the Q3 budget.")
 	if structural != llm {
 		t.Errorf("structural key %q != llm key %q — awaiting_my_reply must ignore summary text", structural, llm)
@@ -70,8 +70,8 @@ func TestBuildIdentityKey_AwaitingMyReply_StructuralAndLLMConverge(t *testing.T)
 
 func TestBuildIdentityKey_OtherKinds_DifferentSummary_DifferentKey(t *testing.T) {
 	t.Parallel()
-	a := BuildIdentityKey("gmail:t1", string(model.KindMyCommitment), "alice@example.com", "Send the Q3 report by Friday")
-	b := BuildIdentityKey("gmail:t1", string(model.KindMyCommitment), "alice@example.com", "Call Bob about the contract")
+	a := BuildIdentityKey("sms:t1", string(model.KindMyCommitment), "alice@example.com", "Send the Q3 report by Friday")
+	b := BuildIdentityKey("sms:t1", string(model.KindMyCommitment), "alice@example.com", "Call Bob about the contract")
 	if a == b {
 		t.Error("two distinct commitments in the same thread collapsed to one identity_key")
 	}
@@ -97,42 +97,13 @@ func TestBuildIdentityKey_FormatMatchesActionPrefixAnd16HexChars(t *testing.T) {
 	}
 }
 
-// TestCounterpartIdentity_GmailFromUser_NotAwaitingReply pins the direction
-// inference rule (spec §7.1): a gmail message the user themself sent cannot
-// generate an awaiting_my_reply signal.
-func TestCounterpartIdentity_GmailFromUser_NotAwaitingReply(t *testing.T) {
-	t.Parallel()
-	doc := &model.Document{
-		SourceType: model.SourceGmail,
-		Metadata:   map[string]any{"from": "me@example.com"},
-	}
-	isUser := func(c string) bool { return c == "me@example.com" }
-	_, ok := CounterpartIdentity(doc, isUser)
-	if ok {
-		t.Error("CounterpartIdentity should return ok=false when from is the user's own address")
-	}
-}
-
-func TestCounterpartIdentity_GmailFromOther_ReturnsFromAddress(t *testing.T) {
-	t.Parallel()
-	doc := &model.Document{
-		SourceType: model.SourceGmail,
-		Metadata:   map[string]any{"from": "alice@example.com"},
-	}
-	isUser := func(c string) bool { return c == "me@example.com" }
-	identity, ok := CounterpartIdentity(doc, isUser)
-	if !ok || identity != "alice@example.com" {
-		t.Errorf("CounterpartIdentity = (%q, %v), want (alice@example.com, true)", identity, ok)
-	}
-}
-
 func TestCounterpartIdentity_SMSContactName(t *testing.T) {
 	t.Parallel()
 	doc := &model.Document{
 		SourceType: model.SourceSMS,
 		Metadata:   map[string]any{"contact_name": "철수"},
 	}
-	identity, ok := CounterpartIdentity(doc, func(string) bool { return false })
+	identity, ok := CounterpartIdentity(doc)
 	if !ok || identity != "철수" {
 		t.Errorf("CounterpartIdentity = (%q, %v), want (철수, true)", identity, ok)
 	}
@@ -144,7 +115,7 @@ func TestCounterpartIdentity_SMSNoContactName_FallsBackToHashedNumber(t *testing
 		SourceType: model.SourceSMS,
 		Metadata:   map[string]any{"number": "010-1234-5678"},
 	}
-	identity, ok := CounterpartIdentity(doc, func(string) bool { return false })
+	identity, ok := CounterpartIdentity(doc)
 	if !ok || identity == "" || identity == "010-1234-5678" {
 		t.Errorf("CounterpartIdentity = (%q, %v), want a hashed non-empty identity", identity, ok)
 	}
@@ -156,37 +127,14 @@ func TestCounterpartIdentity_SMSNoContactName_FallsBackToHashedNumber(t *testing
 func TestCounterpartIdentity_UnsupportedSourceType(t *testing.T) {
 	t.Parallel()
 	doc := &model.Document{SourceType: model.SourceSlack}
-	_, ok := CounterpartIdentity(doc, func(string) bool { return false })
+	_, ok := CounterpartIdentity(doc)
 	if ok {
 		t.Error("CounterpartIdentity should return ok=false for unsupported source types")
 	}
 }
 
-func TestIsUserAddress(t *testing.T) {
-	t.Parallel()
-	addrs := []string{"me@example.com", " Alias@Example.com "}
-	tests := []struct {
-		candidate string
-		want      bool
-	}{
-		{"me@example.com", true},
-		{"ME@EXAMPLE.COM", true},
-		{"alias@example.com", true},
-		{"", false},
-		{"other@example.com", false},
-	}
-	for _, tc := range tests {
-		if got := IsUserAddress(addrs, tc.candidate); got != tc.want {
-			t.Errorf("IsUserAddress(%v, %q) = %v, want %v", addrs, tc.candidate, got, tc.want)
-		}
-	}
-}
-
 func TestThreadKeyBuilders(t *testing.T) {
 	t.Parallel()
-	if got := ThreadKeyGmail("t1"); got != "gmail:t1" {
-		t.Errorf("ThreadKeyGmail = %q", got)
-	}
 	if got := ThreadKeySMS("철수"); got != "sms:철수" {
 		t.Errorf("ThreadKeySMS = %q", got)
 	}

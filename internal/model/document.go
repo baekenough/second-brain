@@ -44,8 +44,6 @@ const (
 	// 이 값을 model.KnownSourceTypes()/DeprecatedSourceTypes() 에서 지우거나
 	// 옮기려면 위 배경을 먼저 이해할 것 (internal/model/source_validation.go).
 	SourceLLMMemory SourceType = "llm-memory"
-	SourceGmail     SourceType = "gmail"
-	SourceCalendar  SourceType = "calendar"
 	SourceSMS       SourceType = "sms"
 	// SourceCallLog is DEPRECATED as of 2026-09-19 (migration 033) — DO NOT
 	// write new documents with this source_type.
@@ -134,8 +132,8 @@ type Document struct {
 	EmbeddingVersion string     `json:"-"`
 	Status           string     `json:"status"`               // "active", "deleted", "moved"
 	DeletedAt        *time.Time `json:"deleted_at,omitempty"` // nil for active documents
-	// OccurredAt is the timestamp of the original event: email sent date,
-	// calendar event start time, SMS/call time, etc.  It is distinct from
+	// OccurredAt is the timestamp of the original event: SMS/call
+	// time, note date, etc.  It is distinct from
 	// CollectedAt (when second-brain ingested the document).  Nil when the
 	// collector has no event-time concept or the value could not be parsed.
 	// "Latest" queries sort by COALESCE(occurred_at, collected_at) DESC so
@@ -404,7 +402,7 @@ type SearchQuery struct {
 	// The store applies this as a WHERE predicate inside every retrieval lane
 	// (internal/store/document.go), NULL-safe via
 	// COALESCE(metadata->>'retention', ''): a document with no "retention" key
-	// at all — most of the corpus, since only gmail is tagged so far — is
+	// at all — most of the corpus, since only some SMS/call documents are tagged — is
 	// NEVER excluded by this filter. search.applyRetentionExclusionDefault
 	// injects RetentionDisposable here by default on every request; callers
 	// do not normally set this field directly.

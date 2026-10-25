@@ -39,18 +39,18 @@ func TestCompare_SliceRegressionIsDiagnosticNotGating(t *testing.T) {
 		t.Fatalf("Compare: %v", err)
 	}
 
-	var call, gmail, overall *Group
+	var call, sms, overall *Group
 	for i := range report.Groups {
 		switch report.Groups[i].Name {
 		case "answer_source:call":
 			call = &report.Groups[i]
-		case "answer_source:gmail":
-			gmail = &report.Groups[i]
+		case "answer_source:sms":
+			sms = &report.Groups[i]
 		case GroupOverall:
 			overall = &report.Groups[i]
 		}
 	}
-	if call == nil || gmail == nil || overall == nil {
+	if call == nil || sms == nil || overall == nil {
 		t.Fatalf("missing expected groups: %+v", report.Groups)
 	}
 
@@ -58,8 +58,8 @@ func TestCompare_SliceRegressionIsDiagnosticNotGating(t *testing.T) {
 	if call.NDCG10.Verdict != VerdictRegressed {
 		t.Fatalf("answer_source:call ndcg10 verdict = %s, want %s", call.NDCG10.Verdict, VerdictRegressed)
 	}
-	if gmail.NDCG10.Verdict != VerdictImprovedCandidate {
-		t.Fatalf("answer_source:gmail ndcg10 verdict = %s, want %s", gmail.NDCG10.Verdict, VerdictImprovedCandidate)
+	if sms.NDCG10.Verdict != VerdictImprovedCandidate {
+		t.Fatalf("answer_source:sms ndcg10 verdict = %s, want %s", sms.NDCG10.Verdict, VerdictImprovedCandidate)
 	}
 	if len(call.WorstQueryIDs) == 0 {
 		t.Fatal("regressed group must list its worst queries")
@@ -67,8 +67,8 @@ func TestCompare_SliceRegressionIsDiagnosticNotGating(t *testing.T) {
 	if call.Gating {
 		t.Fatal("answer_source:call.Gating = true, want false — only the overall group gates")
 	}
-	if gmail.Gating {
-		t.Fatal("answer_source:gmail.Gating = true, want false — only the overall group gates")
+	if sms.Gating {
+		t.Fatal("answer_source:sms.Gating = true, want false — only the overall group gates")
 	}
 	// overall mixes 3 improved + 3 regressed queries of equal magnitude;
 	// the point of this test is that the per-group signal survives even

@@ -30,7 +30,7 @@ LLM 큐레이션 프라이빗 검색 엔진. 다양한 소스의 지식을 수�
 - **듀얼 바이너리** — API 서버와 수집 데몬을 독립 실행
 - **5-lane 하이브리드 검색** — FTS(tsvector) + pgvector 코사인 + pg_bigm + 요약 임베딩 + 엔티티 RRF로 높은 리콜과 정밀도를 동시에 달성. BGE cross-encoder rerank + HyDE 쿼리 확장 옵션 지원
 - **rune 기반 청킹** — 한국어·영어 동일한 정보 밀도로 청크 분할 (issue #145). 헤딩 인식, 단락·문장 경계 분할, 오버랩
-- **멀티 소스 수집** — 파일시스템, Slack, GitHub, SMS/통화/녹음(Android), secretary SQLite, Gmail, Calendar, llm-memory 등
+- **멀티 소스 수집** — 파일시스템, Slack, GitHub, SMS/통화/녹음(Android), secretary SQLite, llm-memory 등
 - **다형식 문서 추출** — HTML, PDF, DOCX, XLSX, PPTX, HWPX 등 주요 오피스 포맷에서 텍스트 자동 추출
 - **엔티티 추출** — LLM 기반 지식 그래프 엔티티(PERSON/ORG/CONCEPT/OTHER) 추출 및 RRF 검색 레인 통합
 - **데이터 가드** — 3계층 soft-delete 대량 삭제 방지: filesystem 루트 stat / 50% 삭제 비율 가드 / document.go empty no-op
@@ -78,7 +78,7 @@ flowchart LR
     OpenAIWhisper["OpenAI\ngpt-4o-transcribe-diarize\n전사 + 화자분리 (기본)"]
     Whisper["whisper (opt-in)\nlocal-inference profile\n음성인식 :8000"]
     Diarization["diarization (opt-in)\nlocal-inference profile\n화자분리 :8001"]
-    Sources["수집 소스\nFilesystem / Slack / GitHub\nSMS·통화·녹음 / Gmail\nCalendar / llm-memory"]
+    Sources["수집 소스\nFilesystem / Slack / GitHub\nSMS·통화·녹음\nllm-memory"]
 
     Agent -->|REST /api/v1| Server
     Agent -->|MCP streamable HTTP| MCP
@@ -180,8 +180,6 @@ second-brain/
 │   │   ├── sms.go               # SMS·통화 수집기 (Android push)
 │   │   ├── recording.go         # 통화 녹음 수집기 (Whisper ASR)
 │   │   ├── secretary.go         # secretary SQLite 수집기
-│   │   ├── gmail.go             # Gmail 수집기
-│   │   ├── calendar.go          # Calendar 수집기
 │   │   └── llm_memory.go        # llm-memory SQLite 수집기
 │   ├── config/
 │   │   └── config.go            # 환경 변수 파싱
@@ -441,8 +439,7 @@ Android 앱이 통화 녹음·음성메모를 multipart(`file`, `kind`, `number`
 | sms / call | Android 앱 설치 + 서버 URL/토큰 설정 | 완전 동작 | Galaxy Z Flip6 실기 검증. 앱: [`mobile/second-brain-push/`](mobile/second-brain-push/README.md) |
 | recording (통화 녹음) | 위와 동일 + `WHISPER_API_KEY` | 완전 동작 | OpenAI gpt-4o-transcribe-diarize (클라우드) → 텍스트 변환 + 화자 분리 후 저장 |
 | secretary | `SECRETARY_DB_HOST_PATH` 마운트 | 완전 동작 | secretary SQLite ro 마운트 |
-| gmail | `/data/gmail` 마운트 | 완전 동작 | secretary 연동 Gmail 익스포트 |
-| calendar | `/data/calendar` 마운트 | 완전 동작 | secretary 연동 Calendar 익스포트 |
+| gmail / calendar | — | 제거됨 | 수집기·마운트·자동 일정 등록 폐기 |
 | llm-memory | `LLM_MEMORY_DB_HOST_PATH` 마운트 | 완전 동작 | llm-memory SQLite ro 마운트 |
 | gdrive (export) | `GDRIVE_CREDENTIALS_JSON` 설정 | 스캐폴드 | ADC 필요, 기본 disabled |
 | notion | — | 제거됨 | main.go 등록 해제 |

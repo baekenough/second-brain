@@ -19,8 +19,8 @@ import (
 // source got that source from the store plus whatever the chunk lanes happened
 // to match — from any source.
 //
-// Measured in production: source_type=calendar with limit=20 returned 14
-// calendar documents from the store and 6 documents of other source types that
+// Measured in production: source_type=<one source> with limit=20 returned 14
+// documents of that source from the store and 6 documents of other source types that
 // the chunk vector lane merged into the free slots. The user asked for one
 // source and got four.
 //
@@ -52,12 +52,12 @@ func TestSearch_IncludeFilter_AppliesToChunkVectorLane(t *testing.T) {
 		storeHits  = 14
 		chunkHits  = 6
 		limit      = 20
-		wantSource = model.SourceCalendar
+		wantSource = model.SourceNote
 	)
 
 	storeResults := make([]*model.SearchResult, 0, storeHits)
 	for i := 0; i < storeHits; i++ {
-		r := makeSearchResult(uuid.New(), fmt.Sprintf("calendar entry %d", i), 1.0-float64(i)/100)
+		r := makeSearchResult(uuid.New(), fmt.Sprintf("note entry %d", i), 1.0-float64(i)/100)
 		r.SourceType = wantSource
 		storeResults = append(storeResults, r)
 	}
@@ -65,8 +65,8 @@ func TestSearch_IncludeFilter_AppliesToChunkVectorLane(t *testing.T) {
 	// The chunk lane matched six documents from three other sources — exactly
 	// the slots the store's narrower result left open.
 	otherSources := []model.SourceType{
-		model.SourceSMS, model.SourceGmail, model.SourceCall,
-		model.SourceSMS, model.SourceGmail, model.SourceSMS,
+		model.SourceSMS, model.SourceUpload, model.SourceCall,
+		model.SourceSMS, model.SourceUpload, model.SourceSMS,
 	}
 	chunkRows := make([]store.ChunkSearchResult, 0, chunkHits)
 	for i, src := range otherSources {
@@ -113,11 +113,11 @@ func TestSearch_IncludeFilter_AppliesToChunkFTSFallback(t *testing.T) {
 	docs := &recordingDocSearcher{} // store found nothing
 	chunks := &mockChunkSearcher{ftsResults: []store.ChunkSearchResult{
 		chunkResult(uuid.New(), model.SourceSMS, 0.9),
-		chunkResult(wanted, model.SourceCalendar, 0.8),
-		chunkResult(uuid.New(), model.SourceGmail, 0.7),
+		chunkResult(wanted, model.SourceCall, 0.8),
+		chunkResult(uuid.New(), model.SourceUpload, 0.7),
 	}}
 
-	src := model.SourceCalendar
+	src := model.SourceCall
 	svc := NewService(docs, disabledEmbedder{}).WithChunkStore(chunks)
 	results, err := svc.Search(context.Background(), model.SearchQuery{
 		Query:      "일정",
@@ -129,20 +129,20 @@ func TestSearch_IncludeFilter_AppliesToChunkFTSFallback(t *testing.T) {
 	}
 
 	if len(results) != 1 || results[0].ID != wanted {
-		t.Fatalf("results = %+v, want only the calendar chunk hit %s", results, wanted)
+		t.Fatalf("results = %+v, want only the call chunk hit %s", results, wanted)
 	}
 }
 
 // TestSearch_MultiSourceInclude_AppliesToChunkLanes is the plural form: a
-// planner emitting ["gmail","sms"] must get gmail and sms and nothing else.
+// planner emitting ["upload","sms"] must get upload and sms and nothing else.
 func TestSearch_MultiSourceInclude_AppliesToChunkLanes(t *testing.T) {
 	t.Parallel()
 
-	gmailDoc, smsDoc, slackDoc := uuid.New(), uuid.New(), uuid.New()
+	uploadDoc, smsDoc, slackDoc := uuid.New(), uuid.New(), uuid.New()
 
 	docs := &recordingDocSearcher{}
 	chunks := &mockChunkSearcher{ftsResults: []store.ChunkSearchResult{
-		chunkResult(gmailDoc, model.SourceGmail, 0.9),
+		chunkResult(uploadDoc, model.SourceUpload, 0.9),
 		chunkResult(slackDoc, model.SourceSlack, 0.85),
 		chunkResult(smsDoc, model.SourceSMS, 0.8),
 	}}
@@ -151,7 +151,7 @@ func TestSearch_MultiSourceInclude_AppliesToChunkLanes(t *testing.T) {
 	results, err := svc.Search(context.Background(), model.SearchQuery{
 		Query:       "예약",
 		Limit:       20,
-		SourceTypes: []model.SourceType{model.SourceGmail, model.SourceSMS},
+		SourceTypes: []model.SourceType{model.SourceUpload, model.SourceSMS},
 	})
 	if err != nil {
 		t.Fatalf("Search returned error: %v", err)
@@ -161,7 +161,7 @@ func TestSearch_MultiSourceInclude_AppliesToChunkLanes(t *testing.T) {
 	for _, r := range results {
 		got[r.ID] = true
 	}
-	if !got[gmailDoc] || !got[smsDoc] {
+	if !got[uploadDoc] || !got[smsDoc] {
 		t.Errorf("results = %+v, want both included sources present", results)
 	}
 	if got[slackDoc] {
@@ -181,7 +181,7 @@ func TestSearch_IncludeFilter_PassedToStoreUnmodified(t *testing.T) {
 	if _, err := svc.Search(context.Background(), model.SearchQuery{
 		Query:       "q",
 		Limit:       20,
-		SourceTypes: []model.SourceType{model.SourceGmail, model.SourceSMS},
+		SourceTypes: []model.SourceType{model.SourceUpload, model.SourceSMS},
 	}); err != nil {
 		t.Fatalf("Search returned error: %v", err)
 	}
@@ -211,11 +211,11 @@ func TestSearch_IncludeFilter_PassedToStoreUnmodified(t *testing.T) {
 func TestSearch_IncludeExcludeConflict_ExcludeWins(t *testing.T) {
 	t.Parallel()
 
-	gmailDoc, smsDoc := uuid.New(), uuid.New()
+	uploadDoc, smsDoc := uuid.New(), uuid.New()
 
 	docs := &recordingDocSearcher{}
 	chunks := &mockChunkSearcher{ftsResults: []store.ChunkSearchResult{
-		chunkResult(gmailDoc, model.SourceGmail, 0.9),
+		chunkResult(uploadDoc, model.SourceUpload, 0.9),
 		chunkResult(smsDoc, model.SourceSMS, 0.8),
 	}}
 
@@ -223,16 +223,16 @@ func TestSearch_IncludeExcludeConflict_ExcludeWins(t *testing.T) {
 	results, err := svc.Search(context.Background(), model.SearchQuery{
 		Query:              "q",
 		Limit:              20,
-		SourceTypes:        []model.SourceType{model.SourceGmail, model.SourceSMS},
-		ExcludeSourceTypes: []model.SourceType{model.SourceGmail},
+		SourceTypes:        []model.SourceType{model.SourceUpload, model.SourceSMS},
+		ExcludeSourceTypes: []model.SourceType{model.SourceUpload},
 	})
 	if err != nil {
 		t.Fatalf("Search returned error: %v", err)
 	}
 
 	for _, r := range results {
-		if r.ID == gmailDoc {
-			t.Errorf("gmail document %s survived although gmail is in ExcludeSourceTypes", gmailDoc)
+		if r.ID == uploadDoc {
+			t.Errorf("upload document %s survived although upload is in ExcludeSourceTypes", uploadDoc)
 		}
 	}
 	var sawSMS bool

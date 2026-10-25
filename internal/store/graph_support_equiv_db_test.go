@@ -104,7 +104,7 @@ func TestDB_GraphSupport_UnionMatchesLegacy(t *testing.T) {
 	if err := es.LinkDocumentEntity(context.Background(), f.outEv, acme); err != nil {
 		t.Fatal(err)
 	}
-	selfEv := seedSparseDoc(t, f.pg, model.SourceCalendar, graphWinFrom.Add(time.Hour), "zz 자기 루프", "zz 가상 본문 자기 루프", `{}`)
+	selfEv := seedSparseDoc(t, f.pg, model.SourceNote, graphWinFrom.Add(time.Hour), "zz 자기 루프", "zz 가상 본문 자기 루프", `{}`)
 	seedRelations(t, f.pg,
 		relation(bobby, alice, f.outEv, 0.4),   // outEv: 두 번째 관계
 		relation(alice, carol, f.seedDoc, 0.8), // 시드 문서 자기 관계, 시드가 from 쪽(자기 지지 제외 대상)
@@ -112,7 +112,7 @@ func TestDB_GraphSupport_UnionMatchesLegacy(t *testing.T) {
 		relation(alice, alice, selfEv, 0.6),    // 자기 루프: from·to 양쪽에서 맞는다
 		relation(acme, alice, f.inEv, 0.7),     // 양 끝 모두 시드
 	)
-	all := []uuid.UUID{f.seedDoc, f.outEv, f.inEv, selfEv, f.outsideEv, f.disposableEv, f.gmailEv, f.deletedEv, f.unrelatedEv, f.plain}
+	all := []uuid.UUID{f.seedDoc, f.outEv, f.inEv, selfEv, f.outsideEv, f.disposableEv, f.uploadEv, f.deletedEv, f.unrelatedEv, f.plain}
 	filtered := graphDBQuery("질문", nil, 0)
 
 	cases := []struct {
@@ -199,7 +199,7 @@ func TestDB_EntityKeywordSeeds_Cap(t *testing.T) {
 	}
 
 	// 정확 일치 시드에서 나간 관계는 상한 아래에서도 그래프 레인에 잡힌다.
-	ev := seedSparseDoc(t, f.pg, model.SourceCalendar, graphWinFrom.Add(time.Hour), "zz 상한 근거", "zz 가상 본문 상한", `{}`)
+	ev := seedSparseDoc(t, f.pg, model.SourceNote, graphWinFrom.Add(time.Hour), "zz 상한 근거", "zz 가상 본문 상한", `{}`)
 	seedRelations(t, f.pg, relation(exact, longIDs[len(longIDs)-1], ev, 0.9))
 	res, err := NewDocumentStore(f.pg).hybridSearch(ctx, graphDBQuery("질문", []string{graphDBEntityPrefix + "cap"}, 1))
 	if err != nil {

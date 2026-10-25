@@ -678,7 +678,7 @@ func TestAskConversationDetailHandler_ReflectsSourceOccurredAt(t *testing.T) {
 		Question: "Q0", Answer: "A0", FinishReason: "stop",
 		Sources: []store.AskSource{
 			{ID: "doc-with-time", Title: "t1", SourceType: "sms", Score: 0.9, OccurredAt: &occurredAt},
-			{ID: "doc-without-time", Title: "t2", SourceType: "gmail", Score: 0.5}, // OccurredAt nil, as a pre-#218 row
+			{ID: "doc-without-time", Title: "t2", SourceType: "sms", Score: 0.5}, // OccurredAt nil, as a pre-#218 row
 		},
 	})
 	srv := newAskTestServerWithSessions(&fixedDocSearcher{}, &fakeIntentClassifier{}, &fakeAskLLM{enabled: true}, sessions)

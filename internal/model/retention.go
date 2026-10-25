@@ -6,8 +6,8 @@ import (
 )
 
 // Retention tag values written to documents.metadata["retention"] by the
-// gmail collector's segmentation pass (11,965 gmail documents tagged as of
-// 2026-09-19), with SMS expected to follow the same three-value scheme.
+// classification worker (SMS and call documents; legacy segmentation passes
+// also tagged since-removed sources).
 // Search never writes these — it only reads them, via Document.RetentionTag,
 // to decide default exclusion (search.applyRetentionExclusionDefault) and the
 // low-retention score penalty (search.applyLowRetentionPenalty / LowRetentionPenalty

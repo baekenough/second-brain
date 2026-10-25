@@ -92,9 +92,8 @@ services:
   collector:
     image: second-brain-collector:ubuntu1
     # server와 동일한 이유로 호스트 uid(1000)와 맞춘다 — 아래 server 블록의
-    # 주석 참고. collector는 gmail/calendar/sms/call을 전부 ro로만 마운트
-    # 하므로 필수는 아니지만, appuser(10001)로는 gmail/calendar 자격증명
-    # (640, group 10001)이 group 비트 드리프트 시 읽기조차 막히므로 동일하게
+    # 주석 참고. collector는 sms/call 스테이징을 ro로만 마운트하므로 필수는
+    # 아니지만, 동기화된 파일의 group 비트 드리프트에 영향받지 않도록 동일하게
     # 맞춘다.
     user: "1000:1000"
     env_file:
@@ -106,9 +105,6 @@ services:
       DIARIZATION_API_URL: "http://diarization:8001"
       DIARIZATION_ENABLED: "${DIARIZATION_ENABLED:-false}"
     volumes:
-      - /home/baekenough/.second-brain/secretary/gmail:/data/gmail:ro
-      - /home/baekenough/.second-brain/secretary/calendar:/data/calendar:ro
-      - /home/baekenough/.second-brain/calendar-write:/data/calendar-write:ro
       - /home/baekenough/.second-brain/stage/sms:/data/sms:ro
       - /home/baekenough/.second-brain/stage/call:/data/call:ro
     networks:

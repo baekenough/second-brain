@@ -178,7 +178,7 @@ func TestBuildFulltextSearchQuery_Retention_EmptyExclude_NoFilterEmitted(t *test
 func TestBuildHybridSearchQuery_Retention_ParametersSurviveOtherFilters(t *testing.T) {
 	t.Parallel()
 
-	src := model.SourceGmail
+	src := model.SourceUpload
 	query := retentionQuery()
 	query.SourceType = &src
 	query.ExcludeSourceTypes = []model.SourceType{model.SourceInsight}

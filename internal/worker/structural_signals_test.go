@@ -57,8 +57,8 @@ func TestStructuralSignalWorker_TickCreatesNoActions(t *testing.T) {
 		{DocumentID: uuid.New(), SourceType: string(model.SourceSMS), Metadata: map[string]any{
 			"contact_name": "철수", "direction": "received",
 		}},
-		{DocumentID: uuid.New(), SourceType: string(model.SourceGmail), Metadata: map[string]any{
-			"thread_id": "t1", "from": "alice@example.com",
+		{DocumentID: uuid.New(), SourceType: string(model.SourceCall), Metadata: map[string]any{
+			"contact_name": "영희", "direction": "incoming",
 		}},
 	}}
 	actions := &fakeStructuralActionWriter{}

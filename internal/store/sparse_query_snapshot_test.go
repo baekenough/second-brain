@@ -48,21 +48,21 @@ func sparseSnapshotCases() []struct {
 } {
 	from := time.Date(2026, 8, 17, 0, 0, 0, 0, time.UTC)
 	to := time.Date(2026, 8, 24, 0, 0, 0, 0, time.UTC)
-	cal := model.SourceCalendar
+	noteSrc := model.SourceNote
 	emb := make([]float32, 4)
 	copy(emb, []float32{0.1, 0.2, 0.3, 0.4})
 	base := model.SearchQuery{Query: "이번 주 회의 일정 알려줘", Limit: 10, Embedding: emb}
 
 	withSrc := base
-	withSrc.SourceType = &cal
+	withSrc.SourceType = &noteSrc
 	withExclude := base
-	withExclude.ExcludeSourceTypes = []model.SourceType{model.SourceInsight, model.SourceGmail}
+	withExclude.ExcludeSourceTypes = []model.SourceType{model.SourceInsight, model.SourceUpload}
 	withRetention := base
 	withRetention.ExcludeRetention = []string{model.RetentionDisposable}
 	withWindow := base
 	withWindow.OccurredFrom, withWindow.OccurredTo = &from, &to
 	all := base
-	all.SourceTypes = []model.SourceType{model.SourceCalendar, model.SourceCall}
+	all.SourceTypes = []model.SourceType{model.SourceNote, model.SourceCall}
 	all.ExcludeSourceTypes = []model.SourceType{model.SourceInsight}
 	all.ExcludeRetention = []string{model.RetentionDisposable}
 	all.OccurredFrom, all.OccurredTo = &from, &to

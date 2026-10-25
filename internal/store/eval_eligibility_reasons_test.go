@@ -12,12 +12,12 @@ func TestExclusionReasonPrecedenceIsFixed(t *testing.T) {
 		fact EvalLabelFact
 		want string
 	}{
-		{"적격", EvalLabelFact{Found: true, Status: "active", SourceType: "gmail"}, ""},
+		{"적격", EvalLabelFact{Found: true, Status: "active", SourceType: "sms"}, ""},
 		{"행 없음", EvalLabelFact{}, "missing"},
 		{"상태가 active 가 아님", EvalLabelFact{Found: true, Status: "superseded"}, "status_not_active"},
 		{"삭제 시각 있음", EvalLabelFact{Found: true, Status: "active", Deleted: true}, "deleted_at"},
 		{"insight 문서", EvalLabelFact{Found: true, Status: "active", SourceType: "insight"}, "insight"},
-		{"disposable 보존태그", EvalLabelFact{Found: true, Status: "active", SourceType: "gmail", Retention: "disposable"}, "disposable"},
+		{"disposable 보존태그", EvalLabelFact{Found: true, Status: "active", SourceType: "sms", Retention: "disposable"}, "disposable"},
 		// 아래 두 건이 우선순위를 실제로 강제한다. 사유가 겹칠 때 더 앞선
 		// 쪽으로만 세야 합계가 Relevant+Irrelevant 와 어긋나지 않는다.
 		{"삭제이면서 disposable", EvalLabelFact{Found: true, Status: "active", Deleted: true, Retention: "disposable"}, "deleted_at"},

@@ -96,7 +96,7 @@ type laneRow struct {
 }
 
 // runGraphLaneOnly 는 그래프 CTE 조각만으로 "SELECT id, rank FROM graph" 를 돌린다.
-// filtered 이면 $4..$7 에 소스(calendar)·retention(disposable)·창 필터를 건다.
+// filtered 이면 $4..$7 에 소스(note)·retention(disposable)·창 필터를 건다.
 func runGraphLaneOnly(t *testing.T, pg *Postgres, build func(kw, prefix, status, source, exclude, retention, occurred string, damping bool) string,
 	keywords []string, damping, filtered bool) []laneRow {
 	t.Helper()
@@ -108,7 +108,7 @@ func runGraphLaneOnly(t *testing.T, pg *Postgres, build func(kw, prefix, status,
 		source = "AND d.source_type = ANY($4)"
 		retention = "AND COALESCE(d.metadata->>'retention', '') <> ALL($5)"
 		occurred = "AND d.occurred_at >= $6\n\t\t\tAND d.occurred_at < $7"
-		args = append(args, []string{string(model.SourceCalendar)}, []string{model.RetentionDisposable}, graphWinFrom, graphWinTo)
+		args = append(args, []string{string(model.SourceNote)}, []string{model.RetentionDisposable}, graphWinFrom, graphWinTo)
 	}
 	ctes := build("$1", "$2", status, source, "", retention, occurred, damping)
 	sql := "WITH " + strings.TrimLeft(ctes, ",\n\t ") + "\nSELECT id, rank FROM graph ORDER BY rank"
@@ -134,7 +134,7 @@ func runGraphLaneOnly(t *testing.T, pg *Postgres, build func(kw, prefix, status,
 func TestDB_GraphLane_IndexedUnionMatchesLegacy(t *testing.T) {
 	f := newGraphFixture(t)
 	alice, acme := entityID(t, f.pg, "alice"), entityID(t, f.pg, "acme")
-	selfEv := seedSparseDoc(t, f.pg, model.SourceCalendar, graphWinFrom.Add(time.Hour), "zz 자기 루프", "zz 가상 본문 자기 루프", `{}`)
+	selfEv := seedSparseDoc(t, f.pg, model.SourceNote, graphWinFrom.Add(time.Hour), "zz 자기 루프", "zz 가상 본문 자기 루프", `{}`)
 	seedRelations(t, f.pg,
 		relation(alice, alice, selfEv, 0.6),                     // 자기 루프: 두 가지(from·to) 모두에서 나온다
 		relation(acme, entityID(t, f.pg, "bobby"), f.inEv, 0.3), // inEv 의 두 번째 관계(이번엔 from 쪽이 시드)

@@ -20,8 +20,8 @@ func TestCitationWithinSupport(t *testing.T) {
 		ID: "scratch-citation-within-support", Category: "single_turn", AsOf: "2026-06-10T09:00:00+09:00",
 		Corpus: []CorpusDoc{
 			{Alias: "support-a", SourceType: "call", Title: "a", Content: "content-a"},
-			{Alias: "support-b", SourceType: "gmail", Title: "b", Content: "content-b"},
-			{Alias: "non-support", SourceType: "gmail", Title: "c", Content: "content-c"},
+			{Alias: "support-b", SourceType: "sms", Title: "b", Content: "content-b"},
+			{Alias: "non-support", SourceType: "sms", Title: "c", Content: "content-c"},
 		},
 		Question: "q?",
 		Gold: Gold{

@@ -428,8 +428,8 @@ func TestSearchSparseContextFiltered_FiltersPreserved(t *testing.T) {
 
 	term := "고유토큰" + uuid.NewString()[:8]
 
-	gmailDocID := seedSparseCtxDoc(t, pg, "gmail", "메일 제목", nil)
-	gmailChunkID := seedSparseCtxChunk(t, pg, gmailDocID, term+" 메일 본문")
+	uploadDocID := seedSparseCtxDoc(t, pg, "upload", "업로드 제목", nil)
+	uploadChunkID := seedSparseCtxChunk(t, pg, uploadDocID, term+" 업로드 본문")
 
 	noteDocID := seedSparseCtxDoc(t, pg, "note", "노트 제목", nil)
 	noteChunkID := seedSparseCtxChunk(t, pg, noteDocID, term+" 노트 본문")
@@ -444,20 +444,20 @@ func TestSearchSparseContextFiltered_FiltersPreserved(t *testing.T) {
 		t.Fatalf("SearchSparseContextFiltered: %v", err)
 	}
 
-	var sawNote, sawGmail bool
+	var sawNote, sawUpload bool
 	for _, r := range results {
 		if r.ID == noteChunkID {
 			sawNote = true
 		}
-		if r.ID == gmailChunkID {
-			sawGmail = true
+		if r.ID == uploadChunkID {
+			sawUpload = true
 		}
 	}
 	if !sawNote {
 		t.Errorf("note chunk not found even though it matches the source filter: %+v", results)
 	}
-	if sawGmail {
-		t.Errorf("gmail chunk leaked through a source_type=note filter: %+v", results)
+	if sawUpload {
+		t.Errorf("upload chunk leaked through a source_type=note filter: %+v", results)
 	}
 }
 

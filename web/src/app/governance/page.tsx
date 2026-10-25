@@ -31,18 +31,6 @@ const PII_ROWS: PIIRow[] = [
       "발신/수신 번호 메타데이터는 저장(오디오 없음), 전사 텍스트에는 PII 필터 미적용 (#112 #2a). 주민번호·계좌·OTP 포함 가능",
   },
   {
-    source: "gmail",
-    label: "Gmail",
-    status: "pending",
-    notes: "PII 분석 미완료. 개인정보 포함 가능성 높음",
-  },
-  {
-    source: "calendar",
-    label: "Calendar",
-    status: "partial",
-    notes: "참석자 이메일·전화번호 노출. 필터 미적용",
-  },
-  {
     source: "filesystem",
     label: "Files",
     status: "na",
@@ -186,7 +174,7 @@ export default function GovernancePage() {
         <h2 className="text-sm font-semibold text-foreground">지식 그래프 뷰</h2>
         <PlaceholderPanel
           title="GraphRAG — 인물·조직·사건 관계 탐색"
-          description="통화 전사·SMS·Gmail에서 엔티티(인물·조직·사건)와 관계를 추출해 그래프로 시각화합니다. 인물 중심 타임라인, 관계 탐색 검색 품질 향상을 목표로 합니다."
+          description="통화 전사·SMS에서 엔티티(인물·조직·사건)와 관계를 추출해 그래프로 시각화합니다. 인물 중심 타임라인, 관계 탐색 검색 품질 향상을 목표로 합니다."
           issueRef="#112 #3"
         >
           <ul className="list-disc space-y-1 pl-4 text-xs text-foreground-muted">

@@ -58,7 +58,7 @@ refactor of this same release):
 | `v1-full` | `chunkctx.RecipeFull` | identical to the embedding header (`BuildChunkContextHeader`) — date, `[소스]` label, title, participants. |
 
 `v1-tp` exists to isolate a specific false-positive risk: a source label like
-`[메일]`/`[통화]` can itself match a query containing the word "메일" or
+`[문자]`/`[통화]` can itself match a query containing the word "문자" or
 "통화", inflating recall for reasons unrelated to WHO the message is about.
 `v1-full` reuses the embedding header exactly, so its ablation result is
 directly comparable to what the dense (embedding) lane already sees.

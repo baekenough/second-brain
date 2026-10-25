@@ -19,8 +19,6 @@ export type SourceType =
   | "telegram"
   | "secretary"
   | "llm-memory"
-  | "gmail"
-  | "calendar"
   | "sms"
   | "call"
   | "call-log"

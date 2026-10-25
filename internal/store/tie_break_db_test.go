@@ -41,7 +41,7 @@ func newTieFixture(t *testing.T) *Postgres {
 	pg := sparseDB(t)
 	for i := 0; i < tieDocs; i++ {
 		at := tieWinFrom.Add(time.Hour + time.Duration(i/4)*time.Minute)
-		seedSparseDoc(t, pg, model.SourceCalendar, at, "zz 동점", "zz 동점 문장", `{}`)
+		seedSparseDoc(t, pg, model.SourceNote, at, "zz 동점", "zz 동점 문장", `{}`)
 	}
 	return pg
 }
@@ -60,7 +60,7 @@ func tieQuery() model.SearchQuery {
 	return model.SearchQuery{
 		Query:        "zz 동점",
 		Limit:        tieLimit,
-		SourceTypes:  []model.SourceType{model.SourceCalendar},
+		SourceTypes:  []model.SourceType{model.SourceNote},
 		OccurredFrom: &from,
 		OccurredTo:   &to,
 		Weights:      model.SearchWeights{DisableSummaryVec: true},

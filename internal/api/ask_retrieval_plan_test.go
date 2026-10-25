@@ -39,7 +39,7 @@ func TestAssembleRetrieval_PlanWindowAndSourcesReachObservedLane(t *testing.T) {
 	plan := intent.QueryPlan{
 		OccurredFrom: from,
 		OccurredTo:   to,
-		SourceTypes:  []model.SourceType{model.SourceCalendar},
+		SourceTypes:  []model.SourceType{model.SourceCall},
 		Limit:        8,
 		Reason:       "내일(8/20) 캘린더만 조회",
 		Origin:       intent.OriginDeterministic,
@@ -60,8 +60,8 @@ func TestAssembleRetrieval_PlanWindowAndSourcesReachObservedLane(t *testing.T) {
 		t.Errorf("observed OccurredTo = %v, want %v", obs.OccurredTo, *to)
 	}
 	got := obs.IncludeSourceTypes()
-	if len(got) != 1 || got[0] != model.SourceCalendar {
-		t.Errorf("observed include set = %v, want [calendar]", got)
+	if len(got) != 1 || got[0] != model.SourceCall {
+		t.Errorf("observed include set = %v, want [call]", got)
 	}
 	if obs.Limit != 8 {
 		t.Errorf("observed Limit = %d, want 8", obs.Limit)

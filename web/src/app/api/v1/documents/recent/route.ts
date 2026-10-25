@@ -7,7 +7,7 @@
  *   (This route is excluded from OAuth middleware — see proxy.ts / middleware.ts)
  *
  * Query params (forwarded verbatim):
- *   kind=sms|call|recording|gmail|calendar  (optional)
+ *   kind=sms|call|recording  (optional)
  *   limit=<number>                           (optional)
  *
  * Response:

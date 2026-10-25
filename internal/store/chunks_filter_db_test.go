@@ -22,7 +22,7 @@ func TestDB_ChunkFiltersBeforeLimit(t *testing.T) {
 	disposable := seedChunkDoc(t, pg, &from, from)
 	atEnd := seedChunkDoc(t, pg, &to, to)
 	noTime := seedChunkDoc(t, pg, nil, from)
-	if _, err := pg.pool.Exec(ctx, `UPDATE documents SET source_type='gmail' WHERE id=$1`, wrongSource); err != nil {
+	if _, err := pg.pool.Exec(ctx, `UPDATE documents SET source_type='upload' WHERE id=$1`, wrongSource); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pg.pool.Exec(ctx, `UPDATE documents SET metadata='{"retention":"disposable"}'::jsonb WHERE id=$1`, disposable); err != nil {
@@ -41,7 +41,7 @@ func TestDB_ChunkFiltersBeforeLimit(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	q := model.SearchQuery{Query: "zzdummychunkneedle", Embedding: testEmbedding(), SourceTypes: []model.SourceType{model.SourceCalendar}, OccurredFrom: &from, OccurredTo: &to, ExcludeRetention: []string{model.RetentionDisposable}}
+	q := model.SearchQuery{Query: "zzdummychunkneedle", Embedding: testEmbedding(), SourceTypes: []model.SourceType{model.SourceNote}, OccurredFrom: &from, OccurredTo: &to, ExcludeRetention: []string{model.RetentionDisposable}}
 	for _, lane := range []struct {
 		name string
 		run  func(context.Context, model.SearchQuery, int) ([]ChunkSearchResult, error)
@@ -57,7 +57,7 @@ func TestDB_ChunkFiltersBeforeLimit(t *testing.T) {
 		})
 	}
 	q.SourceTypes = nil
-	q.ExcludeSourceTypes = []model.SourceType{model.SourceGmail}
+	q.ExcludeSourceTypes = []model.SourceType{model.SourceUpload}
 	rows, err := cs.SearchVectorFiltered(ctx, q, 1)
 	if err != nil || len(rows) != 1 || rows[0].Chunk.DocumentID != eligible {
 		t.Fatalf("exclusion failed: count=%d error=%v", len(rows), err)

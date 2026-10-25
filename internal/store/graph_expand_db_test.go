@@ -56,7 +56,7 @@ func TestDB_GraphLane_HubDamping(t *testing.T) {
 	})
 	in := graphWinFrom.Add(2 * time.Hour)
 	seed := func(at time.Time, title, meta string) uuid.UUID {
-		return seedSparseDoc(t, pg, model.SourceCalendar, at, title, "zz 가상 본문 "+title, meta)
+		return seedSparseDoc(t, pg, model.SourceNote, at, title, "zz 가상 본문 "+title, meta)
 	}
 	hubEv := seed(in, "zz 허브 근거", `{}`)
 	rareEv := seed(in, "zz 희귀 근거", `{}`)
@@ -162,7 +162,7 @@ func TestDB_GraphSupportCounts(t *testing.T) {
 	)
 
 	base := graphDBQuery("질문", nil, 0)
-	all := []uuid.UUID{f.seedDoc, f.outEv, f.inEv, f.outsideEv, f.disposableEv, f.gmailEv, f.deletedEv, f.unrelatedEv, f.plain}
+	all := []uuid.UUID{f.seedDoc, f.outEv, f.inEv, f.outsideEv, f.disposableEv, f.uploadEv, f.deletedEv, f.unrelatedEv, f.plain}
 
 	got, err := ds.GraphSupportCounts(ctx, base, []uuid.UUID{f.seedDoc}, all)
 	if err != nil {
@@ -199,7 +199,7 @@ func TestDB_GraphSupportCounts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, id := range map[string]uuid.UUID{"outsideEv": f.outsideEv, "disposableEv": f.disposableEv, "gmailEv": f.gmailEv, "deletedEv": f.deletedEv} {
+	for name, id := range map[string]uuid.UUID{"outsideEv": f.outsideEv, "disposableEv": f.disposableEv, "uploadEv": f.uploadEv, "deletedEv": f.deletedEv} {
 		if got[id] != 1 {
 			t.Errorf("필터 없는 질의에서 %s 지지 = %d, want 1", name, got[id])
 		}
@@ -212,7 +212,7 @@ func TestDB_GraphSupportCounts(t *testing.T) {
 func named(f graphFixture, m map[uuid.UUID]int) map[string]int {
 	names := map[uuid.UUID]string{
 		f.seedDoc: "seedDoc", f.outEv: "outEv", f.inEv: "inEv", f.outsideEv: "outsideEv",
-		f.disposableEv: "disposableEv", f.gmailEv: "gmailEv", f.deletedEv: "deletedEv",
+		f.disposableEv: "disposableEv", f.uploadEv: "uploadEv", f.deletedEv: "deletedEv",
 		f.unrelatedEv: "unrelatedEv", f.plain: "plain",
 	}
 	out := map[string]int{}

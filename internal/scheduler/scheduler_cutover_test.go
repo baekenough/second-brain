@@ -7,7 +7,7 @@ package scheduler
 //  1. WithCutover sets s.cutover and is fluent (returns *Scheduler).
 //  2. runCollector propagates the cutover to CutoverAwareCollectors.
 //  3. runCollector advances the since watermark to the cutover when since < cutover
-//     (handles date-watermark collectors: gmail/calendar/secretary/llm-memory).
+//     (handles date-watermark collectors: secretary/llm-memory).
 //  4. Zero cutover = no change to since (existing behaviour preserved).
 
 import (
@@ -151,8 +151,8 @@ func (s *sinceCapturingStore) LastCollectedAt(_ context.Context, _ string, _ mod
 // stored since watermark is before the cutover, runCollector advances since to
 // the cutover value before calling Collect.
 //
-// This is the "date-watermark collector" path: gmail, calendar, secretary,
-// llm-memory all receive since as their start time, so advancing since is
+// This is the "date-watermark collector" path: secretary,
+// llm-memory and others all receive since as their start time, so advancing since is
 // sufficient to prevent them from fetching pre-cutover data.
 func TestScheduler_Cutover_AdvancesSinceWhenBeforeCutover(t *testing.T) {
 	t.Parallel()

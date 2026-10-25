@@ -38,7 +38,7 @@ type QueryPlan struct {
 	// Limit is the candidate cap for the observed lane.
 	Limit int
 
-	// Reason is a one-line, user-facing rationale ("내일(8/20) 캘린더만 조회").
+	// Reason is a one-line, user-facing rationale ("어제(8/19) 문자만 조회").
 	//
 	// PRIVACY (design spec §9): on the LLM path this string is written by the
 	// model from the user's question and can therefore contain names, phone
@@ -86,7 +86,7 @@ type Planner interface {
 // was that "오늘" produced a date window and "내일" — absent from the regex
 // list — produced no window at all, so a missing vocabulary entry silently
 // became "search everything, ranked by meaning", and a three-month-old call
-// transcript outranked tomorrow's calendar entry. Because both paths now
+// transcript outranked a recent note. Because both paths now
 // return a QueryPlan, a regex miss costs one LLM round-trip instead of
 // deleting the filter.
 //
@@ -121,11 +121,15 @@ var (
 	// pattern is a prefix of another: `이번 주말` must be tested before
 	// `이번 주`, and `모레` before `내일` so that "내일모레" resolves to the day
 	// after tomorrow rather than to tomorrow.
-	weekendRe   = regexp.MustCompile(`이번\s*주말`)
-	nextWeekRe  = regexp.MustCompile(`다음\s*주`)
-	tomorrowRe  = regexp.MustCompile(`내일`)
-	dayAfterRe  = regexp.MustCompile(`모레`)
-	calendarKwR = regexp.MustCompile(`일정|스케줄|캘린더|약속`)
+	weekendRe  = regexp.MustCompile(`이번\s*주말`)
+	nextWeekRe = regexp.MustCompile(`다음\s*주`)
+	tomorrowRe = regexp.MustCompile(`내일`)
+	dayAfterRe = regexp.MustCompile(`모레`)
+
+	// scheduleKwR 은 일정을 묻는 주제어다. 캘린더 소스가 사라졌으므로 소스를
+	// 고르는 데는 쓰지 않고, 기록 단어와 함께 나올 때 "문자가 논하는 사건의 날짜"
+	// 와 "문자가 온 날짜"가 헷갈리는 질문을 결정론 경로에서 걸러내는 데만 쓴다.
+	scheduleKwR = regexp.MustCompile(`일정|스케줄|캘린더|약속`)
 
 	// 아래부터는 "지난 주"류의 과거·상대 표현 확장분. 마찬가지로 겹치는 표현은
 	// 접두어가 더 구체적인 쪽(주말)을 먼저 매치해야 하므로 lastWeekendRe가
@@ -153,43 +157,7 @@ var (
 var exactDayRe = regexp.MustCompile(`(\d{4})(?:년\s*|-)(\d{1,2})(?:월\s*|-)(\d{1,2})(?:일)?`)
 var complexTimeRe = regexp.MustCompile(`비교|대비|차이|부터|까지|\d{1,2}[/-]\d{1,2}|\d{1,2}일`)
 var recordOccurredRe = regexp.MustCompile(`받|보낸|보냈|수신|발신|통화했|전화했`)
-var recordSourceRe = regexp.MustCompile(`메일|이메일|문자|메시지|메세지|통화|전화|슬랙|노션|문서|노트|기록|대화`)
-
-// scheduleCueRe 는 일정 키워드(calendarKwR) 없이도 일정 질문으로 읽히는 표현이다.
-// HasScheduleIntent 전용이며 계획(DeterministicPlan)의 소스 판정에는 쓰지 않는다 —
-// 이 신호는 하드 필터가 아니라 순위 가산(search 의 ScheduleIntentBoost)에만 쓰인다.
-//
-// 보수적으로 고른 목록이다. 만남·회의 명사(미팅·회의), 계획 표현(예정·계획),
-// 하루 일과 질문(뭐 해/뭐 하), 시점 질문(언제·몇 시), 이동 의무(가야),
-// 만남 동사(만나). "오늘"·"다음" 같은 일반 시간어나 "할 일" 은 넣지 않는다 —
-// 메일·메모 질문에도 흔해서 캘린더를 엉뚱하게 끌어올린다.
-var scheduleCueRe = regexp.MustCompile(`미팅|회의|예정|계획|뭐\s?해|뭐\s?하|언제|몇\s?시|가야|만나`)
-
-// ScheduleCueVersion 은 HasScheduleIntent 의 판정 규칙(scheduleCueRe·
-// scheduleRecordNounRe·기록 단어 우선) 판이다. 목록을 바꾸면 올린다 — 같은
-// 노브 값이라도 판정이 달라지면 다른 평가 baseline 계열이어야 한다(cmd/eval
-// 실행 프로필에 기록).
-const ScheduleCueVersion = "v1"
-
-// scheduleRecordNounRe 는 일정 단서 단어를 포함하지만 그 자체가 기록물인
-// 명사다("회의록", "계획서"). 단서 매칭 전에 지운다.
-var scheduleRecordNounRe = regexp.MustCompile(`회의록|계획서`)
-
-// HasScheduleIntent 는 질문이 일정(캘린더)을 묻는지 알린다.
-//
-// 질문이 명시적인 기록 단어(recordSourceRe: 메일·문자·통화·노트·기록 등)를
-// 담으면 false 다 — "어제 회의 관련 메일" 은 회의가 아니라 메일을 묻는다.
-// 그 밖에는 calendarKwR(일정·스케줄·캘린더·약속) 또는 scheduleCueRe 가 맞으면
-// true 다. LLM 호출이 없고 결정론적이다.
-func HasScheduleIntent(question string) bool {
-	if recordSourceRe.MatchString(question) {
-		return false
-	}
-	if calendarKwR.MatchString(question) {
-		return true
-	}
-	return scheduleCueRe.MatchString(scheduleRecordNounRe.ReplaceAllString(question, " "))
-}
+var recordSourceRe = regexp.MustCompile(`문자|메시지|메세지|통화|전화|슬랙|노션|문서|노트|기록|대화`)
 
 // periodMentionRegexes는 requiresSemanticWindow의 "몇 개 기간이 언급됐는가" 집계와
 // hasPeriodMention의 "기간이 하나라도 있는가" 판정이 공유하는 단일 목록이다. 두
@@ -263,7 +231,6 @@ func explicitRecordSources(question string) []model.SourceType {
 		words  []string
 		source model.SourceType
 	}{
-		{[]string{"메일", "이메일"}, model.SourceGmail},
 		{[]string{"문자", "SMS"}, model.SourceSMS},
 		{[]string{"통화", "전화"}, model.SourceCall},
 		{[]string{"슬랙"}, model.SourceSlack},
@@ -300,8 +267,6 @@ func explicitRecordSources(question string) []model.SourceType {
 // any name outside planSourceTypes) is unchanged and needs no special case
 // for them.
 var planSourceTypes = []model.SourceType{
-	model.SourceCalendar,
-	model.SourceGmail,
 	model.SourceSMS,
 	model.SourceCall,
 	model.SourceNote,
@@ -648,7 +613,7 @@ func DeterministicPlan(question string, now time.Time) (QueryPlan, bool) {
 	// the future. Complex event-vs-sent-time questions have already missed the
 	// deterministic window and go to the semantic planner.
 	if recordSourceRe.MatchString(question) {
-		if calendarKwR.MatchString(question) && !recordOccurredRe.MatchString(question) {
+		if scheduleKwR.MatchString(question) && !recordOccurredRe.MatchString(question) {
 			return QueryPlan{}, false
 		}
 		tomorrow, _ := dayRange(now.AddDate(0, 0, 1))
@@ -656,7 +621,7 @@ func DeterministicPlan(question string, now time.Time) (QueryPlan, bool) {
 			return QueryPlan{}, false
 		}
 	}
-	sources := deterministicSources(question, from, now)
+	sources := deterministicSources(question)
 	return QueryPlan{
 		OccurredFrom: &from,
 		OccurredTo:   &to,
@@ -666,22 +631,11 @@ func DeterministicPlan(question string, now time.Time) (QueryPlan, bool) {
 	}, true
 }
 
-// deterministicSources gives an explicit record source priority over topic
-// words such as 일정 or 약속. Complex record/event-time questions never reach
-// this fast path. Otherwise direct calendar topics and future periods select
-// calendar; unknown source intent stays unconstrained.
-func deterministicSources(question string, from, now time.Time) []model.SourceType {
-	if sources := explicitRecordSources(question); len(sources) > 0 {
-		return sources
-	}
-	if calendarKwR.MatchString(question) {
-		return []model.SourceType{model.SourceCalendar}
-	}
-	tomorrowStart, _ := dayRange(now.AddDate(0, 0, 1))
-	if !from.Before(tomorrowStart) {
-		return []model.SourceType{model.SourceCalendar}
-	}
-	return nil
+// deterministicSources 는 질문이 명시한 소스(문자, 통화, 노트 등)를 돌려준다.
+// 일정·약속 같은 주제어보다 명시한 기록 소스가 우선이다. 복잡한 기록/사건 시각
+// 질문은 이 빠른 경로에 오지 않는다. 소스를 짐작할 수 없으면 제약하지 않는다.
+func deterministicSources(question string) []model.SourceType {
+	return explicitRecordSources(question)
 }
 
 // planSystemPrompt is the LLM path's system prompt. %s placeholders are, in
@@ -700,9 +654,9 @@ Rules:
 1. occurred_from/occurred_to describe a HALF-OPEN date window [from, to) in KST: occurred_to is the day AFTER the last day you want. One single day D is {"occurred_from":"D","occurred_to":"D+1"}.
 2. If the question contains NO explicit time expression, set BOTH to "". Vague words such as "최근", "요즘", "예전에" are NOT explicit: do not invent a window for them. An invented window hides documents the user asked for.
 3. source_types may only contain values from this list: %s. Use it only when the question clearly names a kind of record. Leave it [] when unsure — an empty list means "search everything", and a wrong narrow list returns nothing at all.
-4. Distinguish the time a record occurred from an event discussed inside it. Calendar-only is appropriate for a direct future schedule question. Past messages, calls, and mail CAN discuss future events: for "내일 일정에 대해 어제 받은 메일", choose gmail and yesterday's sent-time window; for "내일 일정에 관한 메일", choose gmail and leave BOTH bounds empty because the sent date is unknown. Do not narrow to calendar merely because 일정/약속 appears.
+4. Distinguish the time a record occurred from an event discussed inside it. Messages and calls CAN discuss future events: for "내일 일정에 대해 어제 받은 문자", choose sms and yesterday's sent-time window; for "내일 일정에 관한 문자", choose sms and leave BOTH bounds empty because the sent date is unknown. Do not narrow to a source merely because 일정/약속 appears.
 5. Respect the most specific date (a named day within a week/month). For comparisons or multiple periods, use a window covering ALL requested periods, never only the first mention. If no single safe occurred-time window exists, leave BOTH bounds empty.
-6. reason: one short Korean sentence stating what will be searched, e.g. "내일(8/20) 캘린더만 조회".`
+6. reason: one short Korean sentence stating what will be searched, e.g. "어제(8/19) 문자만 조회".`
 
 // planResponse is the LLM path's wire schema. Field names are the contract
 // stated in planSystemPrompt.
@@ -884,15 +838,13 @@ func stripInsight(sources []model.SourceType) (kept []model.SourceType, widened 
 // Unlisted types fall through to their raw identifier — a slightly technical
 // Reason is better than a plan that cannot describe itself.
 var sourceLabels = map[model.SourceType]string{
-	model.SourceCalendar: "캘린더",
-	model.SourceGmail:    "메일",
-	model.SourceSMS:      "문자",
-	model.SourceCall:     "통화",
-	model.SourceNote:     "노트",
-	model.SourceUpload:   "업로드 파일",
+	model.SourceSMS:    "문자",
+	model.SourceCall:   "통화",
+	model.SourceNote:   "노트",
+	model.SourceUpload: "업로드 파일",
 }
 
-// planReason renders "내일(8/20) 캘린더만 조회".
+// planReason renders "어제(8/19) 문자만 조회".
 func planReason(label string, from, to time.Time, sources []model.SourceType) string {
 	return fmt.Sprintf("%s(%s) %s", label, formatSpan(from, to), sourcePhrase(sources))
 }

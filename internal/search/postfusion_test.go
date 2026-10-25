@@ -81,7 +81,7 @@ func TestCollapseContactDay_GroupsAndExpands(t *testing.T) {
 	a1 := pfSMS(1, "aaaa", 10, pfAt(1, 9))
 	b := pfSMS(2, "bbbb", 9, pfAt(1, 10))
 	a2 := pfSMS(3, "aaaa", 8, pfAt(1, 11))
-	c := pfDoc(4, model.SourceGmail, 7, pfAt(1, 12))
+	c := pfDoc(4, model.SourceUpload, 7, pfAt(1, 12))
 	a3 := pfSMS(5, "aaaa", 5, pfAt(1, 20))
 	in := []*model.SearchResult{a1, b, a2, c, a3}
 
@@ -143,9 +143,9 @@ func TestCollapseContactDay_KeyRules(t *testing.T) {
 	noMeta2 := pfDoc(10, model.SourceSMS, 1.0, pfAt(6, 10))
 	noTime := pfSMS(11, "aaaa", 0.9, nil)
 	noTime2 := pfSMS(12, "aaaa", 0.8, nil)
-	mail1 := pfDoc(13, model.SourceGmail, 0.7, pfAt(7, 9))
+	mail1 := pfDoc(13, model.SourceUpload, 0.7, pfAt(7, 9))
 	mail1.Metadata["thread_id"] = "t"
-	mail2 := pfDoc(14, model.SourceGmail, 0.6, pfAt(7, 10))
+	mail2 := pfDoc(14, model.SourceUpload, 0.6, pfAt(7, 10))
 	mail2.Metadata["thread_id"] = "t"
 
 	in := []*model.SearchResult{night, morning, h1, h2, t1, t2, smsX, callX, noMeta, noMeta2, noTime, noTime2, mail1, mail2}
@@ -206,7 +206,7 @@ func pfRandomPool(seed int64, n int) []*model.SearchResult {
 		}
 		switch rng.Intn(4) {
 		case 0:
-			out[i] = pfDoc(i+1, model.SourceGmail, score, at)
+			out[i] = pfDoc(i+1, model.SourceUpload, score, at)
 		case 1:
 			r := pfDoc(i+1, model.SourceCall, score, at)
 			r.SourceID = "call-log:1:" + hashes[rng.Intn(len(hashes))] + ":d"
@@ -282,8 +282,8 @@ func TestDiversifyByDay(t *testing.T) {
 		pfDoc(2, model.SourceCall, 9, pfAt(1, 10)),
 		pfDoc(3, model.SourceSMS, 8, pfAt(2, 9)),
 		pfDoc(4, model.SourceCall, 7, pfAt(1, 11)),
-		pfDoc(5, model.SourceGmail, 6, nil), // 날짜 없음: 첫 바퀴에서 빠진다
-		pfDoc(6, model.SourceCalendar, 5, pfAt(3, 9)),
+		pfDoc(5, model.SourceUpload, 6, nil), // 날짜 없음: 첫 바퀴에서 빠진다
+		pfDoc(6, model.SourceCall, 5, pfAt(3, 9)),
 		pfDoc(7, model.SourceCall, math.NaN(), pfAt(4, 9)),
 	}
 	got := diversifyByDay(in)
@@ -347,7 +347,7 @@ func TestApplyMMR_NoPenaltyAcrossSources(t *testing.T) {
 	t.Parallel()
 	in := []*model.SearchResult{
 		pfVecDoc(1, model.SourceCall, 1.0, 1, 0),
-		pfVecDoc(2, model.SourceGmail, 0.95, 1, 0), // 같은 벡터지만 다른 소스
+		pfVecDoc(2, model.SourceUpload, 0.95, 1, 0), // 같은 벡터지만 다른 소스
 		pfVecDoc(3, model.SourceCall, 0.9, 0, 1),
 	}
 	assertSameIDs(t, pfIDs(applyMMR(in, 0.5)), pfIDs(in))
@@ -551,11 +551,11 @@ func pfFixture() []*model.SearchResult {
 		out = append(out, r)
 	}
 	for i, sc := range gmScores {
-		r := pfDoc(10+i, model.SourceGmail, sc, pfAt(11+i, 9))
+		r := pfDoc(10+i, model.SourceUpload, sc, pfAt(11+i, 9))
 		r.Embedding = []float32{0, 1}
 		out = append(out, r)
 	}
-	out = append(out, pfDoc(30, model.SourceCalendar, 1, pfAt(20, 9)))
+	out = append(out, pfDoc(30, model.SourceCall, 1, pfAt(20, 9)))
 	sortByScore(out)
 	return out
 }
@@ -596,7 +596,7 @@ func TestPostFusion_KnobsOffIdentity(t *testing.T) {
 	}
 	got, st = run(window, model.SearchTuning{SourceStratifyK: 2})
 	if len(st.calls) != 1+len(stratifySources) || !slices.Contains(got, pfID(30)) {
-		t.Errorf("stratify: calls=%d, calendar doc surfaced=%v", len(st.calls), slices.Contains(got, pfID(30)))
+		t.Errorf("stratify: calls=%d, call doc surfaced=%v", len(st.calls), slices.Contains(got, pfID(30)))
 	}
 
 	// 노브가 켜져 있어도 적용 조건이 아니면 동일하다.
@@ -670,10 +670,10 @@ func TestExpandCollapsed_OverflowKeepsPreCollapseRelativeOrder(t *testing.T) {
 	t.Parallel()
 	// 접기 전: a1 a2 x1 a3 a4 x2 x3 ... (a 는 한 그룹, x 는 다른 메일 14건)
 	in := []*model.SearchResult{pfSMS(1, "aaaa", 100, pfAt(1, 9)), pfSMS(2, "aaaa", 99, pfAt(1, 10))}
-	in = append(in, pfDoc(50, model.SourceGmail, 98, nil))
+	in = append(in, pfDoc(50, model.SourceUpload, 98, nil))
 	in = append(in, pfSMS(3, "aaaa", 97, pfAt(1, 11)), pfSMS(4, "aaaa", 96, pfAt(1, 12)))
 	for i := 0; i < 14; i++ {
-		in = append(in, pfDoc(60+i, model.SourceGmail, float64(95-i), nil))
+		in = append(in, pfDoc(60+i, model.SourceUpload, float64(95-i), nil))
 	}
 	ranked, set := collapseContactDay(in, 1)
 	out := expandCollapsed(ranked, set) // 리랭크 없음
@@ -739,8 +739,8 @@ func TestExpandCollapsed_ScoresNonIncreasingAcrossScales(t *testing.T) {
 	t.Parallel()
 	in := []*model.SearchResult{
 		pfSMS(1, "aaaa", 0.033, pfAt(1, 9)), pfSMS(2, "aaaa", 0.032, pfAt(1, 10)),
-		pfDoc(3, model.SourceGmail, 0.031, nil), pfSMS(4, "aaaa", 0.030, pfAt(1, 11)),
-		pfDoc(5, model.SourceGmail, 0.029, nil),
+		pfDoc(3, model.SourceUpload, 0.031, nil), pfSMS(4, "aaaa", 0.030, pfAt(1, 11)),
+		pfDoc(5, model.SourceUpload, 0.029, nil),
 	}
 	ranked, set := collapseContactDay(in, 1)
 	// 리랭커(replace)가 대표·문서에 0..1 척도 점수를 매겼다.
@@ -761,9 +761,9 @@ func TestExpandCollapsed_ScoresNonIncreasingAcrossScales(t *testing.T) {
 func TestClampNonIncreasing(t *testing.T) {
 	t.Parallel()
 	in := []*model.SearchResult{
-		pfDoc(1, model.SourceGmail, 0.5, nil), pfDoc(2, model.SourceGmail, 0.9, nil),
-		pfDoc(3, model.SourceGmail, math.NaN(), nil), pfDoc(4, model.SourceGmail, 0.7, nil),
-		pfDoc(5, model.SourceGmail, 0.1, nil),
+		pfDoc(1, model.SourceUpload, 0.5, nil), pfDoc(2, model.SourceUpload, 0.9, nil),
+		pfDoc(3, model.SourceUpload, math.NaN(), nil), pfDoc(4, model.SourceUpload, 0.7, nil),
+		pfDoc(5, model.SourceUpload, 0.1, nil),
 	}
 	out := clampNonIncreasing(in)
 	want := []float64{0.5, 0.5, math.NaN(), 0.5, 0.1}

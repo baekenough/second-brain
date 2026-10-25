@@ -13,9 +13,9 @@ func TestDB_EvalSignedManualVotesAndEligibility(t *testing.T) {
 	ctx := context.Background()
 	s := NewEvalStore(pg)
 	query := "zz-dummy-eval-" + uuid.NewString()
-	positive := seedSrcDoc(t, pg, model.SourceGmail, nil)
-	negative := seedSrcDoc(t, pg, model.SourceGmail, nil)
-	disposable := seedSrcDoc(t, pg, model.SourceGmail, nil)
+	positive := seedSrcDoc(t, pg, model.SourceUpload, nil)
+	negative := seedSrcDoc(t, pg, model.SourceUpload, nil)
+	disposable := seedSrcDoc(t, pg, model.SourceUpload, nil)
 	t.Cleanup(func() { _, _ = pg.pool.Exec(ctx, `DELETE FROM feedback WHERE query=$1`, query) })
 	_, err := pg.pool.Exec(ctx, `INSERT INTO feedback(query,document_id,source,thumbs) VALUES($1,$2,'manual',1),($1,$3,'manual',-1),($1,$3,'manual',1),($1,$4,'manual',1)`, query, positive, negative, disposable)
 	if err != nil {

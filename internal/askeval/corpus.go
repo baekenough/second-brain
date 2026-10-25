@@ -105,7 +105,7 @@ func buildCorpus(f Fixture, now time.Time) (*corpus, error) {
 	for i := range c.docs {
 		doc := &c.docs[i]
 		c.byID[doc.ID] = doc
-		parts := chunker.Split(doc.Content, chunker.Options{SourceType: string(doc.SourceType)})
+		parts := chunker.Split(doc.Content, chunker.Options{})
 		chunks := make([]store.Chunk, 0, len(parts))
 		for idx, text := range parts {
 			ch := store.Chunk{

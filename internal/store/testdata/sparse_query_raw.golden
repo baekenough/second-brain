@@ -448,7 +448,7 @@ $3 = string "v1-tp"
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
-$4 = []model.SourceType []model.SourceType{"calendar"}
+$4 = []model.SourceType []model.SourceType{"note"}
 $5 = string "이번 주 회의 일정 알려줘"
 ==== hybrid/entity_off/source ====
 
@@ -552,7 +552,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
-$4 = []model.SourceType []model.SourceType{"calendar"}
+$4 = []model.SourceType []model.SourceType{"note"}
 ==== fulltext/source ====
 
 		SELECT id, source_type, source_id, title, content, metadata, embedding,
@@ -578,7 +578,7 @@ $4 = []model.SourceType []model.SourceType{"calendar"}
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 10
-$3 = []model.SourceType []model.SourceType{"calendar"}
+$3 = []model.SourceType []model.SourceType{"note"}
 ==== chunk_fts/source ====
 
 		SELECT
@@ -608,7 +608,7 @@ $3 = []model.SourceType []model.SourceType{"calendar"}
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
-$3 = []model.SourceType []model.SourceType{"calendar"}
+$3 = []model.SourceType []model.SourceType{"note"}
 ==== sparse_ctx/source ====
 
 		WITH fresh AS (
@@ -668,7 +668,7 @@ $3 = []model.SourceType []model.SourceType{"calendar"}
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
 $3 = string "v1-tp"
-$4 = []model.SourceType []model.SourceType{"calendar"}
+$4 = []model.SourceType []model.SourceType{"note"}
 ==== hybrid/entity_on/exclude ====
 
 		WITH fts AS (
@@ -786,7 +786,7 @@ $4 = []model.SourceType []model.SourceType{"calendar"}
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
-$4 = []model.SourceType []model.SourceType{"insight", "gmail"}
+$4 = []model.SourceType []model.SourceType{"insight", "upload"}
 $5 = string "이번 주 회의 일정 알려줘"
 ==== hybrid/entity_off/exclude ====
 
@@ -890,7 +890,7 @@ $5 = string "이번 주 회의 일정 알려줘"
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
-$4 = []model.SourceType []model.SourceType{"insight", "gmail"}
+$4 = []model.SourceType []model.SourceType{"insight", "upload"}
 ==== fulltext/exclude ====
 
 		SELECT id, source_type, source_id, title, content, metadata, embedding,
@@ -916,7 +916,7 @@ $4 = []model.SourceType []model.SourceType{"insight", "gmail"}
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 10
-$3 = []model.SourceType []model.SourceType{"insight", "gmail"}
+$3 = []model.SourceType []model.SourceType{"insight", "upload"}
 ==== chunk_fts/exclude ====
 
 		SELECT
@@ -946,7 +946,7 @@ $3 = []model.SourceType []model.SourceType{"insight", "gmail"}
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
-$3 = []model.SourceType []model.SourceType{"insight", "gmail"}
+$3 = []model.SourceType []model.SourceType{"insight", "upload"}
 ==== sparse_ctx/exclude ====
 
 		WITH fresh AS (
@@ -1006,7 +1006,7 @@ $3 = []model.SourceType []model.SourceType{"insight", "gmail"}
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
 $3 = string "v1-tp"
-$4 = []model.SourceType []model.SourceType{"insight", "gmail"}
+$4 = []model.SourceType []model.SourceType{"insight", "upload"}
 ==== hybrid/entity_on/retention ====
 
 		WITH fts AS (
@@ -1823,7 +1823,7 @@ $5 = 2026-08-24T00:00:00Z
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
-$4 = []model.SourceType []model.SourceType{"calendar", "call"}
+$4 = []model.SourceType []model.SourceType{"note", "call"}
 $5 = []model.SourceType []model.SourceType{"insight"}
 $6 = []string []string{"disposable"}
 $7 = 2026-08-17T00:00:00Z
@@ -1935,7 +1935,7 @@ $9 = string "이번 주 회의 일정 알려줘"
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
-$4 = []model.SourceType []model.SourceType{"calendar", "call"}
+$4 = []model.SourceType []model.SourceType{"note", "call"}
 $5 = []model.SourceType []model.SourceType{"insight"}
 $6 = []string []string{"disposable"}
 $7 = 2026-08-17T00:00:00Z
@@ -1966,7 +1966,7 @@ $8 = 2026-08-24T00:00:00Z
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 10
-$3 = []model.SourceType []model.SourceType{"calendar", "call"}
+$3 = []model.SourceType []model.SourceType{"note", "call"}
 $4 = []model.SourceType []model.SourceType{"insight"}
 $5 = []string []string{"disposable"}
 $6 = 2026-08-17T00:00:00Z
@@ -2001,7 +2001,7 @@ $7 = 2026-08-24T00:00:00Z
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
-$3 = []model.SourceType []model.SourceType{"calendar", "call"}
+$3 = []model.SourceType []model.SourceType{"note", "call"}
 $4 = []model.SourceType []model.SourceType{"insight"}
 $5 = 2026-08-17T00:00:00Z
 $6 = 2026-08-24T00:00:00Z
@@ -2067,7 +2067,7 @@ $7 = []string []string{"disposable"}
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
 $3 = string "v1-tp"
-$4 = []model.SourceType []model.SourceType{"calendar", "call"}
+$4 = []model.SourceType []model.SourceType{"note", "call"}
 $5 = []model.SourceType []model.SourceType{"insight"}
 $6 = 2026-08-17T00:00:00Z
 $7 = 2026-08-24T00:00:00Z
@@ -2527,7 +2527,7 @@ $3 = string "v1-tp"
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
-$4 = []model.SourceType []model.SourceType{"calendar", "call"}
+$4 = []model.SourceType []model.SourceType{"note", "call"}
 $5 = []model.SourceType []model.SourceType{"insight"}
 $6 = []string []string{"disposable"}
 $7 = 2026-08-17T00:00:00Z
@@ -2639,7 +2639,7 @@ $9 = string "이번 주 회의 일정 알려줘"
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = vector[0.1 0.2 0.3 0.4]
 $3 = int 20
-$4 = []model.SourceType []model.SourceType{"calendar", "call"}
+$4 = []model.SourceType []model.SourceType{"note", "call"}
 $5 = []model.SourceType []model.SourceType{"insight"}
 $6 = []string []string{"disposable"}
 $7 = 2026-08-17T00:00:00Z
@@ -2670,7 +2670,7 @@ $8 = 2026-08-24T00:00:00Z
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 10
-$3 = []model.SourceType []model.SourceType{"calendar", "call"}
+$3 = []model.SourceType []model.SourceType{"note", "call"}
 $4 = []model.SourceType []model.SourceType{"insight"}
 $5 = []string []string{"disposable"}
 $6 = 2026-08-17T00:00:00Z
@@ -2705,7 +2705,7 @@ $7 = 2026-08-24T00:00:00Z
 ---- args ----
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
-$3 = []model.SourceType []model.SourceType{"calendar", "call"}
+$3 = []model.SourceType []model.SourceType{"note", "call"}
 $4 = []model.SourceType []model.SourceType{"insight"}
 $5 = 2026-08-17T00:00:00Z
 $6 = 2026-08-24T00:00:00Z
@@ -2771,7 +2771,7 @@ $7 = []string []string{"disposable"}
 $1 = string "이번 주 회의 일정 알려줘"
 $2 = int 30
 $3 = string "v1-tp"
-$4 = []model.SourceType []model.SourceType{"calendar", "call"}
+$4 = []model.SourceType []model.SourceType{"note", "call"}
 $5 = []model.SourceType []model.SourceType{"insight"}
 $6 = 2026-08-17T00:00:00Z
 $7 = 2026-08-24T00:00:00Z

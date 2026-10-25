@@ -89,8 +89,6 @@ services:
         condition: service_healthy
     volumes:
       - ${LLM_MEMORY_DB_HOST_PATH:-/Users/user/workspace/llm-memory/data/memory.sqlite}:/data/llm-memory.sqlite:ro
-      - ${GMAIL_HOST_PATH:-/Users/user/workspace/private/secretary/gmail}:/data/gmail:ro
-      - ${CALENDAR_HOST_PATH:-/Users/user/workspace/private/secretary/calendar}:/data/calendar:ro
       # OneDrive sms/call are copied to local staging by onedrive-bridge.sh
       # (launchd: com.user.secondbrain.onedrive-bridge, interval 600s)
       # to avoid VirtioFS resource-deadlock on on-demand cloud files.

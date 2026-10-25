@@ -121,7 +121,7 @@ func TestDeterministicWindow_NoNumberNoWindow(t *testing.T) {
 	t.Parallel()
 	now := planNowUTC.In(timeutil.KST())
 
-	for _, q := range []string{"최근에 받은 메일 정리", "요즘 뭐 하고 지내", "예전에 얘기했던 거"} {
+	for _, q := range []string{"최근에 받은 문자 정리", "요즘 뭐 하고 지내", "예전에 얘기했던 거"} {
 		if _, _, _, ok := intent.DeterministicWindow(q, now); ok {
 			t.Errorf("DeterministicWindow(%q) ok = true, want false (no explicit number)", q)
 		}

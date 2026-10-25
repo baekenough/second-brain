@@ -25,7 +25,7 @@ import (
 // unmigrated 'call-transcript' rows, that is a migration-completeness bug to
 // fix at the DB level (re-run/verify migration 033), not something this
 // query should silently paper over.
-const classifiableSourceTypesSQL = `'sms', 'gmail', 'call'`
+const classifiableSourceTypesSQL = `'sms', 'call'`
 
 // listUnclassifiedQuery backs ListUnclassified. Named/exposed at package
 // scope (rather than inlined as a function-local const, unlike most other
@@ -46,7 +46,7 @@ const listUnclassifiedQuery = `
 	ORDER BY collected_at DESC
 	LIMIT $1`
 
-// ListUnclassified returns up to limit active SMS/Gmail/call documents that
+// ListUnclassified returns up to limit active SMS/call documents that
 // have never been tagged with a retention value, ordered by collected_at
 // DESC (newest first) so that the background worker's steady-state Jev spend
 // tracks newly-collected volume rather than being starved by an
@@ -78,14 +78,14 @@ func (s *DocumentStore) ListUnclassified(ctx context.Context, limit int, backfil
 	return collectDocuments(rows)
 }
 
-// ListLegacyForRecheck returns up to limit active SMS/Gmail/call documents
+// ListLegacyForRecheck returns up to limit active SMS/call documents
 // that already carry ANY retention tag and have not yet been
 // gate-audited (classifier_gate_checked_at is unset) — i.e. every
 // retention-tagged document except a human-authored "user" (golden-set)
 // label. The scope is deliberately "any retention tag", not "tagged by a
 // classifier OTHER than this package's own rule/jev-latest outputs": legacy
 // tagging sources disagree on which metadata keys they set —
-//   - the ox-alpha mail segmentation pass writes retention/segment but
+//   - the (retired) ox-alpha segmentation pass wrote retention/segment but
 //     never writes a classifier key at all, so a `metadata ? 'classifier'`
 //     predicate silently excludes it entirely;
 //   - old sms/call-transcript backfill scripts DO write

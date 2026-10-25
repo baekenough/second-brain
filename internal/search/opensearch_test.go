@@ -80,7 +80,7 @@ func TestOpenSearchClient_Search_ParsesHitsAndAggregatesPerDocument(t *testing.T
 						"_source": map[string]any{
 							"chunk_id":    1,
 							"document_id": docA.String(),
-							"source_type": "gmail",
+							"source_type": "upload",
 							"title":       "회의록 초안",
 							"content":     "오늘 회의에서 논의된 내용",
 							"occurred_at": "2026-08-01T09:00:00Z",
@@ -93,7 +93,7 @@ func TestOpenSearchClient_Search_ParsesHitsAndAggregatesPerDocument(t *testing.T
 						"_source": map[string]any{
 							"chunk_id":    2,
 							"document_id": docA.String(),
-							"source_type": "gmail",
+							"source_type": "upload",
 							"title":       "회의록 초안",
 							"content":     "다음 회의 일정",
 						},
@@ -307,7 +307,7 @@ func TestBuildOpenSearchRequest_OccurredWindowIsHalfOpen(t *testing.T) {
 func TestBuildOpenSearchRequest_SourceTypeIncludeAndExclude(t *testing.T) {
 	t.Parallel()
 
-	st := model.SourceGmail
+	st := model.SourceUpload
 	req := buildOpenSearchRequest(model.SearchQuery{
 		Query:              "q",
 		SourceType:         &st,
@@ -320,8 +320,8 @@ func TestBuildOpenSearchRequest_SourceTypeIncludeAndExclude(t *testing.T) {
 		t.Fatalf("filter clauses = %d, want 1 (include terms)", len(filters))
 	}
 	includeValues := filters[0]["terms"].(map[string]any)["source_type"].([]string)
-	if len(includeValues) != 1 || includeValues[0] != "gmail" {
-		t.Errorf("include filter = %v, want [gmail]", includeValues)
+	if len(includeValues) != 1 || includeValues[0] != "upload" {
+		t.Errorf("include filter = %v, want [upload]", includeValues)
 	}
 
 	mustNot := boolQuery["must_not"].([]map[string]any)
@@ -409,7 +409,7 @@ func TestServiceSearch_OpenSearchLaneFusesAdditiveResults(t *testing.T) {
 			makeSearchResult(osOnlyDoc, "opensearch-only hit", 5.0),
 		},
 	}
-	svc := NewService(&hydratingDocSearcher{mockDocSearcher: store, documents: map[uuid.UUID]*model.Document{osOnlyDoc: {ID: osOnlyDoc, Status: "active", SourceType: model.SourceGmail, Content: "authoritative content"}}}, disabledEmbedder{}).WithOpenSearch(os)
+	svc := NewService(&hydratingDocSearcher{mockDocSearcher: store, documents: map[uuid.UUID]*model.Document{osOnlyDoc: {ID: osOnlyDoc, Status: "active", SourceType: model.SourceUpload, Content: "authoritative content"}}}, disabledEmbedder{}).WithOpenSearch(os)
 
 	results, err := svc.Search(context.Background(), model.SearchQuery{Query: "test"})
 	if err != nil {

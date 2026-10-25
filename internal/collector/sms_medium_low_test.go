@@ -515,8 +515,6 @@ func TestWhisperCollector_CloudEndpoint_WarnsNotFails(t *testing.T) {
 	}
 }
 
-// --- MEDIUM: Gmail nil Payload deref ---
-
 // TestSMSCollector_LatestFile_PrefersNewerDateName is a named test grouping for
 // the latestFileByPrefix filename-primary selection.
 func TestSMSCollector_LatestFile_PrefersNewerDateName(t *testing.T) {

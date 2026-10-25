@@ -45,7 +45,7 @@ func seedDummyGraph(t *testing.T, p *Projector) (ctx context.Context, observed t
 			EntityID: 11, EntityName: "더미갑", EntityType: "PERSON"},
 		{DocumentID: "00000000-0000-0000-0000-0000000000a2", SourceType: "sms", OccurredAt: &observed,
 			EntityID: 11, EntityName: "더미갑", EntityType: "PERSON"},
-		{DocumentID: "00000000-0000-0000-0000-0000000000a3", SourceType: "gmail", OccurredAt: nil,
+		{DocumentID: "00000000-0000-0000-0000-0000000000a3", SourceType: "sms", OccurredAt: nil,
 			EntityID: 22, EntityName: "더미을", EntityType: "PERSON"},
 	}
 	if err := p.UpsertMentions(ctx, mentions); err != nil {

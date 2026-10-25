@@ -15,7 +15,7 @@ describe("buildRankMap", () => {
   it("레이어와 무관하게 원본 배열 순서로 0-based rank를 매긴다", () => {
     const sources = [
       source("a", "note"),
-      source("b", "gmail"),
+      source("b", "sms"),
       source("c", "note"),
       source("d", "insight"),
     ];
@@ -23,7 +23,7 @@ describe("buildRankMap", () => {
   });
 
   it("중복 문서 ID가 있으면 첫 등장 순위를 유지한다", () => {
-    const sources = [source("a", "note"), source("b", "gmail"), source("a", "note")];
+    const sources = [source("a", "note"), source("b", "sms"), source("a", "note")];
     expect(buildRankMap(sources).a).toBe(0);
   });
 

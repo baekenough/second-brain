@@ -180,15 +180,11 @@ func TestSelectOptionsFilesystemRegressionSplit(t *testing.T) {
 	opts := SelectOptions(doc)
 
 	// Verify the options match the old hardcoded values exactly.
-	// SourceType is a new field (textclean dispatch, see internal/textclean) —
-	// SelectOptions always sets it to the document's own source type, so the
-	// expected value here must match doc.SourceType, not the zero value.
 	want := Options{
 		TargetSize:   2000,
 		MaxSize:      4000,
 		Overlap:      100,
 		HeadingAware: true,
-		SourceType:   string(model.SourceFilesystem),
 	}
 	if opts != want {
 		t.Errorf("regression: SelectOptions returned %+v, want %+v", opts, want)
