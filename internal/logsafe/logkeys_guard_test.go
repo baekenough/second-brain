@@ -45,7 +45,7 @@ type guardedFile struct {
 var guardedFiles = []guardedFile{
 	{path: "../collector/whisper.go", strict: true},
 	{path: "../scheduler/scheduler.go", sourceIDKeys: 6},
-	{path: "../store/document.go", sourceIDKeys: 3},
+	{path: "../store/document.go", sourceIDKeys: 4},
 	{path: "../store/document_source_guard.go", sourceIDKeys: 1},
 	{path: "../worker/entity_worker.go", sourceIDKeys: 1},
 	{path: "../worker/summarizer.go", sourceIDKeys: 1},
@@ -60,6 +60,8 @@ var strictAllowedKeys = setOf(
 	// 크기·시각·설정값
 	"size_bytes", "limit_bytes", "mtime", "parsed", "now", "model", "endpoint",
 	"count", "audio_dir", "source_id_bytes", "quarantine_dir",
+	// 사이클당 상한: 미룬 파일 수와 상한(둘 다 숫자)
+	"deferred", "cap",
 	// 오류 모양(logsafe.ErrAttrs 와 whisper 오류 타입의 LogAttrs)
 	"reason", "step", "status", "upstream_error_type", "upstream_error_code",
 )

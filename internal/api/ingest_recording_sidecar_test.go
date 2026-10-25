@@ -178,6 +178,70 @@ func TestIngestRecording_SidecarWrittenForVoiceMemo(t *testing.T) {
 	}
 }
 
+// TestIngestRecording_SidecarCarriesUpsertedSourceID verifies that for BOTH
+// kinds the sidecar's merge_source_id is exactly the source_id of the document
+// the handler upserts. WhisperCollector merges the transcript through this
+// field; for voice memos it is the only way to find the placeholder (the id is
+// a hash of the original upload name, not derivable from the other fields).
+func TestIngestRecording_SidecarCarriesUpsertedSourceID(t *testing.T) {
+	t.Parallel()
+
+	dateMs := time.Now().Add(-time.Hour).UnixMilli()
+	cases := []struct {
+		name     string
+		filename string
+		number   string
+		extra    []string
+		prefix   string
+	}{
+		{name: "call", filename: "call.m4a", number: "01012345678", extra: []string{"duration_sec", "120"}, prefix: "call-log:"},
+		{name: "voice-memo", filename: "memo.m4a", number: "", extra: []string{"kind", "voice-memo", "duration_sec", "45"}, prefix: "call-log:voice-memo:"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			upserter := &stubIngestUpserter{}
+			srv, recordingDir := newRecordingTestServer(t, upserter, "", 0, time.Time{})
+			body, ct := buildRecordingForm(t, tc.filename, validM4ABytes(32), tc.number, dateMs, tc.extra...)
+			rr := doRecordingPost(t, srv, body, ct, "Bearer test-key")
+			if rr.Code != 201 {
+				t.Fatalf("status = %d, want 201; body: %s", rr.Code, rr.Body.String())
+			}
+			if len(upserter.upserted) != 1 {
+				t.Fatalf("upserted %d documents, want 1", len(upserter.upserted))
+			}
+
+			entries, _ := os.ReadDir(recordingDir)
+			var sidecar map[string]any
+			for _, e := range entries {
+				if filepath.Ext(e.Name()) != ".json" {
+					continue
+				}
+				data, err := os.ReadFile(filepath.Join(recordingDir, e.Name()))
+				if err != nil {
+					t.Fatalf("read sidecar: %v", err)
+				}
+				if err := json.Unmarshal(data, &sidecar); err != nil {
+					t.Fatalf("unmarshal sidecar: %v", err)
+				}
+			}
+			if sidecar == nil {
+				t.Fatal("sidecar not found")
+			}
+
+			got, _ := sidecar["merge_source_id"].(string)
+			if want := upserter.upserted[0].SourceID; got != want {
+				t.Errorf("sidecar merge_source_id = %q, want the upserted document's source_id %q", got, want)
+			}
+			if !strings.HasPrefix(got, tc.prefix) {
+				t.Errorf("merge_source_id = %q, want prefix %q", got, tc.prefix)
+			}
+		})
+	}
+}
+
 // TestIngestRecording_SidecarMarshalling verifies the recordingSidecar struct
 // marshals as expected JSON — a unit test that does not touch HTTP or disk.
 func TestIngestRecording_SidecarMarshalling(t *testing.T) {

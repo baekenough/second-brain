@@ -308,6 +308,14 @@ type Config struct {
 	// (e.g. via a load balancer in front of two whisper containers). Default 1
 	// keeps single-node deployments unchanged (sequential behaviour).
 	WhisperConcurrency int
+	// WhisperMaxFilesPerCycle caps how many audio files one collection cycle
+	// transcribes (newest recordings first). Sourced from WHISPER_MAX_FILES_PER_CYCLE
+	// (default 20; 0 = unlimited; negative or non-numeric values warn and use the
+	// default). Only honoured when the scheduler supplied the authoritative index
+	// set — in mtime fallback mode the watermark advances after the cycle, so a
+	// deferred file would never be picked up again. A zero-value Config (tests)
+	// means unlimited.
+	WhisperMaxFilesPerCycle int
 
 	// Speaker diarization (optional — feature-flagged OFF by default).
 	//
@@ -949,6 +957,7 @@ func Load() (*Config, error) {
 		WhisperChunkingStrategy: getenv("WHISPER_CHUNKING_STRATEGY", "auto"),
 		WhisperCloudAllowed:     os.Getenv("WHISPER_CLOUD_ALLOWED") == "true",
 		WhisperConcurrency:      whisperConcurrency(),
+		WhisperMaxFilesPerCycle: whisperMaxFilesPerCycle(),
 
 		DiarizationEnabled: os.Getenv("DIARIZATION_ENABLED") == "true",
 		DiarizationAPIURL:  os.Getenv("DIARIZATION_API_URL"),
@@ -1232,6 +1241,27 @@ func whisperConcurrency() int {
 			"error", err,
 		)
 		return defaultConcurrency
+	}
+	return n
+}
+
+// whisperMaxFilesPerCycle parses WHISPER_MAX_FILES_PER_CYCLE from the environment.
+// Default is 20; 0 means unlimited. A negative or non-numeric value is invalid:
+// it logs a warning and falls back to the default (not to unlimited — the cap is
+// the guard against a runaway paid-API backlog, so a typo must not disable it).
+func whisperMaxFilesPerCycle() int {
+	const defaultMax = 20
+	v := os.Getenv("WHISPER_MAX_FILES_PER_CYCLE")
+	if v == "" {
+		return defaultMax
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		slog.Warn("config: WHISPER_MAX_FILES_PER_CYCLE is invalid; using default 20",
+			"value", v,
+			"error", err,
+		)
+		return defaultMax
 	}
 	return n
 }

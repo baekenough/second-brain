@@ -86,3 +86,24 @@ type IndexAwareCollector interface {
 	// Passing nil disables store-aware detection (fallback to event-time only).
 	WithIndexedIDs(ids map[string]struct{})
 }
+
+// AuthoritativeIndexCollector is an optional interface for IndexAwareCollector
+// implementations whose per-record work is expensive and NON-idempotent (whisper:
+// every re-processed audio file is a paid transcription API call) and therefore
+// must never run against a missing index set.
+//
+// For ordinary IndexAwareCollectors the scheduler answers a failed
+// source-ID-set load with WithIndexedIDs(nil), i.e. event-time-only filtering.
+// That fallback is harmless for cheap, idempotent collectors (SMS), but for a
+// collector that returns true here it turns "the database is unreachable" into
+// "treat every file as new". The scheduler instead skips the whole cycle.
+//
+// An interface (rather than a collector-name check) keeps that policy attached
+// to the collector that owns the cost model, and lets tests exercise it with a
+// fake collector of any name.
+type AuthoritativeIndexCollector interface {
+	IndexAwareCollector
+	// RequiresAuthoritativeIndex reports whether the collector must be skipped
+	// for a cycle when the indexed source-ID set cannot be loaded.
+	RequiresAuthoritativeIndex() bool
+}

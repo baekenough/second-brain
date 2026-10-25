@@ -380,6 +380,6 @@ func TestScheduler_EndToEnd_NoPanic(t *testing.T) {
 // Ensure trackingStoreWithActiveAndCount satisfies time-related methods via
 // embedded trackingStore → mockStore.
 var _ interface {
-	LastCollectedAt(context.Context, string, model.SourceType, time.Time) time.Time
+	LastCollectedAt(context.Context, string, model.SourceType, time.Time) (time.Time, error)
 	UpdateCollectorState(context.Context, string, model.SourceType, time.Time) error
 } = &trackingStoreWithActiveAndCount{}

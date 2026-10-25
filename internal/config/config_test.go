@@ -299,6 +299,46 @@ func TestLoad_WhisperMaxFileBytes(t *testing.T) {
 	}
 }
 
+// TestLoad_WhisperMaxFilesPerCycle verifies WHISPER_MAX_FILES_PER_CYCLE parsing:
+// default 20, 0 = unlimited, invalid values fall back to the default (not to
+// unlimited — a typo must not disable the cost guard).
+func TestLoad_WhisperMaxFilesPerCycle(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		envVal string
+		unset  bool
+		want   int
+	}{
+		{name: "default_when_unset", unset: true, want: 20},
+		{name: "explicit_5", envVal: "5", want: 5},
+		{name: "zero_means_unlimited", envVal: "0", want: 0},
+		{name: "invalid_string_uses_default", envVal: "many", want: 20},
+		{name: "negative_uses_default", envVal: "-3", want: 20},
+		{name: "empty_uses_default", envVal: "", want: 20},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unset {
+				unsetenv(t, "WHISPER_MAX_FILES_PER_CYCLE")
+			} else {
+				setenv(t, "WHISPER_MAX_FILES_PER_CYCLE", tc.envVal)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.WhisperMaxFilesPerCycle != tc.want {
+				t.Errorf("WhisperMaxFilesPerCycle = %d, want %d", cfg.WhisperMaxFilesPerCycle, tc.want)
+			}
+		})
+	}
+}
+
 // TestLoad_CalendarLookbehindDays_Default verifies the default is 365.
 func TestLoad_CalendarLookbehindDays_Default(t *testing.T) {
 	unsetenv(t, "CALENDAR_LOOKBEHIND_DAYS")

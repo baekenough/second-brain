@@ -143,8 +143,8 @@ type sinceCapturingStore struct {
 	since time.Time // value returned by LastCollectedAt
 }
 
-func (s *sinceCapturingStore) LastCollectedAt(_ context.Context, _ string, _ model.SourceType, _ time.Time) time.Time {
-	return s.since
+func (s *sinceCapturingStore) LastCollectedAt(_ context.Context, _ string, _ model.SourceType, _ time.Time) (time.Time, error) {
+	return s.since, nil
 }
 
 // TestScheduler_Cutover_AdvancesSinceWhenBeforeCutover verifies that when the
